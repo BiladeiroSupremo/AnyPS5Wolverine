@@ -379,6 +379,26 @@ void ReportThreadContext(const CONTEXT* context, DWORD threadId, const char* nam
         DescribeAddress(frames[depth], line, sizeof(line));
         Report("    #%llu %s\n", static_cast<unsigned long long>(depth), line);
     }
+    // Debug aid: APS5_STACK_SCAN=1 lists the stack words that point into the executable's image, for
+    // frames the unwinder cannot walk (guest code without unwind data). Heuristic: stale words appear too.
+    static const bool scan = std::getenv("APS5_STACK_SCAN") != nullptr;
+    if (!scan) return;
+    const auto module = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(module + dos->e_lfanew);
+    const auto imageEnd = module + nt->OptionalHeader.SizeOfImage;
+    MEMORY_BASIC_INFORMATION region{};
+    if (VirtualQuery(reinterpret_cast<const void*>(context->Rsp), &region, sizeof(region)) == 0) return;
+    const auto regionEnd = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
+    const auto end = regionEnd < context->Rsp + 0x8000 ? regionEnd : context->Rsp + 0x8000;
+    std::size_t listed = 0;
+    for (auto at = context->Rsp & ~7ull; at + 8 <= end && listed < 32; at += 8) {
+        const auto value = *reinterpret_cast<const std::uint64_t*>(at);
+        if (value <= module + 0x1000 || value >= imageEnd) continue;
+        DescribeAddress(value, line, sizeof(line));
+        Report("    ~ [rsp+0x%llx] %s\n", static_cast<unsigned long long>(at - context->Rsp), line);
+        ++listed;
+    }
 }
 
 void ReportAllThreads() {

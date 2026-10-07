@@ -1,4 +1,6 @@
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "NpUniversalDataSystem.hpp"
@@ -8,6 +10,7 @@
 extern "C" {
 
 int APS5_VABI sceNpUniversalDataSystemCreateContext(int* context, int user_id, uint32_t service_label, uint64_t options) {
+    if (std::getenv("APS5_TRACE_NP") != nullptr) std::fprintf(stderr, "[np] UDS CreateContext user=%d label=%u\n", user_id, service_label);
     if (context == nullptr) {
         throw std::invalid_argument(std::string(__func__) + ": invalid argument context");
     }
@@ -20,6 +23,7 @@ int APS5_VABI sceNpUniversalDataSystemDestroyContext(int context) {
 }
 
 int APS5_VABI sceNpUniversalDataSystemRegisterContext(int context, int handle, uint64_t options) {
+    if (std::getenv("APS5_TRACE_NP") != nullptr) std::fprintf(stderr, "[np] UDS RegisterContext context=%d handle=%d\n", context, handle);
     return SCE_NP_UNIVERSAL_DATA_SYSTEM_OK;
 }
 

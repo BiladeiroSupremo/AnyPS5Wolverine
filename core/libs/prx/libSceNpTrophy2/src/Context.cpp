@@ -1,4 +1,6 @@
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -8,6 +10,7 @@
 extern "C" {
 
 int APS5_VABI sceNpTrophy2CreateContext(int* context, int user_id, uint32_t service_label, uint64_t options) {
+    if (std::getenv("APS5_TRACE_NP") != nullptr) std::fprintf(stderr, "[np] Trophy2 CreateContext user=%d label=%u\n", user_id, service_label);
     if (context == nullptr) {
         APS5_INVALID_ARG_EX;
     }
@@ -24,6 +27,7 @@ int APS5_VABI sceNpTrophy2DestroyContext(int context) {
 }
 
 int APS5_VABI sceNpTrophy2RegisterContext(int context, int handle, uint64_t options) {
+    if (std::getenv("APS5_TRACE_NP") != nullptr) std::fprintf(stderr, "[np] Trophy2 RegisterContext context=%d handle=%d\n", context, handle);
     (void)context;
     (void)handle;
     (void)options;
