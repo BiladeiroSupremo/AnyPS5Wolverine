@@ -3712,6 +3712,18 @@ bool ShaderResources::HasCachedStorageImages() const {
     return std::none_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->StorageSource() != nullptr && !texture->StorageSource()->Cached(); });
 }
 
+// Bit 0: the storage image is written; bit 1: a sampled view of a storage image.
+std::vector<std::uint64_t> ShaderResources::StorageImageAddresses() const {
+    std::vector<std::uint64_t> addresses;
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageTextures[index] != nullptr) addresses.push_back(storageTextures[index]->Descriptor().baseAddress | (storageWritten[index] ? 1u : 0u));
+    }
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->StorageSource() != nullptr) addresses.push_back(texture->StorageSource()->Descriptor().baseAddress | 2u);
+    }
+    return addresses;
+}
+
 bool ShaderResources::ReadsImage(const StorageTexture* image) const {
     if (image == nullptr) return false;
     for (const auto& texture : textures) {

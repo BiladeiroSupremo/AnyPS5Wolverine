@@ -176,6 +176,8 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
+    // Diagnostic: the guest base addresses of the bound storage images.
+    std::vector<std::uint64_t> StorageImageAddresses() const;
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
