@@ -497,6 +497,11 @@ void ReportBacktrace(const char* what, bool reportThreads) {
     }
     ReportStackCandidates(reinterpret_cast<std::uint64_t>(__builtin_frame_address(0)), 32, 0x4000);
     ReportCallTrace();
+    if (std::getenv("APS5_STACK_SCAN") != nullptr) {
+        CONTEXT self{};
+        RtlCaptureContext(&self);
+        ReportThreadContext(&self, GetCurrentThreadId(), "(reporting thread)", nullptr, 0);
+    }
     if (reportThreads) ReportAllThreads();
     std::fflush(stderr);
 }

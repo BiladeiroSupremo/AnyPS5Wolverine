@@ -333,6 +333,13 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
             }
         }
         if (!pinned) return;
+        if (static bool reported = false; !reported && std::chrono::steady_clock::now() >= deadline - pinWait() + std::chrono::seconds(5)) {
+            // Diagnostic: a pin held for seconds; the holders are whoever copied the range pointer.
+            reported = true;
+            auto pin = ranges.upper_bound(address);
+            if (pin != ranges.begin()) --pin;
+            std::fprintf(stderr, "[gpu] guest allocation 0x%llx+0x%llx pinned for 5 s: range 0x%llx+0x%llx use_count=%ld, waiter=%d, synced rounds=%d\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(pin->first), static_cast<unsigned long long>(pin->second->bytes), static_cast<long>(pin->second.use_count()), pinWaiter.load() != nullptr ? 1 : 0, syncedRounds);
+        }
         if (std::chrono::steady_clock::now() >= deadline) PinnedFailure(address, bytes, ("waited " + std::to_string(pinWait().count()) + " ms for the lease (APS5_PIN_WAIT_MS)").c_str());
         const auto waiter = pinWaiter.load(std::memory_order_acquire);
         bool progressed = false;
