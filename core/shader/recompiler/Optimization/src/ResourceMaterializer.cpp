@@ -31,6 +31,8 @@ namespace ShaderRecompiler {
 namespace {
 
 std::atomic<std::uint64_t> specializationNanoseconds{0};
+std::atomic<std::uint64_t> evaluateNanoseconds{0};
+std::atomic<std::uint64_t> materializeNanoseconds{0};
 
 bool MaterializeProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -489,7 +491,9 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
 
     std::vector<DescriptorValue> values;
     std::vector<std::uint8_t> activeSources;
+    const auto evaluateStarted = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources, &snapshot.srtPoison, &snapshot.nullRootReads);
+    if (MaterializeProfiled()) evaluateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - evaluateStarted).count()), std::memory_order_relaxed);
 
     std::size_t cursor = 0;
     if (values.size() < plan.info.buffers.size()) {
@@ -1023,7 +1027,7 @@ void ownPlanValues(IrResourcePlan& plan) {
     }
     plan.valueStorage.Reserve(order.size());
     for (const auto* value : order) {
-        auto* clone = plan.valueStorage.Create(value->Opcode(), value->Type(), value->Id());
+        auto* clone = plan.valueStorage.Create(value->Opcode(), value->Type(), static_cast<std::uint32_t>(plan.valueStorage.Size()));
         clone->SetFlags(value->Flags<std::uint64_t>());
         if (value->HasImmediate()) clone->SetImmediateU64(value->ImmediateU64());
         clone->SetRegister(value->Register());
@@ -1055,7 +1059,7 @@ void ownPlanValues(IrResourcePlan& plan) {
     }
     // The plan is immutable from here on and only its arguments are walked (the SRT evaluation),
     // so the use lists go: with ~8 million plan values in PPSA03671 they held ~0.3 GB.
-    for (auto& value : plan.valueStorage) value->ReleaseUseLists();
+    for (auto& value : plan.valueStorage) value.ReleaseUseLists();
     // APS5_TRACE_PLAN_SIZES: plans made and their values, every 500 plans (the largest named).
     static const bool traceSizes = std::getenv("APS5_TRACE_PLAN_SIZES") != nullptr;
     if (traceSizes) {
@@ -1063,13 +1067,66 @@ void ownPlanValues(IrResourcePlan& plan) {
         static std::uint64_t plans = 0, values = 0, largest = 0, largestHash = 0;
         std::lock_guard lock(mutex);
         ++plans;
-        values += plan.valueStorage.size();
-        if (plan.valueStorage.size() > largest) {
-            largest = plan.valueStorage.size();
+        values += plan.valueStorage.Size();
+        if (plan.valueStorage.Size() > largest) {
+            largest = plan.valueStorage.Size();
             largestHash = plan.shaderHash;
         }
         if (plans % 500 == 0) std::fprintf(stderr, "[plan] %llu plans, %llu values (%.0f each), largest %llu (shader hash 0x%llx), %llu conditions dropped; roots: %zu descriptor sources, %zu SRT reads, %zu control flow, %zu uniform fill\n", static_cast<unsigned long long>(plans), static_cast<unsigned long long>(values), static_cast<double>(values) / static_cast<double>(plans), static_cast<unsigned long long>(largest), static_cast<unsigned long long>(largestHash), static_cast<unsigned long long>(droppedConditions.load(std::memory_order_relaxed)), plan.descriptorSources.size(), plan.srtReads.size(), plan.controlFlow.size(), plan.uniformFill.values.size());
     }
+    plan.denseValueIds = true;
+}
+
+void buildCompactPlan(IrResourcePlan& plan) {
+    if (!plan.denseValueIds || plan.valueStorage.Size() >= CompactResourcePlan::NoValue) return;
+    CompactResourcePlan compact;
+    const auto idOf = [&](const IrValue* value, std::uint32_t& id) {
+        if (value == nullptr) return false;
+        const auto* resolved = value->Resolve();
+        id = resolved->Id();
+        return id < plan.valueStorage.Size() && &plan.valueStorage[id] == resolved;
+    };
+    try {
+        compact.values.reserve(plan.valueStorage.Size());
+        for (const auto& stored : plan.valueStorage) {
+            const auto* value = &stored;
+            if (value->ArgumentCount() > 0xffu) return;
+            CompactPlanValue entry;
+            entry.immediate = value->ImmediateU64();
+            entry.flags = value->Flags<std::uint64_t>();
+            entry.firstArgument = static_cast<std::uint32_t>(compact.arguments.size());
+            entry.registerIndex = value->Register().index;
+            entry.type = value->Type();
+            entry.opcode = value->Opcode();
+            entry.argumentCount = static_cast<std::uint8_t>(value->ArgumentCount());
+            entry.hasImmediate = value->HasImmediate();
+            for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
+                std::uint32_t id = 0;
+                if (!idOf(value->Argument(index), id)) return;
+                compact.arguments.push_back(id);
+            }
+            compact.values.push_back(entry);
+        }
+        compact.sourceDwords.assign(plan.descriptorSources.size() * 8u, CompactResourcePlan::NoValue);
+        for (std::size_t source = 0; source < plan.descriptorSources.size(); source++) {
+            const auto& descriptor = plan.descriptorSources[source];
+            if (descriptor.dwordCount > 8u) return;
+            for (std::uint32_t dword = 0; dword < descriptor.dwordCount; dword++) {
+                if (!idOf(descriptor.dwords[dword], compact.sourceDwords[source * 8u + dword])) return;
+            }
+        }
+        compact.srtReads.resize(plan.srtReads.size());
+        for (std::size_t slot = 0; slot < plan.srtReads.size(); slot++) {
+            if (!idOf(plan.srtReads[slot].value, compact.srtReads[slot])) return;
+        }
+        compact.conditions.assign(plan.controlFlow.size(), CompactResourcePlan::NoValue);
+        for (std::size_t block = 0; block < plan.controlFlow.size(); block++) {
+            if (plan.controlFlow[block].condition != nullptr && !idOf(plan.controlFlow[block].condition, compact.conditions[block])) return;
+        }
+    } catch (const std::exception&) {
+        return;
+    }
+    plan.compact = std::move(compact);
 }
 
 }
@@ -1120,7 +1177,13 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     for (const auto& sampler : plan.info.samplers) addSource(sampler.source);
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
+    buildCompactPlan(plan);
     return plan;
+}
+
+void ResourceMaterializer::CompactPlan(IrResourcePlan& plan) {
+    plan.compact = {};
+    buildCompactPlan(plan);
 }
 
 void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const {
@@ -1131,6 +1194,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     if (plan.requiresSpecializationMemory && runtime.readMemory == nullptr) {
         throw std::runtime_error("ResourceMaterializer::Materialize requires runtime memory access for indirect images");
     }
+    const auto materializeStarted = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SrtWalker walker;
     ResourceSnapshot nextSnapshot;
     std::vector<TableResolution> tables;
@@ -1146,6 +1210,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     snapshot = std::move(nextSnapshot);
     reportBindless();
+    if (MaterializeProfiled()) materializeNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - materializeStarted).count()), std::memory_order_relaxed);
 }
 
 std::uint64_t ResourceMaterializer::SpecializationNanoseconds() {
@@ -1158,6 +1223,14 @@ std::uint32_t ResourceMaterializer::BindlessSlots() {
 
 void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {
     if (reason < BindlessRejection::Count) bindlessCounters().rejected[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t ResourceMaterializer::EvaluateNanoseconds() {
+    return evaluateNanoseconds.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ResourceMaterializer::MaterializeNanoseconds() {
+    return materializeNanoseconds.load(std::memory_order_relaxed);
 }
 
 }

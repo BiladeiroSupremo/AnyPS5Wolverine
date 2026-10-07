@@ -34,10 +34,13 @@ public:
     static void PrepareImageModes(ShaderInfo& info);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
+    static void CompactPlan(IrResourcePlan& plan);
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const;
     static std::uint64_t SpecializationNanoseconds();
     static std::uint32_t BindlessSlots();
     static void CountBindlessRejection(BindlessRejection reason);
+    static std::uint64_t EvaluateNanoseconds();
+    static std::uint64_t MaterializeNanoseconds();
 };
 
 }
