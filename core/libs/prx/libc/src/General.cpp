@@ -384,7 +384,16 @@ extern "C" std::filesystem::path RelinkedModulePath_nid_no_patch(const std::file
     auto relinked = path;
     relinked += ".guest.prx";
     std::error_code error;
-    return std::filesystem::is_regular_file(relinked, error) ? relinked : path;
+    if (std::filesystem::is_regular_file(relinked, error)) return relinked;
+    // The relinker converts only modules in sce_module/ or sce_modules/, so a module the title keeps
+    // elsewhere in app0 (PPSA03671 loads /app0/libcohtml.Prospero.prx) is relinked from there; loading
+    // that file returns the instance already loaded as a dependency.
+    for (const char* directory : {"sce_module", "sce_modules"}) {
+        auto bundled = path.parent_path() / directory / path.filename();
+        bundled += ".guest.prx";
+        if (std::filesystem::is_regular_file(bundled, error)) return bundled;
+    }
+    return path;
 }
 
 extern "C" int SetWorkingDirectory_nid_no_patch(const char* resolved) {

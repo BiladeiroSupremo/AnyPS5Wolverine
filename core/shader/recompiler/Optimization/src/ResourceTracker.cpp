@@ -495,7 +495,7 @@ private:
     // (the SPIR-V selects the bound slot from it); the eight reads become planning-only.
     bool TryMakeTableImage(IrValue& handle, IndirectImagePlan& plan) {
         if (handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u) {
-            return false;
+            { m_tableRejection = "table check 1"; return false; }
         }
 
         std::array<IrValue*, 8> heapReads {};
@@ -507,22 +507,22 @@ private:
             std::uint32_t memoryIndex = 0;
             const MemoryInfo* memory = ScalarReadMemory(*heapReads[dword], memoryIndex);
             if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
-                return false;
+                { m_tableRejection = "table check 2"; return false; }
             }
             if (dword == 0u) {
                 immediateOffset = memory->offset;
             } else if (memory->offset != immediateOffset + dword * sizeof(std::uint32_t)) {
-                return false;
+                { m_tableRejection = "table check 3"; return false; }
             }
             IrValue* currentHandle = heapReads[dword]->Argument(0)->Resolve();
             if (heapHandle != nullptr && currentHandle != heapHandle) {
-                return false;
+                { m_tableRejection = "table check 4"; return false; }
             }
             heapHandle = currentHandle;
             if (dword == 0u) {
                 heapOffset = heapReads[dword]->Argument(1)->Resolve();
             } else if (!EquivalentValue(m_program.Resources(), heapOffset, heapReads[dword]->Argument(1))) {
-                return false;
+                { m_tableRejection = "table check 5"; return false; }
             }
             plan.memory[dword] = memoryIndex;
             plan.reads[dword] = heapReads[dword];
@@ -531,21 +531,39 @@ private:
         IrValue* key = nullptr;
         std::uint32_t entryOffset = 0;
         if (!MatchTableOffset(heapOffset, key, entryOffset) || key->Type() != IrType::U32) {
-            return false;
+            { m_tableRejection = "table check 6"; return false; }
         }
         entryOffset += immediateOffset;
 
-        const std::array<const IrValue*, 1> imageUsers {&handle};
-        for (const auto* read : heapReads) {
-            if (!usesOnly(*read, imageUsers)) {
+        // Every user must be a T# of these same eight reads: this handle, or another image operation
+        // on the same table entry (PPSA03671 builds two from one load), which gets its own plan.
+        const auto sameEntry = [&](const IrValue* user) {
+            if (user->Opcode() != IrOpcode::GetImageResource || user->ArgumentCount() != heapReads.size()) {
                 return false;
+            }
+            for (std::uint32_t dword = 0; dword < heapReads.size(); dword++) {
+                if (user->Argument(dword)->Resolve() != heapReads[dword]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (const auto* read : heapReads) {
+            if (read->Uses().empty() || !std::ranges::all_of(read->Uses(), sameEntry)) {
+                std::string users;
+                for (const IrValue* user : read->Uses()) {
+                    users += " ";
+                    users += IrOpcodeName(user->Opcode());
+                    users += user == &handle ? "(self)" : "";
+                }
+                { m_tableRejection = "table check 7: users" + users; return false; }
             }
         }
 
         DescriptorSource heapSource;
         std::uint32_t heapSourceIndex = 0;
         if (!MakeRuntimeBufferSource(*heapHandle, heapSourceIndex, heapSource)) {
-            return false;
+            { m_tableRejection = "table check 8"; return false; }
         }
 
         DescriptorSource::IndirectImage table;
@@ -582,6 +600,8 @@ private:
         plan.roots = imageSource.dwords;
         return true;
     }
+
+    std::string m_tableRejection;
 
     const IndirectImagePlan* FindIndirectImage(const IrValue& handle) const {
         const auto found = std::ranges::find_if(m_indirectImages, [&](const IndirectImagePlan& plan) {
@@ -1160,7 +1180,9 @@ private:
             for (; badDword < descriptor.dwordCount; badDword++) {
                 const IrValue* value2 = descriptor.dwords[badDword]->Resolve();
                 if (value2->Opcode() == IrOpcode::ReadConstBuffer) {
-                    fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
+                    IndirectImagePlan probe;
+                    m_tableRejection = TryMakeTableImage(*handle, probe) ? "matched late" : m_tableRejection;
+                    fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value (bindless " + m_tableRejection + "); chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
                 }
             }
             badDword = 0;

@@ -37,6 +37,13 @@ int APS5_VABI sceAcmBatchWait(AcmContextId context, AcmBatchId batch, uint32_t t
     return 0;
 }
 
+// Sets a job's scheduling priority; batches run as no-ops, so the priority has no effect.
+int APS5_VABI sceAcmBatchJobPriority(void* job, uint32_t priority) {
+    (void)priority;
+    if (!job) return SCE_ACM_ERROR_INVALID_PARAMETER;
+    return 0;
+}
+
 int APS5_VABI sceAcmContextCreate(AcmContextId* context) {
     if (!context) return SCE_ACM_ERROR_INVALID_PARAMETER;
     *context = g_nextId.fetch_add(1, std::memory_order_relaxed);

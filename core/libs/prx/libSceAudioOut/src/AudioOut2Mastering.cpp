@@ -1,4 +1,7 @@
 #include <cstdint>
+#include <cstdio>
+#include <stdexcept>
+#include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
@@ -21,6 +24,7 @@ int APS5_VABI sceAudioOut2MasteringGetState(AudioOut2MasteringStatesHeader* stat
     return 0;
 }
 
+// The host output plays the title's mix as is: mastering parameters are accepted and have no effect.
 int APS5_VABI sceAudioOut2MasteringSetParam(const AudioOut2MasteringParamsHeader* param, uint32_t output, uint32_t flags) {
     (void)output;
     (void)flags;

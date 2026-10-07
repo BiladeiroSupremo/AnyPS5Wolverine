@@ -216,42 +216,43 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            BindlessTableRejected
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders
             CaptureResources
             DebugProbeActive
             DepthBitsTextureWidth
+            FindUserDataCalls
+            GetPreparedArtifact
+            GetPreparedCode
             HashBytes
+            LinkUserDataCalls
+            MatchesPreparedShader
+            MaterializeShader
             PixelInput
             PixelInputBit
-            RayTracingStrict
+            PrepareShader
+            PreparedShaderInvocation::TryCreate
             RayTracingMiss
+            RayTracingStrict
             ReadWholeFile
             Recompile
             RecompileCacheKey::ContextHash
             RecompileResult
-            PrepareShader
-            GetPreparedCode
-            PreparedShaderInvocation::TryCreate
-            MatchesPreparedShader
-            GetPreparedArtifact
-            MaterializeShader
             RegistrationResult
             ResolveSource
             ResourceMaterializer::SpecializationNanoseconds
-            RuntimeAbi::RequireVersion
             RuntimeAbi::HeapCapacity
+            RuntimeAbi::RequireVersion
             SetDebugProbeActive
             ShaderCacheDirectory
             SrgbDecodeBit
             SrgbUnormFormat
             ThreadOwned
             UnresolvableSwappcTarget
-            ValidateAndOptimizeSpirv
-            FindUserDataCalls
             UserDataCalleeLength
-            LinkUserDataCalls
+            ValidateAndOptimizeSpirv
             WriteFileAtomically
     )
     set(shaderCacheManifest)

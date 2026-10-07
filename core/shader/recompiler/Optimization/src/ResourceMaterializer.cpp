@@ -260,7 +260,7 @@ BindlessCounters& bindlessCounters() {
 
 [[noreturn]] void rejectTable(BindlessRejection reason, const std::string& message) {
     ResourceMaterializer::CountBindlessRejection(reason);
-    throw std::runtime_error(message);
+    throw BindlessTableRejected(message);
 }
 
 void reportBindless() {

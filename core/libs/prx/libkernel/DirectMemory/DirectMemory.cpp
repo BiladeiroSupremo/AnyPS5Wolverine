@@ -204,6 +204,8 @@ int LinuxProtFromSce(int prot) {
         // return SCE_KERNEL_ERROR_EINVAL;
         throw std::invalid_argument("Unsupported memory protection bits: " + std::to_string(prot));
     }
+    // 0x100/0x200 are assumed to be a further device read/write pair like the GPU's 0x10/0x20 (PPSA03671 maps
+    // with 0x3f2). The devices run on the host CPU, so their access needs host read and write access too.
     int result = PROT_NONE;
     if (prot & 0x113) result |= PROT_READ;
     if (prot & 0x222) result |= PROT_READ | PROT_WRITE;

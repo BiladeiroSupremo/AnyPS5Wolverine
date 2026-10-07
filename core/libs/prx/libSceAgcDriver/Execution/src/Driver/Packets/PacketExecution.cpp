@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
@@ -243,8 +244,16 @@ void Driver::execute(const Submission& submission) {
                 gateOpened() = false;
                 timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
             }
-            if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
-            else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            // A dispatch whose bindless image table cannot be bound is reported and skipped, as draws
+            // that cannot be translated are; every other failure stays fatal.
+            timed(&WorkerProfile::dispatchMs, [&] {
+                try {
+                    if (opcode == 0x15) dispatch(queue, packet, submission);
+                    else dispatchIndirect(queue, packet, submission);
+                } catch (const ShaderRecompiler::BindlessTableRejected& error) {
+                    reportSkip("dispatch", error.what());
+                }
+            });
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
         } else if (opcode == 0x3c || opcode == 0x93) {

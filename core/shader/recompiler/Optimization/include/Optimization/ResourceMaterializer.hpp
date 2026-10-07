@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -11,6 +12,12 @@ namespace ShaderRecompiler {
 // Why a bindless image table (a T# loaded from a table buffer at a runtime key) was not bound;
 // counted on the [bindless] line (APS5_PROFILE_DRAW).
 enum class BindlessRejection { Capacity, MaterialScan, NoEntry, Storage, NonUniform, ImageSlots, Count };
+
+// A bindless image table the materializer cannot bind (BindlessRejection): the work using it cannot
+// run, which a driver may report and skip instead of failing the process.
+struct BindlessTableRejected : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 class ResourceMaterializer {
 public:

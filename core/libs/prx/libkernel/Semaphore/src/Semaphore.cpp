@@ -36,8 +36,13 @@ int APS5_VABI sceKernelPollSema(KernelSema sem, int need) {
 }
 
 int APS5_VABI sceKernelSignalSema(KernelSema sem, int count) {
- if (sem == nullptr || count < 0) {
+ if (sem == nullptr) {
   APS5_INVALID_ARG_EX;
+ }
+ // PPSA03671 signals with a count of 0; like an overflow, a count that is not positive is EINVAL (as in
+ // shadPS4's reimplementation), not a fault.
+ if (count <= 0) {
+  return SCE_KERNEL_ERROR_EINVAL;
  }
 
  std::lock_guard<std::mutex> lock(sem->mutex);

@@ -319,4 +319,14 @@ int APS5_VABI scePadVrControllerGetTriggerEffectStates(void) {
     return 0;
 }
 
+// Unknown name. PPSA03671 calls it as (handle, int* out) for each user's pad and flags the pad when the
+// value is 2; assumed to be the connect type (1 USB, 2 Bluetooth), the same field scePadGetInfo reports.
+APS5_EXPORT("zBsgF0q8DIM", scePadUnknown_zBsgF0q8DIM);
+int APS5_VABI scePadUnknown_zBsgF0q8DIM(int handle, std::int32_t* type) {
+ if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
+ if (type == nullptr) return PAD_ERROR_INVALID_ARG;
+ *type = PAD_CONNECT_TYPE_BLUETOOTH;
+ return PAD_OK;
+}
+
 }
