@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include <cstdlib>
@@ -246,11 +247,20 @@ void Driver::execute(const Submission& submission) {
             }
             // A dispatch whose bindless image table cannot be bound is reported and skipped, as draws
             // that cannot be translated are; every other failure stays fatal.
+            // A dispatch whose resource walk read through a null pointer (an async-compute dispatch
+            // left with null user data by the title) is reported and skipped too: on hardware such a
+            // dispatch faults unless it runs no group.
             timed(&WorkerProfile::dispatchMs, [&] {
+                static_cast<void>(ShaderMemory::TakeNullPageRead());
                 try {
                     if (opcode == 0x15) dispatch(queue, packet, submission);
                     else dispatchIndirect(queue, packet, submission);
                 } catch (const ShaderRecompiler::BindlessTableRejected& error) {
+                    reportSkip("dispatch", error.what());
+                } catch (const DispatchShaderRejected& error) {
+                    reportSkip("dispatch", error.what());
+                } catch (const std::runtime_error& error) {
+                    if (!ShaderMemory::TakeNullPageRead()) throw;
                     reportSkip("dispatch", error.what());
                 }
             });

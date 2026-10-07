@@ -41,6 +41,12 @@
 
 namespace AgcDriver::DriverDetail {
 
+// A compute shader the recompiler cannot translate (an unsupported instruction form): the dispatch is
+// reported and skipped, as an untranslatable draw is, instead of failing the queue.
+struct DispatchShaderRejected : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 class Driver {
 public:
     static Driver& Get();

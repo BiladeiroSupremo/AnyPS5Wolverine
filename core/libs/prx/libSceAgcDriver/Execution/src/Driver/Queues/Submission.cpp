@@ -264,9 +264,9 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         submission.serial = accepted + 1;
 
         submission.received = ++eventSerial;
+        submission.enqueuedAt = std::chrono::steady_clock::now();
         if (profile) {
-            const auto now = std::chrono::steady_clock::now();
-            submission.enqueuedAt = now;
+            const auto now = submission.enqueuedAt;
             ++costs.submissions;
             costs.validateNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(validated - copied).count());
             costs.copyNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>((copied - start) + (now - validated)).count());

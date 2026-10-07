@@ -674,7 +674,11 @@ std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
     require(alignment != 0, "zero guest memory alignment");
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-    require(address != 0 && address % alignment == 0, "null or misaligned address");
+    if (address == 0 || address % alignment != 0) {
+        char message[128];
+        std::snprintf(message, sizeof(message), "null or misaligned address 0x%llx (%zu bytes, alignment %zu) from +0x%llx", static_cast<unsigned long long>(address), bytes, alignment, ModuleOffset(__builtin_return_address(0)));
+        throw std::runtime_error(message);
+    }
     require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address, "address range overflow");
     const auto reason = verify(address, bytes, writable);
     if (!reason.empty()) {

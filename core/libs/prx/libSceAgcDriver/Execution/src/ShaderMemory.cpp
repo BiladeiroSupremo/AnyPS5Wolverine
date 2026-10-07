@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -115,10 +116,28 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     return page;
 }
 
+bool& ShaderMemory::nullPageReads() {
+    thread_local bool read = false;
+    return read;
+}
+
+bool ShaderMemory::TakeNullPageRead() {
+    return std::exchange(nullPageReads(), false);
+}
+
 bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* value) {
     auto& self = *static_cast<ShaderMemory*>(context);
     if (address % sizeof(*value) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(*value)) {
         throw std::runtime_error("AGC driver: invalid shader memory read address");
+    }
+    // A pointer the title left null (an unbound table slot, a branch the shader does not take for this
+    // dispatch): the walk treats the value as unknown, as for a read past a buffer's records, instead
+    // of failing the queue. No guest allocation lives in the null page.
+    if (address < 0x10000u) {
+        nullPageReads() = true;
+        static std::atomic<std::uint32_t> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[gpu] shader resource walk read the null page at 0x%llx; the value is left unknown\n", static_cast<unsigned long long>(address));
+        return false;
     }
     ++CaptureTotals().reads;
     if (!self.initial.empty()) {

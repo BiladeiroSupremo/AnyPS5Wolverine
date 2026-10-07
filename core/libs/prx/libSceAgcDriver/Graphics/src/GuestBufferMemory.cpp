@@ -1677,20 +1677,33 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
         }
     } else {
         try {
+            // Diagnostic: a waiter step of a second or more names itself (APS5_TRACE_LEASE_WAIT=1).
+            static const bool traceWait = std::getenv("APS5_TRACE_LEASE_WAIT") != nullptr;
+            const auto stepStart = std::chrono::steady_clock::now();
+            const auto step = [&](const char* what) {
+                if (!traceWait) return;
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stepStart).count();
+                if (ms >= 1000.0) std::fprintf(stderr, "[lease-wait] %s after %.0f ms\n", what, ms);
+            };
             std::lock_guard lock(GuestMemory::GpuMutex());
+            step("acquired the GPU mutex");
             auto& state = Leases();
             auto* recorder = Recorder::Active();
             const auto target = state.newestLeaseSerial;
+            if (traceWait) std::fprintf(stderr, "[lease-wait] recorder=%p leaseRecorder=%p target=%llu finished=%llu idle=%d\n", static_cast<const void*>(recorder), static_cast<const void*>(state.leaseRecorder), static_cast<unsigned long long>(target), static_cast<unsigned long long>(state.finishedLeaseSerial), recorder != nullptr && recorder->Idle() ? 1 : 0);
             if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
                 // The open batch may be the target; FinishUpTo waits front to back up to it only.
                 Recorder::CountSync(4);
                 recorder->Submit();
+                step("submitted");
                 recorder->FinishUpTo(target);
+                step("finished up to the lease batch");
                 state.finishedLeaseSerial = target;
                 synced = true;
             } else if (recorder != nullptr && !recorder->Idle()) {
                 Recorder::CountSync(4);
                 recorder->Sync();
+                step("drained the recorder");
                 synced = true;
                 drained = true;
             } else {
