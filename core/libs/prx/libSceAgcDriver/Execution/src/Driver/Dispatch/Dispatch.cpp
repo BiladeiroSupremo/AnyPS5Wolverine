@@ -362,8 +362,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     }
     const std::uint64_t dispatchThreads = indirectArguments != 0 ? 0 : std::uint64_t{groups[0]} * groups[1] * groups[2] * compute.numThreads[0] * compute.numThreads[1] * compute.numThreads[2];
+    // A dispatch of more than 2^24 workgroups is taken for corrupt arguments and rejected: one ran
+    // for seconds and lost the device (PPSA03671: thread-dimension indirect arguments read as
+    // 1545x1295x1555 threads, the y and z words left over from a pass that aliased them).
+    // APS5_NO_DISPATCH_GROUP_GUARD=1 dispatches them anyway.
     if (indirectArguments == 0 && static_cast<std::uint64_t>(groups[0]) * groups[1] * groups[2] > (std::uint64_t{1} << 24u)) {
-        std::fprintf(stderr, "[gpu] compute shader 0x%llx dispatches %ux%ux%u groups (packet %08x %08x %08x %08x %08x, submission %llu)\n", static_cast<unsigned long long>(address), groups[0], groups[1], groups[2], packet[0], packet[1], packet[2], packet[3], packet[4], static_cast<unsigned long long>(submission.serial));
+        char reason[192];
+        std::snprintf(reason, sizeof(reason), "compute shader 0x%llx: %ux%ux%u workgroups (packet %08x %08x %08x %08x %08x) taken for corrupt dispatch arguments", static_cast<unsigned long long>(address), groups[0], groups[1], groups[2], packet[0], packet[1], packet[2], packet[3], packet[4]);
+        static const bool guard = std::getenv("APS5_NO_DISPATCH_GROUP_GUARD") == nullptr;
+        if (guard) throw DispatchShaderRejected(reason);
+        std::fprintf(stderr, "[gpu] %s\n", reason);
     }
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
     // APS5_TRACE_DISPATCH_IO_ADDRESS=<hex>[,<hex>...]: only the dispatches of those programs (low 36 bits).

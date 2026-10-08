@@ -89,6 +89,8 @@ private:
     bool awaitsTitle(std::uint64_t awaited) const;
     void noteAwaitingTitle(std::uint32_t queue, std::uint64_t awaited);
     void releaseFlipHold();
+    // APS5_MAX_QUEUE_LAG_MS (see Submission.cpp): holds a submitter while its queue lags.
+    void throttleSubmission(std::uint32_t queue);
     void reserveOutputs(Submission& submission);
     void executeRewindTail(const Submission& stalled);
     void enqueue(Submission submission);

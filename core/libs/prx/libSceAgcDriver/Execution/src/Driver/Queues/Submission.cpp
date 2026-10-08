@@ -8,6 +8,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include <bit>
 #include <cstdio>
+#include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -225,6 +228,31 @@ void Driver::executeRewindTail(const Submission& stalled) {
     execute(tail);
 }
 
+// APS5_MAX_QUEUE_LAG_MS=<ms>: a submission waits while the oldest submission still pending on its
+// queue was enqueued longer ago than that. The worker otherwise falls seconds behind a title that
+// paces itself by flips alone, and a title reusing transient memory from the CPU once it believes
+// the GPU is done with it then sees its new contents overwritten by GPU work that runs late
+// (PPSA03671: indirect dispatch arguments overwritten by an earlier pass aliasing them). The wait
+// is bounded (200 ms per submission), so a worker that waits for something this thread has yet to
+// do is not deadlocked.
+void Driver::throttleSubmission(std::uint32_t queue) {
+    static const auto limit = [] {
+        const char* value = std::getenv("APS5_MAX_QUEUE_LAG_MS");
+        return std::chrono::milliseconds(value != nullptr ? std::strtoll(value, nullptr, 10) : 0);
+    }();
+    if (limit.count() <= 0 || onWorkerThread()) return;
+    std::unique_lock lock(mutex);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (true) {
+        const auto worker = workers.find(queue);
+        if (worker == workers.end()) return;
+        const auto oldest = std::find_if(worker->second.pending.begin(), worker->second.pending.end(), [](const Submission& pending) { return !pending.suspend; });
+        const auto now = std::chrono::steady_clock::now();
+        if (oldest == worker->second.pending.end() || now - oldest->enqueuedAt < limit || now >= deadline) return;
+        changed.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(2)));
+    }
+}
+
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CheckFailure();
@@ -251,6 +279,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     waitForFlipRoom(submission);
     holdFlipBehindWorker(submission);
     if (APS5_ENABLE_TIMING_LOG) submission.roomReadyAt = std::chrono::steady_clock::now();
+    throttleSubmission(queue);
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
     const auto validated = profile ? std::chrono::steady_clock::now() : start;
