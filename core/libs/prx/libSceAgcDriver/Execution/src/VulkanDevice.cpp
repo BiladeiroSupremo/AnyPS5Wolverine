@@ -4070,26 +4070,6 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             }
         }
     }
-    if (const char* trace = std::getenv("APS5_BINDLESS_FEEDBACK_TRACE"); trace != nullptr && std::strcmp(trace, "1") == 0) {
-        // Diagnostic: which dispatches sample the bindless heap set (descriptor set 1), and their group counts.
-        static std::atomic<std::uint32_t> logged{0};
-        const auto& words = record.shader->program->spirv.Words();
-        bool heap = false;
-        for (std::size_t i = 5; i < words.size();) {
-            const auto count = words[i] >> 16u;
-            if (count == 0u) break;
-            if ((words[i] & 0xffffu) == 71u && count == 4u && i + 3 < words.size() && words[i + 2] == 34u && words[i + 3] == 1u) heap = true;
-            i += count;
-        }
-        if (heap && logged.fetch_add(1, std::memory_order_relaxed) < 60u) {
-            if (argumentImport != nullptr) {
-                const auto* args = reinterpret_cast<const volatile std::uint32_t*>(arguments);
-                std::fprintf(stderr, "[bindless-dispatch] program 0x%llx indirect args@0x%llx (CPU view now: %u,%u,%u)\n", static_cast<unsigned long long>(record.programAddress), static_cast<unsigned long long>(arguments), args[0], args[1], args[2]);
-            } else {
-                std::fprintf(stderr, "[bindless-dispatch] program 0x%llx direct %u,%u,%u\n", static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z);
-            }
-        }
-    }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
