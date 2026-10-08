@@ -151,6 +151,78 @@ VKAPI_ATTR void VKAPI_CALL TracedFree(VkDevice device, VkDeviceMemory memory, co
 
 }
 
+namespace {
+
+struct DeviceLostReporter {
+    std::mutex mutex;
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkGetDeviceFaultInfoEXT getFaultInfo = nullptr;
+    bool reported = false;
+};
+
+DeviceLostReporter& LostReporter() {
+    static DeviceLostReporter reporter;
+    return reporter;
+}
+
+const char* FaultAddressTypeName(VkDeviceFaultAddressTypeEXT type) {
+    switch (type) {
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "invalid read";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "invalid write";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "invalid execute";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "instruction pointer (unknown)";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "instruction pointer (invalid)";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "instruction pointer (fault)";
+        default: return "unknown";
+    }
+}
+
+}
+
+void SetDeviceLostReporter(VkDevice device, PFN_vkGetDeviceFaultInfoEXT getFaultInfo) {
+    auto& reporter = LostReporter();
+    std::lock_guard lock(reporter.mutex);
+    reporter.device = device;
+    reporter.getFaultInfo = getFaultInfo;
+    reporter.reported = false;
+}
+
+void ReportDeviceLost() {
+    auto& reporter = LostReporter();
+    std::lock_guard lock(reporter.mutex);
+    if (reporter.reported) return;
+    reporter.reported = true;
+    if (reporter.getFaultInfo == nullptr) {
+        std::fprintf(stderr, "[gpu] device lost (no VK_EXT_device_fault report)\n");
+        return;
+    }
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (const auto result = reporter.getFaultInfo(reporter.device, &counts, nullptr); result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        std::fprintf(stderr, "[gpu] device lost; vkGetDeviceFaultInfoEXT counts failed with %d\n", static_cast<int>(result));
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+    info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+    counts.vendorBinarySize = 0;
+    if (const auto result = reporter.getFaultInfo(reporter.device, &counts, &info); result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        std::fprintf(stderr, "[gpu] device lost; vkGetDeviceFaultInfoEXT failed with %d\n", static_cast<int>(result));
+        return;
+    }
+    std::fprintf(stderr, "[gpu] device lost: %s (%u addresses, %u vendor records)\n", info.description, counts.addressInfoCount, counts.vendorInfoCount);
+    for (std::uint32_t index = 0; index < counts.addressInfoCount; ++index) {
+        const auto& address = addresses[index];
+        std::fprintf(stderr, "[gpu]   %s at 0x%llx (precision 0x%llx)\n", FaultAddressTypeName(address.addressType), static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
+    }
+    for (std::uint32_t index = 0; index < counts.vendorInfoCount; ++index) {
+        const auto& vendor = vendors[index];
+        std::fprintf(stderr, "[gpu]   vendor: %s code 0x%llx data 0x%llx\n", vendor.description, static_cast<unsigned long long>(vendor.vendorFaultCode), static_cast<unsigned long long>(vendor.vendorFaultData));
+    }
+}
+
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
 PFN_vkVoidFunction TracedMemoryFunction(const char* name, PFN_vkVoidFunction real) {
     static const bool enabled = std::getenv("APS5_TRACE_VKMEM") != nullptr;

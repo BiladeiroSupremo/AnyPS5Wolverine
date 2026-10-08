@@ -32,7 +32,13 @@ inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
 }
 
+// With VK_EXT_device_fault enabled, the first VK_ERROR_DEVICE_LOST prints the device's fault report
+// (addresses, their kind, the vendor's description) to stderr (Resources.cpp).
+void SetDeviceLostReporter(VkDevice device, PFN_vkGetDeviceFaultInfoEXT getFaultInfo);
+void ReportDeviceLost();
+
 inline void Check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST) ReportDeviceLost();
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 
