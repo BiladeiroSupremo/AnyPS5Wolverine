@@ -1323,6 +1323,9 @@ bool PixelProgramSkipped(const QueueState& queue) {
     const auto& cx = queue.context;
     const auto targetMask = find(cx, 0x8e);
     const auto shaderMask = find(cx, 0x8f);
+    // A queue that never set a pixel program draws depth and stencil only (PPSA03671's depth
+    // passes): without color writes it runs the null pixel program, as with an address of 0.
+    if (low == queue.shader.end() && high == queue.shader.end()) return targetMask != cx.end() && shaderMask != cx.end() && (targetMask->second & shaderMask->second) == 0;
     const auto zFormat = find(cx, 0x1c4);
     const auto shaderControl = find(cx, 0x203);
     if (targetMask == cx.end() || shaderMask == cx.end() || zFormat == cx.end() || shaderControl == cx.end()) return false;

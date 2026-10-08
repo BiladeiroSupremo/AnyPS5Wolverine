@@ -102,7 +102,9 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
                 const auto rejection = Graphics::NullPixelProgramRejection(queue);
                 require(rejection.empty(), rejection.c_str());
             }
-            append(0x008, 1, Stage::Fragment, 0x00b, 0x00c, Role::Fragment);
+            // A pixel program never set reads as address 0 (the null pixel program), not as a missing register.
+            programs.push_back(prepare(pixelSkipped ? 0 : programAddress(0x008), 1, Stage::Fragment, 0x00b, 0x00c));
+            roles.push_back(Role::Fragment);
             programs.back().firstUserSgpr = 0;
         }
     }

@@ -43,7 +43,11 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto direct = Pm4::ReadDispatchArguments(arguments, initiator);
-        if (static_cast<std::uint64_t>(direct[1]) * direct[2] * direct[3] > (std::uint64_t{1} << 24u)) std::fprintf(stderr, "[gpu] indirect dispatch reads %ux%ux%u groups from 0x%llx (path %d, initiator 0x%x)\n", direct[1], direct[2], direct[3], static_cast<unsigned long long>(arguments), path, initiator);
+        if (static_cast<std::uint64_t>(direct[1]) * direct[2] * direct[3] > (std::uint64_t{1} << 24u)) {
+            const auto shaderRegister = [&](std::uint32_t offset) { const auto it = queue.shader.find(offset); return it == queue.shader.end() ? 0u : it->second; };
+            const auto program = (static_cast<std::uint64_t>(shaderRegister(0x20c)) << 8u) | (static_cast<std::uint64_t>(shaderRegister(0x20d) & 0xffu) << 40u);
+            std::fprintf(stderr, "[gpu] indirect dispatch of 0x%llx reads %ux%ux%u from 0x%llx (base 0x%llx + 0x%x, %zu-word packet, queue 0x%x, path %d, initiator 0x%x)\n", static_cast<unsigned long long>(program), direct[1], direct[2], direct[3], static_cast<unsigned long long>(arguments), static_cast<unsigned long long>(queue.dispatchIndirectBase), packet.size() > 1 ? packet[1] : 0u, packet.size(), submission.queue, path, initiator);
+        }
         countIndirect(path, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
         dispatch(queue, direct, submission);
         return;

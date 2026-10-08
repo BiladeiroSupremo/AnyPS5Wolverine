@@ -243,6 +243,7 @@ function(add_shader_recompiler target runtimeTarget)
             # recompile only as the request's code words, which the key hashes.
             RdnaInstruction
             RdnaInstructionFamily
+            RdnaInstructionToString
             RdnaOpcode
             RdnaOperand
             RdnaOperandKind

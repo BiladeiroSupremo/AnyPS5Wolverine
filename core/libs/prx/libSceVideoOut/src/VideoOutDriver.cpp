@@ -93,6 +93,12 @@ void resolveFlipBuffer(FlipRequest& request, const VideoOutConfig& cfg) {
     request.height = request.group.attribute.height;
 }
 
+// APS5_TRACE_FLIPS=1: every flip's submission and completion.
+bool TraceFlips() {
+    static const bool trace = std::getenv("APS5_TRACE_FLIPS") != nullptr;
+    return trace;
+}
+
 class RenderingWait final : public AgcDriver::IRenderingWait {
     std::shared_ptr<VideoOutConfig> _config;
     std::uint32_t _index;
@@ -427,6 +433,7 @@ int VideoOutDriver::SubmitFlip(int handle, int index, int flipMode, int64_t flip
     Packet packet{words.data(), static_cast<uint32_t>(words.size()), 0, {}};
     const auto result = sceAgcDriverSubmitDcb(&packet);
     require(result == 0, "driver rejected flip submission");
+    if (TraceFlips()) std::fprintf(stderr, "[flip] submit handle %d index %d mode %d arg 0x%llx (%u reserved) at %.3f s\n", handle, index, flipMode, static_cast<unsigned long long>(flipArg), static_cast<unsigned>(flipQueue->reservations.load()), std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
     return 0;
 }
 
@@ -569,6 +576,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
     timing.Mark("notify_game");
+    if (TraceFlips()) std::fprintf(stderr, "[flip] done index %d arg 0x%llx count %llu pending %u at %.3f s\n", req.index, static_cast<unsigned long long>(req.flipArg), static_cast<unsigned long long>(req.cfg->flipStatus.count), static_cast<unsigned>(req.cfg->flipStatus.flipPendingNum), std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {
