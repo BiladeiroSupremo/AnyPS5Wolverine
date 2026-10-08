@@ -222,11 +222,14 @@ function(add_shader_recompiler target runtimeTarget)
             BuildRectListShaders
             CaptureResources
             DebugProbeActive
+            DecodeRdnaInstruction
+            DecodeRdnaProgram
             DepthBitsTextureWidth
             FindUserDataCalls
             GetPreparedArtifact
             GetPreparedCode
             HashBytes
+            IsDirectBranchOpcode
             LinkUserDataCalls
             MatchesPreparedShader
             MaterializeShader
@@ -236,6 +239,14 @@ function(add_shader_recompiler target runtimeTarget)
             PreparedShaderInvocation::TryCreate
             RayTracingMiss
             RayTracingStrict
+            # The driver's call expansion (ShaderCalls) decodes guest code; what it changes reaches a
+            # recompile only as the request's code words, which the key hashes.
+            RdnaInstruction
+            RdnaInstructionFamily
+            RdnaOpcode
+            RdnaOperand
+            RdnaOperandKind
+            RdnaProgram
             ReadWholeFile
             Recompile
             RecompileCacheKey::ContextHash

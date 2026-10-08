@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderCalls.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -95,8 +96,22 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     }
     if (partialLastGroup) compute.partialThreads = partialGroups;
+    // A program with subroutine calls is recompiled from its expansion (ShaderCalls), a snapshot
+    // of its own; the memory regions stay the original code's, which the expansion addresses.
+    const auto waveSize = (packet[4] & 0x8000u) != 0 ? 32u : 64u;
+    const auto expanded = [&] {
+        try {
+            return ExpandShaderCalls(registeredShader, codeOffset, userData, waveSize);
+        } catch (const std::exception& error) {
+            char where[64];
+            std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
+            throw DispatchShaderRejected(where + std::string(error.what()));
+        }
+    }();
+    const auto& codeSnapshot = expanded != nullptr ? *expanded : snapshot;
+    const auto codeStart = expanded != nullptr ? std::size_t{0} : codeOffset;
     ShaderRecompiler::RecompileRequest request{
-        {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
+        {ShaderRecompiler::ShaderStage::Compute, address, std::span(codeSnapshot.code).subspan(codeStart), snapshot.headerAddress, snapshot.header},
         {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, memory, RegisteredFloatMode(snapshot)},
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
         {0, 0, 0, 128}
@@ -143,6 +158,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     mix(address);
     mix(packet[4] & 0x8000u);
+    // A changed callee makes a new expansion: its identity keys the compiled program.
+    mix(reinterpret_cast<std::uintptr_t>(expanded.get()));
     for (const auto threads : compute.partialThreads) mix(threads);
     for (const auto word : userData) mix(word);
 
@@ -245,7 +262,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         try {
-            const auto invocation = InvocationFor(snapshot, codeOffset, request);
+            // A shader the recompiler cannot prepare or materialize is rejected: the dispatch is
+            // reported and skipped (DispatchShaderRejected), while other failures stay fatal.
+            const auto rejecting = [](auto&& step) {
+                try {
+                    return step();
+                } catch (const ShaderRecompiler::BindlessTableRejected&) {
+                    throw;
+                } catch (const std::exception& error) {
+                    throw DispatchShaderRejected(error.what());
+                }
+            };
+            const auto invocation = rejecting([&] { return InvocationFor(codeSnapshot, codeStart, request); });
             timing.Mark("prepared_invocation");
 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
@@ -264,7 +292,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
 
             timing.Mark("capture_resources");
-            compiledResult = invocation.Materialize(*capture);
+            compiledResult = rejecting([&] { return invocation.Materialize(*capture); });
             timing.Mark("materialize");
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -310,7 +338,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (cached) ++groupStats.resolvedHits;
         return;
     }
-    if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
+    if (verifyDataHits() && dataHit) verifyDataHit(codeSnapshot, codeStart, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);
