@@ -311,7 +311,11 @@ void Driver::execute(const Submission& submission) {
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
-                    throw;
+                    // A draw that cannot be translated is reported and skipped, so one unsupported
+                    // state does not end a title; APS5_STRICT_DRAWS=1 makes it fatal.
+                    static const bool strictDraws = std::getenv("APS5_STRICT_DRAWS") != nullptr;
+                    if (strictDraws) throw;
+                    reportSkip("draw", error.what());
                 }
             });
             finishDrawPacket(drawn);
