@@ -92,6 +92,11 @@ inline std::uint64_t& DeviceProcLookups() {
     return count;
 }
 
+// APS5_TRACE_VKMEM=1: vkAllocateMemory and vkFreeMemory resolved through Context::Function are
+// wrapped to account live device memory by memory type and by call site (the module offset of the
+// caller), reported every 10 s and when an allocation fails (Resources.cpp). Null when disabled.
+PFN_vkVoidFunction TracedMemoryFunction(const char* name, PFN_vkVoidFunction real);
+
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
 struct Context {
@@ -181,9 +186,10 @@ struct Context {
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
         ++DeviceProcLookups();
-        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
-        if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
-        return function;
+        const auto real = deviceProc(device, name);
+        if (real == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
+        if (const auto traced = TracedMemoryFunction(name, real)) return reinterpret_cast<TFunction>(traced);
+        return reinterpret_cast<TFunction>(real);
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.

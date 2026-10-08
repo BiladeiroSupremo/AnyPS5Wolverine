@@ -4,7 +4,20 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+#ifdef _WIN32
+extern "C" __declspec(dllimport) int __stdcall GetModuleHandleExW(unsigned long flags, const wchar_t* name, void** module);
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long skip, unsigned long count, void** frames, unsigned long* hash);
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -35,12 +48,133 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
     return buffer;
 }
 
+struct MemoryTrace {
+    struct Allocation {
+        VkDeviceSize bytes;
+        std::uint32_t type;
+        std::uintptr_t site;
+    };
+    struct Site {
+        VkDeviceSize bytes = 0;
+        std::uint64_t count = 0;
+        std::uint64_t made = 0;
+    };
+    std::mutex mutex;
+    PFN_vkAllocateMemory allocate = nullptr;
+    PFN_vkFreeMemory free = nullptr;
+    std::unordered_map<VkDeviceMemory, Allocation> live;
+    std::unordered_map<std::uintptr_t, Site> sites;
+    std::array<VkDeviceSize, VK_MAX_MEMORY_TYPES> typeBytes{};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+MemoryTrace& Trace() {
+    static MemoryTrace trace;
+    return trace;
+}
+
+// The caller's offset in its module, for nm/addr2line on the module.
+std::uintptr_t SiteOf(void* caller) {
+#ifdef _WIN32
+    void* module = nullptr;
+    constexpr unsigned long FromAddress = 0x4, UnchangedRefcount = 0x2;
+    if (GetModuleHandleExW(FromAddress | UnchangedRefcount, static_cast<const wchar_t*>(caller), &module) && module) return reinterpret_cast<std::uintptr_t>(caller) - reinterpret_cast<std::uintptr_t>(module);
+#endif
+    return reinterpret_cast<std::uintptr_t>(caller);
+}
+
+void Report(MemoryTrace& trace, const char* why) {
+    VkDeviceSize total = 0;
+    for (const auto bytes : trace.typeBytes) total += bytes;
+    std::fprintf(stderr, "[vkmem] %s: %zu live allocations, %.1f MiB;", why, trace.live.size(), total / 1048576.0);
+    for (std::size_t type = 0; type < trace.typeBytes.size(); ++type) {
+        if (trace.typeBytes[type] != 0) std::fprintf(stderr, " type %zu %.1f MiB", type, trace.typeBytes[type] / 1048576.0);
+    }
+    std::fputc('\n', stderr);
+    std::vector<std::pair<std::uintptr_t, MemoryTrace::Site>> ranked(trace.sites.begin(), trace.sites.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+    for (std::size_t index = 0; index < ranked.size() && index < 10; ++index) {
+        const auto& [site, entry] = ranked[index];
+        std::fprintf(stderr, "[vkmem]   site +0x%llx: %.1f MiB in %llu live (%llu made)\n", static_cast<unsigned long long>(site), entry.bytes / 1048576.0, static_cast<unsigned long long>(entry.count), static_cast<unsigned long long>(entry.made));
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TracedAllocate(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+    auto& trace = Trace();
+    const auto site = SiteOf(__builtin_return_address(0));
+#ifdef _WIN32
+    // Allocations of a GiB and more: the call stack, as module offsets.
+    if (info->allocationSize >= (VkDeviceSize{1} << 30u)) {
+        void* frames[16] = {};
+        const auto count = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
+        std::fprintf(stderr, "[vkmem] %.1f MiB allocation (type %u) from", info->allocationSize / 1048576.0, info->memoryTypeIndex);
+        for (unsigned index = 0; index < count; ++index) std::fprintf(stderr, " +0x%llx", static_cast<unsigned long long>(SiteOf(frames[index])));
+        std::fputc('\n', stderr);
+    }
+#endif
+    const auto result = trace.allocate(device, info, callbacks, memory);
+    std::lock_guard lock(trace.mutex);
+    if (result != VK_SUCCESS) {
+        char why[96];
+        std::snprintf(why, sizeof(why), "allocation of %.1f MiB (type %u) at +0x%llx failed with %d", info->allocationSize / 1048576.0, info->memoryTypeIndex, static_cast<unsigned long long>(site), static_cast<int>(result));
+        Report(trace, why);
+        return result;
+    }
+    trace.live[*memory] = {info->allocationSize, info->memoryTypeIndex, site};
+    auto& entry = trace.sites[site];
+    entry.bytes += info->allocationSize;
+    ++entry.count;
+    ++entry.made;
+    if (info->memoryTypeIndex < trace.typeBytes.size()) trace.typeBytes[info->memoryTypeIndex] += info->allocationSize;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - trace.lastReport > std::chrono::seconds(10)) {
+        trace.lastReport = now;
+        Report(trace, "10 s");
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TracedFree(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+    auto& trace = Trace();
+    {
+        std::lock_guard lock(trace.mutex);
+        if (const auto found = trace.live.find(memory); found != trace.live.end()) {
+            auto& entry = trace.sites[found->second.site];
+            entry.bytes -= found->second.bytes;
+            --entry.count;
+            if (found->second.type < trace.typeBytes.size()) trace.typeBytes[found->second.type] -= found->second.bytes;
+            trace.live.erase(found);
+        }
+    }
+    trace.free(device, memory, callbacks);
+}
+
 }
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
+PFN_vkVoidFunction TracedMemoryFunction(const char* name, PFN_vkVoidFunction real) {
+    static const bool enabled = std::getenv("APS5_TRACE_VKMEM") != nullptr;
+    if (!enabled) return nullptr;
+    auto& trace = Trace();
+    if (std::strcmp(name, "vkAllocateMemory") == 0) {
+        std::lock_guard lock(trace.mutex);
+        trace.allocate = reinterpret_cast<PFN_vkAllocateMemory>(real);
+        return reinterpret_cast<PFN_vkVoidFunction>(&TracedAllocate);
+    }
+    if (std::strcmp(name, "vkFreeMemory") == 0) {
+        std::lock_guard lock(trace.mutex);
+        trace.free = reinterpret_cast<PFN_vkFreeMemory>(real);
+        return reinterpret_cast<PFN_vkVoidFunction>(&TracedFree);
+    }
+    return nullptr;
+}
+
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(usage), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
+    static const bool traceMemory = std::getenv("APS5_TRACE_VKMEM") != nullptr;
+    if (traceMemory && size >= (std::size_t{1} << 30u)) std::fprintf(stderr, "[vkmem] Buffer of %.1f MiB made from +0x%llx\n", size / 1048576.0, static_cast<unsigned long long>(SiteOf(__builtin_return_address(0))));
     cache = GetBufferPool(context);
     if (const auto allocation = cache->Take(size, this->usage, properties)) {
         buffer = allocation->buffer;

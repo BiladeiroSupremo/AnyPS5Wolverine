@@ -728,11 +728,22 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         failures.erase(failed);
     }
     // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
+    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB. Past the budget a range is copied
+    // instead, per dispatch, into a host buffer of its whole size, which costs far more host memory
+    // than pinning the guest's own pages: PPSA03671 registers ~9.5 GiB (heaps of 2.7 GiB at
+    // 0x1120000000 and 0x1210000000), and at the former 6 GiB default its 2.7 GiB copies exhausted
+    // host memory. The default is 6 GiB or 40% of physical memory, whichever is more.
     static const std::uint64_t budget = [] {
-        const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
+        if (const char* value = std::getenv("APS5_HOST_IMPORT_MIB")) return std::strtoull(value, nullptr, 10) << 20u;
+        std::uint64_t physical = 0;
+#ifdef _WIN32
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status)) physical = status.ullTotalPhys;
+#else
+        if (const auto pages = sysconf(_SC_PHYS_PAGES), size = sysconf(_SC_PAGE_SIZE); pages > 0 && size > 0) physical = static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(size);
+#endif
+        return std::max<std::uint64_t>(6144ull << 20u, physical / 10 * 4);
     }();
     const auto live = state.liveBytes;
     if (live + bytes > budget) {
