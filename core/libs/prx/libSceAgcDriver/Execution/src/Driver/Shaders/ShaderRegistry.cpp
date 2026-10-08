@@ -1301,6 +1301,9 @@ void Driver::RegisterShader(const Shader* shader) {
     std::memcpy(snapshot.code.data(), code, fields.shader_size);
     snapshot.header.resize(fields.header_size);
     std::memcpy(snapshot.header.data(), static_cast<const void*>(shader), fields.header_size);
+    snapshot.contentHash = XXH3_64bits(snapshot.code.data(), fields.shader_size);
+    static const bool traceHashes = std::getenv("APS5_TRACE_SHADER_HASHES") != nullptr;
+    if (traceHashes) std::fprintf(stderr, "[shader] 0x%llx type %u size 0x%x hash 0x%016" PRIx64 "\n", static_cast<unsigned long long>(snapshot.codeAddress), fields.type, fields.shader_size, snapshot.contentHash);
 
     transaction.Hold();
     {

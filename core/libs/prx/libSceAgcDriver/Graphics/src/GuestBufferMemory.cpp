@@ -537,9 +537,12 @@ void decideImportWatch(const Context& context, HostImports& state) {
     if (state.watchDevice == context.device) return;
 #ifdef _WIN32
     state.watchDevice = context.device;
-    state.unwatchImports = true;
     state.unwatchDmaBufImports = false;
-    if (context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Windows direct host imports use comparisons; separate shared aliases retain guest write tracking\n");
+    // Diagnostic: APS5_WRITE_WATCH_IMPORTS=watch keeps imports watched, accepting late driver writes
+    // (comparing every import ran a large title at under 2 FPS).
+    const char* watchRequest = std::getenv("APS5_WRITE_WATCH_IMPORTS");
+    state.unwatchImports = watchRequest == nullptr || std::string_view(watchRequest) != "watch";
+    if (context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, state.unwatchImports ? "[write-watch] Windows direct host imports use comparisons; separate shared aliases retain guest write tracking\n" : "[write-watch] host imports stay watched (APS5_WRITE_WATCH_IMPORTS=watch)\n");
 #else
     const auto request = importWatchRequest();
     state.watchDevice = context.device;

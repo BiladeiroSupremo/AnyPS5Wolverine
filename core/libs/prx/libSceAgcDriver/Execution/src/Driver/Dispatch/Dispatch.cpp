@@ -12,6 +12,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
 
@@ -267,6 +268,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         try {
+            // Diagnostic: APS5_DUMP_SHADERS=early writes the request before preparation, for a shader
+            // whose translation does not finish (no captured memory in the dump).
+            static const bool dumpEarly = dumpShaders && std::string_view(std::getenv("APS5_DUMP_SHADERS")) == "early";
+            if (dumpEarly) static_cast<void>(dumpRequest(address, request));
             // A shader the recompiler cannot prepare or materialize is rejected: the dispatch is
             // reported and skipped (DispatchShaderRejected), while other failures stay fatal.
             const auto rejecting = [](auto&& step) {

@@ -380,8 +380,12 @@ Resolution resolveSites(const Analysis& analysis, std::uint64_t base, std::span<
             }
             const std::uint64_t tableBase = descriptor[0] | (static_cast<std::uint64_t>(descriptor[1] & 0xffffu) << 32u);
             const std::uint32_t stride = (descriptor[1] >> 16u) & 0x3fffu;
-            const std::uint64_t size = descriptor[2];
-            if (shift < 3u || shift > 16u || stride != 0u || size == 0u || size > MaxCallTableBytes || tableBase == 0u || (tableBase & 3u) != 0u || (load.memoryOffset & 3u) != 0u) reject("the call table of the call at " + hex(call.programCounter) + " needs unsupported bounds or addressing (shift " + std::to_string(shift) + ", stride " + std::to_string(stride) + ", size " + hex(size) + ", base " + hex(tableBase) + ", load offset " + hex(load.memoryOffset) + ")");
+            // A scalar load bounds its offset by num_records bytes, times the stride when there is one.
+            const std::uint64_t size = stride == 0u ? descriptor[2] : static_cast<std::uint64_t>(stride) * descriptor[2];
+            const bool swizzled = (descriptor[1] >> 30u) != 0u;
+            const bool addTid = ((descriptor[3] >> 23u) & 1u) != 0u;
+            const bool buffer = (descriptor[3] >> 30u) == 0u;
+            if (shift < 3u || shift > 16u || size == 0u || size > MaxCallTableBytes || !buffer || swizzled || addTid || tableBase == 0u || (tableBase & 3u) != 0u || (load.memoryOffset & 3u) != 0u) reject("the call table of the call at " + hex(call.programCounter) + " needs unsupported bounds or addressing (shift " + std::to_string(shift) + ", stride " + std::to_string(stride) + ", size " + hex(size) + ", base " + hex(tableBase) + ", load offset " + hex(load.memoryOffset) + ")");
             std::vector<std::uint32_t> table(static_cast<std::size_t>(size / 4u));
             if (!readGuest(tableBase, table)) reject("the call table of the call at " + hex(call.programCounter) + " is not mapped");
             const std::uint64_t step = std::uint64_t{1} << shift;
@@ -449,6 +453,7 @@ Expansion build(const Analysis& analysis, std::uint64_t base, const Resolution& 
         } else {
             const auto& site = *found->second;
             const auto returnAddress = base + instruction.programCounter + instruction.wordCount * sizeof(std::uint32_t);
+            // The branch words that leave the callee being emitted (its returns).
             std::vector<std::uint32_t> returns;
             const auto emitTarget = [&](std::uint64_t target) {
                 const auto& function = functions.at({target, site.returnRegister});
@@ -476,30 +481,68 @@ Expansion build(const Analysis& analysis, std::uint64_t base, const Resolution& 
                 // SCC, so there are two decision trees, one per incoming SCC value, each restoring
                 // it before its callee (no guest SGPR is borrowed). An address the table did not
                 // hold ends the program.
+                // Every comparison is a selection nested in the previous one's false side. Each
+                // gets its own merge, a branch to the merge of the selection it is nested in, so
+                // the structurizer sees nested constructs instead of one join with a predecessor
+                // per callee return (which it split by cloning the code after the call).
+                struct Level {
+                    std::size_t parent;  // the enclosing level; Join for the outermost
+                    std::vector<std::uint32_t> exits;  // branch words that go to this level's merge
+                };
+                constexpr std::size_t Join = std::numeric_limits<std::size_t>::max();
+                std::vector<Level> levels;
+                const auto addLevel = [&](std::size_t parent) {
+                    levels.push_back({parent, {}});
+                    return levels.size() - 1u;
+                };
+                const auto sccLevel = addLevel(Join);
                 const auto selectScc = static_cast<std::uint32_t>(out.size());
                 out.push_back(SCbranchScc1);
                 for (std::uint32_t scc = 0; scc < 2; ++scc) {
                     if (scc != 0) relocations.emplace_back(selectScc, static_cast<std::uint32_t>(out.size()));
                     std::map<std::uint32_t, std::vector<std::uint64_t>> groups;
                     for (const auto target : site.targets) groups[static_cast<std::uint32_t>(target >> 32u)].push_back(target);
+                    std::size_t groupParent = sccLevel;
                     for (const auto& [high, targets] : groups) {
+                        const auto groupLevel = addLevel(groupParent);
                         out.push_back(0xbf06ff00u | (site.sourceRegister + 1u));  // s_cmp_eq_u32 s[src+1], literal
                         out.push_back(high);
                         const auto highMiss = static_cast<std::uint32_t>(out.size());
                         out.push_back(SCbranchScc0);
+                        std::size_t targetParent = groupLevel;
                         for (const auto target : targets) {
+                            const auto targetLevel = addLevel(targetParent);
                             out.push_back(0xbf06ff00u | site.sourceRegister);  // s_cmp_eq_u32 s[src], literal
                             out.push_back(static_cast<std::uint32_t>(target));
                             const auto lowMiss = static_cast<std::uint32_t>(out.size());
                             out.push_back(SCbranchScc0);
                             out.push_back(scc != 0 ? 0xbf068080u : 0xbf068180u);  // SCC = 1 (0 == 0) or 0 (0 == 1)
+                            returns.clear();
                             emitTarget(target);
+                            // A callee that ends without a return falls through to its merge.
+                            returns.push_back(static_cast<std::uint32_t>(out.size()));
+                            out.push_back(SBranch);
+                            levels[targetLevel].exits = returns;
                             relocations.emplace_back(lowMiss, static_cast<std::uint32_t>(out.size()));
+                            targetParent = targetLevel;
                         }
                         out.push_back(SEndpgm);
                         relocations.emplace_back(highMiss, static_cast<std::uint32_t>(out.size()));
+                        groupParent = groupLevel;
                     }
                     out.push_back(SEndpgm);
+                }
+                returns.clear();
+                // The merges, innermost first: a level's parent comes earlier, so its merge is
+                // emitted later and every branch is forward. The outermost merge is the join.
+                std::vector<std::uint32_t> merges(levels.size(), 0);
+                for (std::size_t level = levels.size(); level-- > 0;) {
+                    merges[level] = static_cast<std::uint32_t>(out.size());
+                    for (const auto at : levels[level].exits) relocations.emplace_back(at, merges[level]);
+                    const auto at = static_cast<std::uint32_t>(out.size());
+                    out.push_back(SBranch);
+                    if (levels[level].parent == Join) returns.push_back(at);
+                    else levels[levels[level].parent].exits.push_back(at);
                 }
             } else {
                 emitTarget(site.targets.front());

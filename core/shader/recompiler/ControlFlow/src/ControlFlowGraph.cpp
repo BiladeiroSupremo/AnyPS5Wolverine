@@ -105,6 +105,7 @@ BasicBlock& ControlFlowGraph::FindBlockByProgramCounter(std::uint32_t programCou
     return const_cast<BasicBlock&>(static_cast<const ControlFlowGraph*>(this)->FindBlockByProgramCounter(programCounter));
 }
 
+// The (post)dominator sets are kept sorted (the structurizer's analyses and id remaps sort them).
 bool ControlFlowGraph::Dominates(std::uint32_t dominator, std::uint32_t blockId) const {
     const auto& dominators = FindBlock(blockId).dominators;
     return std::binary_search(dominators.begin(), dominators.end(), dominator);
