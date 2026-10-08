@@ -134,6 +134,8 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, 
     AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
     auto group = cfg->groups[setIndex];
     group.attribute = *attribute;
+    // A pending flip keeps the group it was submitted with, so the change applies from the next
+    // submitted flip on, as a submitted change should (PPSA03671 changes it with flips in flight).
     for (int i = 0; i < VIDEO_OUT_BUFFER_NUM_MAX; ++i) {
         if (cfg->buffers[i].groupIndex != setIndex) continue;
         const auto display = DescribeVideoOutBuffer(cfg->buffers[i], group);
