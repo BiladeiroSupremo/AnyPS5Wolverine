@@ -28,8 +28,32 @@
 #include <stdexcept>
 #include <thread>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include <algorithm>
+#include <cinttypes>
+#include <string_view>
+#define XXH_INLINE_ALL
+#include "../../../../../../../../3rdparty/xxHash/xxhash.h"
 
 namespace AgcDriver::DriverDetail {
+
+void RejectSkippedShader(const ShaderSnapshot& snapshot) {
+    static const std::vector<std::uint64_t> skipped = [] {
+        std::vector<std::uint64_t> hashes;
+        const char* value = std::getenv("APS5_SKIP_SHADERS");
+        const std::string_view list = value != nullptr ? value : "";
+        for (std::size_t start = 0; start < list.size();) {
+            const auto end = std::min(list.find(',', start), list.size());
+            if (end > start) hashes.push_back(std::strtoull(std::string(list.substr(start, end - start)).c_str(), nullptr, 16));
+            start = end + 1;
+        }
+        for (const auto hash : hashes) std::fprintf(stderr, "[gpu] skipping the draws and dispatches of shader hash 0x%016" PRIx64 " (APS5_SKIP_SHADERS)\n", hash);
+        return hashes;
+    }();
+    if (snapshot.contentHash == 0 || std::find(skipped.begin(), skipped.end(), snapshot.contentHash) == skipped.end()) return;
+    char reason[128];
+    std::snprintf(reason, sizeof(reason), "shader 0x%llx (hash 0x%016" PRIx64 ") is skipped (APS5_SKIP_SHADERS)", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash);
+    throw std::runtime_error(reason);
+}
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
     std::exception_ptr failure;

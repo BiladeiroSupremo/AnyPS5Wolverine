@@ -22,6 +22,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
+    try {
+        RejectSkippedShader(snapshot);
+    } catch (const std::runtime_error& error) {
+        throw DispatchShaderRejected(error.what());
+    }
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
     std::vector<std::uint32_t> userData;
     for (std::uint32_t i = 0; i < userCount; ++i) {
@@ -357,8 +362,22 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     }
     const std::uint64_t dispatchThreads = indirectArguments != 0 ? 0 : std::uint64_t{groups[0]} * groups[1] * groups[2] * compute.numThreads[0] * compute.numThreads[1] * compute.numThreads[2];
+    if (indirectArguments == 0 && static_cast<std::uint64_t>(groups[0]) * groups[1] * groups[2] > (std::uint64_t{1} << 24u)) {
+        std::fprintf(stderr, "[gpu] compute shader 0x%llx dispatches %ux%ux%u groups (packet %08x %08x %08x %08x %08x, submission %llu)\n", static_cast<unsigned long long>(address), groups[0], groups[1], groups[2], packet[0], packet[1], packet[2], packet[3], packet[4], static_cast<unsigned long long>(submission.serial));
+    }
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
-    if (traceIo) {
+    // APS5_TRACE_DISPATCH_IO_ADDRESS=<hex>[,<hex>...]: only the dispatches of those programs (low 36 bits).
+    static const std::vector<std::uint64_t> traceIoAddresses = [] {
+        std::vector<std::uint64_t> list;
+        const char* text = std::getenv("APS5_TRACE_DISPATCH_IO_ADDRESS");
+        while (text != nullptr && *text != '\0') {
+            char* end = nullptr;
+            list.push_back(std::strtoull(text, &end, 16) & 0xfffffffffull);
+            text = *end == ',' ? end + 1 : nullptr;
+        }
+        return list;
+    }();
+    if (traceIo && (traceIoAddresses.empty() || std::find(traceIoAddresses.begin(), traceIoAddresses.end(), address & 0xfffffffffull) != traceIoAddresses.end())) {
 
         std::string words;
         if (std::getenv("APS5_TRACE_DISPATCH_IO")[0] == '2') {
@@ -368,7 +387,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 words += text;
             }
         }
-        std::fprintf(stderr, "[dispatch-io] shader 0x%llx%s\n", static_cast<unsigned long long>(address), words.c_str());
+        if (indirectArguments != 0) {
+            std::array<std::uint32_t, 3> counts{};
+            const bool readable = GuestMemory::Accessible(reinterpret_cast<const void*>(indirectArguments), sizeof(counts));
+            if (readable) GuestMemory::Read(indirectArguments, std::as_writable_bytes(std::span(counts)), 4);
+            char text[96];
+            std::snprintf(text, sizeof(text), " indirect 0x%llx [%u %u %u]%s", static_cast<unsigned long long>(indirectArguments), counts[0], counts[1], counts[2], readable ? "" : " (unreadable)");
+            words += text;
+        }
+        std::fprintf(stderr, "[dispatch-io] shader 0x%llx queue 0x%x submission %llu at %.3f s:%s\n", static_cast<unsigned long long>(address), submission.queue, static_cast<unsigned long long>(submission.serial), std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(), words.c_str());
     }
 
     const auto rethrow = [&](const std::exception& error) {

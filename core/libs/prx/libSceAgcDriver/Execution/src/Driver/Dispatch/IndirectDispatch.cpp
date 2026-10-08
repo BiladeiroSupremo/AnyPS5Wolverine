@@ -43,6 +43,7 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto direct = Pm4::ReadDispatchArguments(arguments, initiator);
+        if (static_cast<std::uint64_t>(direct[1]) * direct[2] * direct[3] > (std::uint64_t{1} << 24u)) std::fprintf(stderr, "[gpu] indirect dispatch reads %ux%ux%u groups from 0x%llx (path %d, initiator 0x%x)\n", direct[1], direct[2], direct[3], static_cast<unsigned long long>(arguments), path, initiator);
         countIndirect(path, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
         dispatch(queue, direct, submission);
         return;

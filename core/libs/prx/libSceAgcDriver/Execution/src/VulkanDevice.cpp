@@ -3370,9 +3370,14 @@ bool SyncEachDispatch() {
 }
 
 // Debug aid: APS5_TRACE_DISPATCH_IO prints every dispatch's resources (after write-back when synced).
-bool TraceDispatchIo() {
+// APS5_TRACE_DISPATCH_IO_ADDRESS=<hex> limits it to that program (low 36 bits).
+bool TraceDispatchIo(std::uint64_t programAddress) {
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
-    return traceIo;
+    static const std::uint64_t only = [] {
+        const char* text = std::getenv("APS5_TRACE_DISPATCH_IO_ADDRESS");
+        return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+    }();
+    return traceIo && (only == 0 || (programAddress & 0xfffffffffull) == (only & 0xfffffffffull));
 }
 
 void WatchMemory(std::uint64_t programAddress) {
@@ -3424,6 +3429,16 @@ void WatchMemory(std::uint64_t programAddress) {
         contents.insert(contents.end(), bytes, bytes + ranges[i].bytes);
     }
     if (history.empty() || history.back().second != contents) {
+        // Each change, by the program whose dispatch just completed (the first 16 dwords).
+        std::string words;
+        for (std::size_t offset = 0; offset + 4 <= contents.size() && offset < 64; offset += 4) {
+            std::uint32_t word = 0;
+            std::memcpy(&word, contents.data() + offset, 4);
+            char text[12];
+            std::snprintf(text, sizeof(text), " %08x", word);
+            words += text;
+        }
+        std::fprintf(stderr, "[watch] after program 0x%llx:%s\n", static_cast<unsigned long long>(programAddress), words.c_str());
         history.emplace_back(programAddress, std::move(contents));
         if (history.size() > 64) history.pop_front();
     }
@@ -4419,7 +4434,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
+    if (TraceDispatchIo(programAddress)) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
     WatchMemory(programAddress);
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
@@ -4555,7 +4570,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         state->recorder->Sync();
         timer.phase(PhaseSync);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, hit->resources->Describe().c_str());
+    if (TraceDispatchIo(programAddress)) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, hit->resources->Describe().c_str());
     WatchMemory(programAddress);
     timer.finish(lookupsBefore, groupsText, indirect);
     if (profile) reportRecipes();

@@ -87,7 +87,15 @@ struct ShaderSnapshot {
     std::shared_ptr<const RegisteredShaderState> registeredState;
     std::shared_ptr<std::atomic<std::uint8_t>> workgroupUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
+    // XXH3-64 of the code as registered (KytyPS5's shader hash, so its --skip-shaders lists apply);
+    // 0 for snapshots made otherwise.
+    std::uint64_t contentHash = 0;
 };
+
+// Throws when the snapshot's content hash is listed in APS5_SKIP_SHADERS="hash,hash,..." (hex,
+// KytyPS5's hashes): its draws and dispatches are skipped, as if it failed to compile. To step past
+// a shader that loses the device, or to see what one contributes.
+void RejectSkippedShader(const ShaderSnapshot& snapshot);
 
 
 std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address);

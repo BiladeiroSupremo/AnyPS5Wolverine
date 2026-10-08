@@ -32,6 +32,7 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         const auto& snapshot = *program;
         require((address - snapshot.codeAddress) % sizeof(std::uint32_t) == 0, "graphics entry point is not dword aligned");
         require(snapshot.header.empty() || snapshot.type == type, "graphics program refers to an incompatible shader binary type");
+        RejectSkippedShader(snapshot);
         if (!nullPixel && snapshot.header.empty()) NoteRawGraphicsDraw();
         if (!nullPixel) Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, rsrc2);
         const auto resources = nullPixel ? 0u : ReadGraphicsRegister(queue.shader, rsrc2);
