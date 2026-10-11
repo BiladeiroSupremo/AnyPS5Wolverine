@@ -6416,7 +6416,6 @@ constexpr std::size_t BlockBytes = 12 * SurfaceBytes;
 class Block {
 public:
     explicit Block(const Context& context, bool watched = false) : context(context), watched(watched) {
-#ifdef _WIN32
         if (watched) {
             memory = GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536);
             const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, BlockBytes, nullptr);
@@ -6425,26 +6424,19 @@ public:
             catch (...) { CloseHandle(section); throw; }
             CloseHandle(section);
         } else memory = VirtualAlloc(nullptr, BlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-#else
-        memory = std::aligned_alloc(65536, BlockBytes);
-#endif
         Require(memory != nullptr, "cannot allocate the texture block");
         std::memset(memory, 0x5a, BlockBytes);
-        GuestAllocations::Mutation().Add(memory, BlockBytes, true, true);
+        GuestAllocations::Mutation().Add(memory, BlockBytes, true, true, true);
     }
 
     ~Block() {
         ClearCachedTextures(context.device);
         GuestAllocations::Mutation().Remove(memory);
         HostImportFor(context, Surface(0), BlockBytes);
-#ifdef _WIN32
         if (watched) {
             GuestArena::GuestArenaReset_nid_postfix(memory, BlockBytes);
             GuestArena::GuestArenaRelease_nid_postfix(memory, BlockBytes);
         } else VirtualFree(memory, 0, MEM_RELEASE);
-#else
-        std::free(memory);
-#endif
     }
 
     std::uint64_t Surface(std::size_t surface) const { return reinterpret_cast<std::uint64_t>(memory) + surface * SurfaceBytes; }
