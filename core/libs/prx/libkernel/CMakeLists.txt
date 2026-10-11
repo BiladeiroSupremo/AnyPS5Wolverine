@@ -14,6 +14,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/OpenFileLimit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/SharedMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/RandomDevice.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/File/src/HostStreams.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Stdio.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../libc/src/Rename.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Semaphore/src/Semaphore.cpp
@@ -1172,6 +1173,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_socket_descriptors PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_socket_descriptors PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_host_stream_tests ${LIBS_INCLUDE_DIR}/tests/GuestHostStreams.cpp)
+    target_include_directories(guest_host_stream_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_host_stream_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_host_stream_tests)
+    add_test(NAME guest_host_streams COMMAND guest_host_stream_tests)
+    set_tests_properties(guest_host_streams PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_host_streams PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_socket_event_tests ${LIBS_INCLUDE_DIR}/tests/GuestSocketEvents.cpp)
