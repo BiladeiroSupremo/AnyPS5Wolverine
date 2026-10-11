@@ -976,6 +976,16 @@ void PixelInputLayoutTests() {
     Require(!readsBuiltin(read, spv::BuiltInFragCoord) && !readsBuiltin(read, spv::BuiltInBaryCoordKHR), "an ADDR-only centroid pair was loaded");
 }
 
+void BlendBypassTests() {
+    auto queue = makeState();
+    for (std::uint32_t constant = 0x105; constant < 0x109; ++constant) queue.context[constant] = 0;
+    queue.context[0x1e0] = (1u << 30u) | 4u | (5u << 8u);
+    Require(AgcDriver::Graphics::DecodeState(queue).blends.at(0).blendEnable, "enabled blending was not decoded");
+    queue.context[0x31c] |= 0x10000u;
+    const auto bypassed = AgcDriver::Graphics::DecodeState(queue);
+    Require(!bypassed.blends.at(0).blendEnable && bypassed.blends.at(0).colorWriteMask != 0, "a target with BLEND_BYPASS still blends");
+}
+
 void OpaqueDestinationAlphaTests() {
     auto queue = makeState();
     for (std::uint32_t constant = 0x105; constant < 0x109; ++constant) queue.context[constant] = 0;
@@ -5615,6 +5625,7 @@ int main(int argc, char** argv) {
         DisabledColorTests();
         OpaqueDestinationAlphaTests();
         Color1555TargetTests();
+        BlendBypassTests();
         CompactedExportTests();
         ReversedComponentOrderTests();
         ShadersWriteMemoryTests();

@@ -923,11 +923,10 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         for (std::uint32_t component = 0; component < 4; ++component) {
             if (((exportedMask >> ((mapping >> (2u * component)) & 3u)) & 1u) != 0) state.colorWriteMask |= 1u << component;
         }
-        state.blendEnable = (blend >> 30u) & 1u;
+        state.blendEnable = ((blend >> 30u) & 1u) != 0 && (read(cx, 0x31c + slot * 0xfu) & 0x10000u) == 0;
         if (state.blendEnable && (mapping == 0x1bu || mapping == 0x93u)) throw std::runtime_error("AGC graphics: blending into a color target with a reversed component order is not implemented");
         Require(!state.blendEnable || !color.uintExport, "blending into an unsigned integer target is unsupported");
         if (state.blendEnable) {
-            Require((read(cx, 0x31c + slot * 0xfu) & 0x10000u) == 0, "blend bypass conflicts with enabled blending");
             state.srcColorBlendFactor = blendFactor(blend & 0x1fu);
             state.dstColorBlendFactor = blendFactor((blend >> 8u) & 0x1fu);
             state.colorBlendOp = blendOp((blend >> 5u) & 7u);
