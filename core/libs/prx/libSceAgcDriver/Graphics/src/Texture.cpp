@@ -1986,6 +1986,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
+    original.resize(static_cast<std::size_t>(guestBytes));
     comparedGuestBytes = {};
     if (original.size() != guestBytes) original.resize(static_cast<std::size_t>(guestBytes));
     std::vector<bool> selected(trackedLayers, true);

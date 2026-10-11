@@ -6404,6 +6404,156 @@ void pipelineLibraryTests(const Device& device) {
     std::cout << "Pipeline library reuse tests passed\n";
 }
 
+#ifdef _WIN32
+namespace StorageCpuSnapshotTest {
+constexpr std::uint32_t Side = 256;
+constexpr std::uint32_t Format32UInt = 20;
+constexpr std::uint32_t TileR64KBX = 0x1b;
+constexpr std::uint32_t Type2D = 9;
+constexpr std::size_t SurfaceBytes = std::size_t{Side} * Side * 4u;
+constexpr std::size_t BlockBytes = 12 * SurfaceBytes;
+
+class Block {
+public:
+    explicit Block(const Context& context, bool watched = false) : context(context), watched(watched) {
+#ifdef _WIN32
+        if (watched) {
+            memory = GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536);
+            const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, BlockBytes, nullptr);
+            Require(section != nullptr, "cannot allocate the shared texture section");
+            try { GuestArena::GuestArenaMap_nid_postfix(memory, BlockBytes, section, 0, PAGE_READWRITE); }
+            catch (...) { CloseHandle(section); throw; }
+            CloseHandle(section);
+        } else memory = VirtualAlloc(nullptr, BlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+        memory = std::aligned_alloc(65536, BlockBytes);
+#endif
+        Require(memory != nullptr, "cannot allocate the texture block");
+        std::memset(memory, 0x5a, BlockBytes);
+        GuestAllocations::Mutation().Add(memory, BlockBytes, true, true);
+    }
+
+    ~Block() {
+        ClearCachedTextures(context.device);
+        GuestAllocations::Mutation().Remove(memory);
+        HostImportFor(context, Surface(0), BlockBytes);
+#ifdef _WIN32
+        if (watched) {
+            GuestArena::GuestArenaReset_nid_postfix(memory, BlockBytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, BlockBytes);
+        } else VirtualFree(memory, 0, MEM_RELEASE);
+#else
+        std::free(memory);
+#endif
+    }
+
+    std::uint64_t Surface(std::size_t surface) const { return reinterpret_cast<std::uint64_t>(memory) + surface * SurfaceBytes; }
+
+private:
+    const Context& context;
+    bool watched;
+    void* memory = nullptr;
+};
+
+std::array<std::uint32_t, 8> Descriptor(std::uint64_t address, std::uint32_t side = Side) {
+    return {
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((side - 1u) & 3u) << 30u),
+        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+        0xfacu | (TileR64KBX << 20u) | (Type2D << 28u),
+        0u,
+        0u,
+        0u,
+        0u,
+    };
+}
+
+GuestTextureResource Resource(std::uint64_t address, std::uint32_t side = Side) {
+    const auto words = Descriptor(address, side);
+    return DecodeTextureResource(words);
+}
+
+void Run(Context context) {
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    for (const bool watched : {true, false}) {
+        Block block(context, watched);
+        const auto address = block.Surface(0);
+        Require(AgcDriver::GuestMemory::Watched(address, SurfaceBytes) == watched, "snapshot fixture has the wrong write tracking");
+        Require(HostImportFor(context, address, SurfaceBytes) != nullptr, "snapshot fixture requires a host import");
+        Require(AgcDriver::GuestMemory::Watched(address, SurfaceBytes) == watched, "host import changed the fixture's write tracking");
+        auto image = std::make_shared<StorageTexture>(context, *context.detiler, Resource(address), 0);
+        const auto expectedBytes = watched ? 0u : SurfaceBytes;
+        Require(image->OriginalSnapshotBytes() == expectedBytes, "watched GPU-direct upload retained an unnecessary CPU surface snapshot");
+        const auto readPixel = [&] {
+            Buffer result(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            CommandBatch batch(context);
+            RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {1, 1, 1};
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, result.Handle(), 1, &copy);
+            RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            batch.SubmitAndWait();
+            result.Invalidate();
+            std::uint32_t pixel = 0;
+            std::memcpy(&pixel, result.Bytes().data(), sizeof(pixel));
+            return pixel;
+        };
+        Require(readPixel() == 0x5a5a5a5au, "snapshot upload returned incorrect GPU texels");
+        std::memset(reinterpret_cast<void*>(address), 0x6b, SurfaceBytes);
+        image->Refresh();
+        Require(readPixel() == 0x6b6b6b6bu, "snapshot refresh missed a CPU write");
+        Require(image->OriginalSnapshotBytes() == expectedBytes, "watched refresh allocated a CPU surface snapshot");
+        {
+            CommandBatch batch(context);
+            RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkClearColorValue clear{};
+            clear.uint32[0] = 0x7c7c7c7cu;
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(batch.Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+            batch.SubmitAndWait();
+        }
+        image->MarkDirty();
+        image->WriteBack();
+        std::uint32_t pixel = 0;
+        AgcDriver::GuestMemory::ReadCommitted(address, std::as_writable_bytes(std::span(&pixel, 1)));
+        Require(pixel == 0x7c7c7c7cu, "snapshot write-back lost GPU texels");
+        Require(image->OriginalSnapshotBytes() == expectedBytes, "GPU-direct write-back allocated a CPU surface snapshot");
+        if (watched) {
+            AgcDriver::GuestMemory::Unwatch(address, SurfaceBytes);
+            Require(!AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "snapshot fixture is still write-watched");
+            std::memset(reinterpret_cast<void*>(address), 0x8d, SurfaceBytes);
+            image->Refresh();
+            Require(image->OriginalSnapshotBytes() == SurfaceBytes, "unwatched refresh did not allocate its comparison snapshot");
+            Require(readPixel() == 0x8d8d8d8du, "unwatched refresh returned incorrect GPU texels");
+        }
+        image.reset();
+        Context cpu = context;
+        cpu.hostImportAlignment = 0;
+        image = std::make_shared<StorageTexture>(cpu, *context.detiler, Resource(address), 0);
+        Require(image->OriginalSnapshotBytes() == SurfaceBytes, "CPU upload has no guest-byte snapshot");
+        const auto expectedPixel = watched ? 0x8d8d8d8du : 0x7c7c7c7cu;
+        Require(readPixel() == expectedPixel, "CPU upload returned incorrect GPU texels");
+        {
+            CommandBatch batch(context);
+            VkClearColorValue clear{};
+            clear.uint32[0] = 0x9e9e9e9eu;
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(batch.Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+            batch.SubmitAndWait();
+        }
+        image->MarkDirty();
+        image->WriteBack();
+        AgcDriver::GuestMemory::ReadCommitted(address, std::as_writable_bytes(std::span(&pixel, 1)));
+        Require(pixel == 0x9e9e9e9eu, "CPU write-back lost guest texels");
+        std::printf("%s snapshot fixture: direct %zu bytes, CPU fallback %zu bytes\n", watched ? "watched" : "unwatched", expectedBytes, image->OriginalSnapshotBytes());
+    }
+}
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
         std::unique_ptr<Device> created;
@@ -6438,6 +6588,18 @@ int main(int argc, char** argv) {
             return 0;
         }
         std::unique_lock gpu(GpuMutex());
+#ifdef _WIN32
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-cpu-snapshot-only") {
+            if (device.GetContext().hostImportAlignment == 0) {
+                Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "storage snapshot test requires host imports");
+                std::cout << "skipped, host imports unavailable\n";
+                return 77;
+            }
+            StorageCpuSnapshotTest::Run(device.GetContext());
+            std::cout << "Storage CPU snapshot tests passed\n";
+            return 0;
+        }
+#endif
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
