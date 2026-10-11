@@ -28,6 +28,7 @@
 #include <cstdarg>
 #include <deque>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -175,6 +176,7 @@ static int NativeSync(int descriptor) {
 static int NativeFlock(int descriptor, int operation) {
     return File::Flock(descriptor, operation);
 }
+static std::mutex g_positionedMutex;
 std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
         throw std::runtime_error("NativePositioned: nbytes exceeds platform limit");
@@ -195,6 +197,7 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
         errno = EBADF;
         return -1;
     }
+    std::lock_guard lock(g_positionedMutex);
     LARGE_INTEGER position{};
     if (::GetFileType(handle) != FILE_TYPE_DISK || !::SetFilePointerEx(handle, LARGE_INTEGER{}, &position, FILE_CURRENT)) {
         errno = !File::DirectoryDescriptorPath(descriptor) ? ESPIPE : write ? EBADF : EISDIR;
@@ -228,6 +231,7 @@ static std::int64_t NativeTransfer(int descriptor, void* buf, std::size_t nbytes
         }
         return CompressedFile::ReadDescriptor(*compressed, buf, nbytes, -1);
     }
+    std::lock_guard lock(g_positionedMutex);
     if (write) {
         const auto result = File::WriteSharedMemory_nid_no_patch(descriptor, buf, nbytes);
         if (result != -2) return result;
