@@ -583,6 +583,17 @@ int APS5_VABI pause_nid_postfix(void) {
         }
     }
 }
+
+int APS5_VABI sigpending_nid_postfix(GuestSignalSet* set) {
+    if (set == nullptr) { *__error_nid_postfix() = 14; return -1; }
+    auto& pending = Pending();
+    std::lock_guard lock(pending.lock);
+    set->bits[0] = pending.words[0].load(std::memory_order_relaxed) & blockedMask.load();
+    set->bits[1] = 0;
+    set->bits[2] = 0;
+    set->bits[3] = 0;
+    return 0;
+}
 }
 
 extern "C" {
