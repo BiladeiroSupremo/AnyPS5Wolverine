@@ -244,8 +244,8 @@ jobs:
           key: linux
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           evict-old-files: job
-      - name: Install lavapipe and the SDL audio and XRandR development files
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev
+      - name: Install lavapipe and the SDL audio, XRandR and Wayland development files
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev
       - id: mesa
         run: |
           echo "version=$(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)" >> "$GITHUB_OUTPUT"
