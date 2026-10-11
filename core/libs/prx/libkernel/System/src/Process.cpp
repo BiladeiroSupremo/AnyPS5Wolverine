@@ -118,10 +118,15 @@ bool hasPriorityRange(int policy) {
     return policy == 1 || policy == 3;
 }
 
+constexpr int guestNoProcess = 3;
 constexpr int guestFault = 14;
 constexpr int guestInvalid = 22;
 constexpr int guestRlimitCpu = 0;
 constexpr int guestRlimitFsize = 1;
+constexpr int guestPriorityProcess = 0;
+constexpr int guestPriorityGroup = 1;
+constexpr int guestPriorityUser = 2;
+constexpr int guestNice = 0;
 constexpr int guestRlimitData = 2;
 constexpr int guestRlimitCore = 4;
 constexpr int guestRlimitSbsize = 9;
@@ -546,6 +551,20 @@ int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit) {
     default:
         throw std::runtime_error("getrlimit: unsupported resource " + std::to_string(resource));
     }
+}
+
+int APS5_VABI getpriority_nid_postfix(int which, int who) {
+    if (which != guestPriorityProcess && which != guestPriorityGroup && which != guestPriorityUser) {
+        *__error_nid_postfix() = guestInvalid;
+        return -1;
+    }
+    const bool found = which == guestPriorityUser ? (who == 0 ? getuid_nid_postfix() : who) == getuid_nid_postfix()
+                                                  : who == 0 || who == getpid_nid_postfix();
+    if (!found) {
+        *__error_nid_postfix() = guestNoProcess;
+        return -1;
+    }
+    return guestNice;
 }
 
 int APS5_VABI sceKernelIsTrinityMode(void) {
