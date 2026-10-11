@@ -30,6 +30,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct KernelIovec {
@@ -310,6 +311,7 @@ static const struct iovec* NativeIovecs(const KernelIovec* iov) {
 }
 #endif
 
+static constexpr int GUEST_EPERM = 1;
 static constexpr int GUEST_ENOENT = 2;
 static constexpr int GUEST_EIO = 5;
 static constexpr int GUEST_EBADF = 9;
@@ -321,6 +323,7 @@ static constexpr int GUEST_ENAMETOOLONG = 63;
 static constexpr int GUEST_ENOTDIR = 20;
 static constexpr int GUEST_EISDIR = 21;
 static constexpr int GUEST_EWOULDBLOCK = 35;
+static constexpr int GUEST_EOPNOTSUPP = 45;
 static constexpr int GUEST_ENOTEMPTY = 66;
 static constexpr int GUEST_EDEADLK = 11;
 static constexpr int GUEST_ELOOP = 62;
@@ -502,6 +505,33 @@ int File::DuplicateFrom(int fd, int start) {
 #endif
 }
 
+static int LookupError(const std::filesystem::path& native) {
+    std::error_code error;
+    const auto status = std::filesystem::status(native, error);
+    if (std::filesystem::exists(status)) return native.has_filename() || std::filesystem::is_directory(status) ? 0 : GUEST_ENOTDIR;
+    if (status.type() != std::filesystem::file_type::not_found) return SceErrorFromErrno(error.default_error_condition().value()) & 0xffff;
+    const bool fileWithSeparator = !native.has_filename() && std::filesystem::exists(WithoutTrailingSeparator(native), error);
+    return fileWithSeparator || HasNonDirectoryPrefix(native) ? GUEST_ENOTDIR : GUEST_ENOENT;
+}
+
+static constexpr std::pair<std::uint64_t, const char*> GUEST_FILE_FLAGS[] = {
+    {0x00000001, "UF_NODUMP"}, {0x00000002, "UF_IMMUTABLE"}, {0x00000004, "UF_APPEND"}, {0x00000008, "UF_OPAQUE"},
+    {0x00000010, "UF_NOUNLINK"}, {0x00000080, "UF_SYSTEM"}, {0x00000100, "UF_SPARSE"}, {0x00000200, "UF_OFFLINE"},
+    {0x00000400, "UF_REPARSE"}, {0x00000800, "UF_ARCHIVE"}, {0x00001000, "UF_READONLY"}, {0x00008000, "UF_HIDDEN"},
+    {0x00010000, "SF_ARCHIVED"}, {0x00020000, "SF_IMMUTABLE"}, {0x00040000, "SF_APPEND"}, {0x00100000, "SF_NOUNLINK"},
+    {0x00200000, "SF_SNAPSHOT"}};
+static constexpr std::uint64_t GUEST_SF_SNAPSHOT = 0x00200000;
+
+static std::string FileFlagNames(std::uint64_t flags) {
+    std::string names;
+    for (const auto& [flag, name] : GUEST_FILE_FLAGS) {
+        if ((flags & flag) == 0) continue;
+        if (!names.empty()) names += '|';
+        names += name;
+    }
+    return names;
+}
+
 extern "C" {
 
 int APS5_VABI chmod_nid_postfix(const char* path, int mode) {
@@ -509,6 +539,18 @@ int APS5_VABI chmod_nid_postfix(const char* path, int mode) {
     std::filesystem::path native;
     if (const int error = ResolvePathError_nid_no_patch(path, native)) return PosixFailure(error);
     if (NativeChmod(native, mode & 07777) != 0) return PosixResult(SceErrorFromErrno(errno));
+    return 0;
+}
+
+int APS5_VABI chflags_nid_postfix(const char* path, std::uint64_t flags) {
+    if (const int error = PathError(path)) return PosixFailure(error);
+    if (const int error = LookupError(ResolvePath_nid_no_patch(path))) return PosixFailure(error);
+    std::uint64_t known = 0;
+    for (const auto& entry : GUEST_FILE_FLAGS) known |= entry.first;
+    if ((flags & ~known) != 0) return PosixFailure(GUEST_EOPNOTSUPP);
+    if ((flags & GUEST_SF_SNAPSHOT) != 0) return PosixFailure(GUEST_EPERM);
+    if (flags != 0)
+        throw std::runtime_error("chflags: setting " + FileFlagNames(flags) + " on " + path + " is not supported, the host keeps no BSD file flags");
     return 0;
 }
 
