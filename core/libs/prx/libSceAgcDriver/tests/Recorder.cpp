@@ -6474,7 +6474,7 @@ void Run(Context context) {
         Require(AgcDriver::GuestMemory::Watched(address, SurfaceBytes) == watched, "snapshot fixture has the wrong write tracking");
         Require(HostImportFor(context, address, SurfaceBytes) != nullptr, "snapshot fixture requires a host import");
         Require(AgcDriver::GuestMemory::Watched(address, SurfaceBytes) == watched, "host import changed the fixture's write tracking");
-        auto image = std::make_shared<StorageTexture>(context, *context.detiler, Resource(address), 0);
+        auto image = StorageTexture::Create(context, *context.detiler, Resource(address), 0);
         const auto expectedBytes = watched ? 0u : SurfaceBytes;
         Require(image->OriginalSnapshotBytes() == expectedBytes, "watched GPU-direct upload retained an unnecessary CPU surface snapshot");
         const auto readPixel = [&] {
@@ -6523,7 +6523,7 @@ void Run(Context context) {
         image.reset();
         Context cpu = context;
         cpu.hostImportAlignment = 0;
-        image = std::make_shared<StorageTexture>(cpu, *context.detiler, Resource(address), 0);
+        image = StorageTexture::Create(cpu, *context.detiler, Resource(address), 0);
         Require(image->OriginalSnapshotBytes() == SurfaceBytes, "CPU upload has no guest-byte snapshot");
         const auto expectedPixel = watched ? 0x8d8d8d8du : 0x7c7c7c7cu;
         Require(readPixel() == expectedPixel, "CPU upload returned incorrect GPU texels");
