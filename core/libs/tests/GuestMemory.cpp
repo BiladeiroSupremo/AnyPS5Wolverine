@@ -1492,6 +1492,43 @@ static void CheckFailedCollectKeepsWrites() {
 #endif
 }
 
+static void CheckSplitPrivateCollect() {
+#ifdef _WIN32
+    constexpr std::size_t granule = 0x4000;
+    constexpr std::size_t regions = 8;
+    constexpr std::size_t bytes = granule * regions;
+    constexpr std::size_t pages = bytes / 4096;
+    auto* block = static_cast<unsigned char*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, granule));
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, granule);
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    const auto collect = [&](std::size_t capacity) {
+        std::vector<std::uintptr_t> found;
+        std::array<void*, pages> buffer{};
+        for (auto cursor = address; cursor < address + bytes;) {
+            std::size_t count = capacity;
+            Require(GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, address + bytes - cursor, buffer.data(), &count, true));
+            for (std::size_t i = 0; i < count; ++i) found.push_back(reinterpret_cast<std::uintptr_t>(buffer[i]));
+            if (count < capacity) break;
+            cursor = found.back() + 4096;
+        }
+        return found;
+    };
+    collect(pages);
+    for (const std::size_t capacity : {pages, std::size_t{5}, std::size_t{1}}) {
+        for (std::size_t page = 0; page < pages; ++page) static_cast<volatile unsigned char*>(block)[page * 4096 + 7] = static_cast<unsigned char>(capacity + page);
+        const auto found = collect(capacity);
+        Require(found.size() == pages);
+        for (std::size_t page = 0; page < pages; ++page) Require(found[page] == address + page * 4096);
+        Require(collect(pages).empty());
+    }
+    static_cast<volatile unsigned char*>(block)[granule * 3 + 4096 + 1] = 9;
+    const auto one = collect(pages);
+    Require(one.size() == 1 && one[0] == address + granule * 3 + 4096);
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+#endif
+}
+
 static void CheckPinnedSharedPages() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -2156,6 +2193,7 @@ int main() {
     CheckFixedMappingReplacesPartialOverlap();
     CheckFixedMappingOverHoleInsideAllocation();
     CheckDirectMemoryGpuProtBits();
+    CheckSplitPrivateCollect();
     CheckGpuAccessFollowsProtection();
     CheckGpuMapsAreObserved();
     CheckClearingTheObserverWaitsForItsCalls();
