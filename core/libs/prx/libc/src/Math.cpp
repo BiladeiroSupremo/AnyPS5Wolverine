@@ -465,6 +465,19 @@ short APS5_VABI _FDtest_nid_postfix(const float* value) {
     if (exponent == 0) return fraction != 0 ? Denormal : Zero;
     return Finite;
 }
+
+short APS5_VABI _Dtest_nid_postfix(const double* value) {
+    constexpr short Denormal = -2, Finite = -1, Zero = 0, Infinite = 1, NotANumber = 2;
+    if (value == nullptr) throw std::invalid_argument("_Dtest: null value");
+    std::uint64_t bits;
+    std::memcpy(&bits, value, sizeof(bits));
+    const auto exponent = bits & 0x7ff0000000000000u;
+    const auto fraction = bits & 0x000fffffffffffffu;
+    if (exponent == 0x7ff0000000000000u) return fraction != 0 ? NotANumber : Infinite;
+    if (exponent == 0) return fraction != 0 ? Denormal : Zero;
+    return Finite;
+}
+
 int APS5_VABI __isnanf_nid_postfix(float x) { return std::isnan(x) ? 1 : 0; }
 int APS5_VABI isnanf_nid_postfix(float x) { return __isnanf_nid_postfix(x); }
 int APS5_VABI isnan_nid_postfix(double x) { return __isnan_nid_postfix(x); }
@@ -533,4 +546,13 @@ int APS5_VABI _Fltrounds_nid_postfix(void) {
     return SonyFltrounds();
 }
 
+union SonyDconst {
+    unsigned short _Word[8];
+    float _Float;
+    double _Double;
+    long double _Long_double;
+};
+
+static_assert(std::endian::native == std::endian::little);
+SonyDconst _Inf_nid_postfix {{0, 0, 0, 0x7ff0, 0, 0, 0, 0}};
 }
