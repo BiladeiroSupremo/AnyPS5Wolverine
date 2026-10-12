@@ -153,6 +153,78 @@ void GpuClock() {
     Check(TraceFormat::GpuSlices(ranges, same, same, origin)[0].begin == origin + microseconds(14), "one calibration does not map at the CPU rate");
 }
 
+void IntervalDue() {
+    Check(!AgcDriver::TraceInterval::Parse(nullptr).has_value(), "an interval was made without a switch");
+    for (const auto* text : {"", "0", "-5", "1.5", "a", "5s", "1:2", "99999999999"}) {
+        bool rejected = false;
+        try { AgcDriver::TraceInterval::Parse(text); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        Check(rejected, "a malformed interval was accepted");
+    }
+    auto interval = AgcDriver::TraceInterval::Parse("30").value();
+    Check(interval.Describe() == "summary_every 30", "interval description changed");
+    Check(!interval.Due(milliseconds(29999)) && interval.Due(milliseconds(30000)), "the interval was due at the wrong time");
+    interval.Restart(milliseconds(30500));
+    Check(interval.Begun() == milliseconds(30500) && !interval.Due(milliseconds(60499)) && interval.Due(milliseconds(60500)), "a restarted interval did not count from its restart");
+}
+
+void SummaryOnlyThread() {
+    std::atomic<std::uint64_t> presents{1};
+    std::atomic<bool> buffering{false};
+    TraceThread thread("queue worker 0x0", presents, 0, buffering);
+    const auto origin = Clock::now();
+    thread.Add("Driver.Packet", nullptr, origin, origin + milliseconds(2));
+    thread.Add("Driver.Packet", nullptr, origin + milliseconds(3), origin + milliseconds(4));
+    presents.store(2);
+    thread.Add("Driver.Completion", nullptr, origin + milliseconds(5), origin + microseconds(5005));
+    auto snapshot = thread.Collect();
+    Check(snapshot.slices.empty() && !snapshot.dropped, "a thread that is not buffering kept a slice");
+    Check(snapshot.totals.size() == 2 && snapshot.totals[0].count + snapshot.totals[1].count == 3, "a thread that is not buffering missed a total");
+    buffering.store(true);
+    thread.Add("Driver.Packet", nullptr, origin + milliseconds(6), origin + milliseconds(7));
+    Check(thread.Collect().slices.empty(), "a zero capacity buffer held a slice");
+}
+
+void TotalsSince() {
+    const std::vector<TraceThread::Total> before{{"Driver.Packet", nullptr, milliseconds(4), 2}, {"Driver.Present", nullptr, milliseconds(1), 1}};
+    const std::vector<TraceThread::Total> now{{"Driver.Packet", nullptr, milliseconds(10), 5}, {"Driver.Present", nullptr, milliseconds(1), 1}, {"Driver.Completion", nullptr, milliseconds(3), 2}};
+    const auto delta = TraceFormat::Since(now, before);
+    Check(delta.size() == 2, "a total without a new slice was kept or a new one lost");
+    Check(delta[0].length == milliseconds(6) && delta[0].count == 3, "a total was not reduced by the previous interval");
+    Check(std::string_view(delta[1].scope) == "Driver.Completion" && delta[1].length == milliseconds(3) && delta[1].count == 2, "a total without a previous value changed");
+    Check(TraceFormat::Since(now, {}).size() == 3, "the first interval dropped a total");
+}
+
+void IntervalSummaryFields() {
+    const auto origin = Clock::now();
+    AgcDriver::TraceSummary summary;
+    summary.commit = "abc";
+    summary.dirty = true;
+    summary.environment = {{"APS5_TRACE_SUMMARY_EVERY", "30"}};
+    summary.gpu = "GPU";
+    summary.driver = "Driver 1";
+    summary.os = "OS 1";
+    summary.width = 1920;
+    summary.height = 1080;
+    summary.window = "summary_every 30";
+    summary.firstPresent = 120;
+    summary.gpuBusyMs = 20;
+    summary.interval = std::make_pair(30.5, 60.25);
+    const std::vector<TraceThread::Snapshot> threads{
+        {"queue worker 0x0", {}, {{"Driver.Packet", nullptr, milliseconds(12), 4}}, false},
+    };
+    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16), origin + milliseconds(40)};
+    const auto line = TraceFormat::Summary(summary, threads, presents);
+    const std::string expected =
+        "{\"commit\":\"abc\",\"dirty\":true,\"env\":{\"APS5_TRACE_SUMMARY_EVERY\":\"30\"},\"gpu\":\"GPU\",\"driver\":\"Driver 1\",\"os\":\"OS 1\","
+        "\"resolution\":\"1920x1080\",\"window\":{\"spec\":\"summary_every 30\",\"first_present\":120,\"ms\":40.000},\"interval_start_s\":30.500,\"interval_end_s\":60.250,\"presents\":2,"
+        "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
+        "\"worker_busy_pct\":{\"queue worker 0x0\":30.000},"
+        "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000},"
+        "\"trace_dropped\":false,\"trace\":\"\"}\n";
+    Check(line == expected, "interval summary line changed");
+}
+
 void GzipFile() {
     std::string text;
     for (int index = 0; index < 20000; ++index) text += "{\"name\":\"Driver.Packet\",\"ph\":\"X\",\"ts\":" + std::to_string(index) + "}\n";
@@ -210,6 +282,10 @@ int main() {
         EventsShape();
         SummaryFields();
         GpuClock();
+        IntervalDue();
+        SummaryOnlyThread();
+        TotalsSince();
+        IntervalSummaryFields();
         GzipFile();
         AppendLines();
         std::cout << "performance trace tests passed\n";
