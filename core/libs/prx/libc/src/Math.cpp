@@ -485,6 +485,13 @@ int APS5_VABI __signbitl_nid_postfix(long double x) {
     return std::signbit(x) ? 1 : 0;
 }
 
+int APS5_VABI __isfinitel_nid_postfix(long double x) {
+    static_assert(sizeof(long double) == 16 && std::numeric_limits<long double>::digits == 64 && std::numeric_limits<long double>::max_exponent == 16384 && std::endian::native == std::endian::little, "guest long double requires little-endian x87 extended precision storage");
+    std::uint16_t exponent;
+    std::memcpy(&exponent, reinterpret_cast<const std::uint8_t*>(&x) + 8, sizeof(exponent));
+    return (exponent & 0x7fffu) != 0x7fffu;
+}
+
 static std::mutex g_randLock;
 static std::uint32_t g_randState = 1;
 
