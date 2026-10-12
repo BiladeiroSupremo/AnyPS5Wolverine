@@ -44,6 +44,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Spinlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Socket/src/Socket.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Socket/src/Udp.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Socket/src/SocketOptions.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Socket/src/AddressConversion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/EventFlag/src/EventFlag.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Module/src/Module.cpp
@@ -1021,6 +1022,16 @@ if(BUILD_TESTING)
     target_include_directories(guest_socket_error_tests PRIVATE ${LIBS_INCLUDE_DIR})
     configure_windows_unwind(guest_socket_error_tests)
     add_test(NAME guest_socket_error COMMAND guest_socket_error_tests)
+    add_test_executable(guest_socket_options_tests ${LIBS_INCLUDE_DIR}/tests/GuestSocketOptions.cpp)
+    target_include_directories(guest_socket_options_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_socket_options_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_socket_options_tests)
+    add_test(NAME guest_socket_options COMMAND guest_socket_options_tests)
+    set_tests_properties(guest_socket_options PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(guest_socket_options PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     add_test_executable(guest_udp_tests ${LIBS_INCLUDE_DIR}/tests/GuestUdp.cpp)
     target_include_directories(guest_udp_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_udp_tests PRIVATE libkernel libc)
