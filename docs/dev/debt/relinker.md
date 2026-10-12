@@ -2,6 +2,8 @@
 
 ### Functional
 
+- [Executable guest imports](../../../core/relinker/relinker/src/guest/GuestModuleBuilder.cpp) - on Linux and macOS, a relocated executable import resolved to one guest provider requires that module and its dependencies at startup, even when it was discovered through `--module-dir` without a DT_NEEDED entry. Unreferenced symbols and no-op relocations do not require an otherwise deferred module. Console module-start ordering is unmeasured.
+
 - [Runtime-loaded modules](../../../core/relinker/relinker/src/guest/GuestModuleBuilder.cpp) (`--module-dir`) that another module needs are initialized at startup with no start arguments, before the module that needs them is loaded; the console is assumed to start them when that module is loaded.
 - The executable file that [relinker](../../../core/relinker/elfpatcher/src/windows/WindowsPeWriter.cpp) generates opens a console when launched, unless it is relinked with `--windows-gui`, which selects the GUI subsystem. A GUI build started from Explorer has no standard output or error handle, so everything it prints is lost, including the entry stub's errors and crash reports (#3282).
 - Converted Windows main executables [omit `DYNAMIC_BASE`](../../../core/relinker/elfpatcher/src/windows/WindowsPeWriter.cpp) by default, not only with `--windows-fixed-base`: on the console the executable lies inside the 40-bit window that the title's own `sceLibcMspaceCreate` checks (#3043). Relocations are kept, so if `0x140000000` is taken Windows relocates the image, possibly above that window. Verified only on Windows 10.

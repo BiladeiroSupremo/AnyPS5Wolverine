@@ -167,10 +167,14 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     const auto declaresHost = [&](const std::string& library) { return !windows && !library.empty() && findGuest(library) == guestNames.end(); };
     if (dynamic.DynSymData.size() % 24 != 0) throw Domain::RelinkerException("Invalid executable symbol table");
     std::vector<std::string> executableModules(dynamic.DynSymData.size() / 24);
+    std::vector<bool> executableReferences(executableModules.size());
+    std::set<std::size_t> executableProviders;
     for (const auto* table : {&dynamic.RelaData, &dynamic.RelaPltData}) {
         if (table->size() % 24 != 0) throw Domain::RelinkerException("Invalid executable relocation table");
         for (std::size_t offset = 0; offset < table->size(); offset += 24) {
-            const auto symbol = Io::ReadU64(*table, offset + 8) >> 32;
+            const auto info = Io::ReadU64(*table, offset + 8);
+            const auto symbol = info >> 32;
+            if (symbol != 0 && symbol < executableReferences.size() && (info & 0xffffffffu) != 0) executableReferences[symbol] = true;
             const auto module = dynamic.ImportModules.find(Io::ReadU64(*table, offset));
             if (symbol != 0 && symbol < executableModules.size() && module != dynamic.ImportModules.end()) executableModules[symbol] = module->second;
         }
@@ -197,7 +201,11 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             }
         }
         if (needed != 1) rejectSharedImport(base, Io::Utf8Path(inputPath));
-        if (!windows && exports.contains(name)) rename(dynamic.DynSymData, dynamic.DynStrData, offset / 24, name);
+        const auto found = exports.find(name);
+        if (!windows && found != exports.end()) {
+            rename(dynamic.DynSymData, dynamic.DynStrData, offset / 24, name);
+            if (executableReferences[offset / 24] && found->second.size() == 1) executableProviders.insert(found->second.front().Provider);
+        }
     }
     std::vector<std::set<std::size_t>> dependencies(images.size());
     std::vector<std::set<std::size_t>> systemImports(images.size());
@@ -251,6 +259,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         const auto found = findGuest(name);
         if (found != guestNames.end()) require(found->second);
     }
+    for (const auto provider : executableProviders) require(provider);
     for (std::size_t index = 0; index < images.size(); ++index) {
         if (!isRuntime(index)) require(index);
         if (windows) for (const auto dependency : dependencies[index]) require(dependency);
