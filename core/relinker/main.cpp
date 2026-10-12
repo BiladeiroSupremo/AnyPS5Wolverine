@@ -61,6 +61,7 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     options.TraceImports = args.traceImports;
     options.WindowsFixedBase = mainExecutable ? args.windowsFixedBase : std::nullopt;
     options.WindowsDiagnostics = args.windowsDiagnostics && mainExecutable;
+    options.LinuxFixedBase = args.linuxFixedBase;
     options.ExcludedModules = args.excludedSceModules;
     progress.IncludeFile(Io::Utf8Path(input.InputPath));
     progress.IncludeFile(Io::Utf8Path(input.OutputPath));

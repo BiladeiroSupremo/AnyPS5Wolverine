@@ -44,6 +44,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     if (input.InputPath.lexically_normal() == input.OutputPath.lexically_normal()) throw Domain::RelinkerException("Executable output would overwrite the input executable");
     if (!input.Modules.empty() && input.ModuleRoot.empty()) throw Domain::RelinkerException("Module root is required");
     if (options.WindowsDiagnostics && options.Target != TargetSystem::Windows) throw Domain::RelinkerException("Windows diagnostics require the Windows target");
+    if (options.LinuxFixedBase && options.Target != TargetSystem::Linux) throw Domain::RelinkerException("A fixed Linux base requires the Linux target");
     const bool windows = options.Target == TargetSystem::Windows;
     const bool macos = options.Target == TargetSystem::MacOs;
     inputProgress.Report({Domain::ProgressStage::Executable, Io::Utf8Path(input.InputPath), 0, 1});
@@ -112,7 +113,8 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
                 byteWriter
             ),
             std::make_shared<Elfpatcher::SectionHeaderTableBuilder>(byteWriter),
-            byteWriter
+            byteWriter,
+            options.LinuxFixedBase
         );
     }
 
