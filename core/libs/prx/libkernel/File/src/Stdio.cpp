@@ -742,22 +742,15 @@ int APS5_VABI _open_nid_postfix(const char* path, int flags, ...) {
 }
 
 int64_t APS5_VABI pread_nid_postfix(int d, void* buf, size_t nbytes, int64_t offset) {
-    if (buf == nullptr) {
-        APS5_INVALID_ARG_EX;
-    }
-    if (offset < 0) {
-        APS5_INVALID_ARG_EX;
-    }
+    if (buf == nullptr && nbytes != 0) return PosixFailure(GUEST_EFAULT);
+    if (offset < 0) return PosixFailure(GUEST_EINVAL);
     if (FailPosixPositionedGuestSocket(d)) return -1;
     const GuestArena::HostWrite destination(buf, nbytes);
-    if (!destination.Open()) errno = EFAULT;
-    else if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<int64_t>(nbytes);
-    auto n = destination.Open() ? NativePread(d, buf, nbytes, offset) : -1;
-    if (n < 0 && errno == EBADF) return PosixFailure(GUEST_EBADF);
-    if (n < 0) {
-        throw std::runtime_error(std::string(__func__) + ": pread failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
-    }
-    return n;
+    if (!destination.Open()) return PosixFailure(GUEST_EFAULT);
+    if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<int64_t>(nbytes);
+    char empty = 0;
+    const auto result = NativePread(d, buf == nullptr ? &empty : buf, nbytes, offset);
+    return result < 0 ? PosixFailure(SceErrorFromErrno(errno) & 0xffff) : result;
 }
 
 int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int d, const void* buf, size_t nbytes, int64_t offset) {
