@@ -13,6 +13,7 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libScePad/include/PadInputTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libSceIme/include/ImeInput.hpp"
 
 PadInput::PadInput() : PadInput(Pad::LoadInputMapping()) {
 }
@@ -220,6 +221,7 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
     const bool input = event.type == SDL_MOUSEWHEEL || event.type == SDL_MOUSEMOTION || event.type == SDL_KEYDOWN || event.type == SDL_KEYUP ||
         event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP;
     if (!input || ignoreInput) return;
+    if (event.type == SDL_KEYDOWN && ImeCapturesKeyboard_nid_postfix()) return;
     const auto requests = keyboardMouse.HandleEvent(event, std::chrono::steady_clock::now());
     if (requests.toggleFullscreen && window.Handle() != nullptr && event.key.windowID == SDL_GetWindowID(window.Handle())) window.ToggleFullscreen();
     if (requests.toggleMouse) setMouseMode(!keyboardMouse.MouseMode());

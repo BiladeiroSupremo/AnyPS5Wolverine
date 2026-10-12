@@ -14,6 +14,7 @@
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceVideoOut/include/KeyboardInput.hpp"
+#include "prx/libSceVideoOut/include/ImeTextInput.hpp"
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
@@ -608,6 +609,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         PadInput padInput;
         MouseInput mouseInput;
         KeyboardInput keyboardInput;
+        ImeTextInput imeTextInput;
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
@@ -630,6 +632,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 if (window.Handle() != nullptr) {
                     mouseInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
                     keyboardInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                    imeTextInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
                 }
             }
             padInput.Update();
