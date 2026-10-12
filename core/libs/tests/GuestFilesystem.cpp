@@ -27,6 +27,7 @@ int APS5_VABI sceKernelChmod_nid_postfix(const char*, unsigned short);
 int APS5_VABI sceKernelFchmod(int, unsigned short);
 int APS5_VABI fchmod_nid_postfix(int, int);
 int APS5_VABI chmod_nid_postfix(const char*, int);
+int APS5_VABI chflags_nid_postfix(const char*, std::uint64_t);
 int APS5_VABI futimes_nid_postfix(int, const KernelTimeval*);
 int APS5_VABI sceKernelFutimes(int, const KernelTimeval*);
 int APS5_VABI socket_nid_postfix(int, int, int);
