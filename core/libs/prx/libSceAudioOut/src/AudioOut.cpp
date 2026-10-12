@@ -105,12 +105,6 @@ static std::mutex g_outputMutex;
 static Port g_ports[PORTS_MAX];
 static bool g_sdlInitialized = false;
 
-int InitializeSdlAudio_nid_no_patch() {
-    static std::mutex initializationMutex;
-    std::lock_guard lock(initializationMutex);
-    return SDL_InitSubSystem(SDL_INIT_AUDIO);
-}
-
 static bool ensureSdlAudio() {
     if (g_sdlInitialized) {
         return true;
