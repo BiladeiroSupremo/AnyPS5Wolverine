@@ -63,10 +63,12 @@ static constexpr std::uint32_t SCE_NGS2_CUSTOM_SAMPLER_VOICE_PARAM_ADD_WAVEFORM_
 static constexpr std::uint32_t SCE_NGS2_CUSTOM_SAMPLER_VOICE_PARAM_EXIT_LOOP = 0x40010004;
 static constexpr std::uint32_t SCE_NGS2_CUSTOM_SAMPLER_VOICE_PARAM_PITCH = 0x40010005;
 static constexpr std::uint32_t SCE_NGS2_CUSTOM_SUBMIXER_VOICE_PARAM_SETUP = 0x40020000;
+static constexpr std::uint32_t SCE_NGS2_CUSTOM_VOICE_PARAM_FILTER = 0x40001300;
 static constexpr std::uint32_t SCE_NGS2_CUSTOM_VOICE_PARAM_USER_FX2 = 0x40001f00;
 
 static constexpr std::uint32_t SCE_NGS2_CUSTOM_MAX_MODULES = 24;
 static constexpr std::uint32_t SCE_NGS2_CUSTOM_MAX_PORTS = 16;
+static constexpr std::uint32_t SCE_NGS2_CUSTOM_MODULE_ID_FILTER = 0x13;
 static constexpr std::uint32_t SCE_NGS2_CUSTOM_MODULE_ID_USER_FX2 = 0x1f;
 
 static constexpr std::uint32_t SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE = 1;
@@ -506,6 +508,33 @@ struct Ngs2CustomVoiceUserFx2Param {
     std::size_t data_size;
 };
 static_assert(sizeof(Ngs2CustomVoiceUserFx2Param) == 24);
+
+struct Ngs2CustomVoiceFilterParam {
+    Ngs2VoiceParamHeader header;
+    std::uint32_t type;
+    std::uint32_t channel_mask;
+    union {
+        struct {
+            float i0;
+            float i1;
+            float i2;
+            float o1;
+            float o2;
+        } direct;
+        struct {
+            float frequency;
+            float q;
+            float level;
+            std::uint32_t reserved;
+            std::uint32_t reserved2;
+        } fcq;
+    } param;
+    std::uint32_t reserved3;
+};
+static_assert(sizeof(Ngs2CustomVoiceFilterParam) == 40);
+static_assert(offsetof(Ngs2CustomVoiceFilterParam, type) == 8);
+static_assert(offsetof(Ngs2CustomVoiceFilterParam, channel_mask) == 12);
+static_assert(offsetof(Ngs2CustomVoiceFilterParam, param) == 16);
 
 struct Ngs2MasteringVoiceSetupParam {
     Ngs2VoiceParamHeader header;
