@@ -76,7 +76,7 @@ class Check:
                 continue
             added, deleted, path = line.split("\t", 2)
             self.numstat[path] = (added, deleted)
-        paths = iter(self.status)
+        paths = iter([path for path, status in self.status.items() for _ in range(2 if status == "T" else 1)])
         path, number = None, None
         for line in git("diff", "-U0", "--no-color", "--no-renames", self.base, head).split("\n"):
             if line.startswith("diff --git "):
