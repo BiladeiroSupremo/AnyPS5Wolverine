@@ -1243,6 +1243,20 @@ bool GuestProtection(uintptr_t addr, int* prot) {
     return true;
 }
 
+void GuestPageTableUsage(std::uint64_t granularity, std::uint64_t* cpuEntries, std::uint64_t* gpuEntries) {
+    std::uint64_t cpu = 0;
+    std::uint64_t gpu = 0;
+    std::lock_guard lock(g_protectionLock);
+    for (const auto& [start, range] : g_protections) {
+        if (range.end <= start) continue;
+        const auto entries = (range.end - 1) / granularity - start / granularity + 1;
+        if (range.prot & 0x7) cpu += entries;
+        if (range.prot & GuestProtGpuReadWrite) gpu += entries;
+    }
+    *cpuEntries = cpu;
+    *gpuEntries = gpu;
+}
+
 bool QueryDirectMapping(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end, std::uint64_t* offset, int* memoryType) {
     std::lock_guard lock(g_directLock);
     const auto next = g_directMappings.upper_bound(address);

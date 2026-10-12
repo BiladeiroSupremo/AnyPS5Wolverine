@@ -49,5 +49,6 @@ bool GuestReservation(std::uintptr_t addr, std::uintptr_t* start, std::uintptr_t
 bool GuestRangeMapped(std::uintptr_t start, std::uintptr_t end);
 void ForgetJitSharedMemory(int descriptor);
 void DuplicateJitSharedMemory(int from, int to);
+void GuestPageTableUsage(std::uint64_t granularity, std::uint64_t* cpu_entries, std::uint64_t* gpu_entries);
 
 #endif
