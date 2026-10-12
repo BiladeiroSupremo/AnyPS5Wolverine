@@ -311,6 +311,58 @@ class SilentStubSectionTests(unittest.TestCase):
         self.assertNotIn("[debt-file]", result.stdout + result.stderr)
 
 
+class TestFixtureExportTests(unittest.TestCase):
+    def check(self, path, text):
+        checker = Path(__file__).resolve().parents[1] / "check_conventions.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-c", f"safe.directory={root}", "-c", "user.name=Conventions Test",
+                     "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", *args],
+                    cwd=root, capture_output=True, text=True, check=True,
+                )
+
+            def write(relative, content):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+
+            git("init", "-q")
+            write("core/libs/prx/libkernel/src/Time.cpp", "std::uint64_t APS5_VABI sceKernelGetProcessTime() { return now(); }\n")
+            write("core/libs/prx/libSceNgs2/tests/Render.cpp", "static int APS5_VABI Process(int value) { return value; }\n")
+            git("add", ".")
+            git("commit", "-qm", "feat: add libraries")
+            write(path, text)
+            git("add", ".")
+            git("commit", "-qm", "feat: add source")
+            env = {key: value for key, value in os.environ.items()
+                   if key not in ("GITHUB_EVENT_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_ACTIONS")}
+            env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="safe.directory", GIT_CONFIG_VALUE_0=str(root))
+            return subprocess.run(
+                [sys.executable, "-I", str(checker), "--base", "HEAD~1"],
+                cwd=root, capture_output=True, text=True, env=env, timeout=20,
+            )
+
+    def test_mock_in_tests_directory_is_not_an_export(self):
+        result = self.check("core/libs/prx/libSceAudioOut/tests/Shutdown.cpp",
+                            'extern "C" std::uint64_t APS5_VABI sceKernelGetProcessTime() { return 0; }\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("All conventions checks passed", result.stdout)
+
+    def test_export_named_like_a_test_fixture_is_not_a_duplicate(self):
+        result = self.check("core/libs/prx/libSceAjm/src/Port.cpp", "int APS5_VABI Process(int value) { return value + 1; }\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("All conventions checks passed", result.stdout)
+
+    def test_export_in_another_library_is_still_a_duplicate(self):
+        result = self.check("core/libs/prx/libSceAudioOut/src/Clock.cpp", "std::uint64_t APS5_VABI sceKernelGetProcessTime() { return now(); }\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("core/libs/prx/libSceAudioOut/src/Clock.cpp:1: error: [duplicate-export]", result.stdout)
+        self.assertIn("sceKernelGetProcessTime is also in libkernel", result.stdout)
+
+
 class PullRequestTemplateTests(unittest.TestCase):
     def body_findings(self, body):
         check = Check.__new__(Check)
