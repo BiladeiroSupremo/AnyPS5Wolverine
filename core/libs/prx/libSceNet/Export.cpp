@@ -1081,6 +1081,25 @@ int APS5_VABI sceNetEpollCreate(const char* name, int flags) {
     return id;
 }
 
+int APS5_VABI sceNetShowNetstatWithMemory(int memid) {
+    struct SocketStatus { int id; int family; int type; bool nonblock; bool bound; bool listening; };
+    std::vector<SocketStatus> sockets;
+    std::size_t poolSize = 0;
+    {
+        std::lock_guard lk(g_mutex);
+        const auto pool = g_pools.find(memid);
+        if (pool == g_pools.end()) return fail(NET_EBADF);
+        poolSize = pool->second;
+        sockets.reserve(g_socks.size());
+        for (const auto& [id, socket] : g_socks)
+            sockets.push_back({id, socket.family, socket.type, socket.nonblock, socket.bound, socket.listening});
+    }
+    std::fprintf(stdout, "sceNet netstat: pool=%d bytes=%zu sockets=%zu\n", memid, poolSize, sockets.size());
+    for (const auto& socket : sockets)
+        std::fprintf(stdout, "socket=%d family=%d type=%d nonblock=%d bound=%d listening=%d\n", socket.id, socket.family, socket.type, int(socket.nonblock), int(socket.bound), int(socket.listening));
+    return 0;
+}
+
 int APS5_VABI sceNetGetMemoryPoolStats(int memid, NetMemoryPoolStats* stats) {
     std::lock_guard lk(g_mutex);
     const auto pool = g_pools.find(memid);
