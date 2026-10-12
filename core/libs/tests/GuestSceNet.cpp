@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -784,6 +785,43 @@ static void CheckSocketError() {
     Require(sceNetSocketClose(refused) == 0);
 }
 
+static void CheckDatagramDisconnect() {
+    const int peer = sceNetSocket("disconnect-peer", 2, 2, 17);
+    const int other = sceNetSocket("disconnect-other", 2, 2, 17);
+    const int dissolved = sceNetSocket("disconnect", 2, 2, 17);
+    Require(peer >= 0 && other >= 0 && dissolved >= 0);
+    std::array<std::uint8_t, 16> peerAddress{16, 2, 0, 0, 127, 0, 0, 1};
+    std::array<std::uint8_t, 16> dissolvedAddress{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(sceNetBind_nid_postfix(peer, peerAddress.data(), peerAddress.size()) == 0);
+    Require(sceNetBind_nid_postfix(dissolved, dissolvedAddress.data(), dissolvedAddress.size()) == 0);
+    std::uint32_t size = peerAddress.size();
+    Require(sceNetGetsockname(peer, peerAddress.data(), &size) == 0);
+    size = dissolvedAddress.size();
+    Require(sceNetGetsockname(dissolved, dissolvedAddress.data(), &size) == 0);
+    Require(sceNetConnect(dissolved, peerAddress.data(), peerAddress.size()) == 0);
+    std::array<std::uint8_t, 16> name{};
+    size = name.size();
+    Require(sceNetGetpeername(dissolved, name.data(), &size) == 0 && name[2] == peerAddress[2] && name[3] == peerAddress[3]);
+    const std::array<std::uint8_t, 16> unspecified{16, 0};
+    Require(Failed(sceNetConnect(dissolved, unspecified.data(), unspecified.size()), 22));
+    size = name.size();
+    Require(Failed(sceNetGetpeername(dissolved, name.data(), &size), 57));
+    std::array<std::uint8_t, 16> local{};
+    size = local.size();
+    Require(sceNetGetsockname(dissolved, local.data(), &size) == 0 && local[2] == dissolvedAddress[2] && local[3] == dissolvedAddress[3]);
+#ifndef _WIN32
+    Require(local[4] == 0 && local[5] == 0 && local[6] == 0 && local[7] == 0);
+#endif
+    const int timeout = 2000000;
+    Require(sceNetSetsockopt(dissolved, 0xffff, 0x1006, &timeout, sizeof(timeout)) == 0);
+    const char unrelated[] = "unrelated sender";
+    Require(sceNetSendto(other, unrelated, sizeof(unrelated), 0, dissolvedAddress.data(), dissolvedAddress.size()) == sizeof(unrelated));
+    char buffer[32]{};
+    Require(sceNetRecvfrom(dissolved, buffer, sizeof(buffer), 0, nullptr, nullptr) == sizeof(unrelated));
+    Require(std::strcmp(buffer, unrelated) == 0);
+    for (const int descriptor : {peer, other, dissolved}) Require(sceNetSocketClose(descriptor) == 0);
+}
+
 int main() {
     const auto epoch = std::chrono::steady_clock::time_point{};
     Require(KernelSocketSelect::DeadlineAfter(epoch, 2, 250000) == epoch + std::chrono::milliseconds(2250));
@@ -811,6 +849,7 @@ int main() {
     CheckUnboundSocketName();
     CheckUnspecifiedIpv6();
     if (!ipv6Unavailable) CheckIpv6SocketsAreIpv6Only();
+    CheckDatagramDisconnect();
 
     const int closed = sceNetSocket("closed-by-kernel", 2, 2, 17);
     Require(closed >= 0);
