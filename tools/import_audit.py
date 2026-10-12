@@ -162,6 +162,7 @@ def elf_exports(path, data):
             continue
         if entry != 24 or size % 24 or link >= len(sections) or sections[link][1] != 3:
             raise AuditError(f"{path}: invalid dynamic symbol table (entry size {entry}, size {size}, string table section {link})")
+        take(data, offset, size, path, "dynamic symbol table")
         strings_offset, strings_size = sections[link][4], sections[link][5]
         take(data, strings_offset, strings_size, path, "dynamic string table")
         indexes = [candidate for candidate in sections if candidate[1] == 18 and candidate[6] == section_index]

@@ -102,6 +102,13 @@ def exporting(*names):
     return build_elf([(name, 1, GLOBAL_FUNCTION) for name in names])
 
 
+def with_elf_symbol_table_range(image, offset, size):
+    image = bytearray(image)
+    section_offset = struct.unpack_from("<Q", image, 40)[0] + 64
+    struct.pack_into("<QQ", image, section_offset + 24, offset, size)
+    return bytes(image)
+
+
 def build_pe(names):
     section_rva, raw_offset = 0x1000, 0x200
     strings, rvas = b"", []
@@ -605,6 +612,35 @@ class ImportAuditTests(unittest.TestCase):
         for cut in (10, 64, len(image) - 5):
             with self.assertRaisesRegex(import_audit.AuditError, "mod.prx"):
                 import_audit.elf_imports(path, image[:cut])
+
+    def test_elf_dynamic_symbol_table_rejects_ranges_outside_file(self):
+        image = exporting("alpha")
+        for offset, size in ((len(image) + 1, 0), (2**64 - 1, 0), (len(image) - 23, 24), (len(image), 24), (len(image) + 1, 24)):
+            with self.subTest(offset=offset, size=size):
+                with self.assertRaisesRegex(import_audit.AuditError, r"lib.prx: .*outside the file"):
+                    import_audit.elf_exports(Path("lib.prx"), with_elf_symbol_table_range(image, offset, size))
+
+    def test_elf_dynamic_symbol_table_accepts_ranges_ending_at_eof(self):
+        image = exporting("alpha")
+        self.assertEqual(import_audit.elf_exports(Path("lib.prx"), with_elf_symbol_table_range(image, len(image), 0)), set())
+        table_offset = struct.unpack_from("<Q", image, struct.unpack_from("<Q", image, 40)[0] + 64 + 24)[0]
+        table = image[table_offset:table_offset + 48]
+        relocated = with_elf_symbol_table_range(image + table, len(image), len(table))
+        self.assertEqual(import_audit.elf_exports(Path("lib.prx"), relocated), {"alpha"})
+
+    def test_invalid_elf_dynamic_symbol_table_exits_two(self):
+        work = self.work
+        library = work.libs / "libSceA.prx"
+        image = exporting("AAAAAAAAAAA")
+        library.write_bytes(with_elf_symbol_table_range(image, len(image) + 1, 0))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn(f"FAIL: {library}: dynamic symbol table", err)
+        self.assertIn("outside the file", err)
+        self.assertFalse(result.exists())
 
     def test_pe_reader(self):
         path = Path("lib.prx")
