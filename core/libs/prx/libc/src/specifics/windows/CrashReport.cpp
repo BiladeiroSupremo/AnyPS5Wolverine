@@ -347,18 +347,21 @@ std::uint64_t FrameWithoutUnwindData(const CONTEXT& start) {
     return 0;
 }
 
+bool ReadWord(std::uint64_t address, std::uint64_t* value) {
+    return ReadCode(address, reinterpret_cast<std::uint8_t*>(value), sizeof(*value)) == sizeof(*value);
+}
+
 void ReportUndeliverableException(const EXCEPTION_POINTERS* info, std::uint64_t frame) {
     const auto* record = info->ExceptionRecord;
     char type[256] = "of unknown type";
-    if (record->NumberParameters >= 1) {
-        const auto header = static_cast<std::uint64_t>(record->ExceptionInformation[0]);
-        if (IsReadable(header) && IsReadable(header - CxaExceptionTypeOffset) && *reinterpret_cast<const std::uint64_t*>(header) == GccExceptionClass) {
-            const auto typeInfo = *reinterpret_cast<const std::uint64_t*>(header - CxaExceptionTypeOffset);
-            if (IsReadable(typeInfo) && IsReadable(typeInfo + 8)) {
-                const auto name = *reinterpret_cast<const std::uint64_t*>(typeInfo + 8);
-                if (IsReadable(name)) std::snprintf(type, sizeof(type), "%s", reinterpret_cast<const char*>(name));
-            }
-        }
+    const auto header = record->NumberParameters >= 1 ? static_cast<std::uint64_t>(record->ExceptionInformation[0]) : 0;
+    std::uint64_t exceptionClass = 0;
+    std::uint64_t typeInfo = 0;
+    std::uint64_t namePointer = 0;
+    if (ReadWord(header, &exceptionClass) && exceptionClass == GccExceptionClass && ReadWord(header - CxaExceptionTypeOffset, &typeInfo) && ReadWord(typeInfo + 8, &namePointer)) {
+        std::uint8_t name[sizeof(type)];
+        const auto copied = ReadCode(namePointer, name, sizeof(name));
+        if (const auto* end = static_cast<const std::uint8_t*>(std::memchr(name, 0, copied))) std::memcpy(type, name, static_cast<std::size_t>(end - name) + 1);
     }
     char line[MAX_PATH + 64];
     DescribeAddress(frame, line, sizeof(line));
