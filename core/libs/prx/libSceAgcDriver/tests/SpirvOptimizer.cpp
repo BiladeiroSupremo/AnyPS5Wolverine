@@ -166,6 +166,8 @@ void testNarrowConversions(bool optimizationEnabled) {
                         check(opcodeCount(normalized, spv::OpStore) == (vector ? 1u : 2u), label + ": optimizer lost buffer stores");
                         if (!optimizationEnabled) {
                             check(output == input, label + ": none mode changed the shader");
+                            const auto specialized = ShaderRecompiler::ValidateAndOptimizeSpirv(input, Vulkan11, Spirv13, false, true, true);
+                            check(specialized == input, label + ": none mode changed the specialized shader");
                         } else {
                             check(opcodeCount(normalized, spv::OpIAdd) == 0, label + ": optimizer did not remove dead arithmetic");
                             if (arithmetic && !type.floating) {
