@@ -246,12 +246,14 @@ class SilentStubSectionTests(unittest.TestCase):
 
 
 class PullRequestTemplateTests(unittest.TestCase):
-    def findings(self, line):
+    def body_findings(self, body):
         check = Check.__new__(Check)
         check.findings = []
-        body = f"### What\nx\n### Tested\nLinux\n### Checklist\n{line}\n- [x] Depends on: none\n- [x] AI-assisted: no\n"
         check.pull_request("fix: x", body)
         return check.findings
+
+    def findings(self, line):
+        return self.body_findings(f"### What\nx\n### Tested\nLinux\n### Checklist\n{line}\n- [x] Depends on: none\n- [x] AI-assisted: no\n")
 
     def test_unchecked_items_with_any_bullet_are_reported(self):
         for bullet in ("-", "*", "+"):
@@ -260,6 +262,14 @@ class PullRequestTemplateTests(unittest.TestCase):
 
     def test_checked_item_is_accepted(self):
         self.assertEqual(self.findings("- [x] all"), [])
+
+    def test_subsections_stay_inside_their_section(self):
+        body = "### What\nx\n### Tested\n#### Linux\nctest\n#### Windows\nctest\n### Checklist\n- [x] Depends on: none\n- [x] AI-assisted: no\n"
+        self.assertEqual(self.body_findings(body), [])
+
+    def test_unchecked_item_after_a_checklist_subsection_is_reported(self):
+        body = "### What\nx\n### Tested\nLinux\n### Checklist\n- [x] Depends on: none\n- [x] AI-assisted: no\n#### Later\n- [ ] all\n"
+        self.assertEqual(self.body_findings(body), [("pr-template", "", 0, "unchecked: all")])
 
 
 class SpacedPathTests(unittest.TestCase):
