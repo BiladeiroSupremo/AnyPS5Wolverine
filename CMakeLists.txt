@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
+if(CMAKE_HOST_APPLE AND NOT ANYPS5_RELINKER_ONLY)
+    set(CMAKE_APPLE_SILICON_PROCESSOR x86_64 CACHE STRING "Host processor CMake reports on Apple silicon")
+    set(CMAKE_OSX_ARCHITECTURES x86_64 CACHE STRING "Architectures built on macOS")
+endif()
 project(Relinker CXX)
 
 set(ANYPS5_TEST_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
@@ -59,6 +63,11 @@ if(ANYPS5_ENABLE_ASAN)
     add_compile_definitions(ANYPS5_ENABLE_ASAN=1)
 elseif(NOT APPLE)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
+endif()
+
+if(APPLE AND NOT ANYPS5_RELINKER_ONLY)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>)
+    add_link_options(-fexperimental-library)
 endif()
 
 if(BUILD_TESTING)
@@ -133,6 +142,10 @@ endif()
 if(ANYPS5_RELINKER_ONLY)
     add_subdirectory(core/relinker)
     return()
+endif()
+
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+    message(FATAL_ERROR "The full build on macOS is x86-64 only; configure without CMAKE_OSX_ARCHITECTURES or set it to x86_64")
 endif()
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
