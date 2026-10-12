@@ -239,13 +239,24 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         }
     }
     std::vector<bool> required(images.size());
+    const std::function<void(std::size_t)> require = [&](const std::size_t index) {
+        if (required[index]) return;
+        required[index] = true;
+        for (const auto dependency : dependencies[index]) require(dependency);
+    };
+    const auto isRuntime = [&](const std::size_t index) {
+        return std::find(runtimeDirectories.begin(), runtimeDirectories.end(), images[index].SourcePath.parent_path().lexically_normal()) != runtimeDirectories.end();
+    };
     for (const auto& name : neededNames) {
         const auto found = findGuest(name);
-        if (found != guestNames.end()) required[found->second] = true;
+        if (found != guestNames.end()) require(found->second);
     }
-    for (const auto& needed : dependencies) for (const auto dependency : needed) required[dependency] = true;
+    for (std::size_t index = 0; index < images.size(); ++index) {
+        if (!isRuntime(index)) require(index);
+        if (windows) for (const auto dependency : dependencies[index]) require(dependency);
+    }
     const auto deferred = [&](const std::size_t index) {
-        return !required[index] && std::find(runtimeDirectories.begin(), runtimeDirectories.end(), images[index].SourcePath.parent_path().lexically_normal()) != runtimeDirectories.end();
+        return !required[index] && isRuntime(index);
     };
     const auto appDirectory = [&](const GuestImage& image) {
         const auto directory = image.SourcePath.parent_path().lexically_relative(root).generic_string();

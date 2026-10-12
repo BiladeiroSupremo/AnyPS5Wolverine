@@ -506,6 +506,9 @@ if(BUILD_TESTING)
         add_test(NAME guest_module_args COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_module_args.py
             $<TARGET_FILE:relinker> $<TARGET_FILE:guest_module_args_host>)
+        add_test(NAME guest_deferred_dependencies COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_deferred_dependencies.py
+            $<TARGET_FILE:relinker> $<TARGET_FILE:guest_module_args_host>)
         add_test(NAME guest_absolute_symbols COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_absolute_symbols.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_module_identity COMMAND ${Python3_EXECUTABLE}
