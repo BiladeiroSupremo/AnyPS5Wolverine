@@ -170,7 +170,7 @@ def apply_change(root, base, new, index_text):
                 position = entries.index(anchored) + 1
         entries.insert(position, moved)
 
-    matcher = difflib.SequenceMatcher(None, [entry[2] for entry in before], [entry[2] for entry in after], autojunk=False)
+    matcher = difflib.SequenceMatcher(None, [entry[1:3] for entry in before], [entry[1:3] for entry in after], autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             continue
