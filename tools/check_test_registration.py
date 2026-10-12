@@ -1,6 +1,7 @@
 import argparse
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 TEST_OUTPUT = r"tests[\\/]"
@@ -23,8 +24,16 @@ def built(build):
         raise ValueError(f"test registration audit requires a Ninja generator, got {generator!r}")
     if not program or program.endswith("-NOTFOUND"):
         raise FileNotFoundError(f"CMAKE_MAKE_PROGRAM is not set in {Path(build) / 'CMakeCache.txt'}")
+    encoding = "utf-8"
+    if sys.platform == "win32":
+        codepage = subprocess.run([program, "-t", "wincodepage"], capture_output=True, text=True,
+                                  encoding="ascii", check=True).stdout.strip()
+        encodings = {"Build file encoding: UTF-8": "utf-8", "Build file encoding: ANSI": "mbcs"}
+        if codepage not in encodings:
+            raise ValueError(f"unsupported Ninja build-file encoding: {codepage!r}")
+        encoding = encodings[codepage]
     listed = subprocess.run([program, "-C", str(build), "-t", "targets", "all"],
-                            capture_output=True, text=True, check=True).stdout
+                            capture_output=True, text=True, encoding=encoding, check=True).stdout
     names = set()
     for line in listed.splitlines():
         path, _, rule = line.partition(": ")
