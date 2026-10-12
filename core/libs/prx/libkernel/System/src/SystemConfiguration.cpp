@@ -20,6 +20,7 @@
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" int APS5_VABI getpid_nid_postfix();
+extern "C" std::uint64_t APS5_VABI sceKernelGetTscFrequency(void);
 
 struct SceKernelSystemSwVersion {
     std::uint64_t size;
@@ -209,6 +210,14 @@ int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::si
         }
         static constexpr std::uint32_t sdkVersion = 0x01000000;
         return CopyOut(&sdkVersion, sizeof(sdkVersion), oldValue, oldLength);
+    }
+    if (std::strcmp(name, "machdep.tsc_freq") == 0) {
+        if (newValue != nullptr) {
+            *__error_nid_postfix() = 1;
+            return -1;
+        }
+        const std::uint64_t frequency = sceKernelGetTscFrequency();
+        return CopyOut(&frequency, sizeof(frequency), oldValue, oldLength);
     }
     if (std::strcmp(name, "hw.ncpu") == 0) {
         static constexpr int mib[] = {6, 3};
