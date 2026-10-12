@@ -1,14 +1,22 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "SceShaders.hpp"
 #include "VulkanTestDevice.hpp"
 #include <spirv/unified1/spirv.hpp>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <span>
@@ -23,7 +31,9 @@ using ShaderRecompiler::ShaderStage;
 constexpr std::uint32_t Width = 256;
 constexpr std::uint32_t Height = 80;
 constexpr std::array<std::uint8_t, 4> Background{16, 24, 40, 255};
+constexpr std::size_t GuestBytes = 65536;
 alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
+std::array<std::uint32_t, 16> HullUserData{0x1000u};
 
 alignas(256) constexpr std::array<std::uint32_t, 29> LocalCode{
     0xd5480004, 0x02090502, 0xd5480005, 0x02090102, 0xd5480006, 0x02110902, 0xd5480007, 0x02111102,
@@ -259,11 +269,10 @@ struct Stages {
 };
 
 ShaderRecompiler::RecompileResult Compile(const ShaderRecompiler::SpirvTarget& target, ShaderStage stage, std::span<const std::uint32_t> code, std::uint32_t& pushCursor, const PatchDraw& patches = Triangles) {
-    static const std::array<std::uint32_t, 16> hullUserData{0x1000u};
     static const std::array<std::uint32_t, 8> domainUserData{};
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const bool hull = stage == ShaderStage::TessellationControl;
-    const auto userData = hull ? std::span<const std::uint32_t>(hullUserData) : stage == ShaderStage::TessellationEvaluation ? std::span<const std::uint32_t>(domainUserData) : std::span<const std::uint32_t>();
+    const auto userData = hull ? std::span<const std::uint32_t>(HullUserData) : stage == ShaderStage::TessellationEvaluation ? std::span<const std::uint32_t>(domainUserData) : std::span<const std::uint32_t>();
     std::optional<ShaderRecompiler::ShaderPixelStageInfo> pixel;
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
     std::optional<ShaderRecompiler::GraphicsCompileContext> graphics;
