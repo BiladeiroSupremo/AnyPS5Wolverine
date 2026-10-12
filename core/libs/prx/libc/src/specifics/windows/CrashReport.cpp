@@ -325,6 +325,47 @@ void TraceSse4a(std::uint64_t rip, const sse4a::Instruction& instruction, const 
     Report("[sse4a] #%llu %s %s (length %u, index %u, %u bytes) at %s on thread %lu\n", count, mnemonic, operands, field.length, field.index, static_cast<unsigned>(instruction.size), line, GetCurrentThreadId());
 }
 
+constexpr DWORD GccExceptionMask = 0x20ffffffu;
+constexpr DWORD GccException = 0x20474343u;
+constexpr std::uint64_t GccExceptionClass = 0x474e5543432b2b00ull;
+constexpr std::uint64_t CxaExceptionTypeOffset = 80;
+
+std::uint64_t FrameWithoutUnwindData(const CONTEXT& start) {
+    const HMODULE runtime[] = {GetModuleHandleA("KERNELBASE.dll"), GetModuleHandleA("libgcc_s_seh-1.dll"), GetModuleHandleA("libstdc++-6.dll")};
+    CONTEXT context = start;
+    for (int depth = 0; depth < 64 && context.Rip != 0; ++depth) {
+        HMODULE module = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(context.Rip), &module);
+        DWORD64 imageBase = 0;
+        const auto entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+        if (module == nullptr || std::find(std::begin(runtime), std::end(runtime), module) == std::end(runtime)) return entry == nullptr ? context.Rip : 0;
+        if (entry == nullptr) return 0;
+        PVOID handlerData = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handlerData, &establisher, nullptr);
+    }
+    return 0;
+}
+
+void ReportUndeliverableException(const EXCEPTION_POINTERS* info, std::uint64_t frame) {
+    const auto* record = info->ExceptionRecord;
+    char type[256] = "of unknown type";
+    if (record->NumberParameters >= 1) {
+        const auto header = static_cast<std::uint64_t>(record->ExceptionInformation[0]);
+        if (IsReadable(header) && IsReadable(header - CxaExceptionTypeOffset) && *reinterpret_cast<const std::uint64_t*>(header) == GccExceptionClass) {
+            const auto typeInfo = *reinterpret_cast<const std::uint64_t*>(header - CxaExceptionTypeOffset);
+            if (IsReadable(typeInfo) && IsReadable(typeInfo + 8)) {
+                const auto name = *reinterpret_cast<const std::uint64_t*>(typeInfo + 8);
+                if (IsReadable(name)) std::snprintf(type, sizeof(type), "%s", reinterpret_cast<const char*>(name));
+            }
+        }
+    }
+    char line[MAX_PATH + 64];
+    DescribeAddress(frame, line, sizeof(line));
+    Report("\nFATAL: C++ exception %s raised on thread %lu cannot be delivered: %s has no unwind data\n", type, GetCurrentThreadId(), line);
+    ReportStackCandidates(info->ContextRecord->Rsp, 32, 0x4000);
+}
+
 bool HandleSse4a(EXCEPTION_POINTERS* info) {
     if (!g_sse4aEmulation) return false;
     const auto* record = info->ExceptionRecord;
@@ -352,7 +393,15 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
+<<<<<<< HEAD
     if (!IsFatal(record->ExceptionCode) && !g_forceReport) return EXCEPTION_CONTINUE_SEARCH;
+=======
+    if ((record->ExceptionCode & GccExceptionMask) == GccException) {
+        if (const auto frame = FrameWithoutUnwindData(*info->ContextRecord)) ReportUndeliverableException(info, frame);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (!IsFatal(record->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
+>>>>>>> da6948ea1 (fix(libc): report host C++ exceptions that Windows cannot deliver)
     if (reported.exchange(true)) {
         // Another thread is already reporting; let it finish before this fault ends the process.
         Sleep(INFINITE);
