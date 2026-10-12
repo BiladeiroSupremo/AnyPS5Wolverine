@@ -91,6 +91,7 @@ constexpr int NET_SO_SCE_SNDTIMEO = 0x1105;
 constexpr int NET_SO_SCE_RCVTIMEO = 0x1106;
 constexpr int NET_MSG_PEEK = 0x2;
 constexpr int NET_MSG_TRUNC = 0x10;
+constexpr int NET_MSG_DONTWAIT = 0x80;
 constexpr int NET_UIO_MAXIOV = 1024;
 
 #ifdef _WIN32
@@ -468,6 +469,21 @@ int receive_error(const Sock& socket) {
     return native_error();
 }
 
+bool message_flags_supported(int flags, int accepted) {
+#ifdef _WIN32
+    accepted &= ~NET_MSG_DONTWAIT;
+#endif
+    return (flags & ~accepted) == 0;
+}
+
+int native_message_flags(int flags) {
+    int native = (flags & NET_MSG_PEEK) ? MSG_PEEK : 0;
+#ifndef _WIN32
+    if (flags & NET_MSG_DONTWAIT) native |= MSG_DONTWAIT;
+#endif
+    return native;
+}
+
 }  // namespace
 
 extern "C" {
@@ -778,7 +794,7 @@ int APS5_VABI sceNetConnect(int s, const void* addr, uint32_t addrlen) {
 }
 
 int64_t APS5_VABI sceNetRecv(int s, void* buf, size_t len, int flags) {
-    if (flags != 0 && flags != 2) return fail(NET_EOPNOTSUPP);
+    if (!message_flags_supported(flags, NET_MSG_PEEK | NET_MSG_DONTWAIT)) return fail(NET_EOPNOTSUPP);
     if (!buf && len) return fail(NET_EINVAL);
     if (len > INT_MAX) return fail(NET_EMSGSIZE);
     Sock socket;
@@ -790,7 +806,7 @@ int64_t APS5_VABI sceNetRecv(int s, void* buf, size_t len, int flags) {
     }
     const GuestArena::HostWrite destination(len == 0 ? nullptr : buf, len);
     if (!destination.Open()) return fail(NET_EFAULT);
-    const int native_flags = flags == 2 ? MSG_PEEK : 0;
+    const int native_flags = native_message_flags(flags);
     const int result = ::recv(socket.native->value, static_cast<char*>(buf), static_cast<int>(len), native_flags);
 #ifdef _WIN32
     if (result < 0 && socket.type == NET_SOCK_DGRAM && WSAGetLastError() == WSAEMSGSIZE) return static_cast<int64_t>(len);
@@ -799,7 +815,7 @@ int64_t APS5_VABI sceNetRecv(int s, void* buf, size_t len, int flags) {
 }
 
 int64_t APS5_VABI sceNetRecvfrom(int s, void* buf, size_t len, int flags, void* from, uint32_t* fromlen) {
-    if (flags != 0 && flags != 2) return fail(NET_EOPNOTSUPP);
+    if (!message_flags_supported(flags, NET_MSG_PEEK | NET_MSG_DONTWAIT)) return fail(NET_EOPNOTSUPP);
     if (!buf && len) return fail(NET_EINVAL);
     if (len > INT_MAX) return fail(NET_EMSGSIZE);
     if (from && !fromlen) return fail(NET_EINVAL);
@@ -814,7 +830,7 @@ int64_t APS5_VABI sceNetRecvfrom(int s, void* buf, size_t len, int flags, void* 
     if (!destination.Open()) return fail(NET_EFAULT);
     sockaddr_storage peer{};
     NativeLength peer_length = sizeof(peer);
-    const int native_flags = flags == 2 ? MSG_PEEK : 0;
+    const int native_flags = native_message_flags(flags);
     int result = ::recvfrom(socket.native->value, static_cast<char*>(buf), static_cast<int>(len),
         native_flags, from ? reinterpret_cast<sockaddr*>(&peer) : nullptr, from ? &peer_length : nullptr);
 #ifdef _WIN32
@@ -826,7 +842,7 @@ int64_t APS5_VABI sceNetRecvfrom(int s, void* buf, size_t len, int flags, void* 
 }
 
 int64_t APS5_VABI sceNetSend(int s, const void* buf, size_t len, int flags) {
-    if (flags != 0) return fail(NET_EOPNOTSUPP);
+    if (!message_flags_supported(flags, NET_MSG_DONTWAIT)) return fail(NET_EOPNOTSUPP);
     if (!buf && len) return fail(NET_EINVAL);
     if (len > INT_MAX) return fail(NET_EMSGSIZE);
     Sock socket;
@@ -836,12 +852,12 @@ int64_t APS5_VABI sceNetSend(int s, const void* buf, size_t len, int flags) {
         if (it == g_socks.end()) return fail(NET_EBADF);
         socket = it->second;
     }
-    const int result = ::send(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS);
+    const int result = ::send(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS | native_message_flags(flags));
     return result >= 0 ? result : fail(native_error());
 }
 
 int64_t APS5_VABI sceNetSendto(int s, const void* buf, size_t len, int flags, const void* to, uint32_t tolen) {
-    if (flags != 0) return fail(NET_EOPNOTSUPP);
+    if (!message_flags_supported(flags, NET_MSG_DONTWAIT)) return fail(NET_EOPNOTSUPP);
     if (!buf && len) return fail(NET_EINVAL);
     if (len > INT_MAX) return fail(NET_EMSGSIZE);
     Sock socket;
@@ -854,13 +870,13 @@ int64_t APS5_VABI sceNetSendto(int s, const void* buf, size_t len, int flags, co
     int result;
     if (!to) {
         if (tolen != 0) return fail(NET_EINVAL);
-        result = ::send(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS);
+        result = ::send(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS | native_message_flags(flags));
     } else {
         sockaddr_storage destination{};
         NativeLength destination_length = 0;
         if (!guest_to_native_address(to, tolen, destination, destination_length)) return fail(NET_EINVAL);
         if (destination.ss_family != (socket.family == NET_AF_INET ? AF_INET : AF_INET6)) return fail(NET_EAFNOSUPPORT);
-        result = ::sendto(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS,
+        result = ::sendto(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS | native_message_flags(flags),
             reinterpret_cast<const sockaddr*>(&destination), destination_length);
     }
     return result >= 0 ? result : fail(native_error());
@@ -887,7 +903,7 @@ int64_t APS5_VABI sceNetSendmsg(int s, const NetMsghdr* msg, int flags) {
 int64_t APS5_VABI sceNetRecvmsg(int s, NetMsghdr* msg, int flags) {
     const auto total = message_length(msg);
     if (total < 0) return total;
-    if (flags != 0 && flags != NET_MSG_PEEK) return fail(NET_EOPNOTSUPP);
+    if (!message_flags_supported(flags, NET_MSG_PEEK | NET_MSG_DONTWAIT)) return fail(NET_EOPNOTSUPP);
     Sock socket;
     {
         std::lock_guard lk(g_mutex);
@@ -905,7 +921,7 @@ int64_t APS5_VABI sceNetRecvmsg(int s, NetMsghdr* msg, int flags) {
     sockaddr_storage peer{};
     NativeLength peer_length = sizeof(peer);
     std::int64_t received = ::recvfrom(socket.native->value, buffer.data(), static_cast<int>(buffer.size()),
-        flags == NET_MSG_PEEK ? MSG_PEEK : 0, reinterpret_cast<sockaddr*>(&peer), &peer_length);
+        native_message_flags(flags), reinterpret_cast<sockaddr*>(&peer), &peer_length);
     if (received < 0) {
 #ifdef _WIN32
         if (!datagram || WSAGetLastError() != WSAEMSGSIZE) return fail(receive_error(socket));

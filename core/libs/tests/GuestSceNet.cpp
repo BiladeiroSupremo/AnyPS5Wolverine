@@ -234,6 +234,50 @@ static void CheckEmptyEpoll() {
     }
 }
 
+static void CheckDontWait() {
+    constexpr int DontWait = 0x80;
+    constexpr int Peek = 0x2;
+    const int receiver = sceNetSocket("dontwait-receiver", 2, 2, 17);
+    const int sender = sceNetSocket("dontwait-sender", 2, 2, 17);
+    Require(receiver >= 0 && sender >= 0);
+    std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(sceNetBind_nid_postfix(receiver, address.data(), address.size()) == 0);
+    std::uint32_t size = address.size();
+    Require(sceNetGetsockname(receiver, address.data(), &size) == 0);
+    const int timeout = 2000000;
+    Require(sceNetSetsockopt(receiver, 0xffff, 0x1006, &timeout, sizeof(timeout)) == 0);
+    char buffer[16]{};
+    NetIovec in[] = {{buffer, sizeof(buffer)}};
+    NetMsghdr receive{nullptr, 0, in, 1, nullptr, 0, 0};
+#ifdef _WIN32
+    Require(Failed(sceNetRecv(receiver, buffer, sizeof(buffer), DontWait), 45));
+    Require(Failed(sceNetRecvfrom(receiver, buffer, sizeof(buffer), DontWait, nullptr, nullptr), 45));
+    Require(Failed(sceNetRecvmsg(receiver, &receive, DontWait), 45));
+    Require(Failed(sceNetSendto(sender, "x", 1, DontWait, address.data(), address.size()), 45));
+#else
+    const auto start = std::chrono::steady_clock::now();
+    Require(Failed(sceNetRecv(receiver, buffer, sizeof(buffer), DontWait), 35));
+    Require(Failed(sceNetRecvfrom(receiver, buffer, sizeof(buffer), DontWait, nullptr, nullptr), 35));
+    Require(Failed(sceNetRecvmsg(receiver, &receive, DontWait), 35));
+    Require(Failed(sceNetRecv(receiver, buffer, sizeof(buffer), DontWait | Peek), 35));
+    Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+    const char datagram[] = "nowait";
+    Require(sceNetSendto(sender, datagram, sizeof(datagram), DontWait, address.data(), address.size()) == sizeof(datagram));
+    Require(sceNetRecvfrom(receiver, buffer, sizeof(buffer), Peek, nullptr, nullptr) == sizeof(datagram));
+    std::memset(buffer, 0, sizeof(buffer));
+    Require(sceNetRecv(receiver, buffer, sizeof(buffer), DontWait | Peek) == sizeof(datagram) && std::strcmp(buffer, datagram) == 0);
+    std::memset(buffer, 0, sizeof(buffer));
+    Require(sceNetRecv(receiver, buffer, sizeof(buffer), DontWait) == sizeof(datagram) && std::strcmp(buffer, datagram) == 0);
+    Require(sceNetConnect(sender, address.data(), address.size()) == 0);
+    Require(sceNetSend(sender, datagram, sizeof(datagram), DontWait) == sizeof(datagram));
+    Require(sceNetRecvmsg(receiver, &receive, 0) == sizeof(datagram) && std::strcmp(buffer, datagram) == 0);
+    Require(Failed(sceNetRecv(receiver, buffer, sizeof(buffer), DontWait), 35));
+#endif
+    Require(Failed(sceNetRecv(receiver, buffer, sizeof(buffer), 0x1), 45));
+    Require(Failed(sceNetSend(sender, "x", 1, Peek), 45));
+    Require(sceNetSocketClose(receiver) == 0 && sceNetSocketClose(sender) == 0);
+}
+
 static void CheckReceiveTimeout(int receiver, int sender, const std::array<std::uint8_t, 16>& address) {
     const int timeout = 50000;
     Require(sceNetSetsockopt(receiver, 0xffff, 0x1006, &timeout, sizeof(timeout)) == 0);
@@ -649,6 +693,7 @@ int main() {
     CheckEpollWritable();
     CheckPoolStats();
     CheckEmptyEpoll();
+    CheckDontWait();
     CheckAddressText(2, "127.0.0.1");
     CheckAddressText(2, "255.255.255.255");
     CheckAddressText(28, "::1");
