@@ -223,7 +223,6 @@ void ReportDeviceLost() {
     }
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
 PFN_vkVoidFunction TracedMemoryFunction(const char* name, PFN_vkVoidFunction real) {
     static const bool enabled = std::getenv("APS5_TRACE_VKMEM") != nullptr;
     if (!enabled) return nullptr;
@@ -241,7 +240,7 @@ PFN_vkVoidFunction TracedMemoryFunction(const char* name, PFN_vkVoidFunction rea
     return nullptr;
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(usage), properties(properties) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
