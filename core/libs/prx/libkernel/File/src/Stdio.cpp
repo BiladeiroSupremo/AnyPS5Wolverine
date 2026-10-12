@@ -233,6 +233,12 @@ static bool NativeIsDisk(int descriptor) {
     const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
     return handle != INVALID_HANDLE_VALUE && ::GetFileType(handle) == FILE_TYPE_DISK;
 }
+static bool NativePipeHasData(int descriptor) {
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    DWORD available = 0;
+    return handle != INVALID_HANDLE_VALUE && ::GetFileType(handle) == FILE_TYPE_PIPE
+        && ::PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) && available != 0;
+}
 static std::int64_t NativePread(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset) {
     return NativePositioned_nid_no_patch(descriptor, buf, nbytes, offset, false);
 }
@@ -1027,7 +1033,7 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* iov, int iovcnt, co
             if (result < 0) return done != 0 ? done : SceErrorFromErrno(errno);
             done += result;
             position += static_cast<std::size_t>(result);
-            if (static_cast<std::size_t>(result) < chunk || !whole) return done;
+            if (static_cast<std::size_t>(result) < chunk || (!whole && !NativePipeHasData(d))) return done;
         }
     }
     return done;
