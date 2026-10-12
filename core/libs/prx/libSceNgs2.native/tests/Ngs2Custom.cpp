@@ -224,8 +224,59 @@ static void TestRackOptions() {
     Require(calls.cleanupVoices == (std::vector<std::uint32_t>{0, 1}));
 }
 
+static void TestCustomSampler() {
+    calls = {};
+    const auto system = CreateSystem();
+    const auto master = Mastering(system, 2);
+    const Ngs2CustomUserFx2ModuleOption modules[2] = {Module(Gain), Module(Offset)};
+
+    Ngs2CustomSamplerRackOption option{};
+    auto& common = option.custom_rack_option.rack_option;
+    common.size = sizeof(option);
+    common.max_grain_samples = 512;
+    common.max_voices = 2;
+    common.max_matrices = 1;
+    common.max_ports = 1;
+    option.custom_rack_option.num_buffers = 1;
+    option.custom_rack_option.num_modules = 2;
+    for (std::uint32_t m = 0; m < 2; m++) {
+        option.custom_rack_option.module[m].option = &modules[m].custom_module_option;
+        option.custom_rack_option.module[m].module_id = SCE_NGS2_CUSTOM_MODULE_ID_USER_FX2;
+        option.custom_rack_option.module[m].state_size = 16;
+    }
+    option.max_channel_works = 4;
+
+    Ngs2ContextBufferInfo query{};
+    Require(sceNgs2RackQueryBufferSize(SCE_NGS2_RACK_ID_CUSTOM_SAMPLER, &option.custom_rack_option.rack_option, &query) == SCE_NGS2_OK);
+    const auto info = Buffer(query);
+    uintptr_t rack = 0;
+    Require(sceNgs2RackCreate(system, SCE_NGS2_RACK_ID_CUSTOM_SAMPLER, &option.custom_rack_option.rack_option, &info, &rack) == SCE_NGS2_OK);
+
+    Ngs2RackInfo rackInfo{};
+    Require(sceNgs2RackGetInfo(rack, &rackInfo, sizeof(rackInfo)) == SCE_NGS2_OK);
+    Require(rackInfo.rack_id == SCE_NGS2_RACK_ID_CUSTOM_SAMPLER && rackInfo.type == 4 && rackInfo.max_channel_works == 4);
+
+    const auto voice = Voice(rack);
+    Control(voice, SCE_NGS2_CUSTOM_SAMPLER_VOICE_PARAM_SETUP, Ngs2SamplerVoiceSetupParam{{}, {SCE_NGS2_WAVEFORM_TYPE_PCM_I16L, 2, 48000, 0, 0, 0}});
+    std::vector<std::int16_t> pcm(Grain * 2 * 4, 16384);
+    const Ngs2WaveformBlock block{0, pcm.size() * sizeof(std::int16_t), 1, 0, static_cast<std::uint32_t>(pcm.size() / 2), 0, 0};
+    Control(voice, SCE_NGS2_CUSTOM_SAMPLER_VOICE_PARAM_ADD_WAVEFORM_BLOCKS, Ngs2SamplerVoiceWaveformBlocksParam{{}, pcm.data(), 0, 1, &block});
+    Control(voice, SCE_NGS2_CUSTOM_SAMPLER_VOICE_PARAM_PITCH, Ngs2SamplerVoicePitchParam{{}, 1.0f});
+    const Ngs2VoiceParamHeader exitLoop{sizeof(Ngs2VoiceParamHeader), 0, SCE_NGS2_CUSTOM_SAMPLER_VOICE_PARAM_EXIT_LOOP};
+    Require(sceNgs2VoiceControl(voice, &exitLoop) == SCE_NGS2_OK);
+    Patch(voice, master);
+    Event(voice, SCE_NGS2_VOICE_EVENT_PLAY);
+
+    const auto out = Render(system);
+    for (std::uint32_t i = 0; i < Grain; i++) Require(out[i * 2] == 0.5f && out[i * 2 + 1] == 0.75f);
+
+    Require(sceNgs2RackDestroy(rack, nullptr) == SCE_NGS2_OK);
+    Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
+}
+
 int main() {
     TestUserFxChain();
     TestRackOptions();
+    TestCustomSampler();
     return 0;
 }
