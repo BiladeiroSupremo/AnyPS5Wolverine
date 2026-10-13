@@ -9,6 +9,7 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <utility>
 
 namespace Elfpatcher::Linux {
 
@@ -67,7 +68,7 @@ void LinuxElfPatcher::_appendTrampoline(
 }
 
 std::vector<std::uint8_t> LinuxElfPatcher::Patch(
-    const std::vector<std::uint8_t>& sourceElf,
+    std::vector<std::uint8_t> sourceElf,
     const std::vector<Domain::ProgramHeader>& originalHeaders,
     const Domain::SysVDynamicSection& dynSection,
     const std::uint64_t originalPltGotVaddr,
@@ -79,7 +80,7 @@ std::vector<std::uint8_t> LinuxElfPatcher::Patch(
     if (dependencyDiagnostics)
         throw Domain::RelinkerException("Linux target does not support --windows-diagnostics");
 
-    std::vector<std::uint8_t> buf = sourceElf;
+    std::vector<std::uint8_t> buf = std::move(sourceElf);
 
     buf[kEhdrOsAbiOffset] = 0;
     buf[kEhdrAbiVersionOffset] = 0;

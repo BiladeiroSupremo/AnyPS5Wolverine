@@ -51,7 +51,7 @@ std::string MachODependency(const std::string& name, const std::string& origin) 
     return "@rpath/" + name;
 }
 
-std::vector<std::uint8_t> MacOsMachOPatcher::Patch(const std::vector<std::uint8_t>& sourceElf, const std::vector<Domain::ProgramHeader>& originalHeaders, const Domain::SysVDynamicSection& dynamicSection, const std::uint64_t originalPltGotVaddr, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Codegen::TrampolineSite>& trampolines) {
+std::vector<std::uint8_t> MacOsMachOPatcher::Patch(std::vector<std::uint8_t> sourceElf, const std::vector<Domain::ProgramHeader>& originalHeaders, const Domain::SysVDynamicSection& dynamicSection, const std::uint64_t originalPltGotVaddr, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Codegen::TrampolineSite>& trampolines) {
     if (dependencyDiagnostics)
         throw Domain::RelinkerException("macOS target does not support --windows-diagnostics");
     static_cast<void>(lazyBinding);
