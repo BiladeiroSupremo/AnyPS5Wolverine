@@ -3,11 +3,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <windows.h>
 #include <psapi.h>
 
 extern "C" int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleInfoForUnwind* info);
+extern "C" void* APS5_VABI dlopen_nid_postfix(const char*, int);
+extern "C" void* APS5_VABI dlsym_nid_postfix(void*, const char*);
+extern "C" int APS5_VABI dlclose_nid_postfix(void*);
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -19,6 +23,41 @@ static bool Throws(std::uint64_t address) {
         return true;
     }
     return false;
+}
+
+static void ReloadedModuleIsRead() {
+    HMODULE linked = nullptr;
+    Require(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(GetUnwindFixture()), &linked));
+    wchar_t original[MAX_PATH] = {};
+    Require(GetModuleFileNameW(linked, original, MAX_PATH) != 0);
+    const auto copy = std::filesystem::path(original).replace_filename("unwind_fixture_reload.dll");
+    std::filesystem::copy_file(original, copy, std::filesystem::copy_options::overwrite_existing);
+    const auto path = copy.string();
+
+    std::uint64_t firstBase = 0;
+    for (int round = 0; round < 2; ++round) {
+        void* handle = dlopen_nid_postfix(path.c_str(), 2);
+        Require(handle != nullptr);
+        const auto get = reinterpret_cast<UnwindFixture* (*)()>(dlsym_nid_postfix(handle, "GetUnwindFixture_nid_no_patch"));
+        Require(get != nullptr);
+        auto* fixture = get();
+        const auto address = reinterpret_cast<std::uint64_t>(fixture);
+        MEMORY_BASIC_INFORMATION memory{};
+        Require(VirtualQuery(reinterpret_cast<LPCVOID>(address), &memory, sizeof(memory)) != 0);
+        const auto base = reinterpret_cast<std::uint64_t>(memory.AllocationBase);
+        if (round == 0) firstBase = base;
+        else Require(base == firstBase);
+        if (round == 0) {
+            fixture->frames.terminator = 12;
+            fixture->frames.spare[0] = 1;
+        }
+        ModuleInfoForUnwind info{};
+        Require(sceKernelGetModuleInfoForUnwind(address, 0, &info) == 0);
+        Require(info.eh_frame_size == (round == 0 ? 4 + 12 + 4 + 12 : 4 + 12));
+        Require(dlclose_nid_postfix(handle) == 0);
+    }
+    std::filesystem::remove(copy);
 }
 
 int main() {
@@ -61,6 +100,8 @@ int main() {
     Require(Throws(address));
     fixture->frames.cieLength = 12;
     Require(!Throws(address));
+
+    ReloadedModuleIsRead();
 
     ModuleInfoForUnwind host{};
     Require(sceKernelGetModuleInfoForUnwind(reinterpret_cast<std::uint64_t>(&GetModuleHandleW), 0, &host) == 0);

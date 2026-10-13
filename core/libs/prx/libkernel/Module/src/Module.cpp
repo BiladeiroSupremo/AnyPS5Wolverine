@@ -3,8 +3,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
-#include <mutex>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/specifics/linux/ElfTypes.hpp"
@@ -13,6 +11,8 @@
 #include "prx/libkernel/Module/EhFrame.hpp"
 #include "prx/libkernel/Module/ModuleArgs.hpp"
 #ifdef _WIN32
+#include <mutex>
+#include <unordered_map>
 #include <windows.h>
 #include <psapi.h>
 #elif defined(__APPLE__)
@@ -27,8 +27,7 @@
 #ifdef _WIN32
 namespace {
 struct UnwindImage {
-  DWORD stamp = 0;
-  DWORD checksum = 0;
+  bool filled = false;
   DWORD size = 0;
   bool hasTables = false;
   EhFrame::Tables tables;
@@ -37,28 +36,30 @@ struct UnwindImage {
   std::string name;
 };
 
+std::mutex unwindImagesMutex;
+std::unordered_map<std::uintptr_t, UnwindImage>& UnwindImages() {
+  static auto& images = *new std::unordered_map<std::uintptr_t, UnwindImage>();
+  return images;
+}
+
 std::uint32_t ReadWord(std::uint64_t address) {
   std::uint32_t value;
   std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
   return value;
 }
 
-void FillUnwindImage(const std::uint8_t* base, ModuleInfoForUnwind* info) {
+void FillUnwindImage(void* allocationBase, ModuleInfoForUnwind* info) {
+  const auto* base = static_cast<const std::uint8_t*>(allocationBase);
   const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
   if (dos->e_magic != IMAGE_DOS_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without a DOS header");
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
   if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without an NT header");
-  static std::mutex mutex;
-  static auto& images = *new std::unordered_map<std::uintptr_t, UnwindImage>();
-  std::lock_guard lock(mutex);
-  auto& image = images[reinterpret_cast<std::uintptr_t>(base)];
-  const bool current = !image.name.empty() && image.stamp == nt->FileHeader.TimeDateStamp && image.checksum == nt->OptionalHeader.CheckSum &&
-                       image.size == nt->OptionalHeader.SizeOfImage &&
+  std::lock_guard lock(unwindImagesMutex);
+  auto& image = UnwindImages()[reinterpret_cast<std::uintptr_t>(base)];
+  const bool current = image.filled && image.size == nt->OptionalHeader.SizeOfImage &&
                        (!image.hasTables || (ReadWord(image.tables.header) == image.headerWord && ReadWord(image.tables.frames) == image.framesWord));
   if (!current) {
     UnwindImage fresh;
-    fresh.stamp = nt->FileHeader.TimeDateStamp;
-    fresh.checksum = nt->OptionalHeader.CheckSum;
     fresh.size = nt->OptionalHeader.SizeOfImage;
     fresh.hasTables = EhFrame::ReadEhmeta(reinterpret_cast<std::uintptr_t>(base), *nt, "sceKernelGetModuleInfoForUnwind", fresh.tables);
     if (fresh.hasTables) {
@@ -66,8 +67,9 @@ void FillUnwindImage(const std::uint8_t* base, ModuleInfoForUnwind* info) {
       fresh.framesWord = ReadWord(fresh.tables.frames);
     }
     char path[4096] = {};
-    const DWORD length = GetMappedFileNameA(GetCurrentProcess(), const_cast<std::uint8_t*>(base), path, sizeof(path) - 1);
+    const DWORD length = GetMappedFileNameA(GetCurrentProcess(), allocationBase, path, sizeof(path) - 1);
     fresh.name.assign(path, length);
+    fresh.filled = true;
     image = std::move(fresh);
   }
   if (image.hasTables) {
@@ -80,6 +82,11 @@ void FillUnwindImage(const std::uint8_t* base, ModuleInfoForUnwind* info) {
   std::strncpy(info->name, image.name.c_str(), sizeof(info->name) - 1);
   info->name[sizeof(info->name) - 1] = '\0';
 }
+}
+
+extern "C" void ForgetUnwindImage_nid_no_patch(const void* base) {
+  std::lock_guard lock(unwindImagesMutex);
+  UnwindImages().erase(reinterpret_cast<std::uintptr_t>(base));
 }
 #elif !defined(__APPLE__)
 extern "C" int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info);
@@ -157,7 +164,7 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
   info->seg0_addr = reinterpret_cast<std::uint64_t>(mbi.BaseAddress);
   info->seg0_size = mbi.RegionSize;
   if (mbi.Type == MEM_IMAGE) {
-    FillUnwindImage(static_cast<const std::uint8_t*>(mbi.AllocationBase), info);
+    FillUnwindImage(mbi.AllocationBase, info);
     return 0;
   }
   char path[4096] = {};
