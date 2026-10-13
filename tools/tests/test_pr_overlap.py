@@ -108,5 +108,14 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(git.call_args_list[-1].args[-1], "+00000000000000000000000000000000000000f9:refs/pr/249")
 
 
+class ConflictTests(unittest.TestCase):
+    def test_uses_the_shared_base_parent_without_newer_merge_tree_option(self):
+        first = {"tree": "first-tree", "files": {"shared.cpp"}, "added": set()}
+        second = {"tree": "second-tree", "files": {"shared.cpp"}, "added": set()}
+        with patch.object(pr_overlap, "merge", return_value=("merged-tree", set())) as merge:
+            self.assertEqual(pr_overlap.conflicts(first, second), {})
+        merge.assert_called_once_with("first-tree", "second-tree")
+
+
 if __name__ == "__main__":
     unittest.main()
