@@ -203,7 +203,9 @@ void CheckStoredLoad(AgcDriver::VulkanDevice& device, GuestBlock& block, std::sp
     const auto bytes = Width * (format == Srgb8 ? 1u : 2u);
     std::fill(block.Data(), block.Data() + BlockBytes, std::uint8_t{0x5au});
     Run(device, format == Srgb8 ? std::span<const std::uint32_t>(StoreX) : std::span<const std::uint32_t>(StoreXy), block.Data(), format == Srgb8 ? Unorm8 : Unorm8_8, SwizzleXY01, Groups);
-    Require(AgcDriver::Graphics::StorageTexture::FindPending(address, bytes) != nullptr, what + ": the image_store results are not pending in the storage image");
+    const auto pending = AgcDriver::Graphics::StorageTexture::FindPending(address, bytes);
+    const bool deferred = std::getenv("APS5_DEFERRED_WRITEBACK") != nullptr;
+    Require(deferred ? pending != nullptr : pending == nullptr, what + (deferred ? ": the image_store results are not pending in the storage image" : ": eager write-back left a pending image"));
     Run(device, code, block.Data(), format, swizzle, Groups);
     Verify(dmask, format, swizzle, what);
     AgcDriver::Graphics::StorageTexture::FlushPending(address, BlockBytes, nullptr, "test");

@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -87,6 +88,11 @@ std::string Describe(const std::shared_ptr<StorageTexture>& image) {
 
 int main() {
     try {
+#ifdef _WIN32
+        Require(_putenv_s("APS5_DEFERRED_WRITEBACK", "1") == 0, "cannot enable deferred write-back for the pending-surface test");
+#else
+        Require(setenv("APS5_DEFERRED_WRITEBACK", "1", 1) == 0, "cannot enable deferred write-back for the pending-surface test");
+#endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         std::vector<std::uint32_t> storage((BlockBytes + 0x10000u) / 4u);

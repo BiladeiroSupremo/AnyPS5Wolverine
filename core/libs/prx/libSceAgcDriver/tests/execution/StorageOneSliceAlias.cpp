@@ -19,6 +19,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <span>
 #include <string>
@@ -169,17 +170,22 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched) {
     AgcDriver::GuestMemory::BumpCollectEpoch();
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     Store(device, texels, 0x11111111u);
-    Require(StorageTexture::FindPending(surface, SurfaceBytes) != nullptr, "the 2D store left no pending image");
+    const bool deferred = std::getenv("APS5_DEFERRED_WRITEBACK") != nullptr;
+    Require((StorageTexture::FindPending(surface, SurfaceBytes) != nullptr) == deferred, deferred ? "the 2D store left no pending image" : "the eager 2D store left a pending image");
+    const auto live = StorageTexture::FindLive(surface, SurfaceBytes);
+    Require(live != nullptr, "the 2D storage image is not cached after its first store");
+    const auto previousVersion = live->Version();
     LoadArray(device, texels);
     RequireOutput(0x11111111u, "the first load through the one-slice array");
     Store(device, texels, 0x22222222u);
     const auto written = StorageTexture::FindPending(surface, SurfaceBytes);
-    Require(written != nullptr && written->Descriptor().dimension == AgcDriver::Graphics::TextureDimension::k2D, "the second 2D store left no pending 2D image");
+    Require(live->Version() > previousVersion, "the second 2D store did not advance the cached image version");
+    Require(deferred ? written != nullptr && written->Descriptor().dimension == AgcDriver::Graphics::TextureDimension::k2D : written == nullptr, deferred ? "the second 2D store left no pending 2D image" : "the eager second 2D store left a pending image");
     LoadArray(device, texels);
     RequireOutput(0x22222222u, "the second load through the one-slice array");
-    if (watched && AgcDriver::GuestMemory::Watched(surface, SurfaceBytes)) {
+    if (deferred && watched && AgcDriver::GuestMemory::Watched(surface, SurfaceBytes)) {
         Require(StorageTexture::FindPending(surface, SurfaceBytes) == written, "the array image's refresh wrote the 2D image's results back instead of taking them on the device");
-    } else {
+    } else if (deferred) {
         std::puts("the imported block is compared, not watched: taking the results on the device is not checked");
     }
     StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");

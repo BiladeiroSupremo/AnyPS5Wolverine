@@ -214,7 +214,7 @@ std::uint64_t SurfaceBytes(std::uint8_t* texels, const Shape& shape) {
 
 std::uint64_t PendingVersion(std::uint8_t* texels, std::uint64_t bytes, const std::string& what) {
     const auto source = AgcDriver::Graphics::StorageTexture::FindPending(reinterpret_cast<std::uintptr_t>(texels), bytes);
-    Require(source != nullptr, what + ": no storage image holds the surface's results");
+    Require(source != nullptr, what + ": no pending storage image holds the surface");
     return source->Version();
 }
 
@@ -298,6 +298,11 @@ void LayersAndMipsCase(AgcDriver::VulkanDevice& device) {
 
 int main() {
     try {
+#ifdef _WIN32
+    Require(_putenv_s("APS5_DEFERRED_WRITEBACK", "1") == 0, "cannot enable deferred write-back for the pending depth-copy test");
+#else
+    Require(setenv("APS5_DEFERRED_WRITEBACK", "1", 1) == 0, "cannot enable deferred write-back for the pending depth-copy test");
+#endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         GuestBlock buffers;
