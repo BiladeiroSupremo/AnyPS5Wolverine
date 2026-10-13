@@ -3476,8 +3476,9 @@ void FlushAfterDispatch(std::uint64_t programAddress, const Graphics::ShaderReso
         }
         return parsed;
     }();
-    if (programs.empty() || std::find(programs.begin(), programs.end(), programAddress & 0xfffffffffull) == programs.end()) return;
+    // The delay counts from the first dispatch of any program (about the game's start).
     static const auto start = std::chrono::steady_clock::now();
+    if (programs.empty() || std::find(programs.begin(), programs.end(), programAddress & 0xfffffffffull) == programs.end()) return;
     static const auto after = [] { const char* text = std::getenv("APS5_FLUSH_AFTER_DISPATCH_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
     static const int times = [] { const char* text = std::getenv("APS5_FLUSH_AFTER_DISPATCH_TIMES"); return text ? std::atoi(text) : 1; }();
     static std::map<std::uint64_t, int> done;

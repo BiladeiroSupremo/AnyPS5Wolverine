@@ -1652,7 +1652,7 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     });
 }
 
-bool TraceDrawIoTarget(std::uint64_t address);
+bool TraceDrawIoTarget(std::uint64_t address, VkFormat format);
 bool TraceDrawIoBudget();
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
@@ -1762,7 +1762,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     if (context.bindlessSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::BindlessHeaps::DescriptorSet, 1, &context.bindlessSet, 0, nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address); }) && TraceDrawIoBudget()) {
+    if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); }) && TraceDrawIoBudget()) {
         std::string stages;
         for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
         std::fprintf(stderr, "[draw-io] recorded target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), resources.Describe().c_str());
@@ -1851,7 +1851,7 @@ bool DumpTargetListed(std::uint64_t address) {
 // Debug aid: APS5_TRACE_DRAW_IO=<hex>[,<hex>...] prints the resources of draws whose first color
 // target is listed (at most APS5_TRACE_DRAW_IO_MAX, default 40, after APS5_TRACE_DRAW_IO_AFTER
 // seconds); traced draws leave the recipe path.
-bool TraceDrawIoTarget(std::uint64_t address) {
+bool TraceDrawIoTarget(std::uint64_t address, VkFormat format) {
     static const std::vector<std::uint64_t> addresses = [] {
         std::vector<std::uint64_t> parsed;
         for (const char* text = std::getenv("APS5_TRACE_DRAW_IO"); text != nullptr && *text != '\0';) {
@@ -1861,11 +1861,15 @@ bool TraceDrawIoTarget(std::uint64_t address) {
         }
         return parsed;
     }();
+    // The delay counts from the first draw of any target (about the game's start).
+    static const auto start = std::chrono::steady_clock::now();
     // "*" (parsed as 0) traces every target.
     const bool all = std::find(addresses.begin(), addresses.end(), 0ull) != addresses.end();
     if (addresses.empty() || (!all && std::find(addresses.begin(), addresses.end(), address) == addresses.end())) return false;
+    // APS5_TRACE_DRAW_IO_FORMAT=<VkFormat> keeps only targets of that format.
+    static const int onlyFormat = [] { const char* text = std::getenv("APS5_TRACE_DRAW_IO_FORMAT"); return text ? std::atoi(text) : -1; }();
+    if (onlyFormat >= 0 && static_cast<int>(format) != onlyFormat) return false;
     static const auto after = [] { const char* text = std::getenv("APS5_TRACE_DRAW_IO_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
-    static const auto start = std::chrono::steady_clock::now();
     return std::chrono::steady_clock::now() - start >= after;
 }
 
@@ -2326,7 +2330,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     if (context.bindlessSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::BindlessHeaps::DescriptorSet, 1, &context.bindlessSet, 0, nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address); }) && TraceDrawIoBudget()) {
+    if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); }) && TraceDrawIoBudget()) {
         std::string stages;
         for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
         std::fprintf(stderr, "[draw-io] target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), resources->Describe().c_str());
@@ -2517,7 +2521,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     };
     Require(!draw.indirect, "a draw recipe covers direct draws only");
     auto* recorder = Recorder::Active();
-    const bool dumpsTarget = (DumpTargetLimit() != 0 && (DumpTargetList().empty() || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return DumpTargetListed(color.address); }))) || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address); });
+    const bool dumpsTarget = (DumpTargetLimit() != 0 && (DumpTargetList().empty() || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return DumpTargetListed(color.address); }))) || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); });
     if (!RecordDraws() || recorder == nullptr || dumpsTarget) return miss(DrawRecipeMiss::NotRecordable);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
