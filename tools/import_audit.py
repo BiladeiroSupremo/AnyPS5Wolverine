@@ -153,7 +153,7 @@ def elf_program_dynamic_symbols(path, data):
 
 def elf_exports(path, data):
     header = unpack("<16sHHIQQQIHHHHHH", data, 0, path, "ELF header")
-    if not header[6]:
+    if not header[6] or header[6] >= len(data):
         return elf_program_dynamic_symbols(path, data)[1]
     sections = elf_sections(path, data)
     names = set()
@@ -188,7 +188,7 @@ def elf_exports(path, data):
 
 def elf_imports(path, data):
     header = unpack("<16sHHIQQQIHHHHHH", data, 0, path, "ELF header")
-    if not header[6]:
+    if not header[6] or header[6] >= len(data):
         imports, _, needed = elf_program_dynamic_symbols(path, data)
         return imports, needed
     sections = elf_sections(path, data)

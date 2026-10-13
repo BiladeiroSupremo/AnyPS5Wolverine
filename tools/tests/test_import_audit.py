@@ -588,6 +588,72 @@ class ImportAuditTests(unittest.TestCase):
         self.assertEqual(records[("AAAAAAAAAAA", "stripped.prx")]["class"], "implemented")
         self.assertEqual(records[("BBBBBBBBBBB", "main.prx")]["class"], "implemented")
 
+    def test_elf_with_out_of_file_section_table_uses_program_headers(self):
+        path = Path("module.prx")
+        image = build_sectionless_elf([
+            ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 1, GLOBAL_FUNCTION)], ["libSceA.prx"])
+        expected_imports = import_audit.elf_imports(path, image)
+        expected_exports = import_audit.elf_exports(path, image)
+        self.assertEqual(expected_imports, ({"AAAAAAAAAAA"}, {"libSceA.prx"}))
+        self.assertEqual(expected_exports, {"BBBBBBBBBBB"})
+        for section_offset in (len(image), len(image) + 64):
+            for section_count in (1, 0):
+                modified = bytearray(image)
+                struct.pack_into("<Q", modified, 40, section_offset)
+                struct.pack_into("<HH", modified, 58, 64, section_count)
+                for reader, expected in ((import_audit.elf_imports, expected_imports), (import_audit.elf_exports, expected_exports)):
+                    with self.subTest(section_offset=section_offset, section_count=section_count, reader=reader.__name__):
+                        self.assertEqual(reader(path, bytes(modified)), expected)
+
+    def test_module_with_out_of_file_section_table_is_audited(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        module = work.modules / "stripped.prx"
+        image = build_sectionless_elf([
+            ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 1, GLOBAL_FUNCTION)], ["libSceA.prx"])
+        module.write_bytes(image)
+        (work.modules / "main.prx").write_bytes(build_elf([("BBBBBBBBBBB", 0, GLOBAL_FUNCTION)]))
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        result = work.root / "audit.json"
+        code, expected_out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (0, ""))
+        expected = json.loads(result.read_text())
+        for section_offset in (len(image), len(image) + 64):
+            for section_count in (1, 0):
+                with self.subTest(section_offset=section_offset, section_count=section_count):
+                    modified = bytearray(image)
+                    struct.pack_into("<Q", modified, 40, section_offset)
+                    struct.pack_into("<HH", modified, 58, 64, section_count)
+                    module.write_bytes(modified)
+                    code, out, err = work.run(registry, "--json", str(result))
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertEqual(out, expected_out)
+                    self.assertEqual(json.loads(result.read_text()), expected)
+
+    def test_elf_with_truncated_section_table_is_rejected(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        path = work.modules / "truncated.prx"
+        image = build_sectionless_elf([
+            ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 1, GLOBAL_FUNCTION)])
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        for section_count in (1, 0):
+            modified = bytearray(image)
+            struct.pack_into("<Q", modified, 40, len(image) - 32)
+            struct.pack_into("<HH", modified, 58, 64, section_count)
+            for reader in (import_audit.elf_imports, import_audit.elf_exports):
+                with self.subTest(section_count=section_count, reader=reader.__name__):
+                    with self.assertRaisesRegex(import_audit.AuditError, "lies outside the file"):
+                        reader(path, bytes(modified))
+            with self.subTest(section_count=section_count, reader="main"):
+                path.write_bytes(modified)
+                code, out, err = work.run(registry)
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn(str(path), err)
+                self.assertIn("lies outside the file", err)
+
     def test_sectionless_elf_gnu_hash(self):
         image = build_sectionless_elf([
             ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 1, GLOBAL_FUNCTION)],
