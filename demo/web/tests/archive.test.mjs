@@ -195,6 +195,10 @@ try {
   assert.deepEqual(new Uint8Array(await downloaded.file.arrayBuffer()), libraryBytes);
   assert(workerMessages.some(message => message.type === "progress" && /rate limit reached/u.test(message.message ?? "")));
 
+  latestResponse = new Response(null, { status: 429 });
+  const rateLimitedDownload = await worker.downloadLibraries("windows");
+  assert.deepEqual(new Uint8Array(await rateLimitedDownload.file.arrayBuffer()), libraryBytes);
+
   latestResponse = new Response(null, { status: 403 });
   await assert.rejects(worker.downloadLibraries("windows"), /Cannot verify the latest release \(403\)/u);
   latestResponse = new Response(JSON.stringify({ tag_name: "v2" }));
