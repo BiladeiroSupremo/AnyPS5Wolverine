@@ -343,7 +343,7 @@ int VideoOutDriver::Open(int busType) {
     uint64_t generation = 1;
     if (previous) {
         std::lock_guard cfgLock(previous->mutex);
-        require(!previous->opened, "port already open");
+        if (previous->opened) return -1;
         require(previous->generation != std::numeric_limits<uint64_t>::max(), "port generation overflow");
         generation = previous->generation + 1;
     }
