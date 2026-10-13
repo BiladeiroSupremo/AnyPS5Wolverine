@@ -2,7 +2,9 @@ import contextlib
 import io
 import json
 import os
+import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -169,6 +171,153 @@ class ImportAuditTests(unittest.TestCase):
     def setUp(self):
         self.work = Workspace()
         self.addCleanup(self.work.close)
+
+    def test_failed_json_write_preserves_existing_report_and_leaves_no_partial_report(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.root / "audit.json"
+        previous = b'{"previous": "complete report"}\n'
+
+        def disk_full(path, content, **kwargs):
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write(content[:24])
+            raise OSError(28, "No space left on device", str(path))
+
+        for exists in (True, False):
+            with self.subTest(existing_report=exists):
+                if exists:
+                    output.write_bytes(previous)
+                else:
+                    output.unlink(missing_ok=True)
+                files = set(work.root.iterdir())
+                with patch.object(Path, "write_text", disk_full):
+                    code, out, err = work.run(registry, "--json", str(output))
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("No space left on device", err)
+                self.assertEqual(set(work.root.iterdir()), files)
+                if exists:
+                    self.assertEqual(output.read_bytes(), previous)
+                else:
+                    self.assertFalse(output.exists())
+
+    def test_failed_json_replacement_preserves_report_and_cleans_staging(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.root / "audit.json"
+        previous = b'{"previous": "complete report"}\n'
+        output.write_bytes(previous)
+        files = set(work.root.iterdir())
+        with patch.object(Path, "replace", side_effect=PermissionError(13, "Permission denied", str(output))):
+            code, out, err = work.run(registry, "--json", str(output))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("Permission denied", err)
+        self.assertEqual(output.read_bytes(), previous)
+        self.assertEqual(set(work.root.iterdir()), files)
+
+    def test_successful_json_write_replaces_complete_report_without_staging_files(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.root / "audit.json"
+        output.write_text("old report", encoding="utf-8")
+        files = set(work.root.iterdir())
+        code, _, err = work.run(registry, "--json", str(output))
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["unique_by_class"]["implemented"], 1)
+        self.assertEqual(set(work.root.iterdir()), files)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows read-only replacement behavior")
+    def test_read_only_json_report_stays_intact_without_a_read_only_temporary(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.root / "audit.json"
+        previous = b'{"previous": "complete report"}\n'
+        output.write_bytes(previous)
+        files = set(work.root.iterdir())
+        output.chmod(0o444)
+        try:
+            code, out, err = work.run(registry, "--json", str(output))
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("FAIL:", err)
+            self.assertEqual(output.read_bytes(), previous)
+            self.assertEqual(set(work.root.iterdir()), files)
+        finally:
+            output.chmod(0o666)
+
+    def test_json_report_symlink_keeps_its_target(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        target = work.root / "actual-report.json"
+        target.write_text("old report", encoding="utf-8")
+        output = work.root / "audit.json"
+        try:
+            output.symlink_to(target.name)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(str(error))
+        files = set(work.root.iterdir())
+        code, _, err = work.run(registry, "--json", str(output))
+        self.assertEqual((code, err), (0, ""))
+        self.assertTrue(output.is_symlink())
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["unique_imports"], 1)
+        self.assertEqual(set(work.root.iterdir()), files)
+
+    def test_json_directory_error_preserves_the_supplied_path(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.modules / ".." / work.modules.name
+        self.assertNotEqual(str(output), str(output.resolve()))
+        files = set(work.root.iterdir())
+        code, out, err = work.run(registry, "--json", str(output))
+        self.assertEqual((code, out), (2, ""))
+        self.assertEqual(err, f"FAIL: {output}: JSON output is a directory\n")
+        self.assertEqual(set(work.root.iterdir()), files)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX report permissions")
+    def test_new_json_report_permissions_follow_the_process_umask(self):
+        script = "\n".join([
+            "import os, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "import import_audit",
+            "os.umask(int(sys.argv[4], 8))",
+            "Path(sys.argv[3]).write_text('{}\\n', encoding='utf-8')",
+            "import_audit.write_json(Path(sys.argv[2]), {'complete': True})",
+        ])
+        for mask, mode in ((0o022, 0o644), (0o002, 0o664), (0o077, 0o600)):
+            with self.subTest(umask=oct(mask)):
+                output = self.work.root / f"audit-{mask:o}.json"
+                reference = self.work.root / f"plain-{mask:o}.json"
+                files = set(self.work.root.iterdir())
+                completed = subprocess.run([sys.executable, "-c", script, str(import_audit.ROOT / "tools"), str(output), str(reference), oct(mask)], capture_output=True, text=True)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), mode)
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), stat.S_IMODE(reference.stat().st_mode))
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"complete": True})
+                self.assertEqual(set(self.work.root.iterdir()), files | {output, reference})
+
+    @unittest.skipUnless(os.name == "posix", "POSIX report permissions")
+    def test_existing_json_report_permissions_are_preserved(self):
+        output = self.work.root / "audit.json"
+        for mode in (0o600, 0o640, 0o664):
+            with self.subTest(mode=oct(mode)):
+                output.write_text("old report", encoding="utf-8")
+                output.chmod(mode)
+                files = set(self.work.root.iterdir())
+                import_audit.write_json(output, {"complete": True})
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), mode)
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"complete": True})
+                self.assertEqual(set(self.work.root.iterdir()), files)
 
     def test_classification_accounts_for_every_reference(self):
         work = self.work
