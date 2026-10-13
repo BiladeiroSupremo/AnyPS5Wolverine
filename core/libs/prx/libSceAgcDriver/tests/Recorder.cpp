@@ -4853,7 +4853,31 @@ void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of a pending fill did not read as its keys without a wait");
     recorder.NotePendingWrite(address, 2 * keyCount);
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address, keyCount), "a later wider writer over a pending fill was not waited for");
+    recorder.NotePendingFill(address, keyCount / 2, 0x40);
+    recorder.NotePendingFill(address + keyCount / 2, keyCount / 2, 0x40);
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of pending 0001 fills over both halves did not read as 0001 without a wait");
+    recorder.NotePendingWrite(address + keyCount / 2, 16);
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address, keyCount), "a later writer of unknown bytes over pending fills was not waited for");
+    recorder.NotePendingFill(address, keyCount / 2, 0x00);
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Mixed && recorder.PendingWriteOverlaps(address, keyCount), "a pending 0000 fill over half of uncompressed keys did not read as mixed without a wait");
     recorder.Sync();
+#ifdef _WIN32
+    auto* edgeBlock = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * bytes, MEM_RESERVE, PAGE_NOACCESS));
+    Require(edgeBlock != nullptr && VirtualAlloc(edgeBlock, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot reserve the key block past committed memory");
+#else
+    void* edgeMapping = mmap(nullptr, 2 * bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(edgeMapping != MAP_FAILED && mprotect(edgeMapping, bytes, PROT_READ | PROT_WRITE) == 0, "cannot reserve the key block past committed memory");
+    auto* edgeBlock = static_cast<std::uint8_t*>(edgeMapping);
+#endif
+    const auto edge = reinterpret_cast<std::uint64_t>(edgeBlock) + bytes - keyCount / 2;
+    Require(!AgcDriver::GuestMemory::Accessible(reinterpret_cast<const void*>(edge), keyCount), "keys past the end of committed memory read as accessible");
+    recorder.NotePendingFill(edge, keyCount / 2, 0x40);
+    Require(CurrentDccKeys(edge, surfaceBytes) == DccKeys::Unreadable && !recorder.PendingWriteOverlaps(edge, keyCount), "keys running past the end of committed memory, with a pending fill over their committed half, were not read as unreadable after a wait");
+#ifdef _WIN32
+    VirtualFree(edgeBlock, 0, MEM_RELEASE);
+#else
+    munmap(edgeBlock, 2 * bytes);
+#endif
     constexpr std::uint64_t displayBytes = 15u * 9u * 65536u;
     constexpr std::size_t consoleKeys = 49152;
     const auto displayKeys = DccKeyCount(TextureTileMode::kR64KBX, 4, 1920, 1080, displayBytes);
