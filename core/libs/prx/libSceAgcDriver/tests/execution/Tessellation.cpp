@@ -572,6 +572,7 @@ ShaderRecompiler::RecompileResult CompileHull(const ShaderRecompiler::SpirvTarge
 
 void RequireSingleControlPointHulls(const ShaderRecompiler::SpirvTarget& target) {
     Require(!CompileHull(target, HullSingleInput, {1u, 3u, 1u, 2u, 2u}).spirv.empty(), "a hull that reads only the one input control point of its patch was not compiled");
+    Require(!CompileHull(target, HullSingleOutput, {1u, 1u, 1u, 2u, 2u}).spirv.empty(), "a hull with one output control point and unguarded patch outputs was not compiled");
 }
 
 }
