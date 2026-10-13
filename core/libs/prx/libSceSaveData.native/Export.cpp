@@ -553,7 +553,6 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     if (slot == -1) {
         return SAVE_DATA_ERROR_MOUNT_FULL;
     }
-    std::memset(mount_result, 0, sizeof(*mount_result));
     if (create || create2) {
         std::filesystem::create_directories(real_path);
     }
@@ -561,6 +560,7 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     // path resolver maps it to the save directory, whose name may be far longer.
     const std::string mountPoint = "/savedata" + std::to_string(slot);
     AddPathAlias_nid_no_patch(mountPoint.c_str(), std::filesystem::absolute(real_path).string().c_str());
+    std::memset(mount_result, 0, sizeof(*mount_result));
     g_slots[slot].used = true;
     g_slots[slot].mount_point = mountPoint;
     g_slots[slot].real_path = real_path;
