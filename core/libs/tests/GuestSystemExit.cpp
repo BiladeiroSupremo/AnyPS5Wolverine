@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
     for (const char* path : {"/app0/another.bin", "/data/eboot.bin", "/app0/../eboot.bin", "/app0//eboot.bin"}) {
         bool rejected = false;
         try { sceSystemServiceLoadExec(path, nullptr); }
-        catch (const std::runtime_error&) { rejected = true; }
+        catch (const std::runtime_error& error) { rejected = std::string(error.what()).find(path) != std::string::npos; }
         Require(rejected);
     }
 #ifdef _WIN32
