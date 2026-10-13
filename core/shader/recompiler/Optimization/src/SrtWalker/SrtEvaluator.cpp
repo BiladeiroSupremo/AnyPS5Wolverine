@@ -250,12 +250,20 @@ std::optional<bool> evaluableAlone(const IrResourcePlan& program, const IrValue&
         case IrOpcode::GetUserData:
         case IrOpcode::GetShaderBase:
         case IrOpcode::ReadFirstLane:
-        case IrOpcode::CompositeExtractU64:
-        case IrOpcode::CompositeExtractU32x2:
         case IrOpcode::ReadConst: return true;
         case IrOpcode::LoadAddressU32:
         case IrOpcode::ReadConstBuffer: return IsRawRead(program, value);
         case IrOpcode::Phi: return std::nullopt;
+        case IrOpcode::CompositeExtractU64:
+        case IrOpcode::CompositeExtractU32x2: {
+            if (value.ArgumentCount() < 2) return true;
+            const auto* index = value.Argument(1) != nullptr ? value.Argument(1)->Resolve() : nullptr;
+            if (index == nullptr || !index->HasImmediate() || index->Type() != IrType::U32 || index->ImmediateU32() >= 2u) return false;
+            if (value.Opcode() == IrOpcode::CompositeExtractU64) return std::nullopt;
+            const auto* source = value.Argument(0) != nullptr ? value.Argument(0)->Resolve() : nullptr;
+            if (source == nullptr || (source->Opcode() != IrOpcode::CompositeConstructU32x2 && source->Opcode() != IrOpcode::IAddCarry32)) return false;
+            return std::nullopt;
+        }
         default: break;
     }
     const auto arguments = evaluatedArguments(value.Opcode());
@@ -272,6 +280,21 @@ bool Evaluator::MayEvaluate(const IrResourcePlan& program, IrValue* value) {
         std::vector<IrValue*> required;
         if (current->IsPhi()) {
             required.push_back(ResolveInvariantPhi(program, current));
+            return required;
+        }
+        const auto resolved = [](IrValue* value) { return value != nullptr ? value->Resolve() : nullptr; };
+        if (current->Opcode() == IrOpcode::CompositeExtractU64) {
+            required.push_back(resolved(current->Argument(0)));
+            return required;
+        }
+        if (current->Opcode() == IrOpcode::CompositeExtractU32x2) {
+            auto* source = current->Argument(0)->Resolve();
+            if (source->Opcode() == IrOpcode::CompositeConstructU32x2) {
+                required.push_back(resolved(source->Argument(current->Argument(1)->Resolve()->ImmediateU32())));
+            } else {
+                required.push_back(resolved(source->Argument(0)));
+                required.push_back(resolved(source->Argument(1)));
+            }
             return required;
         }
         const auto arguments = *evaluatedArguments(current->Opcode());

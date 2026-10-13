@@ -417,9 +417,15 @@ void verifyMayEvaluate() {
     auto& divergent = make(IrOpcode::Phi, IrType::Bool);
     divergent.AddArgument(&uniform);
     divergent.AddArgument(&varying);
+    auto& counter = make(IrOpcode::Phi, IrType::U32);
+    auto& next = make(IrOpcode::CompositeExtractU32x2, IrType::U32, {&make(IrOpcode::IAddCarry32, IrType::U32x2, {&counter, &constant(1)}), &constant(0)});
+    counter.AddArgument(&constant(0));
+    counter.AddArgument(&next);
+    auto& latch = make(IrOpcode::ULessThan32, IrType::Bool, {&next, &constant(4)});
+    auto& sum = make(IrOpcode::CompositeExtractU32x2, IrType::U32, {&make(IrOpcode::IAddCarry32, IrType::U32x2, {&input, &constant(1)}), &constant(0)});
     std::array<std::uint32_t, 1> data{4};
     SrtRuntime runtime{data};
-    for (const auto& [value, expected, name] : std::array<std::tuple<IrValue*, bool, const char*>, 9>{{
+    for (const auto& [value, expected, name] : std::array<std::tuple<IrValue*, bool, const char*>, 11>{{
              {&constant(3), true, "a constant"},
              {&input, true, "user data"},
              {&uniform, true, "a comparison of user data"},
@@ -429,13 +435,15 @@ void verifyMayEvaluate() {
              {&unevaluated, false, "an opcode the evaluator does not evaluate"},
              {&invariant, true, "a phi whose operands agree"},
              {&divergent, false, "a phi whose operands differ"},
+             {&latch, false, "a scalar loop counter's latch condition"},
+             {&sum, true, "the low word of a carry add of user data"},
          }}) {
         require(Detail::Evaluator::MayEvaluate(plan, value) == expected, (std::string("MayEvaluate misjudged ") + name).c_str());
         Detail::Evaluator evaluator(plan, runtime);
         std::uint32_t result = 0;
         require(evaluator.Evaluate(value, result) == expected, (std::string("MayEvaluate disagreed with the evaluator on ") + name).c_str());
     }
-    const std::array<IrOpcode, 11> takenAsEvaluable{IrOpcode::Identity, IrOpcode::Phi, IrOpcode::Void, IrOpcode::GetUserData, IrOpcode::GetShaderBase, IrOpcode::ReadFirstLane, IrOpcode::CompositeExtractU64, IrOpcode::CompositeExtractU32x2, IrOpcode::ReadConst, IrOpcode::LoadAddressU32, IrOpcode::ReadConstBuffer};
+    const std::array<IrOpcode, 9> takenAsEvaluable{IrOpcode::Identity, IrOpcode::Phi, IrOpcode::Void, IrOpcode::GetUserData, IrOpcode::GetShaderBase, IrOpcode::ReadFirstLane, IrOpcode::ReadConst, IrOpcode::LoadAddressU32, IrOpcode::ReadConstBuffer};
     for (std::uint16_t raw = 0; raw < static_cast<std::uint16_t>(IrOpcode::Count); ++raw) {
         const auto opcode = static_cast<IrOpcode>(raw);
         if (std::ranges::find(takenAsEvaluable, opcode) != takenAsEvaluable.end()) continue;
