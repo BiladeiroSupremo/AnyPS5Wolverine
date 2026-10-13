@@ -261,6 +261,31 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             return entryIr.ISub(lhs, minimum(lhs, rhs));
         };
         IrValue& local = builtin(StageInputKind::LocalInvocationIndex);
+        if (mesh.fastLaunch != 0u) {
+            // Fast launch (mesh-shader mode): each workgroup is one input point; the subgroup
+            // computes its own vertices and primitives. The base vertex and instance are broadcast
+            // to every lane; the instance VGPR excludes the start instance, as on hardware (the
+            // shader adds its instance-offset SGPR itself).
+            if (options.userDataBaseRegister != 0u || options.userDataCount < 8u) {
+                throw std::runtime_error("mesh shader translation requires the merged program's eight hidden user words");
+            }
+            IrValue& group = builtin(StageInputKind::WorkgroupId, 0u);
+            IrValue& wave = entryIr.ShiftRightLogical(local, u32(options.waveSize == 32u ? 5u : 6u));
+            IrValue& first = entryIr.IEqual(entryIr.BitwiseAnd(local, u32(~(options.waveSize - 1u))), u32(0u));
+            IrValue& counts = entryIr.Select(first, u32((1u << 8u) | 1u), u32(0u));
+            entryIr.SetScalarReg(static_cast<ScalarReg>(2), u32((1u << 12u) | (1u << 22u)));
+            entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.BitwiseOr(entryIr.BitwiseOr(entryIr.ShiftLeftLogical(wave, u32(24u)), u32((totalThreads / options.waveSize) << 28u)), counts));
+            for (std::uint32_t reg = 4u; reg < 8u; reg++) {
+                entryIr.SetScalarReg(static_cast<ScalarReg>(reg), u32(0u));
+            }
+            for (std::uint32_t reg = 0u; reg < 5u; reg++) {
+                setVector(static_cast<VectorReg>(reg), u32(0u));
+            }
+            setVector(static_cast<VectorReg>(5), entryIr.IAdd(draw(1u), group));
+            setVector(static_cast<VectorReg>(6), builtin(StageInputKind::WorkgroupId, 1u));
+            setVector(static_cast<VectorReg>(7), u32(0u));
+            setVector(static_cast<VectorReg>(8), u32(0u));
+        } else {
         IrValue& firstPrimitive = entryIr.IMul(builtin(StageInputKind::WorkgroupId, 0u), u32(mesh.primitivesPerGroup));
         IrValue& step = u32(stepCount);
         IrValue& firstVertex = entryIr.IMul(firstPrimitive, step);
@@ -316,6 +341,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         setVector(static_cast<VectorReg>(6), u32(0u));
         setVector(static_cast<VectorReg>(7), u32(0u));
         setVector(static_cast<VectorReg>(8), entryIr.IAdd(draw(2u), builtin(StageInputKind::WorkgroupId, 1u)));
+        }
     } else if (options.stage == ShaderStageKind::Local) {
         entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(64u));
         setVector(static_cast<VectorReg>(2), drawIndex(StageInputKind::VertexIndex));

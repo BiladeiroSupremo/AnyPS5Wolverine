@@ -634,7 +634,10 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         Require(result.minTessellationLevel >= 0.0f && result.minTessellationLevel <= 63.0f && result.minTessellationLevel <= result.maxTessellationLevel && result.maxTessellationLevel >= 1.0f, "tessellation level clamps need 0 <= VGT_HOS_MIN_TESS_LEVEL <= 63, VGT_HOS_MAX_TESS_LEVEL >= 1 and the minimum at most the maximum");
         result.tessellation = tess;
     } else {
-        validate((value & ~0x0047ec30u) == 0, "unsupported geometry routing, fast launch or wave-ID state");
+        // GS_FAST_LAUNCH=1 is NGG mesh-shader mode: no input assembly, one subgroup per input point
+        // that computes its own vertices and primitives (the title's meshlet geometry).
+        const auto fastLaunch = (value >> 19u) & 3u;
+        validate((value & ~0x0047ec30u & ~0x00080000u) == 0 && fastLaunch <= 1u, "unsupported geometry routing, fast launch or wave-ID state");
         const auto group = read(queue.userConfig, 0x25b, RegisterBank::UserConfig);
         const auto vertices = (group >> 9u) & 0x1ffu;
         const auto primitives = group & 0x1ffu;
@@ -648,7 +651,19 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         const auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, outputLimit});
         validate(groupPrimitives != 0, "geometry subgroup contains no primitives");
         const auto resources = read(queue.shader, 0x8b, RegisterBank::Shader);
-        validate(vertexWorkgroup || (((read(queue.shader, 0x8a, RegisterBank::Shader) >> 29u) & 3u) == 3 && ((resources >> 16u) & 3u) == 3), "unsupported geometry VGPR allocation");
+        const auto gsVgprs = (read(queue.shader, 0x8a, RegisterBank::Shader) >> 29u) & 3u;
+        const auto esVgprs = (resources >> 16u) & 3u;
+        if (fastLaunch != 0) {
+            validate(!vertexWorkgroup && primitive == 1 && vertices == 1 && primitives == 1 && maxVertices == verticesPerPrimitive && gsVgprs == 0 && esVgprs == 1, "unsupported fast-launch geometry (point list, GE groups of one, GS VGPRs 0, ES VGPRs 1)");
+            const auto subgroup = read(queue.context, 0x2d3);
+            // PRIM_AMP_FACTOR bounds the primitives: a meshlet emits more triangles than vertices.
+            const auto maxPrimitives = std::max(maxVertices, subgroup & 0x1ffu);
+            const auto threads = std::max({maxVertices, maxPrimitives, (subgroup >> 9u) & 0x1ffu});
+            const auto esgsItemSize = std::max(read(queue.context, 0x2ab), 1u);
+            result.mesh = ShaderRecompiler::MeshConfiguration{primitive, 1u, 1u, maxVertices, maxPrimitives, ((threads + result.vertexWaveSize - 1u) / result.vertexWaveSize) * result.vertexWaveSize, ((resources >> 19u) & 0xffu) * 128u, 0, esgsItemSize, 1u};
+            return result;
+        }
+        validate(vertexWorkgroup || (gsVgprs == 3 && esVgprs == 3), "unsupported geometry VGPR allocation");
         const auto esgsItemSize = read(queue.context, 0x2ab);
         validate(esgsItemSize != 0 && esgsItemSize * vertices <= 0xffffu, "invalid VGT_ESGS_RING_ITEMSIZE");
         const auto threads = std::max({(groupPrimitives - 1u) * inputStep + inputSize, primitives, maxVertices, primitives * (verticesPerPrimitive - 2u)});

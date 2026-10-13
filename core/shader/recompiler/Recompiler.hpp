@@ -280,6 +280,8 @@ struct MeshConfiguration {
     std::uint32_t ldsSizeDwords;
     std::uint32_t provokingVertex;
     std::uint32_t esgsItemSize = 0;
+    // GS_FAST_LAUNCH=1 (mesh-shader mode): one workgroup per input point, no input assembly.
+    std::uint32_t fastLaunch = 0;
 };
 
 struct TessellationConfiguration {
