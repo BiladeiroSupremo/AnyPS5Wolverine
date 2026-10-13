@@ -389,6 +389,9 @@ if(BUILD_TESTING)
         set_tests_properties(windows_fixed_base PROPERTIES TIMEOUT 20)
         add_test(NAME elf_offsets COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_elf_offsets.py $<TARGET_FILE:relinker>)
+        add_test(NAME conversion_diagnostics COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_conversion_diagnostics.py $<TARGET_FILE:relinker>)
+        set_tests_properties(conversion_diagnostics PROPERTIES TIMEOUT 20)
         add_test(NAME dynamic_segment COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_dynamic_segment.py $<TARGET_FILE:relinker>)
         add_test(NAME rela_size COMMAND ${Python3_EXECUTABLE}

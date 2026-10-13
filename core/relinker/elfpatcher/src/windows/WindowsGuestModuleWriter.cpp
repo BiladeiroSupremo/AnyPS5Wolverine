@@ -6,6 +6,7 @@
 #include <elfpatcher/windows/WindowsRelocationBuilder.hpp>
 #include <elfpatcher/windows/WindowsTrampolineBuilder.hpp>
 #include <io/BufferUtils.hpp>
+#include <io/NativePath.hpp>
 #include <algorithm>
 #include <map>
 #include <iterator>
@@ -84,7 +85,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
     try {
         directories[9] = WindowsTlsBuilder().Build(guest.Bytes, guest.Headers, image, sections, relocations, nextRva, &tlsIndex);
     } catch (Domain::RelinkerException& error) {
-        error.InputPath = guest.SourcePath.string();
+        if (error.InputPath.empty()) error.InputPath = Io::Utf8Path(guest.SourcePath);
         throw;
     }
     WindowsTrampolineBuilder().Build(guest.Trampolines, image, sections, nextRva);
