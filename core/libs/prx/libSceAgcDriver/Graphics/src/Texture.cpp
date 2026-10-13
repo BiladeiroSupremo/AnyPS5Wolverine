@@ -4570,6 +4570,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         return;
     }
+    original.resize(static_cast<std::size_t>(guestBytes));
     // The store below compares against the guest bytes, read now when `original` does not hold
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
