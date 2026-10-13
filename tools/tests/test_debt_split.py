@@ -84,6 +84,8 @@ class DebtSplitTests(unittest.TestCase):
             self.assertNotIn(entry.split(" - ")[0], text)
         for kept in ("- A toolchain limitation", "Everything throws, except:", SHARED, "### Silent stubs", "[debt](debt/)"):
             self.assertIn(kept, text)
+        for path in (INDEX, "docs/dev/debt/libSceA.md"):
+            self.assertNotIn(b"\r", (self.root / path).read_bytes())
 
     def test_split_again_appends_to_existing_files(self):
         self.split()
@@ -116,6 +118,8 @@ class DebtSplitTests(unittest.TestCase):
         self.assertEqual(sorted(result.stdout.split()),
                          ["docs/dev/debt/libSceA.md", "docs/dev/debt/libSceB.md", "docs/dev/debt/libSceC.md"])
         self.assertEqual(self.git("diff", "--name-only", "--diff-filter=U").stdout, "")
+        for path in (INDEX, "docs/dev/debt/libSceA.md"):
+            self.assertNotIn(b"\r", (self.root / path).read_bytes())
         self.git("rebase", "--continue")
         a = self.read("docs/dev/debt/libSceA.md")
         self.assertLess(a.index("`sceAOne`"), a.index("`sceAFour`"))
