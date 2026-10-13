@@ -247,4 +247,39 @@ int APS5_VABI sceKernelGetSystemSwVersion_nid_postfix(SceKernelSystemSwVersion* 
     version->version = 0x01000000;
     return 0;
 }
+
+int APS5_VABI sysctlnametomib_nid_postfix(const char* name, int* mib, std::size_t* size) {
+    struct KnownName {
+        const char* name;
+        int mib[3];
+        std::size_t length;
+    };
+    static constexpr KnownName known[] = {
+        {"hw.model", {6, 2}, 2},
+        {"hw.ncpu", {6, 3}, 2},
+        {"hw.physmem", {6, 5}, 2},
+        {"hw.realmem", {6, 12}, 2},
+        {"kern.arandom", {1, 37}, 2},
+        {"kern.proc.pathname", {1, 14, 12}, 3},
+    };
+    constexpr std::size_t MaximumPath = 1024;
+    if (name == nullptr || size == nullptr) throw std::invalid_argument(std::string(__func__) + ": null name or size");
+    const std::size_t nameLength = strnlen(name, MaximumPath);
+    if (nameLength == MaximumPath) {
+        *__error_nid_postfix() = 63;
+        return -1;
+    }
+    if (nameLength == 0 || std::strcmp(name, "machdep.cacheline_size") == 0) {
+        *__error_nid_postfix() = 2;
+        return -1;
+    }
+    for (const auto& entry : known) {
+        if (std::strcmp(name, entry.name) != 0) continue;
+        std::size_t bytes = *size * sizeof(int);
+        const int result = CopyOut(entry.mib, entry.length * sizeof(int), mib, &bytes);
+        *size = bytes / sizeof(int);
+        return result;
+    }
+    throw std::runtime_error(std::string(__func__) + ": unsupported name " + name);
+}
 }
