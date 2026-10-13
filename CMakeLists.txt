@@ -77,6 +77,14 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler)
     add_test(NAME shader_cache_file_read COMMAND shader_cache_file_read_tests)
     set_tests_properties(shader_cache_file_read PROPERTIES TIMEOUT 20)
+    add_test_executable(request_serializer_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/RequestSerializerTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/ControlFlow/src/RequestSerializer.cpp)
+    target_include_directories(request_serializer_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/ControlFlow/include)
+    add_test(NAME request_serializer COMMAND request_serializer_tests)
+    set_tests_properties(request_serializer PROPERTIES TIMEOUT 20)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME pr_overlap_encoding COMMAND ${Python3_EXECUTABLE}
