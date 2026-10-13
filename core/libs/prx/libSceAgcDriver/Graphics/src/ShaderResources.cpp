@@ -2913,8 +2913,10 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     Require(!written || !overlap(address, size, indexAddress, indexBytes), "writable shader buffer aliases the index buffer");
     written = written || allWritten;
     const bool swept = read && dispatchThreads != 0 && descriptor.Stride() != 0 && dispatchThreads * descriptor.Stride() * 2u >= byteSize;
-    if (written) guestMemory.AddWritable(address, size, atomic, swept);
-    else {
+    if (written) {
+        guestMemory.AddWritable(address, size, atomic, swept);
+        if (read || atomic) readWrittenBuffers.push_back(address);
+    } else {
         guestMemory.AddReadable(address, size);
         ++readOnlyBuffers;
     }

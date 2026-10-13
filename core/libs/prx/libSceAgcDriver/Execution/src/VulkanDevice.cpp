@@ -2674,6 +2674,10 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
+    // Experiment: APS5_CLEAR_DEPTH_AT_FLIP=<hex depth address>[,...] (or 1 for every depth surface)
+    // clears those depth surfaces before their next use after each flip, as a missed clear would.
+    static const char* clearAtFlip = std::getenv("APS5_CLEAR_DEPTH_AT_FLIP");
+    if (clearAtFlip != nullptr) Graphics::ClearDepthSurfacesAtFlip(clearAtFlip);
     if (buffer.tilingMode == 1) {
         const auto pixels = ReadDisplayBuffer(buffer);
         return present(buffer.width, buffer.height, true, pixels);
@@ -3510,6 +3514,17 @@ void FlushAfterDispatch(std::uint64_t programAddress, const Graphics::ShaderReso
     for (const auto& image : images) {
         const bool dumped = image->DumpImage(tag);
         std::fprintf(stderr, "[flush-dump]   0x%llx image %p %ux%u format %u%s\n", static_cast<unsigned long long>(image->Descriptor().baseAddress), static_cast<const void*>(image.get()), image->Descriptor().width, image->Descriptor().height, image->Descriptor().format, dumped ? "" : " (format not dumped)");
+    }
+}
+
+// Dispatches that overwrite a depth surface's HTILE clear it (Graphics::NoteHtileOverwrite);
+// APS5_NO_HTILE_OVERWRITE_CLEAR=1 ignores them.
+void NoteHtileOverwrites(const Graphics::ShaderResources& resources) {
+    static const bool disabled = std::getenv("APS5_NO_HTILE_OVERWRITE_CLEAR") != nullptr;
+    if (disabled) return;
+    const auto& readWritten = resources.ReadWrittenBuffers();
+    for (const auto& [begin, end] : resources.GpuWrites()) {
+        if (std::find(readWritten.begin(), readWritten.end(), begin) == readWritten.end()) Graphics::NoteHtileOverwrite(begin);
     }
 }
 
@@ -4556,6 +4571,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     if (TraceDispatchIo(programAddress)) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
     FlushAfterDispatch(programAddress, *resources, *state->recorder);
+    NoteHtileOverwrites(*resources);
     WatchMemory(programAddress);
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
@@ -4696,6 +4712,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     }
     if (TraceDispatchIo(programAddress)) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, hit->resources->Describe().c_str());
     FlushAfterDispatch(programAddress, *hit->resources, *state->recorder);
+    NoteHtileOverwrites(*hit->resources);
     WatchMemory(programAddress);
     timer.finish(lookupsBefore, groupsText, indirect);
     if (profile) reportRecipes();

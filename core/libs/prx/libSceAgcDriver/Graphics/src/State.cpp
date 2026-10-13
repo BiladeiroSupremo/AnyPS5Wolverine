@@ -262,6 +262,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
         result.maxDepthBounds = readFloat(cx, 0x009);
     }
     if (depthClear) {
+        static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+        if (traceClears) std::fprintf(stderr, "[depth-clear] clear draw, depth 0x%llx value %g\n", static_cast<unsigned long long>(depth.address), depth.clearDepth);
         result.depthTest = true;
         result.depthWrite = true;
         result.depthCompare = VK_COMPARE_OP_ALWAYS;

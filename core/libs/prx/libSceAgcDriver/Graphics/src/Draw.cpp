@@ -1765,7 +1765,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); }) && TraceDrawIoBudget()) {
         std::string stages;
         for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
-        std::fprintf(stderr, "[draw-io] recorded target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), resources.Describe().c_str());
+        std::fprintf(stderr, "[draw-io] recorded target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s depth 0x%llx vk%d test %d write %d op %d htile 0x%llx:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), static_cast<unsigned long long>(state.depth ? state.depth->address : 0), state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth ? state.depth->htileAddress : 0), resources.Describe().c_str());
     }
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
@@ -2333,7 +2333,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); }) && TraceDrawIoBudget()) {
         std::string stages;
         for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
-        std::fprintf(stderr, "[draw-io] target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), resources->Describe().c_str());
+        std::fprintf(stderr, "[draw-io] target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s depth 0x%llx vk%d test %d write %d op %d htile 0x%llx:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), static_cast<unsigned long long>(state.depth ? state.depth->address : 0), state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth ? state.depth->htileAddress : 0), resources->Describe().c_str());
     }
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");

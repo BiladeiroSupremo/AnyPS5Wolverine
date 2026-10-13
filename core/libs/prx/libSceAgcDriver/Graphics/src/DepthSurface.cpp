@@ -100,6 +100,9 @@ public:
         const auto aspects = pendingClear & (VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u));
         pendingClear = 0;
         if (aspects == 0) return;
+        // Debug aid: APS5_TRACE_DEPTH_CLEAR names every depth clear the driver applies or notices.
+        static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+        if (traceClears) std::fprintf(stderr, "[depth-clear] applied to depth 0x%llx (aspects 0x%x, value %g)\n", static_cast<unsigned long long>(target.address), static_cast<unsigned>(aspects), clearDepth);
         written = ++depthWrites;
         auto* recorder = RecorderFor(context);
         std::unique_ptr<CommandBatch> batch;
@@ -560,6 +563,8 @@ void NoteMemoryValueFill(const MemoryValueFill& fill) {
 }
 
 void NoteHtileDepthClear(std::uint64_t htileAddress) {
+    static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+    if (traceClears) std::fprintf(stderr, "[depth-clear] htile clear kernel over 0x%llx\n", static_cast<unsigned long long>(htileAddress));
     std::lock_guard lock(surfacesMutex());
     bool existing = false;
     for (const auto& surface : surfaces()) {
@@ -568,6 +573,34 @@ void NoteHtileDepthClear(std::uint64_t htileAddress) {
         existing = true;
     }
     if (!existing) clearedHtiles().insert(htileAddress);
+}
+
+bool NoteHtileOverwrite(std::uint64_t address) {
+    std::lock_guard lock(surfacesMutex());
+    bool cleared = false;
+    for (const auto& surface : surfaces()) {
+        if (surface->target.htileAddress != address) continue;
+        surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        cleared = true;
+    }
+    static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+    if (traceClears && cleared) std::fprintf(stderr, "[depth-clear] dispatch overwrites htile 0x%llx\n", static_cast<unsigned long long>(address));
+    return cleared;
+}
+
+void ClearDepthSurfacesAtFlip(const char* selection) {
+    std::vector<std::uint64_t> addresses;
+    for (const char* text = selection; text != nullptr && *text != '\0';) {
+        char* end = nullptr;
+        addresses.push_back(std::strtoull(text, &end, 16));
+        text = *end == ',' ? end + 1 : nullptr;
+    }
+    const bool all = addresses.size() == 1 && addresses[0] == 1;
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (!all && std::find(addresses.begin(), addresses.end(), surface->target.address) == addresses.end()) continue;
+        surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT | (surface->target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+    }
 }
 
 void ClearDepthSurfaces(VkDevice device) {
@@ -660,6 +693,8 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         const auto& target = surface->target;
+        static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+        if (traceClears && target.htileAddress != 0 && target.htileAddress < address + bytes && address < target.htileAddress + HtileMetadataBytes(target.extent)) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x over htile 0x%llx of depth 0x%llx: %s\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.htileAddress), static_cast<unsigned long long>(target.address), HtileFillCovers(target.htileAddress, target.extent, address, bytes) ? "covers" : "partial, ignored");
         if (!HtileFillCovers(target.htileAddress, target.extent, address, bytes)) continue;
         const VkImageAspectFlags written = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         surface->pendingClear = (surface->pendingClear & ~written) | HtileFillClears(pattern, target.htileStencil);

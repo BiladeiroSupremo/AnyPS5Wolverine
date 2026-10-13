@@ -31,6 +31,12 @@ std::optional<MemoryValueFill> MatchMemoryValueFill(std::span<const std::uint32_
 void NoteMemoryValueFill(const MemoryValueFill& fill);
 bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture);
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);
+// A compute dispatch writes a buffer starting at a depth surface's HTILE without reading it: on the
+// GPU that rewrites the tiles' state, which games use to clear depth (written HTILE words of zero
+// read as cleared tiles). The host depth image is marked for a clear at its next use, as Kyty does.
+bool NoteHtileOverwrite(std::uint64_t address);
+// Experiment (APS5_CLEAR_DEPTH_AT_FLIP): mark the selected depth surfaces ("1": all) cleared.
+void ClearDepthSurfacesAtFlip(const char* selection);
 VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile);
 std::uint64_t HtileMetadataBytes(VkExtent2D extent);
 bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes);
