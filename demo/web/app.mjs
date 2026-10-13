@@ -57,14 +57,18 @@ async function fail(message) {
   worker = null;
   working = false;
   summary = null;
+  const transaction = outputTransaction;
+  outputTransaction = null;
+  outputDirectory = null;
   if (sink) {
     const active = sink;
     sink = null;
     try { await active.abort(); } catch (error) { message += `\nCould not discard the output file: ${error.message}`; }
   }
-  if (outputTransaction) message += `\nIncomplete files remain in ${outputTransaction.name}/.`;
-  outputDirectory = null;
-  outputTransaction = null;
+  if (transaction) {
+    try { await transaction.discard(); }
+    catch (error) { message += `\nCould not remove incomplete output folder ${transaction.name}/: ${error.message}`; }
+  }
   $("error").textContent = message;
   $("error").hidden = false;
   $("status").hidden = true;
