@@ -346,7 +346,7 @@ private:
     // The region of a descriptor-bound range (AddWritable/AddReadable), committed pages only. A
     // range inside a base region of the space adds nothing: the region serves it, as today's merge
     // of the two did.
-    void addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept);
+    void addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept, bool readOnly);
     static bool servesView(const Region& region, std::uint64_t view);
     static bool sparseHeapCandidate(const Region& region);
     bool bindSparseMirror(Region& region, const GuestAllocations::Lease& lease);
