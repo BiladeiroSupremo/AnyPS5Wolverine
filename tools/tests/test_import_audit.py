@@ -143,7 +143,13 @@ def write_source(root, library, text):
 
 
 def write_registry(path, entries, encoding="utf-8"):
-    path.write_text(json.dumps([{"nid": nid, "library": library, "relocationType": "R_X86_64_GLOB_DAT"} for nid, library in entries]), encoding=encoding)
+    records = []
+    for entry in entries:
+        record = {"nid": entry[0], "library": entry[1], "relocationType": "R_X86_64_GLOB_DAT"}
+        if len(entry) > 2:
+            record["weak"] = entry[2]
+        records.append(record)
+    path.write_text(json.dumps(records), encoding=encoding)
 
 
 class Workspace:
@@ -667,6 +673,17 @@ class ImportAuditTests(unittest.TestCase):
         self.assertEqual(data["stops"], [{"registry": str(registry), "nid": None, "library": None, "name": None}])
         self.assertIn(f"  {registry}: none", out)
 
+    def test_a_weak_unresolved_import_is_not_a_stop(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("BBBBBBBBBBB", "libSceA.prx", True), ("CCCCCCCCCCC", "libSceA.prx")])
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["stops"], [{"registry": str(registry), "nid": "CCCCCCCCCCC", "library": "libSceA.prx", "name": None}])
+
     def test_removing_an_export_flips_the_class(self):
         work = self.work
         registry = work.root / "game.json"
@@ -699,11 +716,11 @@ class ImportAuditTests(unittest.TestCase):
         nid = nid_names.compute_nid("sceTwinCall")
         stubs = import_audit.source_stubs(source)
         exports = {nid: ["libA.prx", "libB.prx"]}
-        records, _ = import_audit.audit([(nid, "libB.prx")], {nid: ["libB.prx"]}, stubs, {"libB.prx"}, set())
+        records, _ = import_audit.audit([(nid, "libB.prx", False)], {nid: ["libB.prx"]}, stubs, {"libB.prx"}, set())
         self.assertEqual((records[0]["class"], records[0]["name"]), ("stub", "sceTwinCall"))
-        records, _ = import_audit.audit([(nid, "libA.prx")], {nid: ["libA.prx"]}, stubs, {"libA.prx"}, set())
+        records, _ = import_audit.audit([(nid, "libA.prx", False)], {nid: ["libA.prx"]}, stubs, {"libA.prx"}, set())
         self.assertEqual((records[0]["class"], records[0]["name"]), ("implemented", None))
-        records, _ = import_audit.audit([(nid, "libB.prx")], exports, stubs, {"libA.prx", "libB.prx"}, set())
+        records, _ = import_audit.audit([(nid, "libB.prx", False)], exports, stubs, {"libA.prx", "libB.prx"}, set())
         self.assertEqual(records[0]["class"], "implemented")
 
     def test_cmake_shared_library_preserves_stub_names_and_implemented_exports(self):
@@ -1111,7 +1128,7 @@ class ImportAuditTests(unittest.TestCase):
         with self.assertRaisesRegex(import_audit.AuditError, r"entry 1 has an invalid NID 'bad\\x01nid'"):
             import_audit.read_registry(path)
         write_registry(path, [("AAAAAAAAAAA#A#B", "libSceA.prx")], encoding="utf-8-sig")
-        self.assertEqual(import_audit.read_registry(path), [("AAAAAAAAAAA", "libSceA.prx")])
+        self.assertEqual(import_audit.read_registry(path), [("AAAAAAAAAAA", "libSceA.prx", False)])
 
     def test_names_never_download(self):
         work = self.work

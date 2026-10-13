@@ -520,6 +520,7 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         entry.TargetSection = ".got";
         entry.TargetOffset = ref.RelocationAddress;
         entry.CallSitesResolved = false;
+        entry.Weak = ref.Weak;
         entries.push_back(std::move(entry));
     }
 

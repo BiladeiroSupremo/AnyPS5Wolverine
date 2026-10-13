@@ -411,7 +411,7 @@ def read_registry(path):
         nid = entry["nid"].split("#", 1)[0]
         if not NID.fullmatch(nid):
             raise AuditError(f"{path}: entry {index} has an invalid NID {entry['nid']!r}")
-        imports.append((nid, entry["library"]))
+        imports.append((nid, entry["library"], bool(entry.get("weak", False))))
     return imports
 
 
@@ -434,12 +434,13 @@ def classify(nid, library, providers, stubs, modules):
 
 def audit(imports, exports, stubs, libraries, modules, module_imports=None, module_exports=None):
     records = {}
-    for nid, library in imports:
-        record = records.setdefault((nid, library), {"nid": nid, "library": library, "references": 0})
+    for nid, library, weak in imports:
+        record = records.setdefault((nid, library), {"nid": nid, "library": library, "references": 0, "weak": weak})
         record["references"] += 1
+        record["weak"] = weak
     for module, (symbols, needed) in (module_imports or {}).items():
         for nid in symbols:
-            record = records.setdefault((nid, None, module), {"nid": nid, "library": None, "module": module, "references": 0})
+            record = records.setdefault((nid, None, module), {"nid": nid, "library": None, "module": module, "references": 0, "weak": False})
             record["references"] += 1
     for record in records.values():
         nid, library = record["nid"], record["library"]
@@ -466,9 +467,11 @@ def audit(imports, exports, stubs, libraries, modules, module_imports=None, modu
 
 
 def current_stop(imports, records):
-    """The first import the loader cannot resolve, in registry order."""
+    """The first import the loader cannot resolve, in registry order; a weak import resolves to null instead."""
     classes = {(record["nid"], record["library"]): record for record in records}
-    for nid, library in imports:
+    for nid, library, weak in imports:
+        if weak:
+            continue
         record = classes.get((nid, library))
         if record is not None and record["class"] == "absent":
             return record
