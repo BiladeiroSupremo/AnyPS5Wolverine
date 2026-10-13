@@ -2611,7 +2611,48 @@ FrameDumps& Dumps() {
 
 }
 
+namespace {
+
+// Debug aid: APS5_RENDERDOC_CAPTURE_AT=<n>[,<m>...] asks a RenderDoc that injected itself
+// (renderdoccmd capture app.exe) to capture the frame after the n-th presented display buffer.
+void renderDocCaptureAtPresent() {
+#ifdef _WIN32
+    static const std::vector<std::uint64_t> at = [] {
+        std::vector<std::uint64_t> presents;
+        if (const char* text = std::getenv("APS5_RENDERDOC_CAPTURE_AT"); text != nullptr) {
+            for (const char* cursor = text; *cursor != '\0';) {
+                char* end = nullptr;
+                presents.push_back(std::strtoull(cursor, &end, 10));
+                cursor = *end == ',' ? end + 1 : end + std::strlen(end);
+            }
+        }
+        return presents;
+    }();
+    if (at.empty()) return;
+    static std::uint64_t presents = 0;
+    ++presents;
+    if (std::find(at.begin(), at.end(), presents) == at.end()) return;
+    // RENDERDOC_API_1_1_2 (renderdoc_app.h): TriggerCapture is its 16th entry.
+    static void** api = [] {
+        void* table = nullptr;
+        const auto module = GetModuleHandleA("renderdoc.dll");
+        const auto getApi = module != nullptr ? reinterpret_cast<int (*)(int, void**)>(reinterpret_cast<void*>(GetProcAddress(module, "RENDERDOC_GetAPI"))) : nullptr;
+        if (getApi == nullptr || getApi(10102, &table) != 1) return static_cast<void**>(nullptr);
+        return static_cast<void**>(table);
+    }();
+    if (api == nullptr) {
+        std::fprintf(stderr, "[renderdoc] present %llu: RenderDoc is not loaded\n", static_cast<unsigned long long>(presents));
+        return;
+    }
+    reinterpret_cast<void (*)()>(api[15])();
+    std::fprintf(stderr, "[renderdoc] capture triggered after present %llu\n", static_cast<unsigned long long>(presents));
+#endif
+}
+
+}
+
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
+    renderDocCaptureAtPresent();
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
