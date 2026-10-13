@@ -405,6 +405,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         if (options.userDataBaseRegister >= 8u) {
             const auto hostLanes = options.inputInfo.vertex->hostSubgroupSize;
             const std::uint32_t lanes = hostLanes == 1u ? 1u : options.waveSize == 64u && hostLanes == 32u ? 32u : options.waveSize;
+            entryIr.SetScalarReg(static_cast<ScalarReg>(2), entryIr.Constant((lanes << 12u) | (lanes << 22u)));
             entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(lanes | (lanes << 8u)));
             // s2 is the merged stage's threadgroup info: vertices in bits 12..20, primitives in bits
             // 22..30 (one wave per group here, so both are the wave's lanes). A primitive shader that
