@@ -29,6 +29,7 @@
 - [set_constraint_handler_s](../../../core/libs/prx/libc/src/WideConversion.cpp) (libc, re-exported by libSceAmpr) - the default handler is assumed to abort; each module keeps its own handler state, so a handler set through one library is not seen by the other. `ctime_s` and `asctime_s` follow the Dinkumware 26-byte format with `EINVAL` for a buffer under 26 bytes, a null pointer or an out-of-range weekday/month; `ctime_s` uses the guest time zone of `localtime_s`, and the console's exact checks are not verified
 - [__udivti3](../../../core/libs/prx/libc/src/RuntimeSupport.cpp) (libc, re-exported by libSceAmpr) - the hardware traps on a zero divisor; this throws instead
 - [__umodti3](../../../core/libs/prx/libc/src/RuntimeSupport.cpp) (libc) - the hardware traps on a zero divisor; this throws instead
+- [fegetenv](../../../core/libs/prx/libc/src/Math.cpp) (libSceLibcInternal, implemented in libc, NID `psx0YiAKm7k`) follows FreeBSD amd64 [fenv.c](https://github.com/freebsd/freebsd-src/blob/d8b6461f8c56237a00ddc32678b3928bf76f5440/lib/msun/amd64/fenv.c) with the 32-byte `fenv_t` of [x86/fenv.h](https://github.com/freebsd/freebsd-src/blob/d8b6461f8c56237a00ddc32678b3928bf76f5440/lib/msun/x86/fenv.h): `fnstenv` fills the 28-byte x87 part, MXCSR follows at 0x1c, and the x87 control word is reloaded because `fnstenv` masks every x87 exception. That the console's `libSceLibcInternal` has the same code and layout is assumed, not read from its binary. A null pointer throws instead of faulting
 
 ### Functional
 

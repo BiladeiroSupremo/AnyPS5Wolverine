@@ -1,5 +1,6 @@
 #include <mutex>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cerrno>
 #include <cfenv>
@@ -9,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <xmmintrin.h>
 
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/SonyCrt.hpp"
@@ -163,9 +165,25 @@ long double AsinDenominator(long double t) {
     return 1.0L + t * (q[0] + t * (q[1] + t * (q[2] + t * (q[3] + t * q[4]))));
 }
 
+struct GuestFloatingPointEnvironment {
+    std::uint32_t control;
+    std::uint32_t status;
+    std::uint32_t tag;
+    unsigned char other[16];
+    std::uint32_t mxcsr;
+};
+static_assert(sizeof(GuestFloatingPointEnvironment) == 32 && offsetof(GuestFloatingPointEnvironment, mxcsr) == 28);
+
 }
 
 extern "C" {
+
+int APS5_VABI fegetenv_nid_postfix(GuestFloatingPointEnvironment* environment) {
+    if (environment == nullptr) throw std::invalid_argument("fegetenv: null environment");
+    asm volatile("fnstenv %0\n\tfldcw %0" : "+m"(*environment));
+    environment->mxcsr = _mm_getcsr();
+    return 0;
+}
 
 std::lldiv_t APS5_VABI lldiv_nid_postfix(long long numerator, long long denominator) {
     return std::lldiv(numerator, denominator);
