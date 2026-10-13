@@ -385,8 +385,8 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     Report("  r12 %016llx r13 %016llx r14 %016llx r15 %016llx\n", context->R12, context->R13, context->R14, context->R15);
     // The words each register points at, to recognise which structure a bad pointer came from.
     {
-        char indirectBuffer[16]{};
-        const bool indirectMemory = GetEnvironmentVariableA("APS5_CRASH_INDIRECT_MEMORY", indirectBuffer, sizeof(indirectBuffer)) > 0 && indirectBuffer[0] != '\0';
+        const DWORD indirectLength = GetEnvironmentVariableA("APS5_CRASH_INDIRECT_MEMORY", nullptr, 0);
+        const bool indirectMemory = indirectLength > 1;
         const std::pair<const char*, std::uint64_t> pointers[] = {{"rax", context->Rax}, {"rbx", context->Rbx}, {"rcx", context->Rcx}, {"rdx", context->Rdx}, {"rsi", context->Rsi}, {"rdi", context->Rdi}, {"r12", context->R12}, {"r13", context->R13}, {"r14", context->R14}, {"r15", context->R15}};
         for (const auto& [name, value] : pointers) {
             if (value < 0x10000 || (value & 7) != 0 || !IsReadable(value) || !IsReadable(value + 0x38)) continue;
