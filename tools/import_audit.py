@@ -103,11 +103,12 @@ def elf_program_dynamic_symbols(path, data):
     if 4 in dynamic:
         hash_offset = file_offset(dynamic[4], 8, "SysV hash table")
         buckets, chains = unpack("<II", data, hash_offset, path, "SysV hash header")
-        take(data, hash_offset, 8 + 4 * (buckets + chains), path, "SysV hash table")
+        file_offset(dynamic[4], 8 + 4 * (buckets + chains), "SysV hash table")
         symbol_count = chains
     elif 0x6ffffef5 in dynamic:
         hash_offset = file_offset(dynamic[0x6ffffef5], 16, "GNU hash header")
         buckets, first_symbol, bloom_count, _ = unpack("<IIII", data, hash_offset, path, "GNU hash header")
+        file_offset(dynamic[0x6ffffef5], 16 + bloom_count * 8 + buckets * 4, "GNU hash prefix")
         bucket_offset = hash_offset + 16 + bloom_count * 8
         bucket_data = take(data, bucket_offset, buckets * 4, path, "GNU hash buckets")
         chain_offset = bucket_offset + buckets * 4

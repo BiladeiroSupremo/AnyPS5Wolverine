@@ -336,6 +336,31 @@ class ImportAuditTests(unittest.TestCase):
         self.assertEqual(import_audit.elf_program_dynamic_symbols(Path("module.prx"), image),
                          ({"AAAAAAAAAAA"}, {"BBBBBBBBBBB"}, {"libSceA.prx"}))
 
+    def test_sectionless_hash_metadata_must_be_file_backed(self):
+        for gnu_hash in (False, True):
+            image = bytearray(build_sectionless_elf([("AAAAAAAAAAA", 1, GLOBAL_FUNCTION)], gnu_hash=gnu_hash))
+            load = list(struct.unpack_from("<IIQQQQQQ", image, 64))
+            dynamic = list(struct.unpack_from("<IIQQQQQQ", image, 120))
+            tags = dict(struct.unpack_from("<qQ", image, position)
+                        for position in range(dynamic[2], dynamic[2] + dynamic[5], 16))
+            address = tags[0x6ffffef5 if gnu_hash else 4]
+            offset = address - load[3] + load[2]
+            load[5] = load[6] = offset + (24 if gnu_hash else 8)
+            if gnu_hash:
+                struct.pack_into("<I", image, offset + 24, 0)
+            dynamic[3] += 0x1000
+            dynamic[4] = dynamic[3]
+            second = [1, 4, dynamic[2], dynamic[3], dynamic[4], dynamic[5], dynamic[5], 1]
+            table = len(image)
+            for header in (load, second, dynamic):
+                image.extend(struct.pack("<IIQQQQQQ", *header))
+            struct.pack_into("<Q", image, 32, table)
+            struct.pack_into("<H", image, 56, 3)
+            for reader in (import_audit.elf_exports, import_audit.elf_imports):
+                with self.subTest(gnu_hash=gnu_hash, reader=reader.__name__):
+                    with self.assertRaisesRegex(import_audit.AuditError, "hash"):
+                        reader(Path("unmapped-hash.prx"), image)
+
     def test_module_symbol_suffix_is_stripped(self):
         work = self.work
         exported = nid_names.compute_nid("sceRealName")
