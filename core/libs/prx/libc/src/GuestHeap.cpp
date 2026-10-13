@@ -112,7 +112,33 @@ private:
     }
 
     static void commit(void* pointer, std::size_t bytes) {
-        GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, ReadWriteProtection, bytes);
+        try {
+            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, ReadWriteProtection, bytes);
+        } catch (const std::system_error& error) {
+            abandon(pointer, bytes);
+            if (outOfMemory(error)) throw std::bad_alloc();
+            throw;
+        } catch (...) {
+            abandon(pointer, bytes);
+            throw;
+        }
+    }
+
+    static void abandon(void* pointer, std::size_t bytes) {
+        GuestArena::GuestArenaReset_nid_postfix(pointer, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(pointer, bytes);
+    }
+
+    static bool outOfMemory(const std::system_error& error) {
+#ifdef _WIN32
+        constexpr int NotEnoughMemory = 8;
+        constexpr int OutOfMemory = 14;
+        constexpr int CommitmentLimit = 1455;
+        return error.code().category() == std::system_category() &&
+            (error.code().value() == NotEnoughMemory || error.code().value() == OutOfMemory || error.code().value() == CommitmentLimit);
+#else
+        return error.code() == std::errc::not_enough_memory;
+#endif
     }
 
     // Freed large blocks stay committed and are handed out again for the same block size: the game

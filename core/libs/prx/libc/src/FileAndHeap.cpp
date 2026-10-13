@@ -494,7 +494,11 @@ void* APS5_VABI aligned_alloc_nid_postfix(size_t alignment, size_t size) {
 }
 
 void* APS5_VABI reallocalign_nid_postfix(void* ptr, size_t size, size_t alignment) {
-    return ApplicationHeapRealign_nid_no_patch(ptr, size, alignment);
+    if (size != 0 && !validAlignment(alignment)) {
+        errno = 22;
+        return nullptr;
+    }
+    return allocationOrNull([ptr, size, alignment] { return ApplicationHeapRealign_nid_no_patch(ptr, size, alignment); });
 }
 
 void* APS5_VABI calloc_nid_postfix(size_t count, size_t size) {

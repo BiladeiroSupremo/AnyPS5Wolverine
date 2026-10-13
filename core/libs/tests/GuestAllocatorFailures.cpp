@@ -1,4 +1,5 @@
 #include "prx/libc/include/ApplicationHeap.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -100,6 +101,33 @@ int main() {
             if (block[index] != 0x6b) report("realloc failure", "damaged the original block");
         }
         free_nid_postfix(block);
+    }
+
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) {
+        constexpr std::size_t beyondCommitLimit = std::size_t{300} << 30;
+        const auto freeBefore = GuestArena::GuestArenaHighestFree_nid_no_patch(beyondCommitLimit, 0x4000);
+        *__error_nid_postfix() = 0;
+        void* huge = nullptr;
+        try {
+            huge = malloc_nid_postfix(beyondCommitLimit);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "malloc(300 GiB): threw %s\n", error.what());
+            ++failures;
+        }
+        if (huge != nullptr) {
+            free_nid_postfix(huge);
+        } else if (*__error_nid_postfix() != NoMemory && failures == 0) {
+            report("malloc(300 GiB)", "returned NULL without ENOMEM");
+        }
+        if (huge == nullptr && GuestArena::GuestArenaHighestFree_nid_no_patch(beyondCommitLimit, 0x4000) != freeBefore) {
+            report("malloc(300 GiB)", "left its arena range reserved after failing");
+        }
+        void* small = malloc_nid_postfix(100);
+        if (small == nullptr) report("malloc(100) after a failed huge malloc", "returned NULL");
+        free_nid_postfix(small);
+        void* large = malloc_nid_postfix(std::size_t{1} << 20);
+        if (large == nullptr) report("malloc(1 MiB) after a failed huge malloc", "returned NULL");
+        free_nid_postfix(large);
     }
 
     void* untouched = &failures;
