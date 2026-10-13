@@ -54,6 +54,28 @@ class OpenPullRequestsTests(unittest.TestCase):
             7: {"ref": "refs/pr/7", "sha": "head-sha", "author": "contributor", "depends": set()},
         })
 
+    def test_collects_concatenated_json_pages_from_paginated_gh_output(self):
+        pull_requests = [
+            {"number": number, "user": {"login": f"author{number}"},
+             "head": {"sha": f"sha{number}"}, "body": None}
+            for number in range(1, 4)
+        ]
+        pages = [pull_requests[:2], pull_requests[2:]]
+        output = "\n".join(json.dumps(page) for page in pages)
+
+        with patch.object(pr_overlap, "REPO", "owner/project", create=True), \
+                patch.object(pr_overlap, "gh", return_value=output):
+            found = pr_overlap.open_prs("main")
+
+        self.assertEqual(set(found), {1, 2, 3})
+        self.assertEqual(found[3]["sha"], "sha3")
+
+    def test_rejects_empty_paginated_output(self):
+        with patch.object(pr_overlap, "REPO", "owner/project", create=True), \
+                patch.object(pr_overlap, "gh", return_value="  \n"):
+            with self.assertRaisesRegex(ValueError, "returned no JSON pages"):
+                pr_overlap.open_prs("main")
+
 
 class FetchTests(unittest.TestCase):
     def test_fetches_each_head_commit_the_api_reported(self):

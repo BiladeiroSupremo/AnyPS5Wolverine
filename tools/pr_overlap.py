@@ -45,7 +45,24 @@ def open_prs(base):
     query = urlencode({"state": "open", "base": base, "per_page": 100})
     out = gh("api", "--paginate", f"repos/{REPO}/pulls?{query}")
     prs = {}
-    for pr in json.loads(out):
+    decoder = json.JSONDecoder()
+    offset = 0
+    page_count = 0
+    pull_requests = []
+    while offset < len(out):
+        while offset < len(out) and out[offset].isspace():
+            offset += 1
+        if offset == len(out):
+            break
+        page, offset = decoder.raw_decode(out, offset)
+        if not isinstance(page, list):
+            raise ValueError("gh api --paginate returned a non-array page")
+        page_count += 1
+        pull_requests.extend(page)
+    if page_count == 0:
+        raise ValueError("gh api --paginate returned no JSON pages")
+
+    for pr in pull_requests:
         prs[pr["number"]] = {
             "ref": f"refs/pr/{pr['number']}",
             "sha": pr["head"]["sha"],
