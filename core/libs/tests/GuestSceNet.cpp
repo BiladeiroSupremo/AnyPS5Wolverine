@@ -64,6 +64,8 @@ int APS5_VABI sceNetResolverDestroy(int);
 int APS5_VABI sceNetResolverGetError(int, int*);
 int APS5_VABI sceNetCtlGetState(int*);
 int APS5_VABI sceNetCtlGetIfStat(NetCtlIfStat*);
+int APS5_VABI sceNetCtlRegisterCallbackV6(NetCtlCallback, void*, int*);
+int APS5_VABI sceNetCtlUnregisterCallbackV6(int);
 std::uint64_t NetCtlReadByteCounter_nid_no_patch(const char*);
 int APS5_VABI select_nid_postfix(int, void*, void*, void*, const void*);
 int APS5_VABI open_nid_postfix(const char*, int, int);
@@ -1126,6 +1128,26 @@ int main() {
         NetCtlIfStat second{};
         Require(sceNetCtlGetIfStat(&second) == 0);
         Require(second.tx_bytes >= first.tx_bytes && second.rx_bytes >= first.rx_bytes);
+    }
+    {
+        const auto dummyCallback = [](int, void*) {};
+        int cid = -1;
+        Require(sceNetCtlRegisterCallbackV6(nullptr, nullptr, &cid) == static_cast<int>(0x80412107));
+        Require(sceNetCtlRegisterCallbackV6(dummyCallback, nullptr, nullptr) == static_cast<int>(0x80412107));
+        int cids[8] = {};
+        for (int i = 0; i < 8; ++i) {
+            Require(sceNetCtlRegisterCallbackV6(dummyCallback, nullptr, &cids[i]) == 0);
+            Require(cids[i] == i);
+        }
+        Require(sceNetCtlRegisterCallbackV6(dummyCallback, nullptr, &cid) == static_cast<int>(0x80412103));
+        Require(sceNetCtlUnregisterCallbackV6(-1) == static_cast<int>(0x80412105));
+        Require(sceNetCtlUnregisterCallbackV6(8) == static_cast<int>(0x80412105));
+        Require(sceNetCtlUnregisterCallbackV6(3) == 0);
+        Require(sceNetCtlRegisterCallbackV6(dummyCallback, nullptr, &cid) == 0);
+        Require(cid == 3);
+        for (int i = 0; i < 8; ++i) {
+            Require(sceNetCtlUnregisterCallbackV6(i) == 0);
+        }
     }
     if (ipv6Unavailable) {
         std::puts("skipped the IPv6 socket checks, the host has no usable IPv6 loopback");
