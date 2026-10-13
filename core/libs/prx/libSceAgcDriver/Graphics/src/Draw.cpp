@@ -1759,7 +1759,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    if (!state.colors.empty() && TraceDrawIoTarget(state.colors[0].address) && TraceDrawIoBudget()) {
+    if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address); }) && TraceDrawIoBudget()) {
         std::string stages;
         for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
         std::fprintf(stderr, "[draw-io] recorded target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), resources.Describe().c_str());
@@ -1858,7 +1858,9 @@ bool TraceDrawIoTarget(std::uint64_t address) {
         }
         return parsed;
     }();
-    if (addresses.empty() || std::find(addresses.begin(), addresses.end(), address) == addresses.end()) return false;
+    // "*" (parsed as 0) traces every target.
+    const bool all = std::find(addresses.begin(), addresses.end(), 0ull) != addresses.end();
+    if (addresses.empty() || (!all && std::find(addresses.begin(), addresses.end(), address) == addresses.end())) return false;
     static const auto after = [] { const char* text = std::getenv("APS5_TRACE_DRAW_IO_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
     static const auto start = std::chrono::steady_clock::now();
     return std::chrono::steady_clock::now() - start >= after;
@@ -2317,7 +2319,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    if (!state.colors.empty() && TraceDrawIoTarget(state.colors[0].address) && TraceDrawIoBudget()) {
+    if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address); }) && TraceDrawIoBudget()) {
         std::string stages;
         for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
         std::fprintf(stderr, "[draw-io] target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), resources->Describe().c_str());
@@ -2507,7 +2509,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     };
     Require(!draw.indirect, "a draw recipe covers direct draws only");
     auto* recorder = Recorder::Active();
-    const bool dumpsTarget = (DumpTargetLimit() != 0 && (DumpTargetList().empty() || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return DumpTargetListed(color.address); }))) || (!state.colors.empty() && TraceDrawIoTarget(state.colors[0].address));
+    const bool dumpsTarget = (DumpTargetLimit() != 0 && (DumpTargetList().empty() || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return DumpTargetListed(color.address); }))) || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address); });
     if (!RecordDraws() || recorder == nullptr || dumpsTarget) return miss(DrawRecipeMiss::NotRecordable);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);

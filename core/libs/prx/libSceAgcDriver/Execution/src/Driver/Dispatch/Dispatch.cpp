@@ -390,7 +390,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         return list;
     }();
-    if (traceIo && (traceIoAddresses.empty() || std::find(traceIoAddresses.begin(), traceIoAddresses.end(), address & 0xfffffffffull) != traceIoAddresses.end())) {
+    // APS5_TRACE_DISPATCH_IO_AFTER=<s>: only after that many seconds (from the first dispatch).
+    static const auto traceIoStart = std::chrono::steady_clock::now();
+    static const auto traceIoAfter = [] { const char* text = std::getenv("APS5_TRACE_DISPATCH_IO_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
+    if (traceIo && std::chrono::steady_clock::now() - traceIoStart >= traceIoAfter && (traceIoAddresses.empty() || std::find(traceIoAddresses.begin(), traceIoAddresses.end(), address & 0xfffffffffull) != traceIoAddresses.end())) {
 
         std::string words;
         if (std::getenv("APS5_TRACE_DISPATCH_IO")[0] == '2') {

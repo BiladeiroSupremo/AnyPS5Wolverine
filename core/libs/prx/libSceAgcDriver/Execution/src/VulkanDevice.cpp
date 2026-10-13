@@ -3457,7 +3457,9 @@ bool TraceDispatchIo(std::uint64_t programAddress) {
         const char* text = std::getenv("APS5_TRACE_DISPATCH_IO_ADDRESS");
         return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
     }();
-    return traceIo && (only == 0 || (programAddress & 0xfffffffffull) == (only & 0xfffffffffull));
+    static const auto start = std::chrono::steady_clock::now();
+    static const auto after = [] { const char* text = std::getenv("APS5_TRACE_DISPATCH_IO_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
+    return traceIo && std::chrono::steady_clock::now() - start >= after && (only == 0 || (programAddress & 0xfffffffffull) == (only & 0xfffffffffull));
 }
 
 // Debug aid: APS5_FLUSH_AFTER_DISPATCH=<hex program>[,...] writes back (and dumps linear, as
