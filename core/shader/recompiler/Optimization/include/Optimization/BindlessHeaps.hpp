@@ -24,13 +24,14 @@ namespace ShaderRecompiler::BindlessHeaps {
 
 // After the resource set (0) and the workgroup memory set (1).
 inline constexpr std::uint32_t DescriptorSet = 2u;
-inline constexpr std::uint32_t KindCount = 3u;
+inline constexpr std::uint32_t KindCount = 4u;
 // Binding of each kind's image array; the translation and feedback buffers follow.
 inline constexpr std::uint32_t ImageBinding2D = 0u;
 inline constexpr std::uint32_t ImageBinding2DArray = 1u;
 inline constexpr std::uint32_t ImageBinding3D = 2u;
-inline constexpr std::uint32_t TranslationBinding = 3u;
-inline constexpr std::uint32_t FeedbackBinding = 4u;
+inline constexpr std::uint32_t ImageBinding1D = 3u;
+inline constexpr std::uint32_t TranslationBinding = 4u;
+inline constexpr std::uint32_t FeedbackBinding = 5u;
 inline constexpr std::uint32_t SlotsPerKind = 16384u;
 inline constexpr std::uint32_t TranslationEntries = 1u << 20u;
 inline constexpr std::uint32_t KindShift = 24u;

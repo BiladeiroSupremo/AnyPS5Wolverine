@@ -78,6 +78,14 @@ bool TolerateFailedPreparation(const char* where, const std::exception& error) {
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
     std::exception_ptr failure;
     std::string dump;
+    // APS5_DUMP_SHADERS=early writes the request before preparing it (a preparation that never
+    // returns, or takes the process down, leaves its request behind).
+    static const bool dumpEarly = [] { const char* text = std::getenv("APS5_DUMP_SHADERS"); return text != nullptr && std::string_view(text) == "early"; }();
+    if (dumpEarly) {
+        try {
+            static_cast<void>(Driver::dumpRequest(request.shader.codeAddress, request));
+        } catch (...) {}
+    }
     try {
         auto handle = ShaderRecompiler::PrepareShader(request, preparation);
         return handle;

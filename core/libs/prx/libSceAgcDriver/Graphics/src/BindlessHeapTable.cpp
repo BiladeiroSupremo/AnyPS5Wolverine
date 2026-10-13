@@ -118,7 +118,7 @@ void BindlessHeapTable::createPlaceholders() {
     for (std::uint32_t kind = 0; kind < Heaps::KindCount; kind++) {
         auto& placeholder = placeholders[kind];
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        imageInfo.imageType = kind == Heaps::ImageBinding3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+        imageInfo.imageType = kind == Heaps::ImageBinding3D ? VK_IMAGE_TYPE_3D : kind == Heaps::ImageBinding1D ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
         imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
         imageInfo.extent = {1, 1, 1};
         imageInfo.mipLevels = 1;
@@ -157,7 +157,7 @@ void BindlessHeapTable::createPlaceholders() {
 
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = placeholder.image;
-        viewInfo.viewType = kind == Heaps::ImageBinding2D ? VK_IMAGE_VIEW_TYPE_2D : kind == Heaps::ImageBinding2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_3D;
+        viewInfo.viewType = kind == Heaps::ImageBinding2D ? VK_IMAGE_VIEW_TYPE_2D : kind == Heaps::ImageBinding2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : kind == Heaps::ImageBinding1D ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_3D;
         viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
         viewInfo.subresourceRange = range;
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &placeholder.view), "vkCreateImageView bindless placeholder");
@@ -263,6 +263,7 @@ std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table,
     if (range.type == VK_IMAGE_VIEW_TYPE_2D) kind = Heaps::ImageBinding2D;
     else if (range.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY) kind = Heaps::ImageBinding2DArray;
     else if (range.type == VK_IMAGE_VIEW_TYPE_3D) kind = Heaps::ImageBinding3D;
+    else if (range.type == VK_IMAGE_VIEW_TYPE_1D) kind = Heaps::ImageBinding1D;
     // Diagnostic: APS5_TRACE_HEAP_ENTRIES=1 prints every published entry.
     static const bool traceEntries = std::getenv("APS5_TRACE_HEAP_ENTRIES") != nullptr;
     if (kind == Heaps::KindCount) {

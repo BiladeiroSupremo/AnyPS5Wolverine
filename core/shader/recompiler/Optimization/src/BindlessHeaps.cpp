@@ -40,6 +40,9 @@ void SetEnabled(bool enabled) {
 
 bool HeapEligible(bool compute, std::uint32_t dimension, bool sampled, bool depthCompare, bool r128) {
     const auto shape = static_cast<RdnaImageDimension>(dimension);
+    // Dim1D has a heap kind (ImageBinding1D) but stays ineligible: with it, PPSA03671 ends ~2-4 min
+    // in with an uncaught C++ exception (0x20474343) right after shader 0x11d1e2b900's registration
+    // module emits a 1D heap path; offline preparation of that request succeeds. Unresolved.
     const bool kind = shape == RdnaImageDimension::Dim2D || shape == RdnaImageDimension::Dim2DArray || shape == RdnaImageDimension::Dim3D;
     // Graphics stages take the heap too (every graphics pipeline layout carries the set); the
     // driver resolves their requests before the next draw or dispatch.

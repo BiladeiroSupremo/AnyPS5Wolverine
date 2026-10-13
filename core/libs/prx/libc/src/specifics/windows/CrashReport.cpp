@@ -242,6 +242,10 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// Set while the unhandled-exception filter reports an exception IsFatal does not name (an uncaught
+// C++ exception, 0x20474343, which MinGW raises through SEH and the OS ends the process on).
+thread_local bool g_forceReport = false;
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
@@ -249,7 +253,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
-    if (!IsFatal(record->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
+    if (!IsFatal(record->ExceptionCode) && !g_forceReport) return EXCEPTION_CONTINUE_SEARCH;
     if (reported.exchange(true)) {
         // Another thread is already reporting; let it finish before this fault ends the process.
         Sleep(INFINITE);
@@ -354,6 +358,14 @@ void ReportCallTrace() {
     for (std::size_t index = 0; index < counted; ++index) {
         Report("    %12llu %s %s\n", static_cast<unsigned long long>(counts[index].calls), counts[index].library, counts[index].name);
     }
+}
+
+// Second chance: an exception no frame handled (the throw site's frames are still on the stack).
+LONG WINAPI ReportUnhandled(EXCEPTION_POINTERS* info) {
+    g_forceReport = true;
+    static_cast<void>(ReportCrash(info));
+    g_forceReport = false;
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 std::size_t CaptureFrames(const CONTEXT* context, std::uint64_t* frames, std::size_t capacity) {
@@ -526,6 +538,7 @@ const bool g_crashReportInstalled = [] {
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
     AddVectoredExceptionHandler(1, ReportCrash);
+    SetUnhandledExceptionFilter(ReportUnhandled);
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
     InstallWatch();

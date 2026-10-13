@@ -226,6 +226,7 @@ std::uint32_t BindlessHeapKind(const ImageResource& image) {
     case RdnaImageDimension::Dim2D: return BindlessHeaps::ImageBinding2D;
     case RdnaImageDimension::Dim2DArray: return BindlessHeaps::ImageBinding2DArray;
     case RdnaImageDimension::Dim3D: return BindlessHeaps::ImageBinding3D;
+    case RdnaImageDimension::Dim1D: return BindlessHeaps::ImageBinding1D;
     default: FailEmit("bindless image heap: unsupported image dimension");
     }
 }

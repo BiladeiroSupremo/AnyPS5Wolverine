@@ -3,6 +3,7 @@
 #include "ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "ControlFlow/Structurizer.hpp"
+#include "Optimization/BindlessHeaps.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Recompiler.hpp"
@@ -198,6 +199,11 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--spv") {
             g_spirv = true;
+            continue;
+        }
+        // --heaps: as on a device with the bindless heap set (wide tables emit the heap path).
+        if (std::string(argv[i]) == "--heaps") {
+            ShaderRecompiler::BindlessHeaps::SetEnabled(true);
             continue;
         }
         try {

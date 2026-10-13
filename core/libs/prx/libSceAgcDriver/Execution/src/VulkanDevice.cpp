@@ -1687,6 +1687,24 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->descriptorCache = std::make_unique<Graphics::DescriptorCache>(graphicsContext());
     state->samplerCache = std::make_unique<Graphics::SamplerCache>();
     state->CreateWorkgroupMemoryLayout();
+    // An exception that escapes a thread (or a noexcept frame) ends the process through
+    // std::terminate with nothing in the log: name it first.
+    static const std::terminate_handler previousTerminate = std::set_terminate([] {
+        if (const auto current = std::current_exception()) {
+            try {
+                std::rethrow_exception(current);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "\nFATAL: std::terminate with an uncaught exception: %s\n", error.what());
+            } catch (...) {
+                std::fprintf(stderr, "\nFATAL: std::terminate with an uncaught non-standard exception\n");
+            }
+        } else {
+            std::fprintf(stderr, "\nFATAL: std::terminate without an active exception\n");
+        }
+        std::fflush(stderr);
+        if (previousTerminate != nullptr) previousTerminate();
+        std::abort();
+    });
     if (state->bindlessHeaps) {
         try {
             state->bindlessTable = std::make_unique<Graphics::BindlessHeapTable>(graphicsContext());
