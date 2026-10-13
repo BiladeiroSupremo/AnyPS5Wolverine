@@ -1,5 +1,6 @@
 import os
 import json
+import ctypes
 import stat
 import sys
 import tarfile
@@ -230,6 +231,60 @@ class ReleasePackageTests(unittest.TestCase):
                 self.assertEqual(archive.read("libs/libc.prx"), b"library bytes")
         finally:
             destination.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    def file_link(self, link, target):
+        try:
+            link.symlink_to(target)
+        except OSError as error:
+            self.skipTest(f"File symlinks unavailable: {error}")
+
+    def link_attributes(self, link, attributes):
+        setter = ctypes.WinDLL("kernel32", use_last_error=True).SetFileAttributesW
+        setter.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        setter.restype = ctypes.c_int
+        if not setter(str(link), attributes):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only symlink semantics")
+    def test_readonly_dangling_link_preserves_existing_assets(self):
+        self.output.mkdir()
+        tar = self.output / "prx-linux-v1.tar.gz"
+        binary = self.output / "relinker-v1"
+        tar.write_bytes(b"old tar")
+        binary.write_bytes(b"old executable")
+        link = self.output / "prx-linux-v1.zip"
+        self.file_link(link, "missing.zip")
+        self.link_attributes(link, stat.FILE_ATTRIBUTE_READONLY)
+        try:
+            self.assertFalse(link.exists())
+            with self.assertRaisesRegex(RuntimeError, "read-only"):
+                package_release.package("linux", self.build, self.output, "v1")
+            self.assertEqual(tar.read_bytes(), b"old tar")
+            self.assertEqual(binary.read_bytes(), b"old executable")
+            self.assertEqual(link.readlink(), Path("missing.zip"))
+            self.assertTrue(link.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+            self.assertEqual({path.name for path in self.output.iterdir()}, {tar.name, binary.name, link.name})
+        finally:
+            self.link_attributes(link, stat.FILE_ATTRIBUTE_NORMAL)
+
+    @unittest.skipUnless(os.name == "nt", "Windows link and target attributes are distinct")
+    def test_writable_link_to_readonly_target_can_be_replaced(self):
+        self.output.mkdir()
+        target = self.root / "original.zip"
+        target.write_bytes(b"original target")
+        link = self.output / "prx-linux-v1.zip"
+        self.file_link(link, target)
+        target.chmod(stat.S_IREAD)
+        try:
+            self.assertFalse(link.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+            package_release.package("linux", self.build, self.output, "v1")
+            self.assertFalse(link.is_symlink())
+            self.assertEqual(target.read_bytes(), b"original target")
+            self.assertFalse(target.stat().st_mode & stat.S_IWRITE)
+            with zipfile.ZipFile(link) as archive:
+                self.assertEqual(archive.read("libs/libc.prx"), b"library bytes")
+        finally:
+            target.chmod(stat.S_IREAD | stat.S_IWRITE)
 
     def test_invalid_tag_creates_no_assets(self):
         with self.assertRaises(ValueError):
