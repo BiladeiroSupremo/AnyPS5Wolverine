@@ -15,6 +15,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -79,7 +80,7 @@ public:
             if (candidate <= _end && bytes <= _end - candidate && candidate + bytes <= start) break;
             candidate = std::max(candidate, alignUp(end, alignment));
         }
-        if (candidate > _end || bytes > _end - candidate) throw std::runtime_error("guest address space arena exhausted");
+        if (candidate > _end || bytes > _end - candidate) throw std::bad_alloc();
         _used.emplace(candidate, candidate + bytes);
         return reinterpret_cast<void*>(candidate);
     }
