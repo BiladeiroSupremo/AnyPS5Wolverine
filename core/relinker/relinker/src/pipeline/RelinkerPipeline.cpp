@@ -108,10 +108,36 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         return false;
     };
 
-    auto getTagValue = [&](const std::int64_t tag, const char* name) -> std::uint64_t {
+    auto getTagValue = [&](const std::int64_t tag) -> std::uint64_t {
         for (const auto& t : dynTags)
             if (t.Tag == tag)
                 return t.Value;
+        const char* name = "unknown";
+        switch (tag) {
+        case DT_OS_STRTAB: name = "DT_OS_STRTAB"; break;
+        case DT_STRTAB: name = "DT_STRTAB"; break;
+        case DT_OS_STRSZ: name = "DT_OS_STRSZ"; break;
+        case DT_STRSZ: name = "DT_STRSZ"; break;
+        case DT_OS_SYMTAB: name = "DT_OS_SYMTAB"; break;
+        case DT_SYMTAB: name = "DT_SYMTAB"; break;
+        case DT_OS_SYMENT: name = "DT_OS_SYMENT"; break;
+        case DT_SYMENT: name = "DT_SYMENT"; break;
+        case DT_OS_PLTGOT: name = "DT_OS_PLTGOT"; break;
+        case DT_PLTGOT: name = "DT_PLTGOT"; break;
+        case DT_OS_PLTREL: name = "DT_OS_PLTREL"; break;
+        case DT_PLTREL: name = "DT_PLTREL"; break;
+        case DT_OS_PLTRELSZ: name = "DT_OS_PLTRELSZ"; break;
+        case DT_PLTRELSZ: name = "DT_PLTRELSZ"; break;
+        case DT_OS_JMPREL: name = "DT_OS_JMPREL"; break;
+        case DT_JMPREL: name = "DT_JMPREL"; break;
+        case DT_OS_RELA: name = "DT_OS_RELA"; break;
+        case DT_RELA: name = "DT_RELA"; break;
+        case DT_OS_RELASZ: name = "DT_OS_RELASZ"; break;
+        case DT_RELASZ: name = "DT_RELASZ"; break;
+        case DT_OS_RELAENT: name = "DT_OS_RELAENT"; break;
+        case DT_RELAENT: name = "DT_RELAENT"; break;
+        case DT_OS_SYMTABSZ: name = "DT_OS_SYMTABSZ"; break;
+        }
         std::ostringstream message;
         message << "Required dynamic tag " << name << " (0x" << std::hex << tag << ") not found";
         throw RelinkerException(message.str());
@@ -132,17 +158,17 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
 
     auto readAsOffset = [&](const std::int64_t osTag, const std::int64_t sysvTag, const char* name) -> FileByteOffset {
         if (requireExactlyOneOf(osTag, sysvTag, name)) {
-            const std::uint64_t value = getTagValue(osTag, name);
+            const std::uint64_t value = getTagValue(osTag);
             if (value > std::numeric_limits<FileByteOffset>::max() - sceTableBase)
                 throw RelinkerException(std::string("Adding PT_SCE_DYNLIBDATA base to ") + name + " overflows", value);
             return sceTableBase + value;
         }
-        return elfReader->TranslateVirtualAddress(getTagValue(sysvTag, name));
+        return elfReader->TranslateVirtualAddress(getTagValue(sysvTag));
     };
 
     auto readAsSize = [&](const std::int64_t osTag, const std::int64_t sysvTag, const char* name) -> ByteCount {
         requireExactlyOneOf(osTag, sysvTag, name);
-        return hasTag(osTag) ? getTagValue(osTag, name) : getTagValue(sysvTag, name);
+        return hasTag(osTag) ? getTagValue(osTag) : getTagValue(sysvTag);
     };
 
     const bool hasPltRelocations = hasTag(DT_OS_PLTRELSZ) || hasTag(DT_PLTRELSZ)
@@ -150,8 +176,8 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         || hasTag(DT_OS_JMPREL) || hasTag(DT_JMPREL);
     if (hasPltRelocations || hasTag(DT_OS_PLTGOT) || hasTag(DT_PLTGOT)) {
         gotVAddr = requireExactlyOneOf(DT_OS_PLTGOT, DT_PLTGOT, "DT_PLTGOT")
-            ? getTagValue(DT_OS_PLTGOT, "DT_OS_PLTGOT")
-            : getTagValue(DT_PLTGOT, "DT_PLTGOT");
+            ? getTagValue(DT_OS_PLTGOT)
+            : getTagValue(DT_PLTGOT);
     }
 
     const FileByteOffset dynStrTabOffset = readAsOffset(DT_OS_STRTAB, DT_STRTAB, "DT_STRTAB");
@@ -167,8 +193,8 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
     if (hasPltRelocations) {
         gotSize = readAsSize(DT_OS_PLTRELSZ, DT_PLTRELSZ, "DT_PLTRELSZ");
         const std::int64_t jmprelType = requireExactlyOneOf(DT_OS_PLTREL, DT_PLTREL, "DT_PLTREL")
-            ? getTagValue(DT_OS_PLTREL, "DT_OS_PLTREL")
-            : getTagValue(DT_PLTREL, "DT_PLTREL");
+            ? getTagValue(DT_OS_PLTREL)
+            : getTagValue(DT_PLTREL);
         if (jmprelType != DT_RELA)
             throw RelinkerException("Unsupported DT_PLTREL type: " + std::to_string(jmprelType) + "; expected DT_RELA (7)");
         dynJmpRelOffset = readAsOffset(DT_OS_JMPREL, DT_JMPREL, "DT_JMPREL");
@@ -402,7 +428,7 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
     }
 
     if (hasTag(DT_OS_SYMTABSZ)) {
-        const auto symbolBytes = getTagValue(DT_OS_SYMTABSZ, "DT_OS_SYMTABSZ");
+        const auto symbolBytes = getTagValue(DT_OS_SYMTABSZ);
         if (symbolBytes % symEntSize != 0 || dynSymTabOffset > raw.size() || symbolBytes > raw.size() - dynSymTabOffset)
             throw RelinkerException("Invalid executable dynamic symbol table size");
         for (ByteCount off = symEntSize; off < symbolBytes; off += symEntSize) {

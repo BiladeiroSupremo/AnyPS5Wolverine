@@ -117,7 +117,12 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
 
     if (!windows) inputProgress.Report({Domain::ProgressStage::Image, Io::Utf8Path(input.InputPath), 0, 1});
     std::vector<std::uint8_t> executableBytes;
-    executableBytes = patcher->Patch(sourceBytes, result.OriginalHeaders, result.DynamicSection, result.OriginalPltGotVaddr, options.RunPath, options.LazyBinding, options.WindowsDiagnostics, trampolines);
+    try {
+        executableBytes = patcher->Patch(sourceBytes, result.OriginalHeaders, result.DynamicSection, result.OriginalPltGotVaddr, options.RunPath, options.LazyBinding, options.WindowsDiagnostics, trampolines);
+    } catch (Domain::RelinkerException& error) {
+        if (error.InputPath.empty()) error.InputPath = Io::Utf8Path(input.InputPath);
+        throw;
+    }
 
     if (!windows) inputProgress.Report({Domain::ProgressStage::Image, Io::Utf8Path(input.InputPath), 1, 1});
     std::string diagnostics;
