@@ -119,7 +119,7 @@ export class Archive {
     const files = this.entries.filter(entry => !entry.directory);
     while (files.every(entry => entry.filename.slice(prefix.length).includes("/"))) {
       const first = files[0].filename.slice(prefix.length).split("/")[0];
-      if (["sce_sys", "sce_module"].includes(first) || !this.entries.every(entry => entry.filename === prefix || entry.filename.startsWith(prefix + first + "/"))) break;
+      if (["sce_sys", "sce_module"].includes(first) || !this.entries.every(entry => (entry.directory && prefix.startsWith(entry.filename)) || entry.filename.startsWith(prefix + first + "/"))) break;
       prefix += first + "/";
     }
     this.prefix = prefix;
