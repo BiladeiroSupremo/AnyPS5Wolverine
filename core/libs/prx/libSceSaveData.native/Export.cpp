@@ -464,7 +464,6 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     if (mount == nullptr || mount_result == nullptr || mount->dir_name == nullptr) {
         throw std::runtime_error("sceSaveDataMount3: null argument");
     }
-    std::memset(mount_result, 0, sizeof(*mount_result));
     const bool create = (mount->mount_mode & SAVE_DATA_MOUNT_MODE_CREATE) != 0;
     const bool create2 = (mount->mount_mode & SAVE_DATA_MOUNT_MODE_CREATE2) != 0;
     const bool rdonly = (mount->mount_mode & SAVE_DATA_MOUNT_MODE_RDONLY) != 0;
@@ -499,6 +498,7 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     if (slot == -1) {
         return SAVE_DATA_ERROR_MOUNT_FULL;
     }
+    std::memset(mount_result, 0, sizeof(*mount_result));
     if (create || create2) {
         std::filesystem::create_directories(real_path);
     }

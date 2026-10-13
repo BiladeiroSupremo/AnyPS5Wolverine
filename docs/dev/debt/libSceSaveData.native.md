@@ -13,4 +13,5 @@
 ### Functional
 
 - [sceSaveDataDirNameSearch2](../../../core/libs/prx/libSceSaveData.native/Export.cpp) (libSceSaveData.native) runs the same search as `sceSaveDataDirNameSearch` with the same condition and result structures, as [SharpEmu](https://github.com/sharpemu/sharpemu/blob/main/src/SharpEmu.Libs/SaveData/SaveDataExports.cs) does, its only source; what distinguishes it on the console is unknown.
+- [sceSaveDataMount3](../../../core/libs/prx/libSceSaveData.native/Export.cpp) (libSceSaveData.native) - a failed mount (BUSY, EXISTS, NOT_FOUND, MOUNT_FULL) leaves the result as it was, as shadPS4 does; not checked on hardware. Animal Well (PPSA22520) depends on it: it checks for its save with a mount it never unmounts, then saves with a second mount of the same directory, ignores its BUSY and keeps using the first mount point for `sceSaveDataPrepare`, its file and `sceSaveDataUmount2`
 
