@@ -557,6 +557,23 @@ void RequireRegisteredStages() {
     AgcDriverShutdown_nid_postfix();
 }
 
+ShaderRecompiler::RecompileResult CompileHull(const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> code, const ShaderRecompiler::TessellationConfiguration& configuration) {
+    static const std::array<std::uint32_t, 16> userData{0x1000u};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    const ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::TessellationControl, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {64, 0u, userData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, memory},
+        target,
+        ShaderRecompiler::BindingLayout{0, 0, 0, AgcDriver::Graphics::PipelinePushSlotBytes},
+        ShaderRecompiler::GraphicsCompileContext{0u, {}, std::nullopt, configuration, {reinterpret_cast<std::uintptr_t>(Indices.data()), static_cast<std::uint32_t>(Indices.size()), 2, 1}},
+    };
+    return ShaderRecompiler::Recompile(request);
+}
+
+void RequireSingleControlPointHulls(const ShaderRecompiler::SpirvTarget& target) {
+    Require(!CompileHull(target, HullSingleInput, {1u, 3u, 1u, 2u, 2u}).spirv.empty(), "a hull that reads only the one input control point of its patch was not compiled");
+}
+
 }
 
 int main() {
@@ -568,6 +585,7 @@ int main() {
             std::puts("tessellation: skipped, the device has no tessellation shaders");
             return VulkanTestSkipped;
         }
+        RequireSingleControlPointHulls(target);
         ExpectRefusal(target, ShaderStage::TessellationControl, HullUnguardedFactors, "not written by control point 0 alone");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullSquaredAddress, "not a whole number of control points");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullHalfSlotIndex, "not a whole number of control points");

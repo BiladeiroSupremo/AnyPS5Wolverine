@@ -548,7 +548,7 @@ private:
         for (auto& access : accesses) {
             if (access.kind == TessellationAttribute::LocalOutput) agree(localStride, access.address.relative, access.pc);
             if (access.kind == TessellationAttribute::ControlInput && access.address.vertex != 0) agree(localStride, access.address.vertex, access.pc);
-            if (access.kind == TessellationAttribute::ControlInput && access.address.dynamic && access.address.relative > 0 && access.address.relative % inputs == 0) agree(localStride, access.address.relative / inputs, access.pc);
+            if (access.kind == TessellationAttribute::ControlInput && (access.address.dynamic || access.address.vertex == 0) && access.address.relative > 0 && access.address.relative % inputs == 0) agree(localStride, access.address.relative / inputs, access.pc);
             if (access.kind == TessellationAttribute::ControlOutput && access.address.vertex != 0) agree(controlStride, access.address.vertex, access.pc);
             if (access.kind == TessellationAttribute::EvaluationInput) {
                 const auto end = access.address.constant + 4 * static_cast<std::int64_t>(access.components);
