@@ -278,6 +278,7 @@ int main() {
     CheckSdkVersionSysctl();
     CheckArandomSysctl();
     *__error_nid_postfix() = 13;
+    Require(sysconf_nid_postfix(3) == 128);
     Require(sysconf_nid_postfix(47) == 0x4000);
     Require(getpagesize_nid_postfix() == sysconf_nid_postfix(47));
     Require(sysconf_nid_postfix(57) > 0);
