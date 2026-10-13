@@ -39,6 +39,12 @@ class CheckSkipsTests(unittest.TestCase):
         reports = (
             f'<skipped/><system-out>skipped, {reason}</system-out>',
             f'<skipped message="{reason}"/>',
+            f'<skipped>{reason}</skipped>',
+            f'<skipped/><system-err>skipped, {reason}</system-err>',
+            f'<skipped message="{reason}">\n\n{reason}\n</skipped>'
+            f'<system-out>\n\nskipped, {reason}\n\n</system-out>'
+            f'<system-err>\nskipped, {reason}\n</system-err>',
+            f'<skipped>\n\n{reason}\n\n{reason}\n</skipped>',
         )
         with tempfile.TemporaryDirectory() as directory:
             junit = Path(directory) / "junit.xml"
@@ -51,6 +57,35 @@ class CheckSkipsTests(unittest.TestCase):
                             capture_output=True, text=True)
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                         self.assertIn("1 test(s) skipped, all expected", result.stdout)
+
+    def test_high_refresh_reason_cannot_hide_additional_diagnostics(self):
+        reason = "current display does not provide 120 Hz"
+        known = f"skipped, {reason}"
+        extra = "unexpected failure detail"
+        reports = (
+            f'<skipped/><system-out>{known}\n{extra}</system-out>',
+            f'<skipped/><system-out>{extra}\n{known}</system-out>',
+            f'<skipped/><system-err>{known}\n{extra}</system-err>',
+            f'<skipped/><system-out>{known}</system-out><system-err>{extra}</system-err>',
+            f'<skipped/><system-out>{extra}</system-out><system-err>{known}</system-err>',
+            f'<skipped message="{reason}"/><system-err>{extra}</system-err>',
+            f'<skipped>{reason}</skipped><system-out>{extra}</system-out>',
+            f'<skipped message="{reason}">{extra}</skipped>',
+            f'<skipped message="{extra}"/><system-out>{known}</system-out>',
+            f'<skipped>{reason}\n{extra}</skipped>',
+            f'<skipped/><system-out>{known}\n{known}\n{extra}</system-out>',
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            junit = Path(directory) / "junit.xml"
+            for report in reports:
+                junit.write_text(f'<testsuite><testcase name="guest_video_out_high_frame_rate">{report}</testcase></testsuite>', encoding="utf-8")
+                for job in ("linux", "windows"):
+                    with self.subTest(job=job, report=report):
+                        result = subprocess.run(
+                            [sys.executable, "-I", str(TOOL), str(junit), "--job", job],
+                            capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn("error: guest_video_out_high_frame_rate skipped", result.stdout)
 
     def test_unknown_display_reasons_stay_unexpected_in_both_jobs(self):
         reasons = (
