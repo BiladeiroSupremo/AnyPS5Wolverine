@@ -982,7 +982,16 @@ bool ResultMemo() {
     return resultMemo;
 }
 
-constexpr std::size_t ResultMemoEntries = 256;
+// Results memo'd per source. Wolverine hits it ~18% of the time at any size (most misses are new
+// buffer addresses) and a miss costs ~4 us, while 256 per source kept ~87k results alive (each with
+// its own binding table). APS5_RESULT_MEMO_ENTRIES overrides.
+std::size_t resultMemoEntries() {
+    static const std::size_t entries = [] {
+        const char* text = std::getenv("APS5_RESULT_MEMO_ENTRIES");
+        return text != nullptr ? std::max<std::size_t>(1, std::strtoull(text, nullptr, 10)) : std::size_t{32};
+    }();
+    return entries;
+}
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
@@ -1106,7 +1115,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
             source.memo.push_front({variant->artifact.variantId, hash, shared});
             source.memoIndex.emplace(index, source.memo.begin());
-            while (source.memo.size() > ResultMemoEntries) {
+            while (source.memo.size() > resultMemoEntries()) {
                 const auto& last = source.memo.back();
                 source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
                 source.memo.pop_back();

@@ -893,6 +893,21 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
         auto& totals = Profile();
         totals.storageCreate += timer.lap();
         totals.storageBytes += texture->guestBytes;
+        if (totals.storageCount % 50 == 49) {
+            // Live storage images and the host memory their CPU-side copies (original, baseline) hold.
+            std::size_t count = 0;
+            std::uint64_t copies = 0, gpu = 0;
+            {
+                auto& live = Live();
+                std::lock_guard lock(live.mutex);
+                for (const auto* image : live.textures) {
+                    ++count;
+                    copies += image->original.capacity() + image->generationBaseline.capacity();
+                    gpu += image->guestBytes;
+                }
+            }
+            std::fprintf(stderr, "[texture] live storage images: %zu (%.0f MiB of guest bytes), host copies %.0f MiB\n", count, gpu / 1048576.0, copies / 1048576.0);
+        }
         if (++totals.storageCount % 50 == 0) std::fprintf(stderr, "[texture] %llu storage images (%.0f MiB): create %.0f ms, write-back %.0f ms (alloc %.0f, host copy %.0f, gpu %.0f, store %.0f), %llu reused, %llu direct uploads, %llu direct write-backs, clears %llu recorded / %llu waited\n", static_cast<unsigned long long>(totals.storageCount), totals.storageBytes / 1048576.0, totals.storageCreate, totals.storageWriteBack, totals.storageAlloc, totals.storageHostCopy, totals.storageGpu, totals.storageStore, static_cast<unsigned long long>(totals.storageReused), static_cast<unsigned long long>(totals.storageDirectUploads), static_cast<unsigned long long>(totals.storageDirectWriteBacks), static_cast<unsigned long long>(totals.storageRecordedClears), static_cast<unsigned long long>(totals.storageWaitedClears));
     }
     return texture;

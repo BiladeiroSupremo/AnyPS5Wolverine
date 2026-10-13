@@ -37,6 +37,8 @@
 #include <unordered_set>
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
+#define XXH_INLINE_ALL
+#include "../../../../../../3rdparty/xxHash/xxhash.h"
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -99,7 +101,10 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
-    std::vector<std::byte> bytes;
+    // The snapshot's size and XXH3 hash (no snapshot: 0). Keeping the bytes themselves held a host copy
+    // of every cached texture, ~10 GB in Wolverine's opening cinematic.
+    std::uint64_t snapshotBytes = 0;
+    std::uint64_t snapshotHash = 0;
     std::shared_ptr<Texture> texture;
     // A fast-cleared surface is cached as its clear texels; it stays valid while the keys are unchanged.
     DccKeys keys = DccKeys::Uncompressed;
@@ -650,16 +655,23 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
-        } else if (source == nullptr && it->bytes.size() == guestBytes && it->keys == *keys) {
+        } else if (source == nullptr && it->snapshotBytes == guestBytes && it->keys == *keys) {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
             const auto equalsCommitted = [&] {
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                return GuestMemory::EqualsCommitted(address, it->bytes);
+                thread_local std::vector<std::byte>* scratchSlot = nullptr;
+                auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+                scratch.resize(bytes);
+                GuestMemory::ReadCommitted(address, scratch);
+                const bool same = XXH3_64bits(scratch.data(), scratch.size()) == it->snapshotHash;
+                // A big scratch is not kept per thread.
+                if (scratch.capacity() > (64u << 20u)) std::vector<std::byte>().swap(scratch);
+                return same;
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || GuestMemory::UnchangedSince(address, static_cast<std::size_t>(it->snapshotBytes), it->generation) || equalsCommitted()) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
@@ -671,7 +683,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
+    CachedTexture entry{key, address, 0, 0, nullptr, *keys, generation};
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
@@ -686,14 +698,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
-        ReadTextureSurface(resource, *keys, entry.bytes);
+        std::vector<std::byte> snapshot(bytes);
+        ReadTextureSurface(resource, *keys, snapshot);
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
-            for (std::size_t i = 0; i < entry.bytes.size(); i += 64) nonzero += entry.bytes[i] != std::byte{0};
-            std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
+            for (std::size_t i = 0; i < snapshot.size(); i += 64) nonzero += snapshot[i] != std::byte{0};
+            std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
         }
-        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        entry.snapshotBytes = snapshot.size();
+        entry.snapshotHash = XXH3_64bits(snapshot.data(), snapshot.size());
+        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
