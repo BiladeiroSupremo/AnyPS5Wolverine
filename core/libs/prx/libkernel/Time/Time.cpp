@@ -600,7 +600,7 @@ static HostZone HostZoneAt(std::int64_t utcTime) {
 }
 
 static KernelTimesec ZoneState(std::int64_t time, const HostZone& zone) {
-    return {time, static_cast<std::uint32_t>(-zone.standardEast), static_cast<std::uint32_t>(zone.daylight)};
+    return {time, static_cast<std::uint32_t>(zone.standardEast), static_cast<std::uint32_t>(zone.daylight)};
 }
 
 int APS5_VABI sceKernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) {

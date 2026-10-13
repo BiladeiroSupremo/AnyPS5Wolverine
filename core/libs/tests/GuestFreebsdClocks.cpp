@@ -261,7 +261,7 @@ static void RequireZone(const char* zone, std::int64_t utc, std::int64_t east, s
     std::int32_t universalDst = -1;
     Require(sceKernelConvertUtcToLocaltime(utc, &local, &universal, &universalDst) == SCE_OK);
     Require(local == utc + east && universalDst == daylight);
-    Require(universal.t == utc && universal.west_sec == static_cast<std::uint32_t>(daylight - east) && universal.dst_sec == static_cast<std::uint32_t>(daylight));
+    Require(universal.t == utc && universal.west_sec == static_cast<std::uint32_t>(east - daylight) && universal.dst_sec == static_cast<std::uint32_t>(daylight));
     std::int64_t converted = -1;
     KernelTimesec state{-1, 0xa5a5a5a5u, 0xa5a5a5a5u};
     std::int32_t dst = -1;
