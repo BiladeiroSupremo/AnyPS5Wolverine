@@ -60,6 +60,10 @@ static int NativeRead(int fd, void* buf, std::size_t n) {
     if (const auto compressed = CompressedFile::FindDescriptor(fd)) return static_cast<int>(CompressedFile::ReadDescriptor(*compressed, buf, n, -1));
     const int result = ::_read(fd, buf, static_cast<unsigned int>(n));
     if (result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
+    if (result == 0 && File::DirectoryDescriptorPath(fd)) {
+        errno = EISDIR;
+        return -1;
+    }
     return result;
 }
 static int NativeWrite(int fd, const void* buf, std::size_t n) {

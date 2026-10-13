@@ -192,7 +192,7 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
     }
     LARGE_INTEGER position{};
     if (::GetFileType(handle) != FILE_TYPE_DISK || !::SetFilePointerEx(handle, LARGE_INTEGER{}, &position, FILE_CURRENT)) {
-        errno = ESPIPE;
+        errno = !File::DirectoryDescriptorPath(descriptor) ? ESPIPE : write ? EBADF : EISDIR;
         return -1;
     }
     OVERLAPPED overlapped{};
@@ -1023,6 +1023,7 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* iov, int iovcnt, co
         const auto result = offset != nullptr ? NativePositioned_nid_no_patch(d, &none, 0, *offset, write) : NativeTransfer(d, &none, 0, write);
         return result < 0 ? SceErrorFromErrno(errno) : 0;
     }
+    if (!write && offset == nullptr && File::DirectoryDescriptorPath(d)) return SceErrorFromErrno(GUEST_EISDIR);
     const bool whole = write || offset != nullptr || NativeIsDisk(d);
     std::int64_t done = 0;
     for (int i = 0; i < iovcnt; ++i) {
