@@ -302,20 +302,21 @@ void _readFile(const Apr::ReadFileCommand& command) {
         timing->bytes += command.size;
     }
     std::uint64_t read = 0;
+    std::uint64_t fileBytes = 0;
     if (const auto compressed = _compressed(command.fileId, file, handle)) {
-        // The uncompressed bytes in the file, then the same short-read failure as an ordinary file.
-        read = command.offset < compressed->uncompressedBytes ? std::min<std::uint64_t>(command.size, compressed->uncompressedBytes - command.offset) : 0;
+        fileBytes = compressed->uncompressedBytes;
+        read = command.offset < fileBytes ? std::min<std::uint64_t>(command.size, fileBytes - command.offset) : 0;
         const CompressedFile::RawRead raw = [handle](std::uint64_t offset, void* target, std::size_t bytes) { return _readAt(handle, offset, static_cast<std::uint8_t*>(target), bytes) == bytes; };
         if (read != 0) CompressedFile::Read(*compressed, raw, command.offset, reinterpret_cast<void*>(command.destination), static_cast<std::size_t>(read));
     } else {
         read = _readAt(handle, command.offset, reinterpret_cast<std::uint8_t*>(command.destination), command.size);
+        if (read != command.size) fileBytes = std::filesystem::file_size(file.path);
     }
-    // The guest write closes after this (HostWrite's destructor runs before closeTimer's).
     if (timing != nullptr) closeTimer.readDone = std::chrono::steady_clock::now();
-    // Debug aid: APS5_APR_READ_DELAY_US=<us> slows every read down (load-order races).
     static const auto delay = [] { const char* text = std::getenv("APS5_APR_READ_DELAY_US"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul; }();
     if (delay != 0) PreciseSleepUs(delay);
-    if (read != command.size) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
+    if (read != command.size && command.offset + read < fileBytes) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
+    if (read != command.size) std::memset(reinterpret_cast<char*>(command.destination) + read, 0, static_cast<std::size_t>(command.size - read));
 }
 
 void _writeAddress(const Apr::WriteAddressCommand& command) {
