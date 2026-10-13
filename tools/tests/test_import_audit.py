@@ -1067,5 +1067,48 @@ class ImportAuditTests(unittest.TestCase):
         self.assertIn(f"FAIL: Permission denied: {library}", err)
 
 
+class StrictProviderTests(unittest.TestCase):
+    def test_named_provider_mismatch_is_optional_failure(self):
+        work = Workspace()
+        self.addCleanup(work.close)
+        (work.libs / "libSceExpected.prx").write_bytes(build_pe(["BBBBBBBBBBB"]))
+        (work.libs / "libSceOther.prx").write_bytes(build_pe(["AAAAAAAAAAA"]))
+        registry = work.root / "registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceExpected.prx")])
+        result = work.root / "audit.json"
+        self.assertEqual(work.run(registry)[0], 0)
+        code, out, err = work.run(registry, "--strict-providers", "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        report = json.loads(result.read_text())
+        self.assertEqual(report["library_mismatch"], 1)
+        self.assertEqual(report["imports"][0]["providers"], ["libSceOther.prx"])
+        self.assertIn("only by a library other than", out)
+
+    def test_matching_provider_passes(self):
+        work = Workspace()
+        self.addCleanup(work.close)
+        (work.libs / "libSceExpected.prx").write_bytes(build_pe(["AAAAAAAAAAA"]))
+        registry = work.root / "registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceExpected.prx")])
+        self.assertEqual(work.run(registry, "--strict-providers")[0], 0)
+
+    def test_shared_libc_provider_remains_valid(self):
+        work = Workspace()
+        self.addCleanup(work.close)
+        (work.libs / "libSceExpected.prx").write_bytes(build_pe([]))
+        (work.libs / "libc.prx").write_bytes(build_pe(["AAAAAAAAAAA"]))
+        registry = work.root / "registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceExpected.prx")])
+        self.assertEqual(work.run(registry, "--strict-providers")[0], 0)
+
+    def test_missing_provider_file_still_fails(self):
+        work = Workspace()
+        self.addCleanup(work.close)
+        (work.libs / "libc.prx").write_bytes(build_pe(["AAAAAAAAAAA"]))
+        registry = work.root / "registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceMissing.prx")])
+        self.assertEqual(work.run(registry, "--strict-providers")[0], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
