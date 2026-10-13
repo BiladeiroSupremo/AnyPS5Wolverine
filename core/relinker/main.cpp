@@ -40,7 +40,7 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     input.InputPath = std::filesystem::absolute(Io::NativePath(inputPath)).lexically_normal();
     input.OutputPath = Io::NativePath(absPath);
     if (!args.skipSceModule) {
-        auto modules = Cli::ReadModules(input.InputPath, Io::NativePath(args.sceModulePath), args.excludedSceModules, args.moduleDirectories);
+        auto modules = Cli::ReadModules(std::filesystem::absolute(Io::NativePath(args.inputPath)).lexically_normal(), Io::NativePath(args.sceModulePath), args.excludedSceModules, args.moduleDirectories);
         input.ModuleRoot = std::move(modules.Root);
         input.Modules = std::move(modules.Modules);
         input.RuntimeDirectories = std::move(modules.RuntimeDirectories);
