@@ -126,7 +126,8 @@ class Check:
         self.duplicates(exports)
         for path, lines in self.files(lambda p: p.suffix in (".py", ".cmake") or p.name == "CMakeLists.txt"):
             for number, text in lines:
-                if "#" in STRINGS.sub('""', text) and not text.startswith("#!"):
+                shebang = text.startswith("#!") or (number == 1 and text.startswith("\ufeff#!"))
+                if "#" in STRINGS.sub('""', text) and not shebang:
                     self.report("comment", path, number)
         if any(is_debt(path) for path in self.status):
             self.findings = [finding for finding in self.findings if finding[0] != "comment"]
