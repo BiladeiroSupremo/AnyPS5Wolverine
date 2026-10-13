@@ -241,6 +241,66 @@ class ImportAuditTests(unittest.TestCase):
         self.assertEqual(data["missing_libraries"], {"libSceMissing.prx": 1})
         self.assertIn("libSceMissing.prx", out)
 
+    def test_conflicting_module_files_preserve_or_leave_no_json_report(self):
+        work = self.work
+        first, second = work.modules, work.root / "other-modules"
+        second.mkdir()
+        (work.libs / "libc.prx").write_bytes(exporting())
+        (first / "main.prx").write_bytes(build_elf([
+            ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 1, GLOBAL_FUNCTION)], ["libSceMissing.prx"]))
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        code, _, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["unique_by_class"]["absent"], 1)
+        self.assertEqual(data["missing_libraries"], {"libSceMissing.prx": 1})
+        (second / "main.prx").write_bytes(exporting("CCCCCCCCCCC"))
+        previous = b'{"previous": "complete report"}\n'
+        for directories in ((first, second), (second, first)):
+            for exists in (False, True):
+                with self.subTest(directories=directories, existing_report=exists):
+                    if exists:
+                        result.write_bytes(previous)
+                    else:
+                        result.unlink(missing_ok=True)
+                    with patch.object(work, "modules", directories[0]):
+                        code, out, err = work.run(registry, "--modules", str(directories[1]), "--json", str(result))
+                    self.assertEqual((code, out), (2, ""))
+                    self.assertIn("ambiguous guest module main.prx", err)
+                    self.assertIn(str(first / "main.prx"), err)
+                    self.assertIn(str(second / "main.prx"), err)
+                    if exists:
+                        self.assertEqual(result.read_bytes(), previous)
+                    else:
+                        self.assertFalse(result.exists())
+
+    def test_identical_module_files_are_audited_once(self):
+        work = self.work
+        first, second = work.modules, work.root / "other-modules"
+        second.mkdir()
+        (work.libs / "libc.prx").write_bytes(exporting())
+        image = build_elf([
+            ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 1, GLOBAL_FUNCTION)], ["libSceMissing.prx"])
+        for directory in (first, second):
+            (directory / "main.prx").write_bytes(image)
+        (first / "consumer.prx").write_bytes(build_elf([("BBBBBBBBBBB", 0, GLOBAL_FUNCTION)]))
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        for directories in ((first, second, first), (second, first, second)):
+            with self.subTest(directories=directories), patch.object(work, "modules", directories[0]):
+                extra = [argument for directory in directories[1:] for argument in ("--modules", str(directory))]
+                code, _, err = work.run(registry, *extra, "--json", str(result))
+                self.assertEqual((code, err), (1, ""))
+                data = json.loads(result.read_text())
+                self.assertEqual((data["references"], data["unique_imports"]), (2, 2))
+                self.assertEqual(data["unique_by_class"], {"implemented": 1, "stub": 0, "absent": 1, "module": 0})
+                self.assertEqual(data["references_by_class"], data["unique_by_class"])
+                self.assertEqual(data["missing_libraries"], {"libSceMissing.prx": 1})
+                records = {record["nid"]: record for record in data["imports"]}
+                self.assertEqual((records["AAAAAAAAAAA"]["class"], records["AAAAAAAAAAA"]["references"]), ("absent", 1))
+                self.assertEqual((records["BBBBBBBBBBB"]["class"], records["BBBBBBBBBBB"]["providers"]), ("implemented", ["main.prx"]))
+
     def test_module_files_must_be_elf(self):
         work = self.work
         (work.libs / "libc.prx").write_bytes(exporting())

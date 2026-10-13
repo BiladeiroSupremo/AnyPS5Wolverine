@@ -321,9 +321,17 @@ def built_libraries(directories):
 def read_modules(directories):
     imports = {}
     exports = defaultdict(set)
+    images = {}
     for directory in directories:
         for file in directory_files(directory, "*"):
             data = file.read_bytes()
+            digest = hashlib.sha256(data).digest()
+            if file.name in images:
+                previous, fingerprint = images[file.name]
+                if digest != fingerprint:
+                    raise AuditError(f"ambiguous guest module {file.name}: {previous} and {file} have different contents")
+                continue
+            images[file.name] = (file, digest)
             own = elf_imports(file, data)
             symbols, needed = own
             imports[file.name] = (sorted(symbols), sorted(needed))
