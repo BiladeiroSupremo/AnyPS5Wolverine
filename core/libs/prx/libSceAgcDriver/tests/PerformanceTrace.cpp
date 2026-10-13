@@ -106,6 +106,27 @@ void EventsShape() {
     Check(json == expected, "trace events changed shape");
 }
 
+void BatchIds() {
+    const auto origin = Clock::now();
+    const std::vector<TraceThread::Slice> slices{{"Driver.Packet", "dispatch", origin + microseconds(10), microseconds(30), 42}};
+    const std::vector<TraceThread::Snapshot> threads{{"queue worker 0x0", slices, {}, false}};
+    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16)};
+    const auto json = TraceFormat::Events(7, origin, threads, 0, presents, 5);
+    Check(json.find("{\"name\":\"Driver.Packet.dispatch\",\"ph\":\"X\",\"ts\":10.000,\"pid\":7,\"tid\":1,\"dur\":30.000,\"args\":{\"batch\":42}}") != std::string::npos, "a slice's batch id was not written");
+    std::atomic<std::uint64_t> count{1};
+    TraceThread thread("queue worker 0x0", count, 4);
+    AgcDriver::TraceBatchTag = 9;
+    thread.Add("Driver.Packet", nullptr, origin, origin + microseconds(30));
+    AgcDriver::TraceBatchTag = 0;
+    thread.Add("Driver.Packet", nullptr, origin + milliseconds(1), origin + milliseconds(1) + microseconds(30));
+    const auto snapshot = thread.Collect();
+    Check(snapshot.slices.size() == 2 && snapshot.slices[0].batch == 9 && snapshot.slices[1].batch == 0, "a slice did not take its thread's batch id");
+    const AgcDriver::TraceClockSample first{1000.0, origin + microseconds(10)};
+    const AgcDriver::TraceClockSample last{41000.0, origin + microseconds(30)};
+    const std::vector<AgcDriver::TraceGpuRange> ranges{{"batch", 5000.0, 9000.0, 3}};
+    Check(TraceFormat::GpuSlices(ranges, first, last, origin)[0].batch == 3, "a GPU range lost its batch id");
+}
+
 void SummaryFields() {
     const auto origin = Clock::now();
     AgcDriver::TraceSummary summary;
@@ -280,6 +301,7 @@ int main() {
         FoldShortSlices();
         EscapeStrings();
         EventsShape();
+        BatchIds();
         SummaryFields();
         GpuClock();
         IntervalDue();
