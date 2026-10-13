@@ -3063,6 +3063,23 @@ std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t addres
     return containing != nullptr ? containing->weak_from_this().lock() : nullptr;
 }
 
+std::string StorageTexture::DescribePendingOverlapping(std::uint64_t address, std::uint64_t bytes) {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    std::string text;
+    std::size_t total = 0;
+    for (const auto* texture : pending.textures) {
+        ++total;
+        const auto begin = texture->descriptor.baseAddress;
+        if (!(address < begin + texture->guestBytes && begin < address + bytes)) continue;
+        char line[192];
+        std::snprintf(line, sizeof(line), "  pending 0x%llx+0x%llx %ux%u format %u tile %d mips %u\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(texture->guestBytes), texture->descriptor.width, texture->descriptor.height, texture->descriptor.format, static_cast<int>(texture->descriptor.tileMode), texture->descriptor.mipCount);
+        text += line;
+    }
+    text += "  (" + std::to_string(total) + " pending images in all)\n";
+    return text;
+}
+
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);

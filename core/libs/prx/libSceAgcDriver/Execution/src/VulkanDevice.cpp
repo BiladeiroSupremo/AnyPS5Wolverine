@@ -2680,6 +2680,13 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         }
         if (!pending) {
             ++notPending;
+            // Diagnostic (APS5_TRACE_FLIP): what is pending over a display buffer the flip found nothing for.
+            static const bool traceMiss = std::getenv("APS5_TRACE_FLIP") != nullptr;
+            static auto lastMiss = std::chrono::steady_clock::time_point{};
+            if (traceMiss && std::chrono::steady_clock::now() - lastMiss > std::chrono::seconds(10)) {
+                lastMiss = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[flip-trace] display 0x%llx (0x%llx bytes, pixel format %u) has no pending image:\n%s", static_cast<unsigned long long>(buffer.address), static_cast<unsigned long long>(bytes), static_cast<unsigned>(buffer.pixelFormat), Graphics::StorageTexture::DescribePendingOverlapping(buffer.address, bytes).c_str());
+            }
         } else if (resident == nullptr) {
             ++unsuitable;
         } else {
