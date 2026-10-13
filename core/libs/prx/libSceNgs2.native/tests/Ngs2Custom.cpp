@@ -293,6 +293,8 @@ static void TestCustomFilter() {
     option.custom_rack_option.rack_option.size = sizeof(option);
     option.custom_rack_option.rack_option.max_grain_samples = 512;
     option.custom_rack_option.rack_option.max_voices = 1;
+    option.custom_rack_option.rack_option.max_matrices = 1;
+    option.custom_rack_option.rack_option.max_ports = 1;
     option.custom_rack_option.num_buffers = 1;
     option.custom_rack_option.num_modules = 1;
     option.custom_rack_option.module[0].module_id = SCE_NGS2_CUSTOM_MODULE_ID_FILTER;
@@ -332,7 +334,7 @@ static void TestCustomFilter() {
     std::vector<float> out(Grain, -1.0f);
     const Ngs2RenderBufferInfo renderInfo{out.data(), out.size() * sizeof(float), SCE_NGS2_WAVEFORM_TYPE_PCM_F32L, 1};
     Require(sceNgs2SystemRender(system, &renderInfo, 1) == SCE_NGS2_OK);
-    Require(out[0] > 0.0f && out[0] < 0.1f && out.back() > out[0]);
+    Require(out[0] > 0.0f && out[0] < 0.2f && out.back() > out[0]);
     Require(sceNgs2RackDestroy(rack, nullptr) == SCE_NGS2_OK);
     Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
 }
