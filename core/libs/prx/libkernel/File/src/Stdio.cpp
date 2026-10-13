@@ -106,7 +106,10 @@ static int NativeFchmod(int descriptor, int mode) {
 }
 static int NativeFtruncate(int descriptor, std::int64_t length) {
     const int result = File::TruncateSharedMemory_nid_no_patch(descriptor, length);
-    return result == -2 ? static_cast<int>(::_chsize_s(descriptor, length)) : result;
+    if (result != -2) return result;
+    const auto handle = reinterpret_cast<HANDLE>(WithoutParameterHandler([descriptor] { return ::_get_osfhandle(descriptor); }));
+    if (handle != INVALID_HANDLE_VALUE && ::GetFileType(handle) != FILE_TYPE_DISK) return EINVAL;
+    return static_cast<int>(::_chsize_s(descriptor, length));
 }
 static int NativeTruncate(const std::filesystem::path& path, std::int64_t length) {
     const int descriptor = ::_wopen(path.c_str(), _O_WRONLY | _O_BINARY);

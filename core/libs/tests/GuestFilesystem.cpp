@@ -274,6 +274,20 @@ int main() {
         Require(created >= 0 && close_nid_postfix(created) == 0 && std::filesystem::file_size("creat_probe.bin") == 0);
         Require(std::filesystem::remove("creat_probe.bin"));
     }
+    {
+        int ends[2] = {-1, -1};
+        Require(pipe_nid_postfix(ends) == 0 && write_nid_postfix(ends[1], "abc", 3) == 3);
+        for (const int end : ends) {
+            Require(sceKernelFtruncate(end, 0) == static_cast<int>(0x80020016u) && sceKernelFtruncate(end, 8) == static_cast<int>(0x80020016u));
+        }
+        char kept[4]{};
+        Require(read_nid_postfix(ends[0], kept, sizeof(kept)) == 3 && std::memcmp(kept, "abc", 3) == 0);
+        Require(close_nid_postfix(ends[0]) == 0 && close_nid_postfix(ends[1]) == 0);
+        for (const char* name : {".", "/dev/urandom"}) {
+            const int opened = open_nid_postfix(name, 0, 0);
+            Require(opened >= 0 && sceKernelFtruncate(opened, 0) == static_cast<int>(0x80020016u) && close_nid_postfix(opened) == 0);
+        }
+    }
     Require(close_nid_postfix(descriptors[0]) == 0);
     auto* hostCapture = std::tmpfile();
     Require(hostCapture != nullptr && pipe_nid_postfix(descriptors) == 0);
