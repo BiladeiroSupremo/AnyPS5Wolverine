@@ -6548,6 +6548,11 @@ void Run(Context context) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
+            queuedWriteGroupTests();
+            std::cout << "queued write group tests passed\n";
+            return 0;
+        }
         std::unique_ptr<Device> created;
         try {
             created = std::make_unique<Device>();
