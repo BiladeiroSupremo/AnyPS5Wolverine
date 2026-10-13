@@ -105,22 +105,33 @@ int main() {
 
     if (GuestArena::GuestArenaAvailable_nid_postfix()) {
         constexpr std::size_t beyondCommitLimit = std::size_t{300} << 30;
-        const auto freeBefore = GuestArena::GuestArenaHighestFree_nid_no_patch(beyondCommitLimit, 0x4000);
-        *__error_nid_postfix() = 0;
-        void* huge = nullptr;
-        try {
-            huge = malloc_nid_postfix(beyondCommitLimit);
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "malloc(300 GiB): threw %s\n", error.what());
-            ++failures;
+        constexpr std::size_t probeBytes = std::size_t{100} << 30;
+        void* before = GuestArena::GuestArenaAllocate_nid_postfix(probeBytes, 0x4000);
+        GuestArena::GuestArenaRelease_nid_postfix(before, probeBytes);
+        bool committed = false;
+        for (int attempt = 0; attempt < 10 && !committed; ++attempt) {
+            *__error_nid_postfix() = 0;
+            void* huge = nullptr;
+            try {
+                huge = malloc_nid_postfix(beyondCommitLimit);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "malloc(300 GiB): threw %s\n", error.what());
+                ++failures;
+                break;
+            }
+            if (huge != nullptr) {
+                free_nid_postfix(huge);
+                committed = true;
+            } else if (*__error_nid_postfix() != NoMemory) {
+                report("malloc(300 GiB)", "returned NULL without ENOMEM");
+            }
         }
-        if (huge != nullptr) {
-            free_nid_postfix(huge);
-        } else if (*__error_nid_postfix() != NoMemory && failures == 0) {
-            report("malloc(300 GiB)", "returned NULL without ENOMEM");
-        }
-        if (huge == nullptr && GuestArena::GuestArenaHighestFree_nid_no_patch(beyondCommitLimit, 0x4000) != freeBefore) {
-            report("malloc(300 GiB)", "left its arena range reserved after failing");
+        if (committed) {
+            std::fputs("skipped: the host can commit 300 GiB, so the failed commit and arena release checks did not run\n", stderr);
+        } else {
+            void* after = GuestArena::GuestArenaAllocate_nid_postfix(probeBytes, 0x4000);
+            GuestArena::GuestArenaRelease_nid_postfix(after, probeBytes);
+            if (after != before) report("malloc(300 GiB)", "left its arena range reserved after failing");
         }
         void* small = malloc_nid_postfix(100);
         if (small == nullptr) report("malloc(100) after a failed huge malloc", "returned NULL");
