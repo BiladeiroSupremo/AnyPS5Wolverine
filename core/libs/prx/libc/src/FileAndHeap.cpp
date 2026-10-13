@@ -438,8 +438,9 @@ int APS5_VABI fflush_nid_postfix(FileStream* stream) {
 #ifdef __linux__
     if (native && !__fwriting(native)) return 0;
 #endif
-    if (std::fflush(native) != 0) throw std::runtime_error("fflush: flush failed");
-    return 0;
+    const int result = std::fflush(native);
+    if (stream) stream->SyncStatus();
+    return result;
 }
 
 int APS5_VABI malloc_stats_fast_nid_postfix(void* stats) {
