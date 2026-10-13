@@ -143,6 +143,10 @@ static void CheckPathnameSysctl() {
     const int mibTooLong[] = {1, 14, 12, -1, 0};
     Require(sysctl_nid_postfix(mibTooLong, 5, buffer, &length, nullptr, 0) == -1 && *__error_nid_postfix() == 22);
 
+    Require(sysctl_nid_postfix(mibTooShort, 3, buffer, &length, buffer, sizeof(buffer)) == -1 && *__error_nid_postfix() == 1);
+    Require(sysctl_nid_postfix(mibTooLong, 5, buffer, &length, buffer, sizeof(buffer)) == -1 && *__error_nid_postfix() == 1);
+    Require(sysctlbyname_nid_postfix("kern.proc.pathname", buffer, &length, buffer, sizeof(buffer)) == -1 && *__error_nid_postfix() == 1);
+
     const int mibSelf[] = {1, 14, 12, -1};
     length = 0;
     Require(sysctl_nid_postfix(mibSelf, 4, nullptr, &length, nullptr, 0) == 0 && length == sizeof("/app0/eboot.bin"));

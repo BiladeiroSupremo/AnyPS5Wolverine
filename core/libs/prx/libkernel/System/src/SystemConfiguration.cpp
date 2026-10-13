@@ -142,12 +142,12 @@ int APS5_VABI sysctl_nid_postfix(const int* name, std::uint32_t nameLength, void
         return CopyOut(&physmem, sizeof(physmem), oldValue, oldLength);
     }
     if (nameLength >= 3 && name[0] == 1 && name[1] == 14 && name[2] == 12) {
-        if (nameLength != 4) {
-            *__error_nid_postfix() = 22;
-            return -1;
-        }
         if (newValue != nullptr) {
             *__error_nid_postfix() = 1;
+            return -1;
+        }
+        if (nameLength != 4) {
+            *__error_nid_postfix() = 22;
             return -1;
         }
         const int pid = name[3];
@@ -188,8 +188,8 @@ int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::si
         return -1;
     }
     if (std::strcmp(name, "kern.proc.pathname") == 0) {
-        *__error_nid_postfix() = 22;
-        return -1;
+        static constexpr int mib[] = {1, 14, 12};
+        return sysctl_nid_postfix(mib, 3, oldValue, oldLength, newValue, newLength);
     }
     if (std::strcmp(name, "kern.arandom") == 0) {
         static constexpr int mib[] = {1, 37};
