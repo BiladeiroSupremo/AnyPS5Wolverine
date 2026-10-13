@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from check_conventions import STUB_BODY, SYSTEM_DEPENDENCY, Check, function_body, links, output
@@ -39,6 +40,18 @@ class FunctionBodyTests(unittest.TestCase):
         source = 'int APS5_VABI sceExample() {\nuse("// }", "/* { */");\nreturn 0;\n}'
         self.assertEqual(function_body(source.splitlines(), 0), 'use("","");return0;')
 
+    def test_raw_literal_braces_and_comments_preserve_following_statements(self):
+        source = 'int APS5_VABI sceExample() {\nuse(R"json({"brace":"}","comment":"/* hidden */"})json");\nvalidate();\nreturn 0;\n}'
+        body = function_body(source.splitlines(), 0)
+        self.assertEqual(body, 'use("");validate();return0;')
+        self.assertIsNone(STUB_BODY.fullmatch(body))
+
+    def test_raw_literal_return_keeps_a_literal_sentinel(self):
+        source = 'const char* APS5_VABI sceExample() { return R"json({"url":"https://example.test"})json"; }'
+        body = function_body(source.splitlines(), 0)
+        self.assertEqual(body, 'return"";')
+        self.assertIsNone(STUB_BODY.fullmatch(body))
+
     def test_apostrophes_in_comments_do_not_open_character_literals(self):
         source = "int APS5_VABI sceExample() {\n// don't fail here\nvalidate();\n// it's fine\nreturn 0;\n}"
         body = function_body(source.splitlines(), 0)
@@ -56,6 +69,59 @@ class FunctionBodyTests(unittest.TestCase):
     def test_unterminated_function_has_no_body(self):
         source = "int APS5_VABI sceExample() {\n// pending implementation\nreturn 0;"
         self.assertIsNone(function_body(source.splitlines(), 0))
+
+
+class RawLiteralCommentTests(unittest.TestCase):
+    path = "core/example.cpp"
+
+    def findings(self, source, added):
+        check = Check.__new__(Check)
+        check.tree = set()
+        check.status = {}
+        check.findings = []
+        lines = source.split("\n")
+        check.added = {self.path: [(number, lines[number - 1]) for number in added]}
+        with patch.object(check, "show", return_value=source), patch.object(check, "duplicates"):
+            check.code()
+        return check.findings
+
+    def test_isolated_checker_loads_its_trusted_sibling_from_another_directory(self):
+        checker = Path(__file__).resolve().parents[1] / "check_conventions.py"
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "nid_names.py").write_text('raise RuntimeError("untrusted current directory")\n', encoding="utf-8")
+            result = subprocess.run([sys.executable, "-I", str(checker), "--help"], cwd=directory, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("check a branch", result.stdout)
+
+    def test_raw_url_does_not_create_a_comment(self):
+        source = 'static const char* Metadata = R"json({"url":"https://example.test"})json";'
+        self.assertEqual(self.findings(source, [1]), [])
+
+    def test_blank_added_cpp_lines_preserve_positions(self):
+        for source, added in (("\n", [1]), ("int value;\n\n", [2])):
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source, added), [])
+
+    def test_unicode_separators_in_literals_keep_physical_lines(self):
+        for separator in ("\x85", "\u2028", "\u2029"):
+            with self.subTest(separator=separator):
+                source = f'static const char* Metadata = R"text(https://example.test/{separator}more)text";\nint value; // pending\n'
+                self.assertEqual(self.findings(source, [1, 2]), [("comment", self.path, 2, "")])
+
+    def test_added_line_inside_an_existing_multiline_raw_literal_is_not_a_comment(self):
+        source = 'static const char* Metadata = R"text(\nhttps://example.test/metadata\n)text";\n'
+        self.assertEqual(self.findings(source, [2]), [])
+
+    def test_actual_comment_after_a_raw_literal_retains_its_line(self):
+        for comment in ("// pending implementation", "/* pending implementation */"):
+            with self.subTest(comment=comment):
+                source = f'static const char* Metadata = R"text(\nhttps://example.test/metadata\n)text"; {comment}\n'
+                self.assertEqual(self.findings(source, [2, 3]), [("comment", self.path, 3, "")])
+
+    def test_quotes_and_raw_looking_text_do_not_hide_actual_comments(self):
+        for comment in ('// " R"text(https://example.test)text"', '/* " R"text(https://example.test)text" */'):
+            with self.subTest(comment=comment):
+                self.assertEqual(self.findings(comment, [1]), [("comment", self.path, 1, "")])
 
 
 class SilentStubTests(unittest.TestCase):
@@ -379,6 +445,23 @@ class RepositoryChecksTests(unittest.TestCase):
         check = Check("HEAD~1", "HEAD")
         check.code()
         self.assertIn(("comment", "core/example.cpp", 3, ""), check.findings)
+
+    def test_unicode_raw_literals_keep_git_patch_and_grep_records_intact(self):
+        literals = 'R"text(foo\u2028+tail\u2029+tail)text"'
+        fixtures = (
+            ("core/example.cpp", f"static const char* Metadata = {literals};\n"),
+            ("core/libs/prx/libSceExample/Export.cpp", f"const char* APS5_VABI sceGetLabel() {{ return {literals}; }}\n"),
+        )
+        for name, definition in fixtures:
+            with self.subTest(path=name):
+                path = self.root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(definition + "int value; // pending\n", encoding="utf-8")
+                self.commit()
+                check = Check("HEAD~1", "HEAD")
+                self.assertEqual([number for number, _ in check.added[name]], [1, 2])
+                check.code()
+                self.assertEqual(check.findings, [("comment", name, 2, "")])
 
     def test_checks_from_a_subdirectory_see_the_whole_repository(self):
         definition = "int APS5_VABI sceFooBar(int a, int b) { return a + b; }\n"
