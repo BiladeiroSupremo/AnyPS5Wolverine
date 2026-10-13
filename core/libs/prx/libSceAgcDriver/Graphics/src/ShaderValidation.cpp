@@ -286,6 +286,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 const bool isDescriptorIndexingCapability =
                     descriptorIndexing &&
                     (capability == spv::CapabilityShaderNonUniform ||
+                     capability == spv::CapabilityRuntimeDescriptorArray ||
                      capability == spv::CapabilitySampledImageArrayNonUniformIndexing ||
                      capability == spv::CapabilityStorageImageArrayNonUniformIndexing);
 

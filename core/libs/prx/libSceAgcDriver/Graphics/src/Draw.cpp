@@ -1698,9 +1698,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    // Heap keys requested by earlier work: their slots are published before this draw (ending an
-    // open pass when there is anything to publish).
-    ResolveBindlessHeapRequests(context, *recorder);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -1901,6 +1898,9 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
+    // Heap keys requested by earlier work: their slots are published before this draw, before it
+    // allocates anything (a lookup may submit the open batch; publishing ends an open pass).
+    if (context.recorder != nullptr) ResolveBindlessHeapRequests(context, *context.recorder);
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -2253,7 +2253,6 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
-    if (recorded) ResolveBindlessHeapRequests(context, *recorder);
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
     if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
@@ -2497,6 +2496,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
+    if (context.recorder != nullptr) ResolveBindlessHeapRequests(context, *context.recorder);
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
