@@ -53,6 +53,7 @@ jobs:
         id: gate
         env:
           PR_NUMBER: ${{ inputs.pr }}
+          LINUX_BUILD: ${{ inputs.linux }}
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -71,8 +72,9 @@ jobs:
                 writeWatch: touches('core/libs/tests/write_watch/', 'core/libs/tests/WriteWatch.cpp', libc, workflow),
               };
             };
-            const relinkerHosts = (full) => JSON.stringify([
-              ...(full ? [] : [{ os: 'ubuntu-latest', compiler: 'g++' }, { os: 'windows-latest', compiler: 'g++' }]),
+            const relinkerHosts = (full, linux) => JSON.stringify([
+              ...(full && linux ? [] : [{ os: 'ubuntu-latest', compiler: 'g++' }]),
+              ...(full ? [] : [{ os: 'windows-latest', compiler: 'g++' }]),
               { os: 'macos-latest', compiler: 'clang++' },
             ]);
             if (context.eventName === 'push') {
@@ -101,7 +103,7 @@ jobs:
               core.setOutput('register-context', run.registerContext);
               core.setOutput('write-watch', run.writeWatch);
               core.setOutput('full', true);
-              core.setOutput('relinker-hosts', relinkerHosts(true));
+              core.setOutput('relinker-hosts', relinkerHosts(true, true));
               await core.summary.addRaw(
                 `Building main at ${context.sha}: full builds enabled, ` +
                 `macOS relinker ${run.relinker ? 'enabled' : 'skipped'}, ` +
@@ -110,6 +112,7 @@ jobs:
               return;
             }
             const manual = context.eventName === 'workflow_dispatch';
+            const linux = process.env.LINUX_BUILD !== 'false';
             if (manual) {
               for (const username of new Set([context.actor, process.env.GITHUB_TRIGGERING_ACTOR])) {
                 const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username });
@@ -173,12 +176,12 @@ jobs:
             core.setOutput('register-context', registerContext);
             core.setOutput('write-watch', writeWatch);
             core.setOutput('full', manual);
-            core.setOutput('relinker-hosts', relinkerHosts(manual));
+            core.setOutput('relinker-hosts', relinkerHosts(manual, linux));
             const merged = pulls.map((pull) => `PR #${pull.number} at ${pull.head} merged into main at ${main.commit.sha}`);
             merged.forEach((line) => core.info(line));
             await core.summary.addRaw(
               `${merged.join(', then ')}: full builds ${manual ? 'enabled' : 'disabled'}, ` +
-              `relinker ${relinker ? (manual ? 'enabled on macOS (the full builds run the Linux and Windows relinker tests)' : 'enabled') : 'skipped: no relinker file changed or the author has no commit in main'}, ` +
+              `relinker ${relinker ? (manual ? (linux ? 'enabled on macOS (the full builds run the Linux and Windows relinker tests)' : 'enabled on Linux and macOS (the full Windows build runs the Windows relinker tests)') : 'enabled') : 'skipped: no relinker file changed or the author has no commit in main'}, ` +
               `register context tests ${registerContext ? 'enabled' : 'skipped'}, write watch tests ${writeWatch ? 'enabled' : 'skipped'}`
             ).write();
 
