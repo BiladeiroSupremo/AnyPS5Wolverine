@@ -601,6 +601,17 @@ static HostZone HostZoneAt(std::int64_t utcTime) {
 #endif
 }
 
+static std::int64_t HostDaylightAmount(std::int64_t utcTime) {
+    constexpr std::int64_t monthSeconds = 2629746;
+    for (int month = 0; month <= 11; ++month) {
+        for (const int direction : {1, -1}) {
+            const HostZone zone = HostZoneAt(utcTime + direction * month * monthSeconds);
+            if (zone.daylight != 0) return zone.daylight;
+        }
+    }
+    return 0;
+}
+
 static KernelTimesec ZoneState(std::int64_t time, const HostZone& zone) {
     return {time, static_cast<std::uint32_t>(zone.standardEast), static_cast<std::uint32_t>(zone.daylight)};
 }
@@ -623,7 +634,7 @@ int APS5_VABI sceKernelConvertLocaltimeToUtc(int64_t local_time, int64_t reserve
     const HostZone zone = HostZoneAt(local_time - guess.standardEast - guess.daylight);
     if (utc_time != nullptr) *utc_time = local_time - zone.standardEast - zone.daylight;
     if (timezone != nullptr) *timezone = ZoneState(local_time, zone);
-    if (dst_seconds != nullptr) *dst_seconds = static_cast<int32_t>(zone.daylight);
+    if (dst_seconds != nullptr) *dst_seconds = static_cast<int32_t>(HostDaylightAmount(local_time - zone.standardEast - zone.daylight));
     return 0;
 }
 
