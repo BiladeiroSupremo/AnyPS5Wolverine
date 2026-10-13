@@ -32,6 +32,18 @@
 #include <thread>
 #include <type_traits>
 
+// Entries are deflated with stb's zlib codec: SPIR-V shrinks about 3x, and a cache version runs to gigabytes.
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_NO_STDIO
+#define STBI_NO_FAILURE_STRINGS
+#include <stb_image.h>
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBI_WRITE_NO_STDIO
+#include <stb_image_write.h>
+
 namespace ShaderRecompiler {
 
 std::filesystem::path ShaderCacheDirectory() {
@@ -108,8 +120,9 @@ struct FileHeader {
     std::uint64_t payloadBytes;
     std::uint64_t keyHash;
     std::uint64_t payloadHash;
+    std::uint64_t rawPayloadBytes; // the payload's size before deflating
 };
-static_assert(sizeof(FileHeader) == 48 && std::is_trivially_copyable_v<FileHeader>);
+static_assert(sizeof(FileHeader) == 56 && std::is_trivially_copyable_v<FileHeader>);
 
 class Writer {
 public:
@@ -950,11 +963,16 @@ std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const Compile
     encodeArtifact(writer, variant.artifact);
     encodeInfo(writer, variant.info);
     encodeAllocation(writer, variant.bindings);
-    const FileHeader header{FileMagic, FormatVersion, SourceVersion(), key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
-    std::vector<std::byte> file(sizeof(header) + key.size() + payload.size());
+    int deflatedBytes = 0;
+    unsigned char* deflated = stbi_zlib_compress(reinterpret_cast<unsigned char*>(payload.data()), static_cast<int>(payload.size()), &deflatedBytes, 8);
+    if (deflated == nullptr) return {};
+    const std::span<const std::byte> stored(reinterpret_cast<const std::byte*>(deflated), static_cast<std::size_t>(deflatedBytes));
+    const FileHeader header{FileMagic, FormatVersion, SourceVersion(), key.size(), stored.size(), HashBytes(key), HashBytes(stored), payload.size()};
+    std::vector<std::byte> file(sizeof(header) + key.size() + stored.size());
     std::memcpy(file.data(), &header, sizeof(header));
     std::memcpy(file.data() + sizeof(header), key.data(), key.size());
-    std::memcpy(file.data() + sizeof(header) + key.size(), payload.data(), payload.size());
+    std::memcpy(file.data() + sizeof(header) + key.size(), stored.data(), stored.size());
+    STBIW_FREE(deflated);
     return file;
 }
 
@@ -966,10 +984,15 @@ LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byt
     const auto body = file.size() - sizeof(header);
     if (header.keyBytes > body || header.payloadBytes != body - header.keyBytes) return LoadStatus::Rejected;
     const auto storedKey = file.subspan(sizeof(header), static_cast<std::size_t>(header.keyBytes));
-    const auto payload = file.subspan(sizeof(header) + static_cast<std::size_t>(header.keyBytes));
+    const auto stored = file.subspan(sizeof(header) + static_cast<std::size_t>(header.keyBytes));
     if (HashBytes(storedKey) != header.keyHash) return LoadStatus::Rejected;
     if (storedKey.size() != key.size() || !std::equal(storedKey.begin(), storedKey.end(), key.begin())) return LoadStatus::KeyMismatch;
-    if (HashBytes(payload) != header.payloadHash) return LoadStatus::Rejected;
+    if (HashBytes(stored) != header.payloadHash) return LoadStatus::Rejected;
+    if (header.rawPayloadBytes == 0 || header.rawPayloadBytes > (1ull << 30)) return LoadStatus::Rejected;
+    std::vector<std::byte> payload(static_cast<std::size_t>(header.rawPayloadBytes));
+    const int inflated = stbi_zlib_decode_buffer(reinterpret_cast<char*>(payload.data()), static_cast<int>(payload.size()),
+                                                 reinterpret_cast<const char*>(stored.data()), static_cast<int>(stored.size()));
+    if (inflated < 0 || static_cast<std::uint64_t>(inflated) != header.rawPayloadBytes) return LoadStatus::Rejected;
     Reader reader(payload);
     CompiledVariant decoded;
     decodeArtifact(reader, decoded.artifact);

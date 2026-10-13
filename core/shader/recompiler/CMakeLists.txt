@@ -163,6 +163,9 @@ function(add_shader_recompiler target runtimeTarget)
             ${ANYPS5_GLSLANG_INCLUDE_DIRS}
     )
 
+    # stb provides the zlib codec that compresses disk cache entries.
+    target_include_directories(${target} SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/stb)
+
     target_compile_features(${target} PUBLIC cxx_std_20)
 
     set(shaderCacheGeneratedDir "${CMAKE_CURRENT_BINARY_DIR}/${target}_generated")
