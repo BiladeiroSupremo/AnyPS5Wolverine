@@ -101,12 +101,16 @@ def body_end(text, start):
 
 
 def stub_calls(text):
-    calls = {STUB}
+    helpers = {}
     for match in STUB_WRAPPER.finditer(text):
         body = text[match.end() - 1:body_end(text, match.end() - 1)]
-        if any(call.group(1) == STUB for call in CALL.finditer(body)):
-            calls.add(match.group(1))
-    return calls
+        helpers.setdefault(match.group(1), set()).update(call.group(1) for call in CALL.finditer(body))
+    calls = {STUB}
+    while True:
+        found = {name for name, targets in helpers.items() if name not in calls and targets & calls}
+        if not found:
+            return calls
+        calls |= found
 
 
 def statements(body):
