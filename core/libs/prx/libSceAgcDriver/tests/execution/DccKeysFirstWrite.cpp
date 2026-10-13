@@ -685,6 +685,11 @@ void RunSharedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
 
 int main() {
     try {
+#ifdef _WIN32
+        Require(_putenv_s("APS5_DEFERRED_WRITEBACK", "1") == 0, "cannot enable deferred write-back for the pending-image test");
+#else
+        Require(setenv("APS5_DEFERRED_WRITEBACK", "1", 1) == 0, "cannot enable deferred write-back for the pending-image test");
+#endif
         std::optional<GuestBlock> block;
         std::optional<GuestBlock> watched;
         std::optional<GuestBlock> untracked;
