@@ -1188,7 +1188,19 @@ private:
             badDword = 0;
         }
         if (!ValidateSource(descriptor, badDword)) {
-            fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
+            // A per-wave S# (a sampler table indexed through ReadFirstLane) has no sampler heap to
+            // land in yet; it samples through a default trilinear wrap S# instead of dropping the
+            // draw. APS5_STRICT_SAMPLERS keeps the rejection.
+            static const bool strict = std::getenv("APS5_STRICT_SAMPLERS") != nullptr;
+            if (expected != IrOpcode::GetSamplerResource || strict || descriptor.dwordCount != 4u) {
+                fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
+            }
+            constexpr std::array<std::uint32_t, 4> defaultSampler {0u, 0x00fff000u, 0x08500000u, 0u};
+            for (std::uint32_t dword = 0; dword < 4u; dword++) {
+                IrValue& constant = m_builder.Constant(defaultSampler[dword]);
+                handle->ReplaceArgument(dword, &constant);
+                descriptor.dwords[dword] = &constant;
+            }
         }
         source = InternSource(descriptor);
     }
