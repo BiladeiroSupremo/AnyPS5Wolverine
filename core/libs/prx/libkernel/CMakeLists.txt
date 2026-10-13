@@ -1311,6 +1311,13 @@ if(BUILD_TESTING)
         add_test(NAME guest_mutex_raise_exception COMMAND guest_mutex_raise_exception_tests)
         set_tests_properties(guest_mutex_raise_exception PROPERTIES TIMEOUT 20 ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        add_test_executable(guest_mutex_contention_tests ${LIBS_INCLUDE_DIR}/tests/GuestMutexContention.cpp)
+        target_include_directories(guest_mutex_contention_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_mutex_contention_tests PRIVATE libkernel libc)
+        configure_windows_unwind(guest_mutex_contention_tests)
+        add_test(NAME guest_mutex_contention COMMAND guest_mutex_contention_tests)
+        set_tests_properties(guest_mutex_contention PROPERTIES TIMEOUT 20 RUN_SERIAL TRUE ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_pthread_rename_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadRename.cpp)
     target_include_directories(guest_pthread_rename_tests PRIVATE ${LIBS_INCLUDE_DIR})
