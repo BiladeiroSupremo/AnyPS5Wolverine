@@ -15,7 +15,7 @@ function report(event) {
   self.postMessage({ type: "progress", ...event });
 }
 
-async function downloadLibraries(target) {
+export async function downloadLibraries(target) {
   report({ phase: "Downloading system libraries" });
   const response = await fetch("./release.json", { cache: "no-cache" });
   if (!response.ok) throw new Error(`Cannot load release manifest (${response.status})`);
@@ -23,9 +23,14 @@ async function downloadLibraries(target) {
   const asset = release.platforms[target];
   if (!asset || !/^libraries\/(windows|linux)-[a-f0-9]+\.zip$/u.test(asset.path) || !/^[a-f0-9]{64}$/u.test(asset.sha256)) throw new Error("Invalid release manifest");
   const latestResponse = await fetch("https://api.github.com/repos/boykopovar/AnyPS5/releases/latest", { headers: { Accept: "application/vnd.github+json" } });
-  if (!latestResponse.ok) throw new Error(`Cannot verify the latest release (${latestResponse.status}). Try again later.`);
-  const latest = await latestResponse.json();
-  if (latest.tag_name !== release.tag) throw new Error("A new release is being published to this site. Try again after the Pages build finishes.");
+  if (!latestResponse.ok) {
+    const rateLimited = latestResponse.status === 429 || (latestResponse.status === 403 && latestResponse.headers.get("x-ratelimit-remaining") === "0");
+    if (!rateLimited) throw new Error(`Cannot verify the latest release (${latestResponse.status}). Try again later.`);
+    report({ phase: "Downloading system libraries", message: "GitHub API rate limit reached; using the libraries published with this site." });
+  } else {
+    const latest = await latestResponse.json();
+    if (latest.tag_name !== release.tag) throw new Error("A new release is being published to this site. Try again after the Pages build finishes.");
+  }
   const download = await fetch(asset.path);
   if (!download.ok) throw new Error(`Cannot download system libraries (${download.status})`);
   const bytes = await download.arrayBuffer();
