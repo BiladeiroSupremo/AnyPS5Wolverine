@@ -803,7 +803,7 @@ static void CheckDatagramDisconnect() {
     size = name.size();
     Require(sceNetGetpeername(dissolved, name.data(), &size) == 0 && name[2] == peerAddress[2] && name[3] == peerAddress[3]);
     const std::array<std::uint8_t, 16> unspecified{16, 0};
-    Require(Failed(sceNetConnect(dissolved, unspecified.data(), unspecified.size()), 22));
+    Require(Failed(sceNetConnect(dissolved, unspecified.data(), unspecified.size()), 47));
     size = name.size();
     Require(Failed(sceNetGetpeername(dissolved, name.data(), &size), 57));
     std::array<std::uint8_t, 16> local{};
