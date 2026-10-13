@@ -256,6 +256,13 @@ public:
     static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes);
     // Diagnostic: the pending images overlapping [address, address + bytes), one per line.
     static std::string DescribePendingOverlapping(std::uint64_t address, std::uint64_t bytes);
+    // Diagnostic: writes back the pending image at `address` (if any), dumping it linear like
+    // APS5_DUMP_STORAGE does (storage_<address>_<n>.raw).
+    static void FlushAndDump(std::uint64_t address, const char* reason);
+    // Diagnostic: copies mip 0, layer 0 of the image to the host and writes it as
+    // gpu_<address>_<tag>.raw (u32 width, height, VkFormat, then rows). The caller has finished the
+    // GPU work that wrote it. False when the format's texel size is not known here.
+    bool DumpImage(const char* tag) const;
     // How a buffer fill of [address, address + bytes) (Driver.cpp's fill HLE) meets the storage
     // images alive: none of them; a whole surface (Exact) or one array layer of a surface (Layer),
     // `image` and `layer` naming it, whatever other images lie over the range (`others`, of which

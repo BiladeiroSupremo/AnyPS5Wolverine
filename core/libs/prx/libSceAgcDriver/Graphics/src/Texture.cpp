@@ -3011,7 +3011,13 @@ const StorageDumpSelector& StorageDumpSelection() {
     return selector;
 }
 
+std::atomic<bool>& DumpEveryFlush() {
+    static std::atomic<bool> every{false};
+    return every;
+}
+
 bool StorageDumpSelects(const GuestTextureResource& descriptor) {
+    if (DumpEveryFlush().load(std::memory_order_relaxed)) return true;
     const auto& selector = StorageDumpSelection();
     if (selector.address != 0) return descriptor.baseAddress == selector.address;
     return selector.width != 0 && descriptor.width == selector.width && descriptor.height == selector.height && descriptor.depthOrLastArray + 1 == selector.layers && (selector.anyFormat || descriptor.format == selector.format);
@@ -3061,6 +3067,53 @@ std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t addres
         if (containing == nullptr) containing = texture;
     }
     return containing != nullptr ? containing->weak_from_this().lock() : nullptr;
+}
+
+bool StorageTexture::DumpImage(const char* tag) const {
+    std::uint32_t texel = 0;
+    switch (storageFormat) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_UINT: texel = 1; break;
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_UINT: case VK_FORMAT_R8G8_UNORM: texel = 2; break;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: texel = 4; break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT: texel = 8; break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_UINT: texel = 16; break;
+    default: return false;
+    }
+    const auto width = descriptor.width;
+    const auto height = descriptor.height;
+    const auto bytes = static_cast<std::size_t>(width) * height * texel;
+    Buffer host(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CommandBatch batch(context);
+    const auto commands = batch.Handle();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {width, height, 1};
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_GENERAL, host.Handle(), 1, &copy);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    batch.SubmitAndWait();
+    char name[96];
+    std::snprintf(name, sizeof(name), "gpu_%llx_%s.raw", static_cast<unsigned long long>(descriptor.baseAddress), tag);
+    if (std::FILE* file = std::fopen(name, "wb")) {
+        const std::uint32_t header[3] = {width, height, static_cast<std::uint32_t>(storageFormat)};
+        std::fwrite(header, sizeof(header), 1, file);
+        std::fwrite(host.Bytes().data(), 1, bytes, file);
+        std::fclose(file);
+    }
+    return true;
+}
+
+void StorageTexture::FlushAndDump(std::uint64_t address, const char* reason) {
+    DumpEveryFlush().store(true, std::memory_order_relaxed);
+    try {
+        static_cast<void>(FlushPending(address, 1u, nullptr, reason));
+    } catch (...) {
+        DumpEveryFlush().store(false, std::memory_order_relaxed);
+        throw;
+    }
+    DumpEveryFlush().store(false, std::memory_order_relaxed);
 }
 
 std::string StorageTexture::DescribePendingOverlapping(std::uint64_t address, std::uint64_t bytes) {
@@ -4361,7 +4414,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const bool dumpSelected = StorageDumpSelects(descriptor);
     static int dumps = 0;
     std::unique_ptr<Buffer> dump;
-    if (dumpSelected && dumps < 8) {
+    static const int dumpMax = [] { const char* text = std::getenv("APS5_DUMP_STORAGE_MAX"); return text != nullptr ? std::atoi(text) : 8; }();
+    if (dumpSelected && dumps < dumpMax) {
         dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(mips[0].linearSize * arrayLayers), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {

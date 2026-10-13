@@ -1650,6 +1650,9 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     });
 }
 
+bool TraceDrawIoTarget(std::uint64_t address);
+bool TraceDrawIoBudget();
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -1756,6 +1759,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
+    if (!state.colors.empty() && TraceDrawIoTarget(state.colors[0].address) && TraceDrawIoBudget()) {
+        std::string stages;
+        for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
+        std::fprintf(stderr, "[draw-io] recorded target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), resources.Describe().c_str());
+    }
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
@@ -1814,6 +1822,52 @@ std::optional<State> maskedState(const State& state, const std::set<std::uint32_
 int DumpTargetLimit() {
     static const int dumpLimit = [] { const char* text = std::getenv("APS5_DUMP_TARGETS"); return text ? std::atoi(text) : 0; }();
     return dumpLimit;
+}
+
+// APS5_DUMP_TARGETS_ADDRESS=<hex>[,<hex>...]: the targets the dumps keep (all when unset). Listed
+// targets also leave the resident path, so they are copied out (and dumped) without making every
+// other target synchronous (APS5_NO_RESIDENT_TARGETS).
+const std::vector<std::uint64_t>& DumpTargetList() {
+    static const std::vector<std::uint64_t> addresses = [] {
+        std::vector<std::uint64_t> parsed;
+        for (const char* text = std::getenv("APS5_DUMP_TARGETS_ADDRESS"); text != nullptr && *text != '\0';) {
+            char* end = nullptr;
+            parsed.push_back(std::strtoull(text, &end, 16));
+            text = *end == ',' ? end + 1 : nullptr;
+        }
+        return parsed;
+    }();
+    return addresses;
+}
+
+bool DumpTargetListed(std::uint64_t address) {
+    const auto& list = DumpTargetList();
+    return std::find(list.begin(), list.end(), address) != list.end();
+}
+
+// Debug aid: APS5_TRACE_DRAW_IO=<hex>[,<hex>...] prints the resources of draws whose first color
+// target is listed (at most APS5_TRACE_DRAW_IO_MAX, default 40, after APS5_TRACE_DRAW_IO_AFTER
+// seconds); traced draws leave the recipe path.
+bool TraceDrawIoTarget(std::uint64_t address) {
+    static const std::vector<std::uint64_t> addresses = [] {
+        std::vector<std::uint64_t> parsed;
+        for (const char* text = std::getenv("APS5_TRACE_DRAW_IO"); text != nullptr && *text != '\0';) {
+            char* end = nullptr;
+            parsed.push_back(std::strtoull(text, &end, 16));
+            text = *end == ',' ? end + 1 : nullptr;
+        }
+        return parsed;
+    }();
+    if (addresses.empty() || std::find(addresses.begin(), addresses.end(), address) == addresses.end()) return false;
+    static const auto after = [] { const char* text = std::getenv("APS5_TRACE_DRAW_IO_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
+    static const auto start = std::chrono::steady_clock::now();
+    return std::chrono::steady_clock::now() - start >= after;
+}
+
+bool TraceDrawIoBudget() {
+    static const int max = [] { const char* text = std::getenv("APS5_TRACE_DRAW_IO_MAX"); return text ? std::atoi(text) : 40; }();
+    static std::atomic<int> printed{0};
+    return printed.fetch_add(1, std::memory_order_relaxed) < max;
 }
 
 // A draw whose targets are all resident is recorded into the device's open batch like a dispatch:
@@ -1907,7 +1961,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         timer.phase(PhaseSetup);
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
-        if ((binding.gpuTiling || (color.tileMode != ColorTileMode::Linear && context.detiler != nullptr)) && residentTargets) {
+        if ((binding.gpuTiling || (color.tileMode != ColorTileMode::Linear && context.detiler != nullptr)) && residentTargets && !(DumpTargetLimit() != 0 && DumpTargetListed(color.address))) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
             // UnchangedSince). The page walk is skipped while the worker's collect epoch lasts
@@ -2263,6 +2317,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
+    if (!state.colors.empty() && TraceDrawIoTarget(state.colors[0].address) && TraceDrawIoBudget()) {
+        std::string stages;
+        for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
+        std::fprintf(stderr, "[draw-io] target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), resources->Describe().c_str());
+    }
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
@@ -2314,12 +2373,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 // APS5_DUMP_TARGETS_SKIP=<n> leaves out each target's first n renders, and
                 // APS5_DUMP_TARGETS_ADDRESS=<hex> keeps only that target.
                 static const int skip = [] { const char* text = std::getenv("APS5_DUMP_TARGETS_SKIP"); return text ? std::atoi(text) : 0; }();
-                static const std::uint64_t only = [] { const char* text = std::getenv("APS5_DUMP_TARGETS_ADDRESS"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
+                const bool listed = DumpTargetList().empty() || DumpTargetListed(binding.color.address);
                 // APS5_DUMP_TARGETS_AFTER=<s> leaves out renders in the first s seconds of the first dump check.
                 static const auto after = [] { const char* text = std::getenv("APS5_DUMP_TARGETS_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
                 static const auto firstCheck = std::chrono::steady_clock::now();
                 static std::map<std::uint64_t, int> renders;
-                const bool wanted = (only == 0 || binding.color.address == only) && renders[binding.color.address]++ >= skip && std::chrono::steady_clock::now() - firstCheck >= after;
+                const bool wanted = listed && renders[binding.color.address]++ >= skip && std::chrono::steady_clock::now() - firstCheck >= after;
                 if (wanted && dumped[binding.color.address] < dumpLimit) {
                     binding.dump = std::make_unique<Buffer>(context, binding.linearDevice->Size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
                     CopyBuffer(context, commands, binding.linearDevice->Handle(), 0, binding.dump->Handle(), 0, binding.linearDevice->Size());
@@ -2448,7 +2507,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     };
     Require(!draw.indirect, "a draw recipe covers direct draws only");
     auto* recorder = Recorder::Active();
-    if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
+    const bool dumpsTarget = (DumpTargetLimit() != 0 && (DumpTargetList().empty() || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return DumpTargetListed(color.address); }))) || (!state.colors.empty() && TraceDrawIoTarget(state.colors[0].address));
+    if (!RecordDraws() || recorder == nullptr || dumpsTarget) return miss(DrawRecipeMiss::NotRecordable);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
     if (inputs.nothing) {

@@ -2707,11 +2707,13 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     if (static const bool traceFlip = std::getenv("APS5_TRACE_FLIP") != nullptr; traceFlip) {
         // Diagnostic: each distinct display buffer once, with how it is presented.
         static std::mutex flipMutex;
-        static std::vector<std::uint64_t> seen;
+        static std::vector<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t>> seen;
         std::lock_guard flipLock(flipMutex);
-        if (std::find(seen.begin(), seen.end(), buffer.address) == seen.end()) {
-            seen.push_back(buffer.address);
-            std::fprintf(stderr, "[flip-trace] display 0x%llx %ux%u tiling=%u dcc=0x%llx resident=%d cleared=%d\n", static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, buffer.tilingMode, static_cast<unsigned long long>(buffer.dccAddress), resident != nullptr ? 1 : 0, cleared ? 1 : 0);
+        // Each display buffer once per shape and presented image size.
+        const auto shown = std::make_tuple(buffer.address, buffer.width, buffer.height, resident != nullptr ? resident->Descriptor().width : 0u);
+        if (std::find(seen.begin(), seen.end(), shown) == seen.end()) {
+            seen.push_back(shown);
+            std::fprintf(stderr, "[flip-trace] display 0x%llx %ux%u pitch %u tiling=%u dcc=0x%llx resident=%d (%ux%u) cleared=%d\n", static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, buffer.pitchInPixel, buffer.tilingMode, static_cast<unsigned long long>(buffer.dccAddress), resident != nullptr ? 1 : 0, resident != nullptr ? resident->Descriptor().width : 0u, resident != nullptr ? resident->Descriptor().height : 0u, cleared ? 1 : 0);
         }
     }
     auto& dumps = Dumps();
@@ -3456,6 +3458,38 @@ bool TraceDispatchIo(std::uint64_t programAddress) {
         return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
     }();
     return traceIo && (only == 0 || (programAddress & 0xfffffffffull) == (only & 0xfffffffffull));
+}
+
+// Debug aid: APS5_FLUSH_AFTER_DISPATCH=<hex program>[,...] writes back (and dumps linear, as
+// storage_<address>_<n>.raw) every storage image the dispatch binds, after it was recorded:
+// APS5_FLUSH_AFTER_DISPATCH_AFTER=<s> delays it, APS5_FLUSH_AFTER_DISPATCH_TIMES=<n> (default 1)
+// repeats it. Raise APS5_DUMP_STORAGE_MAX for more than 8 dumps.
+void FlushAfterDispatch(std::uint64_t programAddress, const Graphics::ShaderResources& resources, Graphics::Recorder& recorder) {
+    static const std::vector<std::uint64_t> programs = [] {
+        std::vector<std::uint64_t> parsed;
+        for (const char* text = std::getenv("APS5_FLUSH_AFTER_DISPATCH"); text != nullptr && *text != '\0';) {
+            char* end = nullptr;
+            parsed.push_back(std::strtoull(text, &end, 16) & 0xfffffffffull);
+            text = *end == ',' ? end + 1 : nullptr;
+        }
+        return parsed;
+    }();
+    if (programs.empty() || std::find(programs.begin(), programs.end(), programAddress & 0xfffffffffull) == programs.end()) return;
+    static const auto start = std::chrono::steady_clock::now();
+    static const auto after = [] { const char* text = std::getenv("APS5_FLUSH_AFTER_DISPATCH_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
+    static const int times = [] { const char* text = std::getenv("APS5_FLUSH_AFTER_DISPATCH_TIMES"); return text ? std::atoi(text) : 1; }();
+    static std::map<std::uint64_t, int> done;
+    if (std::chrono::steady_clock::now() - start < after || done[programAddress]++ >= times) return;
+    // The dispatch was recorded into the open batch: finish it, then read the images back.
+    recorder.Sync();
+    const auto images = resources.DebugStorageImages();
+    std::fprintf(stderr, "[flush-dump] after shader 0x%llx: %zu images\n", static_cast<unsigned long long>(programAddress), images.size());
+    char tag[48];
+    std::snprintf(tag, sizeof(tag), "%llx_%d", static_cast<unsigned long long>(programAddress), done[programAddress]);
+    for (const auto& image : images) {
+        const bool dumped = image->DumpImage(tag);
+        std::fprintf(stderr, "[flush-dump]   0x%llx %ux%u format %u%s\n", static_cast<unsigned long long>(image->Descriptor().baseAddress), image->Descriptor().width, image->Descriptor().height, image->Descriptor().format, dumped ? "" : " (format not dumped)");
+    }
 }
 
 void WatchMemory(std::uint64_t programAddress) {
@@ -4500,6 +4534,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     }
     if (TraceDispatchIo(programAddress)) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
+    FlushAfterDispatch(programAddress, *resources, *state->recorder);
     WatchMemory(programAddress);
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
@@ -4636,6 +4671,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         timer.phase(PhaseSync);
     }
     if (TraceDispatchIo(programAddress)) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, hit->resources->Describe().c_str());
+    FlushAfterDispatch(programAddress, *hit->resources, *state->recorder);
     WatchMemory(programAddress);
     timer.finish(lookupsBefore, groupsText, indirect);
     if (profile) reportRecipes();

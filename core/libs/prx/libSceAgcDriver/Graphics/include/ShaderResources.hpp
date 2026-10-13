@@ -178,6 +178,8 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     // Diagnostic: the guest base addresses of the bound storage images.
     std::vector<std::uint64_t> StorageImageAddresses() const;
+    // Diagnostic: the storage images bound (written or not) and the images sampled textures view.
+    std::vector<std::shared_ptr<StorageTexture>> DebugStorageImages() const;
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
