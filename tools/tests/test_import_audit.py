@@ -165,9 +165,9 @@ class Workspace:
     def close(self):
         self._directory.cleanup()
 
-    def run(self, registry, *extra):
+    def run(self, registry, *extra, registries=()):
         out, err = io.StringIO(), io.StringIO()
-        arguments = [str(registry), "--libs", str(self.libs), "--modules", str(self.modules), "--source", str(self.source), *extra]
+        arguments = [str(registry), *map(str, registries), "--libs", str(self.libs), "--modules", str(self.modules), "--source", str(self.source), *extra]
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = import_audit.main(arguments)
         return code, out.getvalue(), err.getvalue()
@@ -760,6 +760,73 @@ class ImportAuditTests(unittest.TestCase):
         code, out, _ = work.run(registry)
         self.assertEqual(code, 1)
         self.assertIn("AAAAAAAAAAA", out)
+
+    def test_needed_library_without_imports_is_reported(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        needed = work.root / "game.needed.json"
+        needed.write_text(json.dumps(["libSceA.prx", "Party.prx", "Party.prx"]))
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["missing_libraries"], {"Party.prx": 0})
+        self.assertEqual((data["references"], data["unique_imports"]), (1, 1))
+        self.assertIn("Party.prx: 0 imports", out)
+        self.assertEqual(data["needed_libraries"], ["Party.prx", "libSceA.prx"])
+        (work.modules / "Party.prx").write_bytes(exporting())
+        self.assertEqual(work.run(registry)[0], 0)
+        (work.modules / "Party.prx").unlink()
+        (work.libs / "Party.prx").write_bytes(exporting())
+        self.assertEqual(work.run(registry)[0], 0)
+
+    def test_needed_libraries_from_empty_and_module_registries(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting())
+        registry = work.root / "game.registry.json"
+        module_registry = work.root / "game.engine.prx.guest.prx.registry.json"
+        write_registry(registry, [])
+        write_registry(module_registry, [])
+        (work.root / "game.needed.json").write_text('["Party.prx"]')
+        (work.root / "game.engine.prx.guest.prx.needed.json").write_text('["Party.prx", "libSceOther.prx"]')
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result), registries=[module_registry])
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["missing_libraries"], {"Party.prx": 0, "libSceOther.prx": 0})
+        self.assertEqual((data["references"], data["unique_imports"], data["imports"]), (0, 0, []))
+        self.assertIn("0 references, 0 unique imports", out)
+
+    def test_invalid_needed_registry_fails_instead_of_ignoring_it(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting())
+        registry = work.root / "game.registry.json"
+        write_registry(registry, [])
+        needed = work.root / "game.needed.json"
+        for text in ('{', '{}', '[42]', '[""]'):
+            with self.subTest(text=text):
+                needed.write_text(text)
+                code, out, err = work.run(registry)
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn(str(needed), err)
+
+    def test_json_output_cannot_overwrite_needed_registry(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting())
+        registry = work.root / "game.registry.json"
+        write_registry(registry, [])
+        needed = work.root / "game.needed.json"
+        needed.write_text('["Party.prx"]')
+        alias = work.root / "needed-alias.json"
+        os.link(needed, alias)
+        for output in (needed, alias):
+            with self.subTest(output=output):
+                code, out, err = work.run(registry, "--json", str(output))
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("overwrite an input", err)
+                self.assertEqual(needed.read_text(), '["Party.prx"]')
 
     def test_source_stubs(self):
         source = self.work.source

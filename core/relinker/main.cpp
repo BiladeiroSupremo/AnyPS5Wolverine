@@ -265,6 +265,7 @@ int Run(const int argc, char* argv[]) {
             checkOutputInputs(std::filesystem::absolute("windows-diagnostics-imports.txt"), "Windows import diagnostics");
 
         std::vector<std::filesystem::path> registryPaths;
+        std::vector<std::filesystem::path> neededPaths;
         if (args.writeRegistry) {
             for (const auto& executable : executables) {
                 const std::filesystem::path outFsPath = Io::NativePath(executable.OutputPath);
@@ -274,6 +275,12 @@ int Run(const int argc, char* argv[]) {
             for (const auto& artifact : guestArtifacts)
                 registryPaths.push_back(outFsPath.parent_path() / Io::NativePath(Io::Utf8Path(outFsPath.stem()) + "." + Io::Utf8Path(artifact.Path.filename()) + ".registry.json"));
             for (const auto& path : registryPaths) checkOutputInputs(path, "Registry");
+            for (const auto& path : registryPaths) {
+                auto name = Io::Utf8Path(path.filename());
+                name.resize(name.size() - std::string(".registry.json").size());
+                neededPaths.push_back(path.parent_path() / Io::NativePath(name + ".needed.json"));
+            }
+            for (const auto& path : neededPaths) checkOutputInputs(path, "Needed libraries");
         }
 
         checkOutputInputs(Io::NativePath(absPath), "Executable");
@@ -317,10 +324,14 @@ int Run(const int argc, char* argv[]) {
         }
         if (args.writeRegistry) {
             const auto registryWriter = std::make_shared<Relinker::CallRegistryWriter>();
-            for (std::size_t index = 0; index < executables.size(); ++index)
+            for (std::size_t index = 0; index < executables.size(); ++index) {
                 fileWriter.Write(Io::Utf8Path(registryPaths[index]), registryWriter->WriteCallRegistry(executables[index].Result.RegistryEntries));
-            for (std::size_t index = 0; index < guestArtifacts.size(); ++index)
+                fileWriter.Write(Io::Utf8Path(neededPaths[index]), registryWriter->WriteNeededLibraries(executables[index].Result.DynamicSection.NeededLibraries));
+            }
+            for (std::size_t index = 0; index < guestArtifacts.size(); ++index) {
                 fileWriter.Write(Io::Utf8Path(registryPaths[executables.size() + index]), registryWriter->WriteModuleImports(guestArtifacts[index].Imports));
+                fileWriter.Write(Io::Utf8Path(neededPaths[executables.size() + index]), registryWriter->WriteNeededLibraries(guestArtifacts[index].NeededLibraries));
+            }
         }
         progress.Finish();
         if (desktopEntry) std::cout << "Desktop entry: " << Io::Utf8Path(desktopEntryWriter.Write(*desktopEntry)) << '\n';
