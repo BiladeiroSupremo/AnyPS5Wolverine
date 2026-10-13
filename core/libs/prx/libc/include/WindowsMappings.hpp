@@ -104,6 +104,23 @@ public:
         }
     }
 
+    // Read-only pages that read as zeros, all views of one pagefile-backed page nothing writes: the range
+    // costs one physical page however large. A private commit would take a page for each one read (an
+    // AMM PRT range's unbacked pages, gigabytes that the GPU path imports and reads).
+    void MapZero(void* address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        if (zeroSection == nullptr) {
+            zeroSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(pageBytes), nullptr);
+            if (zeroSection == nullptr) fail("create the zero guest page");
+        }
+        const auto cursor = reinterpret_cast<std::uintptr_t>(address);
+        reset(cursor, bytes);
+        for (std::size_t done = 0; done < bytes; done += pageBytes) {
+            split(cursor + done, pageBytes);
+            if (!map(zeroSection, GetCurrentProcess(), reinterpret_cast<void*>(cursor + done), 0, pageBytes, MEM_REPLACE_PLACEHOLDER, PAGE_READONLY, nullptr, 0)) fail("map a zero guest page");
+        }
+    }
+
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
@@ -596,6 +613,7 @@ private:
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
     std::mutex mutex;
+    HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;

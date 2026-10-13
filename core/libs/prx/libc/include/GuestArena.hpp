@@ -40,6 +40,7 @@ bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_
 std::uint64_t GuestArenaCommitGeneration_nid_postfix();
 void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes, std::uint64_t generation));
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection);
+void GuestArenaMapZero_nid_postfix(void* pointer, std::size_t bytes);
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaUnmapAlias_nid_postfix(void* alias);
 #else

@@ -554,12 +554,12 @@ void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int
 #endif
 }
 
-bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len, int prot, int flags, int64_t physStart = -1) {
+bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len, int prot, int flags, int64_t physStart = -1, bool zero = false) {
     constexpr int GuestMapFixed = 0x10;
     constexpr int GuestMapNoOverwrite = 0x80;
     if (addr == nullptr || (flags & GuestMapFixed) == 0 || (flags & GuestMapNoOverwrite) != 0 || !mutation.Covers(addr, len)) return false;
     ValidateRange(addr, len, PS5_PAGE_SIZE);
-    Trace("remap fixed %p+0x%zx prot=0x%x phys=0x%llx", addr, len, prot, static_cast<long long>(physStart));
+    Trace("remap fixed %p+0x%zx prot=0x%x phys=0x%llx%s", addr, len, prot, static_cast<long long>(physStart), zero ? " (zero page)" : "");
     const auto nativeProtection = LinuxProtFromSce(prot);
     mutation.Protect(addr, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
         const auto address = reinterpret_cast<std::uintptr_t>(addr);
@@ -570,7 +570,8 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
             EraseMappings(address, address + len);
 #ifdef _WIN32
             GuestArena::GuestArenaReset_nid_postfix(addr, len);
-            if (nativeProtection != PROT_NONE) CommitArenaRange(addr, len, WinProtFromPosix(nativeProtection));
+            if (zero) GuestArena::GuestArenaMapZero_nid_postfix(addr, len);
+            else if (nativeProtection != PROT_NONE) CommitArenaRange(addr, len, WinProtFromPosix(nativeProtection));
 #else
             if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(addr, len);
@@ -868,19 +869,45 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     return 0;
 }
 
+static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool zero);
+
 int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
+    return MapAnonymous(addr, len, prot, flags, alignment, false);
+}
+
+int DoMapZero(void** addr, size_t len, int prot, int flags) {
+    // Only read-only fixed pages can share the zero page (Windows); anything else is ordinary memory.
+#ifdef _WIN32
+    const bool zero = (flags & GuestMapFixedFlag) != 0 && (LinuxProtFromSce(prot) & PROT_WRITE) == 0 && *addr != nullptr && GuestArena::GuestArenaContains_nid_postfix(*addr, len);
+#else
+    const bool zero = false;
+#endif
+    return MapAnonymous(addr, len, prot, flags, PS5_PAGE_SIZE, zero);
+}
+
+static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool zero) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
-    if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
+    if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, -1, zero)) {
         EraseReservations(*addr, len);
         RecordProtection(*addr, len, prot);
         return 0;
     }
     ReplaceFixedOverlap(mutation, *addr, len, flags);
-    void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, alignment);
+    void* mapped = MapAligned(*addr, len, zero ? PROT_NONE : LinuxProtFromSce(prot), flags, alignment);
+#ifdef _WIN32
+    if (zero) {
+        try {
+            GuestArena::GuestArenaMapZero_nid_postfix(mapped, len);
+        } catch (...) {
+            Unmap(mapped, len);
+            throw;
+        }
+    }
+#endif
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
         if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(mapped, len);
@@ -891,7 +918,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
     *addr = mapped;
     EraseReservations(mapped, len);
     RecordProtection(mapped, len, prot);
-    Trace("map anon %p+0x%zx prot=0x%x flags=0x%x", mapped, len, prot, flags);
+    Trace("map anon %p+0x%zx prot=0x%x flags=0x%x%s", mapped, len, prot, flags, zero ? " (zero page)" : "");
     return 0;
 }
 

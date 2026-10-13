@@ -33,6 +33,9 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
@@ -156,18 +159,65 @@ int _resolveForEach(const char* prefix, const char** paths, uint32_t count, uint
     return static_cast<int>(resolvedCount);
 }
 
+// Host handles of resolved files, opened on first read and kept: titles stream thousands of small
+// reads (Wolverine ~16000 at startup), and opening the file for each took ~8 ms, minutes in all.
+// Reads are positional, so the queues' workers share a handle.
+#ifdef _WIN32
+using HostFile = HANDLE;
+const HostFile NoHostFile = INVALID_HANDLE_VALUE;
+#else
+using HostFile = int;
+constexpr HostFile NoHostFile = -1;
+#endif
+std::mutex& g_handlesLock = *new std::mutex();
+std::vector<HostFile>& g_handles = *new std::vector<HostFile>();
+
+HostFile _hostFile(std::uint32_t id, const AprFile& file) {
+    std::lock_guard lock(g_handlesLock);
+    if (id < g_handles.size() && g_handles[id] != NoHostFile) return g_handles[id];
+#ifdef _WIN32
+    const HostFile handle = CreateFileW(file.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+#else
+    const HostFile handle = open(file.path.c_str(), O_RDONLY | O_CLOEXEC);
+#endif
+    if (handle == NoHostFile) throw std::runtime_error("APR: cannot open " + file.path.string());
+    if (g_handles.size() <= id) g_handles.resize(id + 1, NoHostFile);
+    g_handles[id] = handle;
+    return handle;
+}
+
+// Reads `bytes` at `offset` into `destination`; returns the bytes read (fewer at the end of the file).
+std::uint64_t _readAt(HostFile handle, std::uint64_t offset, std::uint8_t* destination, std::uint64_t bytes) {
+    std::uint64_t done = 0;
+    while (done < bytes) {
+        const auto chunk = static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes - done, 1u << 30u));
+#ifdef _WIN32
+        OVERLAPPED at{};
+        at.Offset = static_cast<DWORD>(offset + done);
+        at.OffsetHigh = static_cast<DWORD>((offset + done) >> 32u);
+        DWORD read = 0;
+        if (!ReadFile(handle, destination + done, chunk, &read, &at) && GetLastError() != ERROR_HANDLE_EOF) throw std::runtime_error("APR: ReadFile failed with error " + std::to_string(GetLastError()));
+#else
+        const auto read = pread(handle, destination + done, chunk, static_cast<off_t>(offset + done));
+        if (read < 0) throw std::runtime_error("APR: pread failed with errno " + std::to_string(errno));
+#endif
+        if (read == 0) break;
+        done += static_cast<std::uint64_t>(read);
+    }
+    return done;
+}
+
 void _readFile(const Apr::ReadFileCommand& command) {
     const auto file = _file(command.fileId);
     static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
     if (trace) std::fprintf(stderr, "[apr] read %s offset=0x%llx size=0x%llx -> 0x%llx at %.3f s\n", file.path.string().c_str(), static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination), std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
-    std::ifstream stream(file.path, std::ios::binary);
-    if (!stream) throw std::runtime_error("APR: cannot open " + file.path.string());
-    stream.seekg(static_cast<std::streamoff>(command.offset));
+    const auto handle = _hostFile(command.fileId, file);
     const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
     if (!destination.Open()) throw std::runtime_error("APR: the read destination of " + file.path.string() + " is not writable guest memory");
-    stream.read(reinterpret_cast<char*>(command.destination), static_cast<std::streamsize>(command.size));
-    if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
-    const auto read = static_cast<std::uint64_t>(stream.gcount());
+    const auto read = _readAt(handle, command.offset, reinterpret_cast<std::uint8_t*>(command.destination), command.size);
+    // Debug aid: APS5_APR_READ_DELAY_US=<us> slows every read down (load-order races).
+    static const auto delay = [] { const char* text = std::getenv("APS5_APR_READ_DELAY_US"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul; }();
+    if (delay != 0) PreciseSleepUs(delay);
     if (read != command.size) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
 }
 
@@ -426,7 +476,7 @@ void _requirePrt(AmmState& state, std::uint64_t address, std::uint64_t size) {
 void _zeroPrt(std::uint64_t address, std::uint64_t size) {
     constexpr int GpuRead = 0x10;
     void* target = reinterpret_cast<void*>(address);
-    if (DoMapAnon(&target, size, GpuRead, GuestMapFixed) != 0) throw std::runtime_error("AMM: cannot map the unbacked PRT pages");
+    if (DoMapZero(&target, size, GpuRead, GuestMapFixed) != 0) throw std::runtime_error("AMM: cannot map the unbacked PRT pages");
 }
 
 void _ammUnmap(const Apr::AmmUnmapCommand& command) {
@@ -656,7 +706,9 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
         }
         case Apr::Opcode::WriteKernelEventQueue: {
             const auto command = _read<Apr::WriteKernelEventQueueCommand>(buffer, cursor);
-            EqueueTriggerEvent_nid_postfix(static_cast<KernelEqueue>(command.equeue), static_cast<uintptr_t>(command.ident), EVFILT_AMPR, reinterpret_cast<void*>(command.data));
+            const int result = EqueueTriggerEvent_nid_postfix(static_cast<KernelEqueue>(command.equeue), static_cast<uintptr_t>(command.ident), EVFILT_AMPR, reinterpret_cast<void*>(command.data));
+            static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
+            if (result != 0 || trace) std::fprintf(stderr, "[apr] kernel event queue %p ident %llu data 0x%llx -> 0x%x\n", reinterpret_cast<void*>(command.equeue), static_cast<unsigned long long>(command.ident), static_cast<unsigned long long>(command.data), static_cast<unsigned>(result));
             break;
         }
         case Apr::Opcode::WriteAddressFromTimeCounter: {
@@ -759,6 +811,21 @@ AprQueue& _queue(bool amm) {
 }
 
 std::uint32_t _submit(const std::uint8_t* base, std::uint32_t bytes, bool amm) {
+    // APS5_TRACE_APR_OPS=1: the opcodes of each submitted buffer, with the submitting thread.
+    static const bool traceOps = std::getenv("APS5_TRACE_APR_OPS") != nullptr;
+    if (traceOps) {
+        std::string ops;
+        for (std::uint32_t cursor = 0; cursor + sizeof(Apr::CommandHeader) <= bytes;) {
+            Apr::CommandHeader header;
+            std::memcpy(&header, base + cursor, sizeof(header));
+            const auto opcode = static_cast<std::uint32_t>(header.opcode) & 0xffu;
+            ops += ' ' + std::to_string(opcode);
+            if (opcode == static_cast<std::uint32_t>(Apr::Opcode::CompactReadFileGather)) cursor += sizeof(Apr::CompactReadFileGatherCommand);
+            else if (header.bytes < sizeof(header)) break;
+            else cursor += header.bytes;
+        }
+        std::fprintf(stderr, "[apr-ops] %s thread %zx at %.4f s:%s\n", amm ? "amm" : "generic", std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffffu, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(), ops.c_str());
+    }
     auto& queue = _queue(amm);
     std::lock_guard submitLock(queue.submit);
     std::uint32_t id;
