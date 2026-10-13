@@ -82,6 +82,7 @@ constexpr int NET_EPOLL_CTL_DEL = 3;
 constexpr int NET_SOL_SOCKET = 0xFFFF;
 constexpr int NET_SO_SNDTIMEO = 0x1005;
 constexpr int NET_SO_RCVTIMEO = 0x1006;
+constexpr int NET_SO_ERROR = 0x1007;
 constexpr int NET_SO_NBIO = 0x1200;
 constexpr int NET_SO_REUSEADDR = 0x4;
 constexpr int NET_SO_BROADCAST = 0x20;
@@ -107,8 +108,8 @@ bool initialize_sockets() {
     return result == 0;
 }
 void close_socket(NativeSocket socket) { closesocket(socket); }
-int native_error() {
-    switch (WSAGetLastError()) {
+int net_error(int code) {
+    switch (code) {
         case WSAEWOULDBLOCK: return NET_EAGAIN;
         case WSAEINPROGRESS: return NET_EINPROGRESS;
         case WSAEALREADY: return NET_EALREADY;
@@ -133,6 +134,7 @@ int native_error() {
         default: return 5;
     }
 }
+int native_error() { return net_error(WSAGetLastError()); }
 #else
 using NativeSocket = int;
 using NativeLength = socklen_t;
@@ -140,8 +142,8 @@ constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
 constexpr int NATIVE_SEND_FLAGS = MSG_NOSIGNAL;
 bool initialize_sockets() { return true; }
 void close_socket(NativeSocket socket) { ::close(socket); }
-int native_error() {
-    switch (errno) {
+int net_error(int code) {
+    switch (code) {
         case EAGAIN: return NET_EAGAIN;
 #if EWOULDBLOCK != EAGAIN
         case EWOULDBLOCK: return NET_EAGAIN;
@@ -169,6 +171,7 @@ int native_error() {
         default: return 5;
     }
 }
+int native_error() { return net_error(errno); }
 #endif
 
 struct NativeSocketHandle {
@@ -244,6 +247,7 @@ struct Sock {
     bool aborted = false;
     int rcv_timeout_us = 0;
     int snd_timeout_us = 0;
+    int reported_error = 0;
 };
 
 #ifdef _WIN32
@@ -780,6 +784,7 @@ int APS5_VABI sceNetConnect(int s, const void* addr, uint32_t addrlen) {
         std::lock_guard lk(g_mutex);
         auto it = g_socks.find(s);
         if (it == g_socks.end()) return fail(NET_EBADF);
+        it->second.reported_error = 0;
         socket = it->second;
     }
     sockaddr_storage native{};
@@ -1017,6 +1022,21 @@ int APS5_VABI sceNetGetsockopt(int s, int level, int optname, void* optval, uint
         case NET_SO_NBIO: value = socket.nonblock ? 1 : 0; break;
         case NET_SO_RCVTIMEO: value = socket.rcv_timeout_us; break;
         case NET_SO_SNDTIMEO: value = socket.snd_timeout_us; break;
+        case NET_SO_ERROR: {
+            int pending = 0;
+            NativeLength size = sizeof(pending);
+            if (::getsockopt(socket.native->value, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&pending), &size) != 0)
+                return fail(native_error());
+#ifdef _WIN32
+            std::lock_guard lk(g_mutex);
+            auto it = g_socks.find(s);
+            if (it == g_socks.end()) return fail(NET_EBADF);
+            if (pending != 0 && pending == it->second.reported_error) pending = 0;
+            else if (pending != 0) it->second.reported_error = pending;
+#endif
+            value = pending == 0 ? 0 : net_error(pending);
+            break;
+        }
         default: return fail(NET_EOPNOTSUPP);
     }
     std::memcpy(optval, &value, sizeof(value));

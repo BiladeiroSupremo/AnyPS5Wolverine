@@ -734,6 +734,36 @@ static void CheckIpv6SocketsAreIpv6Only() {
     Require(sceNetSocketClose(inet) == 0);
 }
 
+static void CheckSocketError() {
+    std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    const int listener = sceNetSocket(nullptr, 2, 1, 6);
+    Require(listener >= 0 && sceNetBind_nid_postfix(listener, address.data(), address.size()) == 0 && sceNetListen(listener, 1) == 0);
+    std::uint32_t size = address.size();
+    Require(sceNetGetsockname(listener, address.data(), &size) == 0 && size == address.size());
+    const int connected = sceNetSocket(nullptr, 2, 1, 6);
+    Require(connected >= 0 && sceNetConnect(connected, address.data(), address.size()) == 0);
+    int error = -1;
+    size = sizeof(error);
+    Require(sceNetGetsockopt(connected, 0xffff, 0x1007, &error, &size) == 0 && size == sizeof(error) && error == 0);
+    for (const int descriptor : {connected, listener}) Require(sceNetSocketClose(descriptor) == 0);
+
+    const int refused = sceNetSocket(nullptr, 2, 1, 6);
+    const int nonblocking = 1;
+    Require(refused >= 0 && sceNetSetsockopt(refused, 0xffff, 0x1200, &nonblocking, sizeof(nonblocking)) == 0);
+    const int started = sceNetConnect(refused, address.data(), address.size());
+    Require(started == static_cast<int>(0x80410124) && *sceNetErrnoLoc() == 36);
+    error = 0;
+    for (int attempt = 0; attempt < 500 && error == 0; ++attempt) {
+        size = sizeof(error);
+        Require(sceNetGetsockopt(refused, 0xffff, 0x1007, &error, &size) == 0 && size == sizeof(error));
+        if (error == 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    Require(error == 61);
+    size = sizeof(error);
+    Require(sceNetGetsockopt(refused, 0xffff, 0x1007, &error, &size) == 0 && error == 0);
+    Require(sceNetSocketClose(refused) == 0);
+}
+
 int main() {
     const auto epoch = std::chrono::steady_clock::time_point{};
     Require(KernelSocketSelect::DeadlineAfter(epoch, 2, 250000) == epoch + std::chrono::milliseconds(2250));
@@ -771,6 +801,7 @@ int main() {
     Require(close_nid_postfix(closed) == 0);
     Require(Failed(sceNetSocketClose(closed), 9));
     CheckKernelTimeouts();
+    CheckSocketError();
 
     const int listener = sceNetSocket(nullptr, 2, 1, 6);
     Require(listener >= 0);
