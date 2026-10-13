@@ -559,9 +559,10 @@ int APS5_VABI sigwaitinfo_nid_postfix(const GuestSignalSet* set, void* info) {
 }
 
 int APS5_VABI sigwait_nid_postfix(const GuestSignalSet* set, int* received) {
-    if (set == nullptr || received == nullptr || !SetHasSignal(*set)) { *__error_nid_postfix() = 22; return -1; }
+    if (set == nullptr || received == nullptr || !SetHasSignal(*set)) return 22;
     int guest = 0;
-    if (WaitForPendingInSet(*set, true, nullptr, &guest) != 0) { *__error_nid_postfix() = GuestEagain; return -1; }
+    const int result = WaitForPendingInSet(*set, true, nullptr, &guest);
+    if (result != 0) return result;
     *received = guest;
     return 0;
 }

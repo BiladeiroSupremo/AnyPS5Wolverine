@@ -96,9 +96,8 @@ int main() {
     *__error_nid_postfix() = 0;
     Require(sigwaitinfo_nid_postfix(&empty, &info) == -1 && *__error_nid_postfix() == 22);
     *__error_nid_postfix() = 0;
-    Require(sigwait_nid_postfix(&empty, &taken) == -1 && *__error_nid_postfix() == 22 && taken == -1);
-    *__error_nid_postfix() = 0;
-    Require(sigwait_nid_postfix(&interrupt, nullptr) == -1 && *__error_nid_postfix() == 22);
+    Require(sigwait_nid_postfix(&empty, &taken) == 22 && *__error_nid_postfix() == 0 && taken == -1);
+    Require(sigwait_nid_postfix(&interrupt, nullptr) == 22 && *__error_nid_postfix() == 0);
     RequireUntouched(info);
     *__error_nid_postfix() = 0;
     Require(sigtimedwait_nid_postfix(&interrupt, &info, &poll) == -1 && *__error_nid_postfix() == 35);
