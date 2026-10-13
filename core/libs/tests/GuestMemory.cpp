@@ -1853,6 +1853,55 @@ static void CheckDirectMemoryBackingNeedsNoFilesystem() {
     Require(sceKernelReleaseDirectMemory(phys, page) == 0);
 }
 
+static void CheckRegularFileMapping() {
+    constexpr std::size_t page = 0x4000;
+    const auto path = std::filesystem::path("anyps5-file-mapping-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+    {
+        std::ofstream stream(path, std::ios::binary);
+        std::vector<char> seed(page * 2, 0x11);
+        std::fill(seed.begin() + page, seed.end(), 0x22);
+        stream.write(seed.data(), static_cast<std::streamsize>(seed.size()));
+    }
+    const auto byteAt = [&](int fd, std::int64_t offset) {
+        unsigned char byte = 0;
+        Require(sceKernelPread(fd, &byte, 1, offset) == 1);
+        return byte;
+    };
+    const int fd = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDWR, 0);
+    Require(fd >= 0);
+    auto* shared = static_cast<volatile unsigned char*>(mmap_nid_postfix(nullptr, page * 2, 3, 0x1, fd, 0));
+    Require(shared != reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)));
+    Require(shared[0] == 0x11 && shared[page] == 0x22);
+    shared[5] = 0x77;
+    Require(munmap_nid_postfix(const_cast<unsigned char*>(shared), page * 2) == 0);
+    Require(byteAt(fd, 5) == 0x77);
+    auto* privateCopy = static_cast<volatile unsigned char*>(mmap_nid_postfix(nullptr, page, 3, 0x2, fd, 0));
+    Require(privateCopy != reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)));
+    Require(privateCopy[5] == 0x77);
+    privateCopy[6] = 0x66;
+    Require(munmap_nid_postfix(const_cast<unsigned char*>(privateCopy), page) == 0);
+    Require(byteAt(fd, 6) == 0x11);
+    auto* second = static_cast<volatile unsigned char*>(mmap_nid_postfix(nullptr, page, 1, 0x1, fd, page));
+    Require(second != reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)) && second[0] == 0x22);
+    Require(munmap_nid_postfix(const_cast<unsigned char*>(second), page) == 0);
+    Require(sceKernelClose(fd) == 0);
+    const int readOnly = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Require(readOnly >= 0);
+    *__error_nid_postfix() = 0;
+    Require(mmap_nid_postfix(nullptr, page, 3, 0x1, readOnly, 0) == reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)) && *__error_nid_postfix() == 13);
+    auto* readable = static_cast<volatile unsigned char*>(mmap_nid_postfix(nullptr, page, 1, 0x1, readOnly, 0));
+    Require(readable != reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)) && readable[5] == 0x77);
+    Require(munmap_nid_postfix(const_cast<unsigned char*>(readable), page) == 0);
+    Require(sceKernelClose(readOnly) == 0);
+    int ends[2] = {-1, -1};
+    Require(pipe(ends) == 0);
+    *__error_nid_postfix() = 0;
+    Require(mmap_nid_postfix(nullptr, page, 1, 0x1, ends[0], 0) == reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)) && *__error_nid_postfix() == 45);
+    close(ends[0]);
+    close(ends[1]);
+    std::filesystem::remove(path);
+}
+
 static void CheckDirectMemorySharedBacking() {
     constexpr std::size_t page = 0x4000;
     std::int64_t phys = 0;
@@ -2279,6 +2328,7 @@ int main() {
     CheckDirectMemorySharedBacking();
     CheckVirtualQueryFindsNeighbours();
     CheckReleaseFindsEveryDirectMapping();
+    CheckRegularFileMapping();
 #endif
     constexpr std::size_t page = 0x4000;
     const auto failed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));
