@@ -490,6 +490,12 @@ bool IsPipe(int descriptor, short events) {
 #endif
 }
 
+#ifdef _WIN32
+bool GuestSockets::PipeReady(int descriptor, short events, short& revents) {
+    return PipeReadiness(descriptor, events, revents);
+}
+#endif
+
 int GuestSockets::Duplicate(int descriptor) {
     std::lock_guard lock(socketsMutex);
     const auto found = sockets.find(descriptor);
