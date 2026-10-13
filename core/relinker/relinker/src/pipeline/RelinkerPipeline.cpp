@@ -16,6 +16,12 @@ namespace Relinker {
 
 using namespace Elfpatcher;
 
+namespace {
+
+constexpr std::uint16_t kEtRel = 1;
+
+}
+
 RelinkerPipeline::RelinkerPipeline(std::shared_ptr<IElfReader> elfReader, std::shared_ptr<ISyscallScanner> syscallScanner, std::shared_ptr<ICallSiteResolver> callSiteResolver, std::shared_ptr<IValidationPolicy> validationPolicy, std::shared_ptr<ISysVDynamicSectionBuilder> dynamicSectionBuilder, std::shared_ptr<IUnusedNidFilter> unusedNidFilter, std::uint32_t unusedFilterLevel, Domain::IProgress& progress)
     : elfReader(std::move(elfReader))
     , syscallScanner(std::move(syscallScanner))
@@ -45,6 +51,9 @@ std::string RelinkerPipeline::relocationTypeName(std::uint32_t type) {
 }
 
 RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf) {
+    if (elfReader->ReadHeader().Type == kEtRel)
+        throw RelinkerException("ET_REL relocatable inputs are not supported");
+
     auto programHeaders = elfReader->ReadProgramHeaders();
 
     std::vector<std::uint8_t> textSection;
