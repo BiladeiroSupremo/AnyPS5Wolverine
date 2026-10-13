@@ -3584,6 +3584,15 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     if (writes.empty()) return CachedTable{space->serial, &space->ranges};
     if (writeTableRanges != nullptr) return CachedTable{writeTableSerial, writeTableRanges.get()};
+    const auto& spaceRanges = space->ranges;
+    const bool inWritable = std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
+        auto at = std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const auto& range) { return range.end <= written.first; });
+        for (; at != spaceRanges.end() && at->begin < written.second; ++at) {
+            if ((at->permissions & ShaderRecompiler::BdaAbi::Write) == 0u) return false;
+        }
+        return true;
+    });
+    if (inWritable) return CachedTable{space->serial, &space->ranges};
     std::lock_guard lock(space->tableMutex);
     const auto found = space->writeTables.find(writes);
     if (found != space->writeTables.end()) {

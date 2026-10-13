@@ -119,6 +119,59 @@ void importSpanTests(const Context& context) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void spaceWritableWritesTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) return;
+    constexpr std::size_t piece = 65536;
+    auto* writable = static_cast<std::uint8_t*>(::operator new(piece, std::align_val_t{piece}));
+    auto* readOnly = static_cast<std::uint8_t*>(::operator new(piece, std::align_val_t{piece}));
+    std::memset(writable, 0x11, piece);
+    std::memset(readOnly, 0x22, piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::uint8_t* range, bool add, bool canWrite) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, canWrite, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(writable, true, true);
+    change(readOnly, true, false);
+    const auto same = [](const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const std::vector<ShaderRecompiler::BdaAbi::Range>& right) {
+        return left.size() == right.size() && (left.empty() || std::memcmp(left.data(), right.data(), left.size() * sizeof(left.front())) == 0);
+    };
+    struct Built {
+        std::uint64_t serial;
+        std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    };
+    const auto build = [&](std::initializer_list<std::pair<std::size_t, std::size_t>> written, const char* step) {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        for (const auto& [offset, bytes] : written) leased.AddWritable(reinterpret_cast<std::uintptr_t>(writable) + offset, bytes);
+        leased.Upload(true);
+        const auto cached = leased.CachedAddressTable();
+        Require(cached.has_value() && cached->ranges != nullptr, std::string("a build of the space alone has no cached table: ") + step);
+        Built result{cached->serial, leased.AddressRanges()};
+        Require(same(*cached->ranges, result.ranges), std::string("the cached table differs from AddressRanges(): ") + step);
+        leased.WriteBack();
+        return result;
+    };
+    const auto plain = build({}, "no writes");
+    const auto once = build({{256, 512}}, "one write in a writable import");
+    const auto twice = build({{4096, 64}, {8192, 128}}, "two writes in a writable import");
+    Require(once.serial == plain.serial && twice.serial == plain.serial, "writes in a writable import did not bind the space's table");
+    Require(same(once.ranges, plain.ranges) && same(twice.ranges, plain.ranges), "writes in a writable import changed the BDA table");
+    const auto writableBegin = reinterpret_cast<std::uint64_t>(writable);
+    const auto readOnlyBegin = reinterpret_cast<std::uint64_t>(readOnly);
+    for (const auto& range : once.ranges) {
+        if (range.begin == writableBegin) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u, "the writable import lost its write permission");
+        if (range.begin == readOnlyBegin) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0u, "the read-only import gained write permission");
+    }
+    change(writable, false, true);
+    change(readOnly, false, false);
+    ::operator delete(writable, std::align_val_t{piece});
+    ::operator delete(readOnly, std::align_val_t{piece});
+}
+
 void failedImportRemapTests(const Context& context, const BdaTestAccess& access) {
     constexpr std::size_t piece = 65536;
     auto* block = static_cast<std::byte*>(::operator new(4 * piece, std::align_val_t{piece}));
@@ -1314,6 +1367,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importSpanTests(context);
     failedImportRemapTests(context, access);
     spaceImportRunTests(context);
+    spaceWritableWritesTests(context);
     importWindowTests(context);
     importJoinTests(context);
     heapMirrorTests(context, access);
