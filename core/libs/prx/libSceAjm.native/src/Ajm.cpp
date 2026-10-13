@@ -403,7 +403,7 @@ std::int32_t InitializeInstance(Instance& instance, const std::uint8_t* paramete
         std::uint32_t mappingFamily = 0;
         if (size >= 12) std::memcpy(&mappingFamily, parameters + 8, sizeof(mappingFamily));
         if (sampleRate != 48000) NotImplemented_nid_no_patch("sceAjmBatchJobInitialize (Opus sample rate other than 48000)");
-        if (mappingFamily > 1) NotImplemented_nid_no_patch("sceAjmBatchJobInitialize (Opus mapping family other than 0 or 1)");
+        if (mappingFamily > 1 && (mappingFamily != 255 || channels != 1)) NotImplemented_nid_no_patch("sceAjmBatchJobInitialize (Opus mapping family other than 0, 1 or a mono stream's 255)");
         if (mappingFamily == 0 && channels > 2) return AJM_RESULT_INVALID_PARAMETER;
         instance.opusChannels = channels;
         instance.opusMappingFamily = mappingFamily;

@@ -537,6 +537,53 @@ bool Refused(std::uint32_t context, const AjmBatchInfo& info) {
     return false;
 }
 
+void TestOpusMonoFamily255(std::uint32_t context) {
+    std::uint32_t instances[2] = {};
+    for (std::size_t index = 0; index < 2; ++index) {
+        Require(sceAjmInstanceCreate(context, 24, 0, &instances[index]) == 0);
+        const std::uint32_t parameters[3] = {1, 48000, index == 0 ? 0u : 255u};
+        std::vector<std::uint8_t> batch(4096);
+        AjmBatchInfo info{};
+        std::int64_t initResult[2] = {-1, -1};
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobInitialize(&info, instances[index], parameters, sizeof(parameters), initResult) == 0);
+        Submit(context, info);
+        Require(initResult[0] == 0);
+    }
+    std::size_t offset = 0;
+    int peak = 0;
+    for (int packet = 0; packet < 3; ++packet) {
+        const std::size_t bytes = OPUS_STEREO[offset] | (std::size_t{OPUS_STEREO[offset + 1]} << 8u);
+        std::vector<std::int16_t> pcm[2] = {std::vector<std::int16_t>(960, -12345), std::vector<std::int16_t>(960, -12345)};
+        for (std::size_t index = 0; index < 2; ++index) {
+            DecodeSideband sideband{};
+            RunDecode(context, instances[index], OPUS_STEREO + offset, 2 + bytes, pcm[index].data(), pcm[index].size() * sizeof(std::int16_t), sideband);
+            Require(sideband.result == 0 && static_cast<std::size_t>(sideband.inputConsumed) == 2 + bytes && sideband.outputWritten == 960 * 2);
+            Require(sideband.totalDecodedSamples == static_cast<std::uint64_t>(packet + 1) * 960);
+        }
+        Require(pcm[0] == pcm[1]);
+        if (packet > 0) {
+            for (const std::int16_t sample : pcm[1]) peak = std::max(peak, std::abs(static_cast<int>(sample)));
+        }
+        offset += 2 + bytes;
+    }
+    Require(peak > 900 && peak < 1200);
+
+    const std::uint32_t refusedParameters[2][3] = {{2, 48000, 255}, {1, 48000, 2}};
+    for (const auto& parameters : refusedParameters) {
+        std::uint32_t instance = 0;
+        Require(sceAjmInstanceCreate(context, 24, 0, &instance) == 0);
+        std::vector<std::uint8_t> batch(4096);
+        AjmBatchInfo info{};
+        std::int64_t initResult[2] = {-1, -1};
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobInitialize(&info, instance, parameters, sizeof(parameters), initResult) == 0);
+        Require(Refused(context, info));
+        Require(sceAjmInstanceDestroy(context, instance) == 0);
+    }
+    for (const std::uint32_t instance : instances) Require(sceAjmInstanceDestroy(context, instance) == 0);
+}
+
 void TestDecodeSingle(std::uint32_t context) {
     std::uint32_t instance = 0;
     Require(sceAjmInstanceCreate(context, 0, 0, &instance) == 0);
@@ -1557,6 +1604,7 @@ int main() {
     TestMp3(context);
     TestOpus(context);
     TestOpus(context, 1);
+    TestOpusMonoFamily255(context);
     TestOpusFamilyZeroChannels(context);
     TestOpusSurround(context, 3, 0);
     for (std::size_t stream = 0; stream < 2; ++stream) {
