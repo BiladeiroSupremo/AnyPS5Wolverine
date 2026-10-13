@@ -361,6 +361,7 @@ void importJoinTests(const Context& context) {
     Require(bind(second - 16).first == grownBuffer && HostImportFor(importing, first, 16)->buffer == grownBuffer, "two joins sharing a range retired each other");
     change(heap, piece, false);
     change(heap + piece, piece, false);
+    change(heap + 2 * piece, piece, false);
     change(guest + large, large, false);
     const auto* alone = HostImportFor(importing, first, 16);
     Require(alone != nullptr && alone->base == first && alone->bytes == large, "the joined import outlived one of its ranges");

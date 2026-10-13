@@ -3187,7 +3187,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (entry == nullptr) {
                 const bool covered = runCovers(importRanges(), region.begin, region.end);
                 if (covered) entry = importAllocation(context, state, region.begin, importRanges());
-                else entry = importJoined(context, state, region.begin, region.end, importRanges());
+                if (!covered || (entry != nullptr && region.end > entry->base + entry->bytes)) entry = importJoined(context, state, region.begin, region.end, importRanges());
+                if (entry != nullptr && (region.begin < entry->base || region.end > entry->base + entry->bytes)) entry = nullptr;
                 // Debug aid: APS5_TRACE_IMPORT_MISSES names the first regions served by CPU copies, the
                 // registered range around each and the next one.
                 static const bool traceMisses = std::getenv("APS5_TRACE_IMPORT_MISSES") != nullptr;
