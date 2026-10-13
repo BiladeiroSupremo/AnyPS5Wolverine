@@ -219,6 +219,10 @@ int APS5_VABI sceSaveDataCreateTransactionResource(uint32_t size) {
     return g_transaction_counter.fetch_add(1);
 }
 
+static std::string blocks_path(const std::string& real_path) {
+    return real_path + ".blocks";
+}
+
 static int deleteSave(const SaveDataDelete* del) {
     if (del == nullptr || del->dir_name == nullptr) {
         throw std::runtime_error("sceSaveDataDelete: null argument");
@@ -254,6 +258,7 @@ static int deleteSave(const SaveDataDelete* del) {
     }
     std::error_code ec;
     std::filesystem::remove(param_path(path), ec);
+    std::filesystem::remove(blocks_path(path), ec);
     return SAVE_DATA_OK;
 }
 
@@ -266,6 +271,45 @@ int APS5_VABI sceSaveDataDelete(const SaveDataDelete* del) {
 int APS5_VABI sceSaveDataDeleteTransactionResource(int32_t resource) {
     (void)resource;
     return SAVE_DATA_OK;
+}
+
+static constexpr std::uint64_t SAVE_DATA_BLOCK_BYTES = 32768;
+
+static std::uint64_t save_blocks(const std::string& real_path) {
+    std::ifstream file(blocks_path(real_path));
+    std::uint64_t blocks = 0;
+    if (!(file >> blocks) || blocks == 0) {
+        return SAVE_DATA_BLOCKS_MAX;
+    }
+    return std::min(blocks, SAVE_DATA_BLOCKS_MAX);
+}
+
+static void keep_save_blocks(const std::string& real_path, std::uint64_t blocks) {
+    std::ofstream file(blocks_path(real_path), std::ios::trunc);
+    file << std::min(blocks, SAVE_DATA_BLOCKS_MAX) << '\n';
+    if (!file) {
+        throw std::runtime_error("sceSaveDataMount3: the save's size could not be kept");
+    }
+}
+
+static std::uint64_t used_blocks(const std::string& real_path) {
+    std::uint64_t blocks = 0;
+    std::error_code error;
+    for (auto it = std::filesystem::recursive_directory_iterator(real_path, error); !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+        if (!it->is_regular_file(error)) {
+            continue;
+        }
+        const auto bytes = it->file_size(error);
+        if (!error) {
+            blocks += (bytes + SAVE_DATA_BLOCK_BYTES - 1) / SAVE_DATA_BLOCK_BYTES;
+        }
+    }
+    return blocks;
+}
+
+static SaveDataSearchInfo search_info(const std::string& real_path) {
+    const auto blocks = save_blocks(real_path);
+    return SaveDataSearchInfo{blocks, blocks - std::min(blocks, used_blocks(real_path)), {}};
 }
 
 static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameSearchResult* result) {
@@ -287,6 +331,7 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
         std::string name;
         std::string path;
         SaveDataParam param;
+        SaveDataSearchInfo info;
     };
     const bool sortByParam = key == SAVE_DATA_SORT_KEY_USER_PARAM || key == SAVE_DATA_SORT_KEY_MTIME;
     std::vector<Match> matches;
@@ -298,7 +343,7 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
         if (!dir_name_match(name.c_str(), pattern)) {
             continue;
         }
-        Match match{name, entry.path().string(), {}};
+        Match match{name, entry.path().string(), {}, search_info(entry.path().string())};
         if (sortByParam) {
             match.param = load_param(match.path);
         }
@@ -309,6 +354,10 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
         std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.param.user_param < b.param.user_param; });
     } else if (key == SAVE_DATA_SORT_KEY_MTIME) {
         std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.param.mtime < b.param.mtime; });
+    } else if (key == SAVE_DATA_SORT_KEY_BLOCKS) {
+        std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.info.blocks < b.info.blocks; });
+    } else if (key == SAVE_DATA_SORT_KEY_FREE_BLOCKS) {
+        std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.info.free_blocks < b.info.free_blocks; });
     }
     if (cond->order == SAVE_DATA_SORT_ORDER_DESCENT) {
         std::reverse(matches.begin(), matches.end());
@@ -320,7 +369,7 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
             result->params[i] = sortByParam ? matches[i].param : load_param(matches[i].path);
         }
         if (result->infos != nullptr) {
-            result->infos[i] = SaveDataSearchInfo{SAVE_DATA_BLOCKS_MAX, SAVE_DATA_BLOCKS_MAX, {}};
+            result->infos[i] = matches[i].info;
         }
     }
     result->hit_num = static_cast<std::uint32_t>(matches.size());
@@ -353,12 +402,14 @@ static int getMountInfo(const SaveDataMountPoint* mount_point, SaveDataMountInfo
         throw std::runtime_error("sceSaveDataGetMountInfo: null argument");
     }
     std::lock_guard lock(g_slots_mutex);
-    if (find_slot_by_mount_point(mount_point->data) == -1) {
+    const int slot = find_slot_by_mount_point(mount_point->data);
+    if (slot == -1) {
         return SAVE_DATA_ERROR_NOT_MOUNTED;
     }
     std::memset(info, 0, sizeof(*info));
-    info->blocks = SAVE_DATA_BLOCKS_MAX;
-    info->free_blocks = SAVE_DATA_BLOCKS_MAX;
+    const auto search = search_info(g_slots[slot].real_path);
+    info->blocks = search.blocks;
+    info->free_blocks = search.free_blocks;
     return SAVE_DATA_OK;
 }
 
@@ -512,6 +563,10 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     std::memcpy(mount_result->mount_point.data, mountPoint.c_str(), mountPoint.size() + 1);
     mount_result->required_blocks = 0;
     mount_result->mount_status = (create || (create2 && !exists)) ? 1u : 0u;
+    std::error_code sized;
+    if (mount->blocks != 0 && (create || (create2 && !exists) || !std::filesystem::exists(blocks_path(real_path), sized))) {
+        keep_save_blocks(real_path, mount->blocks);
+    }
     return SAVE_DATA_OK;
 }
 
