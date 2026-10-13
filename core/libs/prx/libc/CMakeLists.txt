@@ -595,6 +595,7 @@ if(BUILD_TESTING)
     target_link_libraries(guest_allocator_failures_tests PRIVATE libc)
     configure_windows_unwind(guest_allocator_failures_tests)
     add_test(NAME guest_allocator_failures COMMAND guest_allocator_failures_tests)
+    set_tests_properties(guest_allocator_failures PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_allocator_failures PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

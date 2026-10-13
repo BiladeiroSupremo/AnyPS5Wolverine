@@ -1,12 +1,16 @@
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 
 extern "C" {
 void* APS5_VABI malloc_nid_postfix(std::size_t);
@@ -104,11 +108,25 @@ int main() {
     }
 
     if (GuestArena::GuestArenaAvailable_nid_postfix()) {
+#ifdef __linux__
+        rlimit originalLimit{};
+        if (getrlimit(RLIMIT_DATA, &originalLimit) != 0) {
+            report("failed commit setup", "could not read RLIMIT_DATA");
+            return 1;
+        }
+        auto limited = originalLimit;
+        limited.rlim_cur = std::min(limited.rlim_cur, rlim_t{128} << 20);
+        if (setrlimit(RLIMIT_DATA, &limited) != 0) {
+            report("failed commit setup", "could not limit RLIMIT_DATA");
+            return 1;
+        }
+#endif
         constexpr std::size_t beyondCommitLimit = std::size_t{300} << 30;
         constexpr std::size_t probeBytes = std::size_t{100} << 30;
         void* before = GuestArena::GuestArenaAllocate_nid_postfix(probeBytes, 0x4000);
         GuestArena::GuestArenaRelease_nid_postfix(before, probeBytes);
         bool committed = false;
+        int failedCommits = 0;
         for (int attempt = 0; attempt < 10 && !committed; ++attempt) {
             *__error_nid_postfix() = 0;
             void* huge = nullptr;
@@ -124,14 +142,31 @@ int main() {
                 committed = true;
             } else if (*__error_nid_postfix() != NoMemory) {
                 report("malloc(300 GiB)", "returned NULL without ENOMEM");
+            } else {
+                ++failedCommits;
             }
         }
+#ifdef __linux__
+        if (setrlimit(RLIMIT_DATA, &originalLimit) != 0) report("failed commit cleanup", "could not restore RLIMIT_DATA");
+#endif
         if (committed) {
+#ifdef __linux__
+            report("malloc(300 GiB)", "succeeded despite RLIMIT_DATA");
+#else
             std::fputs("skipped: the host can commit 300 GiB, so the failed commit and arena release checks did not run\n", stderr);
+#endif
         } else {
-            void* after = GuestArena::GuestArenaAllocate_nid_postfix(probeBytes, 0x4000);
-            GuestArena::GuestArenaRelease_nid_postfix(after, probeBytes);
+            if (failedCommits != 10) report("failed heap commits", "did not return ENOMEM for all ten attempts");
+            void* after = nullptr;
+            try {
+                after = GuestArena::GuestArenaAllocate_nid_postfix(probeBytes, 0x4000);
+                GuestArena::GuestArenaRelease_nid_postfix(after, probeBytes);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "failed commit range probe: %s\n", error.what());
+                ++failures;
+            }
             if (after != before) report("malloc(300 GiB)", "left its arena range reserved after failing");
+            std::fprintf(stderr, "Checked %d failed heap commits and arena range reuse\n", failedCommits);
         }
         void* small = malloc_nid_postfix(100);
         if (small == nullptr) report("malloc(100) after a failed huge malloc", "returned NULL");
