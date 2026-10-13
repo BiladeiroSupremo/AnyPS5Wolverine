@@ -163,7 +163,7 @@ def apply_change(root, base, new, index_text):
         _, section, item, name = entry
         entries = load(name).setdefault(section, [])
         moved = relink(item, INDEX, debt_file(name))
-        position = len(entries)
+        position = 0 if anchor is None else len(entries)
         if anchor is not None and anchor[1] == section and anchor[3] == name:
             anchored = relink(anchor[2], INDEX, debt_file(name))
             if anchored in entries:
