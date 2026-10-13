@@ -816,6 +816,7 @@ static void CheckFegetenv() {
     const unsigned savedCsr = _mm_getcsr();
     const std::uint16_t control = 0x0f7e;
     const unsigned csr = 0x7fa0;
+    asm volatile("fnclex");
     asm volatile("fldcw %0" : : "m"(control));
     _mm_setcsr(csr);
     volatile long double zero = 0.0L;
@@ -839,6 +840,9 @@ static void CheckFegetenv() {
     Require(environment.mxcsr == csr);
     Require(controlAfter == control);
     Require(csrAfter == csr);
+    bool threw = false;
+    try { fegetenv_nid_postfix(nullptr); } catch (...) { threw = true; }
+    Require(threw);
 }
 
 int main() {
