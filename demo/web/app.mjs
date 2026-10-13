@@ -1,3 +1,5 @@
+import { OutputDirectoryTransaction } from "./output-directory.mjs";
+
 const $ = id => document.getElementById(id);
 const stages = ["Converting executable", "Converting PRX modules", "Scanning syscalls", "Scanning instructions", "Converting instructions", "Analysing imports", "Building output image", "Writing output"];
 let worker;
@@ -6,6 +8,7 @@ let summary;
 let working = false;
 let sink;
 let outputDirectory;
+let outputTransaction;
 let downloadUrl;
 let logs = [];
 let release;
@@ -59,7 +62,9 @@ async function fail(message) {
     sink = null;
     try { await active.abort(); } catch (error) { message += `\nCould not discard the output file: ${error.message}`; }
   }
-  if (outputDirectory) { message += `\nIncomplete files remain in ${outputDirectory.name}/.`; outputDirectory = null; }
+  if (outputTransaction) message += `\nIncomplete files remain in ${outputTransaction.name}/.`;
+  outputDirectory = null;
+  outputTransaction = null;
   $("error").textContent = message;
   $("error").hidden = false;
   $("status").hidden = true;
@@ -141,11 +146,13 @@ async function onMessage({ data }) {
       } else if (data.mode === "zip") {
         $("result-info").textContent += " · ZIP saved to disk";
       } else {
-        $("result-info").textContent += ` · Saved in ${outputDirectory.name}/`;
+        $("result-info").textContent += ` · Saved in ${outputTransaction.name}/`;
         if (document.querySelector('input[name="target"]:checked').value === "linux") $("result-info").textContent += ` · On Linux, run chmod +x "${data.outputName}" before launching.`;
       }
       $("result-note").hidden = data.mode === "disk";
       outputDirectory = null;
+      outputTransaction?.commit();
+      outputTransaction = null;
       summary = null;
       worker.terminate();
       worker = null;
@@ -206,11 +213,8 @@ $("convert").onclick = async () => {
     } else if ($("save").value === "disk") {
       const parent = await window.showDirectoryPicker({ mode: "readwrite" });
       const name = file.name.replace(/\.zip$/iu, "") + "-" + document.querySelector('input[name="target"]:checked').value;
-      let exists = false;
-      try { await parent.getDirectoryHandle(name); exists = true; }
-      catch (error) { if (error.name !== "NotFoundError") throw error; }
-      if (exists) throw new Error(`The folder ${name} already exists. Choose another destination or rename the existing folder.`);
-      outputDirectory = await parent.getDirectoryHandle(name, { create: true });
+      outputTransaction = await OutputDirectoryTransaction.create(parent, name);
+      outputDirectory = outputTransaction.directory;
     }
     $("status").hidden = false;
     $("cancel").hidden = false;
