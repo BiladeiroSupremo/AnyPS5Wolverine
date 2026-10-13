@@ -9,6 +9,7 @@ register("./cdn-loader.mjs", import.meta.url, { data: { url: process.env.ANYPS5_
 const site = name => pathToFileURL(path.join(process.argv[2], name)).href;
 const { Archive, memoryEstimate, MEMORY_LIMIT, ICON_LIMIT, packageArchive } = await import(site("archive.mjs"));
 const { BlobReader, BlobWriter, Uint8ArrayReader, Uint8ArrayWriter, ZipReader, ZipWriter } = await import(process.env.ANYPS5_TEST_ZIP_URL);
+await import("./archive-reserved.test.mjs");
 const { default: createRelinker } = await import(site("native/relinker_wasm.mjs"));
 const native = await createRelinker();
 const executable = new Uint8Array(await readFile(path.join(process.argv[3], "main.elf")));
