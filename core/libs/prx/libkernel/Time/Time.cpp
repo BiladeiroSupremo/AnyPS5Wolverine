@@ -585,6 +585,7 @@ static HostZone HostZoneAt(std::int64_t utcTime) {
     constexpr std::int64_t lastHostSecond = 32535215999LL;
     const std::int64_t cycles = utcTime >= 0 && utcTime <= lastHostSecond ? 0 : (utcTime >= 0 ? utcTime / cycleSeconds : -((-(utcTime + 1)) / cycleSeconds + 1));
     const std::time_t t = static_cast<std::time_t>(utcTime - cycles * cycleSeconds);
+    _tzset();
     if (localtime_s(&local, &t) != 0) throw std::runtime_error(std::string(__func__) + ": no host local time for " + std::to_string(utcTime));
     long standardBias = 0;
     long daylightBias = 0;
@@ -593,6 +594,7 @@ static HostZone HostZoneAt(std::int64_t utcTime) {
     return {-static_cast<std::int64_t>(standardBias), local.tm_isdst > 0 ? -static_cast<std::int64_t>(daylightBias) : 0};
 #else
     const std::time_t t = static_cast<std::time_t>(utcTime);
+    ::tzset();
     if (localtime_r(&t, &local) == nullptr) throw std::runtime_error(std::string(__func__) + ": no host local time for " + std::to_string(utcTime));
     const std::int64_t daylight = local.tm_isdst > 0 ? static_cast<std::int64_t>(local.tm_gmtoff) + ::timezone : 0;
     return {static_cast<std::int64_t>(local.tm_gmtoff) - daylight, daylight};
