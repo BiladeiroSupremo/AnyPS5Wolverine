@@ -973,6 +973,29 @@ static void CheckGuestModuleImageProtection() {
         rejected = true;
     }
     Require(rejected);
+
+    rejected = false;
+    try {
+        sceKernelMprotect(reinterpret_cast<const void*>(&sceKernelMprotect), page, 1);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    Require(rejected);
+
+    const auto prxPath = std::filesystem::path(path).parent_path() / "guest_memory_module_foreign.prx";
+    std::filesystem::copy_file(path, prxPath, std::filesystem::copy_options::overwrite_existing);
+    void* foreignModule = dlopen_nid_postfix(prxPath.generic_string().c_str(), 2);
+    Require(foreignModule != nullptr);
+    auto* foreignTarget = GuestModulePage(foreignModule, page);
+    Require(!RegisteredGuestRange(foreignTarget, page));
+    Require(sceKernelMprotect(foreignTarget, page, 1) == 0);
+    Require(ImageProtection(foreignTarget) == PAGE_READONLY);
+    Require(RegisteredGuestRange(foreignTarget, page));
+    Require(sceKernelMprotect(foreignTarget, page, 3) == 0);
+    Require(ImageProtection(foreignTarget) == PAGE_READWRITE || ImageProtection(foreignTarget) == PAGE_WRITECOPY);
+    Require(dlclose_nid_postfix(foreignModule) == 0);
+    Require(!RegisteredGuestRange(foreignTarget, page));
+    std::filesystem::remove(prxPath);
 }
 #endif
 
