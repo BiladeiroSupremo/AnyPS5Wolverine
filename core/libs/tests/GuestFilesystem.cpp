@@ -225,6 +225,8 @@ int main() {
     Require(chmod_nid_postfix("", 0600) == -1 && *__error_nid_postfix() == 2);
     Require(chmod_nid_postfix("anyps5_missing_chmod_path", 0600) == -1 && *__error_nid_postfix() == 2);
     Require(sceKernelChmod_nid_postfix("anyps5_missing_chmod_path", 0600) == static_cast<int>(0x80020002u));
+    Require(sceKernelStat("anyps5_missing_chmod_path", nullptr) == static_cast<int>(0x80020002u));
+    Require(sceKernelStat(".", nullptr) == static_cast<int>(0x8002000eu));
     Require(sceKernelDebugOutText(-1, "text") == static_cast<int>(0x80020016u));
     std::uint64_t throttling[4] = {1, 2, 3, 4};
     Require(sceKernelWriteThrottlingStatus(throttling) == 0);

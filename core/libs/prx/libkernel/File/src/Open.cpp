@@ -308,15 +308,13 @@ int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {
     if (path == nullptr) {
         throw std::invalid_argument(std::string(__func__) + ": path is null");
     }
-    if (sb == nullptr) {
-        throw std::invalid_argument(std::string(__func__) + ": sb is null");
-    }
     if (*path == '\0') return SceErrorFromErrno(2);
     std::filesystem::path native;
     if (const int error = ResolvePathError_nid_no_patch(path, native)) return SceKernelError(error);
     native = File::PathOrRelinkedModule(native);
     std::error_code error;
     constexpr int GuestEnotdir = 20;
+    constexpr int GuestEfault = 14;
     const auto status = std::filesystem::status(native, error);
     if (error == std::errc::not_a_directory) return SceErrorFromErrno(GuestEnotdir);
     if (!std::filesystem::exists(status)) {
@@ -324,6 +322,7 @@ int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {
     }
     const std::string_view guestPath(path);
     if (!guestPath.empty() && guestPath.back() == '/' && !std::filesystem::is_directory(status)) return SceErrorFromErrno(GuestEnotdir);
+    if (sb == nullptr) return SceErrorFromErrno(GuestEfault);
     File::FillFileStat(native, sb);
     return 0;
 }
