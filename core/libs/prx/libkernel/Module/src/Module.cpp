@@ -48,20 +48,30 @@ std::uint32_t ReadWord(std::uint64_t address) {
   return value;
 }
 
-void FillUnwindImage(void* allocationBase, ModuleInfoForUnwind* info) {
+bool UnwindImageCurrent(const UnwindImage& image, const IMAGE_NT_HEADERS64& nt) {
+  return image.filled && image.size == nt.OptionalHeader.SizeOfImage &&
+         (!image.hasTables || (ReadWord(image.tables.header) == image.headerWord && ReadWord(image.tables.frames) == image.framesWord));
+}
+
+void WriteUnwindInfo(const UnwindImage& image, const std::uint8_t* base, ModuleInfoForUnwind* info) {
+  if (image.hasTables) {
+    info->eh_frame_hdr_addr = image.tables.header;
+    info->eh_frame_addr = image.tables.frames;
+    info->eh_frame_size = image.tables.framesSize;
+    info->seg0_addr = reinterpret_cast<std::uint64_t>(base);
+    info->seg0_size = image.size;
+  }
+  std::strncpy(info->name, image.name.c_str(), sizeof(info->name) - 1);
+  info->name[sizeof(info->name) - 1] = '\0';
+}
+
+const UnwindImage& CurrentUnwindImage(void* allocationBase, const IMAGE_NT_HEADERS64& nt) {
   const auto* base = static_cast<const std::uint8_t*>(allocationBase);
-  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-  if (dos->e_magic != IMAGE_DOS_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without a DOS header");
-  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-  if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without an NT header");
-  std::lock_guard lock(unwindImagesMutex);
   auto& image = UnwindImages()[reinterpret_cast<std::uintptr_t>(base)];
-  const bool current = image.filled && image.size == nt->OptionalHeader.SizeOfImage &&
-                       (!image.hasTables || (ReadWord(image.tables.header) == image.headerWord && ReadWord(image.tables.frames) == image.framesWord));
-  if (!current) {
+  if (!UnwindImageCurrent(image, nt)) {
     UnwindImage fresh;
-    fresh.size = nt->OptionalHeader.SizeOfImage;
-    fresh.hasTables = EhFrame::ReadEhmeta(reinterpret_cast<std::uintptr_t>(base), *nt, "sceKernelGetModuleInfoForUnwind", fresh.tables);
+    fresh.size = nt.OptionalHeader.SizeOfImage;
+    fresh.hasTables = EhFrame::ReadEhmeta(reinterpret_cast<std::uintptr_t>(base), nt, "sceKernelGetModuleInfoForUnwind", fresh.tables);
     if (fresh.hasTables) {
       fresh.headerWord = ReadWord(fresh.tables.header);
       fresh.framesWord = ReadWord(fresh.tables.frames);
@@ -72,15 +82,33 @@ void FillUnwindImage(void* allocationBase, ModuleInfoForUnwind* info) {
     fresh.filled = true;
     image = std::move(fresh);
   }
-  if (image.hasTables) {
-    info->eh_frame_hdr_addr = image.tables.header;
-    info->eh_frame_addr = image.tables.frames;
-    info->eh_frame_size = image.tables.framesSize;
-    info->seg0_addr = reinterpret_cast<std::uint64_t>(base);
-    info->seg0_size = image.size;
-  }
-  std::strncpy(info->name, image.name.c_str(), sizeof(info->name) - 1);
-  info->name[sizeof(info->name) - 1] = '\0';
+  return image;
+}
+
+void FillUnwindImage(void* allocationBase, ModuleInfoForUnwind* info) {
+  const auto* base = static_cast<const std::uint8_t*>(allocationBase);
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without a DOS header");
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without an NT header");
+  std::lock_guard lock(unwindImagesMutex);
+  WriteUnwindInfo(CurrentUnwindImage(allocationBase, *nt), base, info);
+}
+
+bool FillKnownUnwindImage(std::uint64_t address, ModuleInfoForUnwind* info) {
+  PVOID allocationBase = nullptr;
+  if (RtlPcToFileHeader(reinterpret_cast<PVOID>(address), &allocationBase) == nullptr || allocationBase == nullptr) return false;
+  const auto* base = static_cast<const std::uint8_t*>(allocationBase);
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+  std::lock_guard lock(unwindImagesMutex);
+  const auto found = UnwindImages().find(reinterpret_cast<std::uintptr_t>(base));
+  if (found == UnwindImages().end() || !found->second.hasTables || !UnwindImageCurrent(found->second, *nt)) return false;
+  info->st_size = sizeof(ModuleInfoForUnwind);
+  WriteUnwindInfo(found->second, base, info);
+  return true;
 }
 }
 
@@ -155,6 +183,7 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
   (void)flags;
   if (!info) return SCE_KERNEL_ERROR_EFAULT;
 #ifdef _WIN32
+  if (FillKnownUnwindImage(addr, info)) return 0;
   MEMORY_BASIC_INFORMATION mbi{};
   if (!VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi))) return SCE_KERNEL_ERROR_ESRCH;
   info->st_size = sizeof(ModuleInfoForUnwind);

@@ -82,6 +82,11 @@ int main() {
     char mapped[4096] = {};
     Require(GetMappedFileNameA(GetCurrentProcess(), memory.BaseAddress, mapped, sizeof(mapped) - 1) != 0);
     Require(std::strcmp(info.name, mapped) == 0);
+    for (const auto* inside : {static_cast<const void*>(&fixture->header), static_cast<const void*>(&fixture->frames)}) {
+        ModuleInfoForUnwind other{};
+        Require(sceKernelGetModuleInfoForUnwind(reinterpret_cast<std::uint64_t>(inside), 0, &other) == 0);
+        Require(std::memcmp(&other, &info, sizeof(info)) == 0);
+    }
     for (int repeat = 0; repeat < 3; ++repeat) {
         ModuleInfoForUnwind again{};
         Require(sceKernelGetModuleInfoForUnwind(address, 0, &again) == 0);
@@ -106,4 +111,7 @@ int main() {
     ModuleInfoForUnwind host{};
     Require(sceKernelGetModuleInfoForUnwind(reinterpret_cast<std::uint64_t>(&GetModuleHandleW), 0, &host) == 0);
     Require(host.eh_frame_hdr_addr == 0 && host.eh_frame_addr == 0 && host.eh_frame_size == 0);
+    ModuleInfoForUnwind hostAgain{};
+    Require(sceKernelGetModuleInfoForUnwind(reinterpret_cast<std::uint64_t>(&GetModuleHandleW), 0, &hostAgain) == 0);
+    Require(std::memcmp(&hostAgain, &host, sizeof(host)) == 0);
 }
