@@ -35,6 +35,7 @@
 #include <cstring>
 #include <new>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <cstdarg>
@@ -158,6 +159,7 @@ Waker& ThreadWaker() {
 }
 std::mutex socketsMutex;
 std::map<int, std::shared_ptr<Socket>> sockets;
+std::set<int> closeOnExecDescriptors;
 #ifdef _WIN32
 int ReserveNumber(NativeSocket) {
     const HANDLE placeholder = ::CreateFileW(L"NUL", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -297,6 +299,7 @@ int GuestSockets::Close(int descriptor) {
         if (found == sockets.end()) return Fail(9);
         released = std::move(found->second);
         sockets.erase(found);
+        closeOnExecDescriptors.erase(descriptor);
     }
     EqueueDescriptorClosed(descriptor);
     ReleaseNumber(descriptor);
@@ -311,6 +314,7 @@ void GuestSockets::Forget(int descriptor) {
         if (found == sockets.end()) return;
         released = std::move(found->second);
         sockets.erase(found);
+        closeOnExecDescriptors.erase(descriptor);
     }
     EqueueDescriptorClosed(descriptor);
 }
@@ -504,6 +508,7 @@ int GuestSockets::Duplicate(int descriptor) {
     if (duplicate < 0) return -1;
     try {
         sockets.insert_or_assign(duplicate, found->second);
+        closeOnExecDescriptors.erase(duplicate);
     } catch (const std::bad_alloc&) {
         ReleaseNumber(duplicate);
         return Fail(12);
@@ -533,6 +538,10 @@ int GuestSockets::DuplicateTo(int descriptor, int target) {
         }
     }
     if (replaced) EqueueDescriptorClosed(target);
+    {
+        std::lock_guard lock(socketsMutex);
+        closeOnExecDescriptors.erase(target);
+    }
     return target;
 }
 
@@ -765,6 +774,27 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     std::lock_guard lock(socket->modeMutex);
+    if (command == 1) {
+        std::lock_guard registry(socketsMutex);
+        return closeOnExecDescriptors.count(descriptor) != 0 ? 1 : 0;
+    }
+    if (command == 2) {
+#ifdef _WIN32
+        __builtin_sysv_va_list arguments;
+        __builtin_sysv_va_start(arguments, command);
+        const int flags = __builtin_va_arg(arguments, int);
+        __builtin_sysv_va_end(arguments);
+#else
+        std::va_list arguments;
+        va_start(arguments, command);
+        const int flags = va_arg(arguments, int);
+        va_end(arguments);
+#endif
+        std::lock_guard registry(socketsMutex);
+        if ((flags & 1) != 0) closeOnExecDescriptors.insert(descriptor);
+        else closeOnExecDescriptors.erase(descriptor);
+        return 0;
+    }
     if (command == 3) return 2 | (socket->nonblocking ? 4 : 0); // F_GETFL, O_RDWR
     if (command != 4) return Fail(22);
 #ifdef _WIN32
@@ -833,7 +863,12 @@ int APS5_VABI socket_nid_postfix(int family, int type, int protocol) {
         auto socket = std::make_shared<Socket>(native, family, plainType);
         guard.value = Invalid;
         if (nonblocking && SetNonBlocking(*socket)) return -1;
-        return Install(std::move(socket));
+        const int number = Install(std::move(socket));
+        if (number >= 0 && (type & GuestCloseOnExec) != 0) {
+            std::lock_guard registry(socketsMutex);
+            closeOnExecDescriptors.insert(number);
+        }
+        return number;
     } catch (const std::bad_alloc&) {
         return Fail(12);
     }
