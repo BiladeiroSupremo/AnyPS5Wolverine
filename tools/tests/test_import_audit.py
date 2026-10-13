@@ -368,6 +368,57 @@ class ImportAuditTests(unittest.TestCase):
         records, _ = import_audit.audit([(nid, "libB.prx")], exports, stubs, {"libA.prx", "libB.prx"}, set())
         self.assertEqual(records[0]["class"], "implemented")
 
+    def test_cmake_shared_library_preserves_stub_names_and_implemented_exports(self):
+        work = self.work
+        owner, library = "libZOwner", "libAOwner.native"
+        pending, runtime, live = "scePending", "printf_nid_postfix", "sceLive"
+        alias_nid, alias_name = "AAAAAAAAAAA", "sceOwnerUnknown"
+        write_source(work.source, owner, STUB_SOURCE.format(name=pending) + STUB_SOURCE.format(name=runtime)
+                     + f'APS5_EXPORT("{alias_nid}", {alias_name});\n' + STUB_SOURCE.format(name=alias_name)
+                     + DONE_SOURCE.format(name=live))
+        shared = work.source / library
+        shared.mkdir()
+        (shared / "CMakeLists.txt").write_text(f'include(${{CMAKE_CURRENT_SOURCE_DIR}}/../{owner}/OwnerLibrary.cmake)\n')
+        expected = {nid_names.compute_nid(pending): pending, nid_names.compute_nid("printf"): runtime, alias_nid: alias_name}
+        live_nid = nid_names.compute_nid(live)
+        (work.libs / (library + ".prx")).write_bytes(exporting(*expected, live_nid))
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [(nid, library + ".prx") for nid in [*expected, live_nid]])
+        code, _, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (0, ""))
+        records = {record["nid"]: record for record in json.loads(result.read_text())["imports"]}
+        self.assertEqual({nid: (records[nid]["class"], records[nid]["name"]) for nid in expected},
+                         {nid: ("stub", name) for nid, name in expected.items()})
+        self.assertEqual((records[live_nid]["class"], records[live_nid]["name"]), ("implemented", None))
+
+    def test_source_include_shared_library_preserves_stubs(self):
+        source = self.work.source
+        write_source(source, "libOwner", STUB_SOURCE.format(name="scePending"))
+        write_source(source, "libShared", '#include "prx/libOwner/Export.cpp"\n')
+        nid = nid_names.compute_nid("scePending")
+        self.assertEqual(import_audit.source_stubs(source), {
+            ("libOwner.prx", nid): "scePending", ("libShared.prx", nid): "scePending"})
+
+    def test_transitive_shared_library_preserves_stubs(self):
+        source = self.work.source
+        write_source(source, "libZOwner", STUB_SOURCE.format(name="scePending"))
+        for library, owner in (("libA", "libB"), ("libB", "libZOwner")):
+            shared = source / library
+            shared.mkdir()
+            (shared / "CMakeLists.txt").write_text(f'include(${{CMAKE_CURRENT_SOURCE_DIR}}/../{owner}/OwnerLibrary.cmake)\n')
+        nid = nid_names.compute_nid("scePending")
+        self.assertEqual(import_audit.source_stubs(source), {
+            (library + ".prx", nid): "scePending" for library in ("libA", "libB", "libZOwner")})
+
+    def test_shared_source_cycle_fails(self):
+        source = self.work.source
+        for library, owner in (("libA", "libB"), ("libB", "libA")):
+            shared = source / library
+            shared.mkdir()
+            (shared / "CMakeLists.txt").write_text(f'include(${{CMAKE_CURRENT_SOURCE_DIR}}/../{owner}/OwnerLibrary.cmake)\n')
+        with self.assertRaisesRegex(import_audit.AuditError, "shared source cycle.*libA.*libB"):
+            import_audit.source_stubs(source)
+
     def test_formatted_export_aliases_remain_stubs(self):
         work = self.work
         nid = "AAAAAAAAAAA"

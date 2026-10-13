@@ -342,17 +342,30 @@ def source_stubs(source):
     if not Path(source).is_dir():
         raise AuditError(f"{source}: not a directory")
     stubs = {}
+    shared = {}
     for library in sorted(item for item in Path(source).iterdir() if item.is_dir()):
         aliases = {}
         for file in library.rglob("*.cpp"):
             for nid, name in nid_names.source_aliases(file.read_text(errors="ignore")):
                 aliases[name] = nid
         group = progress.scan_library(library)
+        if "shared_sources" in group:
+            shared[library.name] = group["shared_sources"]
         done = {nid_of(name, aliases) for name in group["done_names"]}
         for name in group["todo_names"]:
             nid = nid_of(name, aliases)
             if nid not in done:
                 stubs.setdefault((library.name + ".prx", nid), name)
+    for library, owner in shared.items():
+        chain = [library]
+        while owner in shared:
+            if owner in chain:
+                raise AuditError(f"{source}: shared source cycle: {' -> '.join(chain + [owner])}")
+            chain.append(owner)
+            owner = shared[owner]
+        for (provider, nid), name in list(stubs.items()):
+            if provider == owner + ".prx":
+                stubs[(library + ".prx", nid)] = name
     return stubs
 
 
