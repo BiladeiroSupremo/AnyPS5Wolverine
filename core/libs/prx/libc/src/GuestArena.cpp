@@ -49,8 +49,8 @@ std::uintptr_t alignUp(std::uintptr_t value, std::size_t alignment) {
 class Arena {
 public:
     static Arena& Get() {
-        static Arena arena;
-        return arena;
+        static auto* arena = new Arena;
+        return *arena;
     }
 
     bool Available() const {

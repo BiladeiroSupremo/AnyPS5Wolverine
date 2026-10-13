@@ -243,19 +243,19 @@ int PhysicalFile() {
     return file;
 }
 
-std::vector<bool> g_physicalUsed(DIRECT_MEMORY_SIZE / PS5_PAGE_SIZE);
+std::vector<bool>& PhysicalUsed();
 
 void ZeroReusedPhysical(std::uint64_t start, std::size_t bytes) {
     const auto first = start / PS5_PAGE_SIZE;
     const auto count = bytes / PS5_PAGE_SIZE;
     for (std::size_t page = 0; page < count;) {
-        if (!g_physicalUsed[first + page]) {
-            g_physicalUsed[first + page] = true;
+        if (!PhysicalUsed()[first + page]) {
+            PhysicalUsed()[first + page] = true;
             ++page;
             continue;
         }
         std::size_t run = 0;
-        while (page + run < count && g_physicalUsed[first + page + run]) ++run;
+        while (page + run < count && PhysicalUsed()[first + page + run]) ++run;
         const auto offset = (first + page) * PS5_PAGE_SIZE;
         void* view = ::mmap(nullptr, run * PS5_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, PhysicalFile(), static_cast<off_t>(offset));
         if (view == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map reused direct memory");
@@ -338,9 +338,6 @@ struct PhysicalPage {
     std::uint64_t offset;
 };
 
-std::mutex g_directLock;
-std::map<std::uint64_t, PhysicalPage> g_physPages;
-
 struct DirectMapping {
     std::uintptr_t end;
     std::uint64_t phys;
@@ -348,13 +345,47 @@ struct DirectMapping {
     std::shared_ptr<PhysicalBacking> backing;
 };
 
-std::map<std::uintptr_t, DirectMapping> g_directMappings;
 struct PhysicalSpan {
     std::uint64_t end;
     std::vector<std::uintptr_t> bases;
 };
 
-std::map<std::uint64_t, PhysicalSpan> g_physicalSpans;
+struct ProtectedRange {
+    std::uintptr_t end;
+    int prot;
+};
+
+struct DirectMemoryState {
+#if defined(__linux__)
+    std::vector<bool> physicalUsed = std::vector<bool>(DIRECT_MEMORY_SIZE / PS5_PAGE_SIZE);
+#endif
+    std::map<std::uint64_t, PhysicalSpan> physicalSpans;
+    std::mutex directLock;
+    std::map<std::uint64_t, PhysicalPage> physPages;
+    std::map<std::uintptr_t, DirectMapping> directMappings;
+    std::mutex protectionLock;
+    std::map<std::uintptr_t, ProtectedRange> protections;
+    std::mutex reservationLock;
+    std::map<std::uintptr_t, std::uintptr_t> reservations;
+};
+
+DirectMemoryState& MemoryState() {
+    static auto* state = new DirectMemoryState;
+    return *state;
+}
+
+#if defined(__linux__)
+std::vector<bool>& PhysicalUsed() { return MemoryState().physicalUsed; }
+#endif
+
+auto& g_directLock = MemoryState().directLock;
+auto& g_physPages = MemoryState().physPages;
+auto& g_directMappings = MemoryState().directMappings;
+auto& g_physicalSpans = MemoryState().physicalSpans;
+auto& g_protectionLock = MemoryState().protectionLock;
+auto& g_protections = MemoryState().protections;
+auto& g_reservationLock = MemoryState().reservationLock;
+auto& g_reservations = MemoryState().reservations;
 
 void SplitPhysicalSpan(std::uint64_t at) {
     auto span = g_physicalSpans.upper_bound(at);
@@ -444,7 +475,6 @@ void ErasePhysMappings(std::uint64_t first, std::uint64_t last) {
         }
     }
 }
-
 
 void ValidatePhysicalRange(std::uint64_t phys, std::size_t len) {
     for (std::size_t offset = 0; offset < len; offset += PS5_PAGE_SIZE) {
@@ -718,13 +748,6 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     return aligned;
 }
 
-struct ProtectedRange {
-    std::uintptr_t end;
-    int prot;
-};
-std::mutex g_protectionLock;
-std::map<std::uintptr_t, ProtectedRange> g_protections;
-
 void EraseProtections(std::uintptr_t start, std::uintptr_t end) {
     auto it = g_protections.lower_bound(start);
     if (it != g_protections.begin() && std::prev(it)->second.end > start) --it;
@@ -736,9 +759,6 @@ void EraseProtections(std::uintptr_t start, std::uintptr_t end) {
         if (range.end > end) it = g_protections.emplace(end, ProtectedRange{range.end, range.prot}).first;
     }
 }
-
-std::mutex g_reservationLock;
-std::map<std::uintptr_t, std::uintptr_t> g_reservations;
 
 void EraseReservations(const void* addr, size_t len) {
     const auto start = reinterpret_cast<std::uintptr_t>(addr);

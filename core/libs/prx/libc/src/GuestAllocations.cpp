@@ -41,8 +41,8 @@ struct Registry {
 };
 
 Registry& registry() {
-    static Registry value;
-    return value;
+    static auto* value = new Registry;
+    return *value;
 }
 
 std::atomic<std::uint64_t> generation{1};
