@@ -45,6 +45,10 @@ int CopyOut(const void* value, std::size_t size, void* oldValue, std::size_t* ol
     return 0;
 }
 
+bool IsLeafMib(const int* name) {
+    return (name[0] == 6 && (name[1] == 2 || name[1] == 3 || name[1] == 5)) || (name[0] == 1 && name[1] == 37);
+}
+
 std::string HostCpuModel() {
 #if defined(__x86_64__) || defined(__i386__)
     if (__get_cpuid_max(0x80000000, nullptr) < 0x80000004) return {};
@@ -172,6 +176,10 @@ int APS5_VABI sysctl_nid_postfix(const int* name, std::uint32_t nameLength, void
         }
         *oldLength = count;
         return 0;
+    }
+    if (nameLength > 2 && IsLeafMib(name)) {
+        *__error_nid_postfix() = 20;
+        return -1;
     }
     std::string mib;
     for (std::uint32_t i = 0; i < nameLength; ++i) mib += (i == 0 ? "" : ".") + std::to_string(name[i]);

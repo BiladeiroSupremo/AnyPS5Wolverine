@@ -176,6 +176,18 @@ static void CheckPathnameSysctl() {
     length = sizeof(buffer);
     Require(sysctl_nid_postfix(mibSelf, 4, buffer, &length, buffer, sizeof(buffer)) == -1 && *__error_nid_postfix() == 1);
 }
+static void CheckLeafWithTrailingComponent() {
+    const int leaves[][2] = {{6, 3}, {6, 2}, {6, 5}, {1, 37}};
+    for (const auto& leaf : leaves) {
+        const int mib[] = {leaf[0], leaf[1], 0};
+        char buffer[8] = {};
+        std::size_t length = sizeof(buffer);
+        *__error_nid_postfix() = 13;
+        Require(sysctl_nid_postfix(mib, 3, buffer, &length, nullptr, 0) == -1 && *__error_nid_postfix() == 20);
+        Require(sysctl_nid_postfix(mib, 3, buffer, &length, buffer, sizeof(buffer)) == -1 && *__error_nid_postfix() == 20);
+        Require(length == sizeof(buffer));
+    }
+}
 static void CheckSystemSwVersion() {
     *__error_nid_postfix() = 13;
     Require(sceKernelGetSystemSwVersion_nid_postfix(nullptr) == SCE_KERNEL_ERROR_EFAULT && *__error_nid_postfix() == 13);
@@ -277,6 +289,7 @@ int main() {
     CheckTscFrequencySysctl();
     CheckMachdepCachelineSizeSysctl();
     CheckPathnameSysctl();
+    CheckLeafWithTrailingComponent();
     CheckSystemSwVersion();
     CheckPseudoRandomSysctl();
     CheckSdkVersionSysctl();
