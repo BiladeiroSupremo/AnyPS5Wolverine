@@ -69,7 +69,7 @@ static void CommitArenaRange(void* addr, size_t len, DWORD winProt) {
 
 static void* mmap_aligned(size_t len, int prot, size_t alignment, std::uintptr_t hint = 0) {
     auto& arena = KernelArena::Get();
-    void* result = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(hint, len, alignment);
+    void* result = GuestArena::GuestArenaAllocateFromHint_nid_postfix(hint, len, alignment);
     if (prot != PROT_NONE) {
         try {
             CommitArenaRange(result, len, WinProtFromPosix(prot));
@@ -715,7 +715,7 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     if (addr) {
 #if defined(__linux__)
         if (ArenaAvailable()) {
-            void* placed = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(
+            void* placed = GuestArena::GuestArenaAllocateFromHint_nid_postfix(
                 reinterpret_cast<std::uintptr_t>(addr), len, alignment);
             if (void* committed = ArenaCommit(placed, len, prot); committed != MAP_FAILED) return committed;
             ArenaForget(placed, len);
