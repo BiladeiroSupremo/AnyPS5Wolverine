@@ -177,6 +177,10 @@ On Windows, NVIDIA driver 610.47 can crash in its shader compiler while pipeline
 
 HDR output is available on Windows only. Titles see it when the monitor showing the window runs in HDR mode (Settings > Display > Use HDR), the window's Vulkan surface offers an HDR10 (`VK_COLOR_SPACE_HDR10_ST2084_EXT`) swapchain in a 10-bit format, the instance has `VK_EXT_swapchain_colorspace` and the device `VK_EXT_hdr_metadata`. The monitor's luminance comes from DXGI; a monitor that reports no peak luminance is taken as 1000 nits peak and full-frame, 0 nits black. On Linux and other hosts the output is always SDR, because the surface's formats do not show whether the display is in HDR. A title's BT.2100 PQ display buffers then reach the display unchanged; without HDR output they are converted to SDR.
 
+### Shader cache
+
+Recompiled shaders and the Vulkan pipeline cache are kept in a `shader_cache/` directory beside the output executable, so later runs skip recompilation. Set `ANYPS5_SHADER_CACHE_DIR` to use another directory, or set `ANYPS5_NO_SHADER_CACHE` to any non-empty value other than `0` to disable both caches. Shaders are stored in a subdirectory named after the recompiler's source version; subdirectories of other versions unused for 14 days are removed the first time a run looks up a shader. The pipeline cache is one `vk-pipelines-*.bin` file per GPU and driver version. Deleting the directory is safe: it is rebuilt on the next run.
+
 ### Storing GPU results at each flip
 
 GPU results in storage images and render targets stay on the GPU until something reads their memory. A title that frees such an image after waiting for its GPU work and reuses the memory can have its new data overwritten when the results are stored later ([TechnicalDebt](../dev/TechnicalDebt.md)). `APS5_STORE_AT_FLIP=1` stores every pending result when a display buffer is flipped, at the cost of one write-back per pending image and frame. Any other value stops the title at its first flip.
