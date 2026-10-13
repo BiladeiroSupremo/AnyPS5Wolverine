@@ -15,6 +15,7 @@ struct ResourceLimit {
 
 extern "C" int APS5_VABI getrlimit_nid_postfix(int resource, ResourceLimit* limit);
 extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" int APS5_VABI getdtablesize_nid_postfix(void);
 
 static constexpr int GUEST_EFAULT = 14;
 static constexpr int GUEST_EINVAL = 22;
@@ -124,4 +125,11 @@ int main() {
          }) {
         RequireUnsupported(resource);
     }
+    bool unsupported = false;
+    try {
+        getdtablesize_nid_postfix();
+    } catch (const std::runtime_error&) {
+        unsupported = true;
+    }
+    Require(unsupported);
 }
