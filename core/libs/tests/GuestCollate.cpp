@@ -11,6 +11,7 @@
 extern "C" {
 extern GuestLocale::Implementation* _ZSt21_sceLibcClassicLocale_nid_postfix;
 std::size_t APS5_VABI _ZNSt7collateIcE7_GetcatEPPKNSt6locale5facetEPKS1__nid_postfix(GuestLocale::Facet** facet, const GuestLocale::Implementation* const* locale);
+std::size_t APS5_VABI _ZNSt7collateIwE7_GetcatEPPKNSt6locale5facetEPKS1__nid_postfix(GuestLocale::Facet** facet, const GuestLocale::Implementation* const* locale);
 }
 
 namespace {
@@ -63,6 +64,60 @@ std::uint64_t Hash(const GuestLocale::CollateFacet* facet, const std::string& te
     return static_cast<std::uint64_t>(Vtable(&facet->base).hash(facet, text.data(), text.data() + text.size()));
 }
 
+// The wide facet mirrors the narrow one: the same facet allocation, the same C-locale
+// validation and the same vtable, because GuestLocale models one CollateVtable for both.
+void CheckWideGetcat(const GuestLocale::Implementation* const* classic, const void* narrowVtable) {
+    require(_ZNSt7collateIwE7_GetcatEPPKNSt6locale5facetEPKS1__nid_postfix(nullptr, classic) == 1);
+
+    const std::size_t before = allocations;
+    GuestLocale::Facet existing{};
+    GuestLocale::Facet* facet = &existing;
+    require(_ZNSt7collateIwE7_GetcatEPPKNSt6locale5facetEPKS1__nid_postfix(&facet, classic) == 1);
+    require(facet == &existing && allocations == before);
+
+    GuestLocale::Implementation french = *_ZSt21_sceLibcClassicLocale_nid_postfix;
+    french.name = "fr_FR";
+    const GuestLocale::Implementation* frenchPointer = &french;
+    GuestLocale::Implementation unnamed = *_ZSt21_sceLibcClassicLocale_nid_postfix;
+    unnamed.name = nullptr;
+    const GuestLocale::Implementation* unnamedPointer = &unnamed;
+    const GuestLocale::Implementation* missingPointer = nullptr;
+    for (const GuestLocale::Implementation* const* rejected : {&frenchPointer, &unnamedPointer, &missingPointer}) {
+        GuestLocale::Facet* absent = nullptr;
+        reject([&] { _ZNSt7collateIwE7_GetcatEPPKNSt6locale5facetEPKS1__nid_postfix(&absent, rejected); });
+        require(absent == nullptr && allocations == before);
+    }
+    GuestLocale::Facet* absent = nullptr;
+    reject([&] { _ZNSt7collateIwE7_GetcatEPPKNSt6locale5facetEPKS1__nid_postfix(&absent, nullptr); });
+    require(absent == nullptr && allocations == before);
+
+    facet = nullptr;
+    require(_ZNSt7collateIwE7_GetcatEPPKNSt6locale5facetEPKS1__nid_postfix(&facet, classic) == 1);
+    require(facet != nullptr && allocations == before + 1 && lastSize == sizeof(GuestLocale::CollateFacet) && lastAllocation == facet);
+    const auto* wide = reinterpret_cast<const GuestLocale::CollateFacet*>(facet);
+    require(facet->references == 0 && facet->vtable == narrowVtable);
+    require(wide->collation == nullptr && wide->wideCollation == nullptr);
+
+    require(Compare(wide, "abc", "abd") == -1);
+    require(Compare(wide, "abd", "abc") == 1);
+    require(Compare(wide, "abc", "abc") == 0);
+    require(Compare(wide, "ab", "abc") == -1);
+    require(Compare(wide, "", "a") == -1);
+    require(Hash(wide, "foobar") == 0x85944171f73967e8ull);
+    const char narrow[] = "abc";
+    reject([&] { Vtable(facet).compare(wide, narrow + 2, narrow, narrow, narrow + 1); });
+
+    Vtable(facet).facet.retain(facet);
+    require(facet->references == 1);
+    require(Vtable(facet).facet.release(facet) == facet && facet->references == 0);
+    const std::size_t freed = frees;
+    Vtable(facet).facet.destroy(facet);
+    require(frees == freed);
+    Vtable(facet).facet.deleteObject(facet);
+    require(frees == freed + 1 && lastFree == wide);
+    require(allocations == before + 1);
+}
+
 }
 
 int main() {
@@ -87,6 +142,7 @@ int main() {
     require(facet != nullptr && allocations == 1 && lastSize == sizeof(GuestLocale::CollateFacet) && lastAllocation == facet);
     const auto* collate = reinterpret_cast<const GuestLocale::CollateFacet*>(facet);
     require(facet->references == 0 && collate->collation == nullptr && collate->wideCollation == nullptr);
+    const void* narrowVtable = facet->vtable;
 
     require(Compare(collate, "abc", "abd") == -1);
     require(Compare(collate, "abd", "abc") == 1);
@@ -159,5 +215,8 @@ int main() {
     require(frees == 0);
     Vtable(facet).facet.deleteObject(facet);
     require(frees == 1 && lastFree == collate);
+
+    CheckWideGetcat(classic, narrowVtable);
+    require(frees == 2 && allocations == 5);
     return 0;
 }
