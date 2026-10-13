@@ -7,21 +7,29 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
-static constexpr int SCE_AGC_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80890001);
+namespace {
+
+constexpr std::uint32_t kRegisterDefaultsVersionCount = 14;
+constexpr std::uint32_t kRegisterDefaultsFallbackVersion = kRegisterDefaultsVersionCount - 1;
+
+std::uint32_t ResolveRegisterDefaultsVersion(std::uint32_t version) {
+    return version < kRegisterDefaultsVersionCount ? version : kRegisterDefaultsFallbackVersion;
+}
+
+}
 
 extern "C" {
 
-int APS5_VABI sceAgcInit_0090(std::uint32_t* state, std::uint32_t version) {
-    Agc::Command::CheckAddress(reinterpret_cast<std::uintptr_t>(state), alignof(std::uint32_t), __func__);
-    Agc::Command::Require(version < 14, __func__, "unsupported AGC initialization version");
+int APS5_VABI sceAgcInit(std::uint32_t version) {
+    const std::uint32_t defaultsVersion = ResolveRegisterDefaultsVersion(version);
+    Agc::Command::GetRegisterDefaults(defaultsVersion, false, __func__);
+    Agc::Command::GetRegisterDefaults(defaultsVersion, true, __func__);
     return 0;
 }
 
-int APS5_VABI sceAgcInit(std::uint32_t version) {
-    if (version >= 14) return SCE_AGC_ERROR_INVALID_ARGUMENT;
-    Agc::Command::GetRegisterDefaults(version, false, __func__);
-    Agc::Command::GetRegisterDefaults(version, true, __func__);
-    return 0;
+int APS5_VABI sceAgcInit_0090(std::uint32_t* state, std::uint32_t version) {
+    Agc::Command::CheckAddress(reinterpret_cast<std::uintptr_t>(state), alignof(std::uint32_t), __func__);
+    return sceAgcInit(version);
 }
 
 }
