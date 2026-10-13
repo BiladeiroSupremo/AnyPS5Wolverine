@@ -2,8 +2,10 @@
 #include "tests/GuestUnwindModuleInfoFixture.hpp"
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <windows.h>
+#include <psapi.h>
 
 extern "C" int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleInfoForUnwind* info);
 
@@ -38,6 +40,14 @@ int main() {
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     Require(info.seg0_size == nt->OptionalHeader.SizeOfImage);
+    char mapped[4096] = {};
+    Require(GetMappedFileNameA(GetCurrentProcess(), memory.BaseAddress, mapped, sizeof(mapped) - 1) != 0);
+    Require(std::strcmp(info.name, mapped) == 0);
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        ModuleInfoForUnwind again{};
+        Require(sceKernelGetModuleInfoForUnwind(address, 0, &again) == 0);
+        Require(std::memcmp(&again, &info, sizeof(info)) == 0);
+    }
 
     fixture->header.version = 2;
     Require(Throws(address));

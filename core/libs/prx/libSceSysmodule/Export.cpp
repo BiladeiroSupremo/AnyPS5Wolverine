@@ -38,6 +38,52 @@ void* openHostModule(const char* name) {
     return dlopen_nid_postfix(relative.c_str(), kRtldNow);
 }
 
+#ifdef _WIN32
+struct ImageName {
+    DWORD stamp = 0;
+    DWORD checksum = 0;
+    DWORD size = 0;
+    std::string name;
+};
+
+std::string queryMappedFileName(void* address) {
+    char path[4096] = {};
+    const DWORD length = GetMappedFileNameA(GetCurrentProcess(), address, path, sizeof(path) - 1);
+    return std::string(path, length);
+}
+
+void copyMappedFileName(const MEMORY_BASIC_INFORMATION& mbi, ModuleInfoForUnwind* info) {
+    std::string name;
+    if (mbi.Type != MEM_IMAGE) {
+        name = queryMappedFileName(mbi.BaseAddress);
+    } else {
+        const auto* base = static_cast<const std::uint8_t*>(mbi.AllocationBase);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt = dos->e_magic == IMAGE_DOS_SIGNATURE ? reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew) : nullptr;
+        if (nt == nullptr || nt->Signature != IMAGE_NT_SIGNATURE) {
+            name = queryMappedFileName(mbi.BaseAddress);
+        } else {
+            static std::mutex mutex;
+            static auto& names = *new std::unordered_map<const void*, ImageName>();
+            std::lock_guard lock(mutex);
+            auto& cached = names[mbi.AllocationBase];
+            if (cached.name.empty() || cached.stamp != nt->FileHeader.TimeDateStamp || cached.checksum != nt->OptionalHeader.CheckSum ||
+                cached.size != nt->OptionalHeader.SizeOfImage) {
+                cached.stamp = nt->FileHeader.TimeDateStamp;
+                cached.checksum = nt->OptionalHeader.CheckSum;
+                cached.size = nt->OptionalHeader.SizeOfImage;
+                cached.name = queryMappedFileName(mbi.BaseAddress);
+            }
+            std::strncpy(info->name, cached.name.c_str(), sizeof(info->name) - 1);
+            info->name[sizeof(info->name) - 1] = '\0';
+            return;
+        }
+    }
+    std::strncpy(info->name, name.c_str(), sizeof(info->name) - 1);
+    info->name[sizeof(info->name) - 1] = '\0';
+}
+#endif
+
 bool fillModuleInfoForUnwind(std::uint64_t addr, ModuleInfoForUnwind* info) {
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi{};
@@ -50,11 +96,7 @@ bool fillModuleInfoForUnwind(std::uint64_t addr, ModuleInfoForUnwind* info) {
     info->eh_frame_size = 0;
     info->seg0_addr = reinterpret_cast<std::uint64_t>(mbi.BaseAddress);
     info->seg0_size = mbi.RegionSize;
-    char path[4096] = {};
-    DWORD len = GetMappedFileNameA(GetCurrentProcess(), mbi.BaseAddress, path, sizeof(path) - 1);
-    path[len] = '\0';
-    std::strncpy(info->name, path, sizeof(info->name) - 1);
-    info->name[sizeof(info->name) - 1] = '\0';
+    copyMappedFileName(mbi, info);
     return true;
 #else
     const auto mapping = HostMapping::Find(addr, "sceSysmoduleGetModuleInfoForUnwind");
