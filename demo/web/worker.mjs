@@ -1,4 +1,4 @@
-import { Archive, MEMORY_LIMIT, memoryEstimate, packageArchive } from "./archive.mjs";
+import { Archive, CONVERSION_LIMIT, MEMORY_LIMIT, memoryEstimate, packageArchive } from "./archive.mjs";
 
 let archive;
 let busy = false;
@@ -54,8 +54,10 @@ self.onmessage = async ({ data }) => {
     } else if (data.type === "convert") {
       if (data.target === "windows" && data.mode === "disk") throw new Error("Windows folder output is unavailable because browsers block DLL creation. Choose a ZIP save mode.");
       if (!archive) throw new Error("Select a ZIP or folder first");
+      const selectedBytes = archive.selectedBytesForTarget(data.target);
+      if (selectedBytes > CONVERSION_LIMIT) throw new Error(`Selected ${data.target} conversion input exceeds the 256 MiB conversion limit. Use the native relinker for this app.`);
       const libraries = await downloadLibraries(data.target);
-      const estimate = memoryEstimate(archive.totalBytes, archive.selectedBytes, libraries.expandedBytes, archive.entries.length);
+      const estimate = memoryEstimate(archive.totalBytes, selectedBytes, libraries.expandedBytes, archive.entries.length);
       if (data.mode === "memory" && estimate > MEMORY_LIMIT) throw new Error("This result exceeds the 256 MiB memory-download budget. Use Save ZIP to disk in desktop Chrome or Edge.");
       report({ phase: "Loading converter" });
       const { default: createRelinker } = await import("./native/relinker_wasm.mjs");

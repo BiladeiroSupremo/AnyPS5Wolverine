@@ -141,19 +141,27 @@ export class Archive {
     this.executable = executables[0];
     if (this.executable.name.includes("/")) throw new Error("Place the executable next to sce_sys and sce_module, not inside another folder");
     this.icon = this.files.find(item => item.name === "sce_sys/icon0.png" && !item.entry.directory);
-    if (this.icon && this.icon.entry.uncompressedSize > ICON_LIMIT) throw new Error("sce_sys/icon0.png exceeds 16 MiB");
-    this.selectedBytes = [this.executable, ...this.modules, ...(this.icon ? [this.icon] : [])].reduce((sum, item) => sum + item.entry.uncompressedSize, 0);
-    if (this.selectedBytes > CONVERSION_LIMIT) throw new Error("Executable, modules and icon exceed the 256 MiB conversion limit. Use the native relinker for this app.");
+    this.selectedBytes = [this.executable, ...this.modules].reduce((sum, item) => sum + item.entry.uncompressedSize, 0);
+    this.windowsSelectedBytes = this.selectedBytes + (this.icon?.entry.uncompressedSize ?? 0);
+    if (this.selectedBytes > CONVERSION_LIMIT) throw new Error("Executable and modules exceed the 256 MiB conversion limit. Use the native relinker for this app.");
     const warnings = [];
     if (!this.files.some(item => item.name.startsWith("sce_sys/"))) warnings.push("sce_sys is missing. The Windows executable will have no app icon.");
     else if (!this.icon) warnings.push("sce_sys/icon0.png is missing. The Windows executable will have no app icon.");
     if (!this.files.some(item => item.name.startsWith("sce_module/"))) warnings.push("sce_module is missing. If the original app included this folder, leaving it out can prevent the app from starting.");
     this.totalBytes = total;
-    return { name: this.executable.name, files: files.length, modules: this.modules.length, totalBytes: total, selectedBytes: this.selectedBytes, root: prefix, warnings };
+    return { name: this.executable.name, files: files.length, modules: this.modules.length, totalBytes: total, selectedBytes: this.selectedBytes, windowsSelectedBytes: this.windowsSelectedBytes, windowsIconTooLarge: (this.icon?.entry.uncompressedSize ?? 0) > ICON_LIMIT, root: prefix, warnings };
+  }
+
+  selectedBytesForTarget(target) {
+    if (target !== "linux" && target !== "windows") throw new Error(`Unsupported conversion target: ${target}`);
+    if (target === "windows" && (this.icon?.entry.uncompressedSize ?? 0) > ICON_LIMIT) throw new Error("sce_sys/icon0.png exceeds 16 MiB");
+    return target === "windows" ? this.windowsSelectedBytes : this.selectedBytes;
   }
 
   async conversionInput(target, toIntel, report) {
     let remaining = CONVERSION_LIMIT;
+    const selectedBytes = this.selectedBytesForTarget(target);
+    if (selectedBytes > CONVERSION_LIMIT) throw new Error(`Selected ${target} conversion input exceeds the 256 MiB conversion limit. Use the native relinker for this app.`);
     const read = async item => {
       report({ phase: "Reading conversion input", input: item.name });
       const bytes = await boundedBytes(item.entry, remaining);
