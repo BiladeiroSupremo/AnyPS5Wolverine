@@ -214,6 +214,11 @@ int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::si
         for (std::size_t i = 0; i < *oldLength; ++i) bytes[i] = static_cast<std::uint8_t>(device());
         return 0;
     }
+    if (std::strcmp(name, "vm.overcommit") == 0) {
+        if (newValue != nullptr) throw std::runtime_error(std::string(__func__) + ": setting vm.overcommit");
+        static constexpr int overcommit = 0;
+        return CopyOut(&overcommit, sizeof(overcommit), oldValue, oldLength);
+    }
     if (std::strcmp(name, "kern.sdk_version") == 0) {
         if (newValue != nullptr) {
             *__error_nid_postfix() = 1;
