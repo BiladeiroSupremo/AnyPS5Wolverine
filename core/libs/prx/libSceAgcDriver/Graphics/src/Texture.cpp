@@ -31,6 +31,9 @@
 #include <optional>
 #include <unordered_map>
 #include <utility>
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long, unsigned long, void**, unsigned long*);
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -2798,7 +2801,11 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
     return !overlapped || bytes <= DccKeyCount(descriptor, guestBytes);
 }
 
+// The caller of the current MarkDirty, for APS5_TRACE_WRITE_IMAGE.
+thread_local void* markDirtyCaller = nullptr;
+
 void StorageTexture::MarkDirty() {
+    markDirtyCaller = __builtin_return_address(0);
     if (descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
@@ -2817,6 +2824,32 @@ void StorageTexture::refreshGeneration() {
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
+    // Debug aid: APS5_TRACE_WRITE_IMAGE=<hex address>[:<width>] prints the callers that mark that
+    // image written (return addresses, for the symbol table), at most 64 times.
+    static const std::pair<std::uint64_t, std::uint32_t> traced = [] {
+        const char* text = std::getenv("APS5_TRACE_WRITE_IMAGE");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint32_t>{0, 0};
+        char* end = nullptr;
+        const auto address = std::strtoull(text, &end, 16);
+        const auto width = *end == ':' ? static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10)) : 0u;
+        return std::pair<std::uint64_t, std::uint32_t>{address, width};
+    }();
+    if (traced.first != 0 && traced.first == descriptor.baseAddress && (traced.second == 0 || traced.second == descriptor.width)) {
+        static std::atomic<int> printed{0};
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 64) {
+            std::string frames;
+#ifdef _WIN32
+            void* stack[12] = {};
+            const auto count = RtlCaptureStackBackTrace(0, 12, stack, nullptr);
+            for (unsigned short i = 0; i < count; ++i) {
+                char text[24];
+                std::snprintf(text, sizeof(text), " %p", stack[i]);
+                frames += text;
+            }
+#endif
+            std::fprintf(stderr, "[write-image] 0x%llx %ux%u marked written (traceKeyStore at %p) caller %p dirty-caller %p:%s\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, reinterpret_cast<void*>(&traceKeyStore), __builtin_return_address(0), markDirtyCaller, frames.c_str());
+        }
+    }
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
     // Results of this image now cover the alias's results borrowed into these units: this image

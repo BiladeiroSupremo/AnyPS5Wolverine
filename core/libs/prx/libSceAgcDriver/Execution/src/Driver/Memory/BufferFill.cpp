@@ -244,6 +244,9 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             }
         }
         phase(FillClearPhase);
+        // Debug aid: with APS5_TRACE_WRITE_IMAGE=<hex address>, fills over that address are named too.
+        static const std::uint64_t tracedImage = [] { const char* text = std::getenv("APS5_TRACE_WRITE_IMAGE"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
+        if (tracedImage != 0 && tracedImage >= base && tracedImage < base + bytes) std::fprintf(stderr, "[fill] 0x%llx+0x%zx pattern %08x cover %d image %s cleared %d (%s)\n", static_cast<unsigned long long>(base), bytes, pattern[0], static_cast<int>(coverage.cover), coverage.image != nullptr ? (std::to_string(coverage.image->Descriptor().width) + "x" + std::to_string(coverage.image->Descriptor().height)).c_str() : "none", cleared ? 1 : 0, refusal != nullptr ? refusal : "-");
         fillClearCount(coverage, bytes, pattern, discarded, cleared, refusal);
         noteForeignWriter(base, base + bytes, queueId);
 
