@@ -37,6 +37,9 @@ public:
     // Puts the texture's view in the next free slot of `kind` (a BindlessHeaps::ImageBinding*) and
     // keeps the texture alive; the translation word for it, or Unusable when the kind is full.
     std::uint32_t Publish(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout imageLayout);
+    // Gives back the slot of a translation word that was replaced: its texture stays alive and the
+    // slot unused until the recorder's open batch (the last work that may read it) completes.
+    void Retire(std::uint32_t word, Recorder& recorder);
     // Whether a feedback scan is due (at most one per interval).
     bool ScanDue();
     // Marks a translation entry handled (its word published or about to be); false when it already
@@ -53,6 +56,7 @@ public:
         std::uint64_t address = 0;
         std::array<std::uint32_t, 8> words{};
         std::shared_ptr<Texture> texture;
+        std::uint32_t word = 0;
     };
     std::vector<Entry>& Entries() { return entries; }
     std::size_t& RevalidateCursor() { return revalidateCursor; }
@@ -77,7 +81,11 @@ private:
         VkImageView view = VK_NULL_HANDLE;
     };
     std::array<Placeholder, ShaderRecompiler::BindlessHeaps::KindCount> placeholders{};
-    std::vector<std::shared_ptr<Texture>> pinned;
+    // The texture each published slot holds; slots retired by Retire come back through freeSlots
+    // (filled when the batch that last used them completes, hence its own mutex).
+    std::array<std::vector<std::shared_ptr<Texture>>, ShaderRecompiler::BindlessHeaps::KindCount> slotTextures;
+    std::shared_ptr<std::mutex> freeMutex = std::make_shared<std::mutex>();
+    std::shared_ptr<std::array<std::vector<std::uint32_t>, ShaderRecompiler::BindlessHeaps::KindCount>> freeSlots = std::make_shared<std::array<std::vector<std::uint32_t>, ShaderRecompiler::BindlessHeaps::KindCount>>();
     std::vector<std::uint8_t> claimed;
     std::chrono::steady_clock::time_point lastScan{};
     std::vector<Entry> entries;

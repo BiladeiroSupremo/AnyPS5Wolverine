@@ -91,7 +91,7 @@ BindlessHeapTable::~BindlessHeapTable() {
 }
 
 void BindlessHeapTable::release() noexcept {
-    pinned.clear();
+    for (auto& textures : slotTextures) textures.clear();
     translation.reset();
     feedback.reset();
     if (pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
@@ -190,8 +190,20 @@ std::span<std::uint32_t> BindlessHeapTable::Feedback() {
 }
 
 std::uint32_t BindlessHeapTable::Publish(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout imageLayout) {
-    if (kind >= Heaps::KindCount || nextSlot[kind] >= Heaps::SlotsPerKind) return Heaps::Unusable;
-    const auto slot = nextSlot[kind]++;
+    if (kind >= Heaps::KindCount) return Heaps::Unusable;
+    std::uint32_t slot = 0;
+    {
+        std::lock_guard lock(*freeMutex);
+        auto& free = (*freeSlots)[kind];
+        if (!free.empty()) {
+            slot = free.back();
+            free.pop_back();
+        }
+    }
+    if (slot == 0) {
+        if (nextSlot[kind] >= Heaps::SlotsPerKind) return Heaps::Unusable;
+        slot = nextSlot[kind]++;
+    }
     const VkDescriptorImageInfo info{VK_NULL_HANDLE, view, imageLayout};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = set;
@@ -201,8 +213,35 @@ std::uint32_t BindlessHeapTable::Publish(std::uint32_t kind, const std::shared_p
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     write.pImageInfo = &info;
     context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &write, 0, nullptr);
-    pinned.push_back(texture);
+    auto& textures = slotTextures[kind];
+    if (textures.size() <= slot) textures.resize(slot + 1u);
+    textures[slot] = texture;
     return (kind << Heaps::KindShift) | slot;
+}
+
+void BindlessHeapTable::Retire(std::uint32_t word, Recorder& recorder) {
+    const auto kind = word >> Heaps::KindShift;
+    const auto slot = word & Heaps::IndexMask;
+    if (kind >= Heaps::KindCount || slot == 0 || slot >= slotTextures[kind].size()) return;
+    // Holds the texture until the batch completes, then returns the slot.
+    struct Retired {
+        std::shared_ptr<Texture> texture;
+        std::shared_ptr<std::mutex> mutex;
+        std::shared_ptr<std::array<std::vector<std::uint32_t>, Heaps::KindCount>> free;
+        std::uint32_t kind = 0;
+        std::uint32_t slot = 0;
+        ~Retired() {
+            std::lock_guard lock(*mutex);
+            (*free)[kind].push_back(slot);
+        }
+    };
+    auto retired = std::make_shared<Retired>();
+    retired->texture = std::move(slotTextures[kind][slot]);
+    retired->mutex = freeMutex;
+    retired->free = freeSlots;
+    retired->kind = kind;
+    retired->slot = slot;
+    recorder.Keep(std::move(retired));
 }
 
 bool BindlessHeapTable::Claim(std::uint32_t index) {
@@ -250,7 +289,7 @@ bool readHeapWords(std::uint64_t address, std::array<std::uint32_t, 8>& words) {
 // The translation word of one heap entry: the entry's texture in a slot of the kind its view has,
 // or Unusable (null, unreadable, integer or of a kind the heap set lacks). A usable entry is
 // recorded for revalidation (`existing`: the entry being revalidated, updated in place).
-std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table, std::uint32_t index, std::uint64_t address, BindlessHeapTable::Entry* existing = nullptr) {
+std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table, Recorder& recorder, std::uint32_t index, std::uint64_t address, BindlessHeapTable::Entry* existing = nullptr) {
     std::array<std::uint32_t, 8> words{};
     if (!readHeapWords(address, words)) return Heaps::Unusable;
     const auto texture = CachedSampledTexture(context, words);
@@ -273,10 +312,13 @@ std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table,
     const auto word = table.Publish(kind, texture, texture->View(), texture->Layout());
     if (word != Heaps::Unusable) {
         if (existing != nullptr) {
+            // The replaced slot (and its texture) is released once the work that may read it ends.
+            table.Retire(existing->word, recorder);
             existing->words = words;
             existing->texture = texture;
+            existing->word = word;
         } else {
-            table.Entries().push_back({index, address, words, texture});
+            table.Entries().push_back({index, address, words, texture, word});
         }
     }
     if (traceEntries) {
@@ -348,7 +390,7 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             if (!table->Claim(index)) continue;
             std::uint32_t word = Heaps::Unusable;
             try {
-                word = resolveHeapEntry(context, *table, index, region.heapBase + region.entryOffset + static_cast<std::uint64_t>(key) * 32u);
+                word = resolveHeapEntry(context, *table, recorder, index, region.heapBase + region.entryOffset + static_cast<std::uint64_t>(key) * 32u);
             } catch (const std::exception& error) {
                 static std::atomic<int> reported{0};
                 if (reported.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[bindless] heap 0x%llx key %u is unusable: %s\n", static_cast<unsigned long long>(region.heapBase), key, error.what());
@@ -368,7 +410,7 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             if (cursor >= entries.size()) cursor = 0;
             auto& entry = entries[cursor++];
             try {
-                const auto word = resolveHeapEntry(context, *table, entry.index, entry.address, &entry);
+                const auto word = resolveHeapEntry(context, *table, recorder, entry.index, entry.address, &entry);
                 if (word == Heaps::Pending) continue;
                 published.emplace_back(entry.index, word);
                 counters.republished.fetch_add(1, std::memory_order_relaxed);
