@@ -117,6 +117,13 @@ A storage image over guest memory that the write watch does not cover (a host-po
 
 The comparison runs again when any of them changes. A CPU store into unwatched memory is therefore seen at the next ordering point, the same bound the collect memo gives watched memory. Driver stores into unwatched memory are recorded per 64 KiB block in a fixed table of 65,536 slots indexed by block number modulo the table size, each slot holding the newest generation stored to any of its blocks. A collision can only raise a surface's stamp, which costs one comparison and never skips one. `agc_driver_dcc_keys_first_write` (`RunUntrackedReuse`) checks that a CPU edit to an unwatched image is uploaded after the next epoch, and `agc_write_tracking` (`CheckNewestStamp`) checks which stores advance `NewestStamp`.
 
+### Resource plans
+
+A cached shader keeps an `IrResourcePlan` (`ResourceMaterializer::ExtractPlan` in [`ResourceMaterializer.cpp`](../../core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp)) for as long as it is registered: a copy of the IR values its descriptor sources, SRT reads, uniform fill and control-flow conditions depend on, which every capture walks to read the shader's resources from guest memory. The copy is sized to what the walk can use:
+
+- A control-flow condition is kept only when `Detail::Evaluator::MayEvaluate` finds a runtime it could be evaluated for. A condition that depends on a vector register, or on an opcode the evaluator does not evaluate, takes both successors whatever the runtime holds, so the plan stores it as no condition and does not copy its operands. Such conditions are most of a shader's IR when the masked-lane code feeds its branches.
+- The copied values are allocated in one `IrValueArena` and hold no use lists: the walk only follows arguments.
+
 ### Shader MODE register access
 
 `GuestContext::floatMode` carries the initial shader mode through `Recompile` and `TranslateOptions` into each block's `TranslationContext`. `s_getreg_b32` reads confined to MODE bits 0–3 return the selected initial rounding bits in the destination's low bits. Bits 0–1 select f32 rounding; bits 2–3 select f16/f64 rounding. Missing mode metadata retains the legacy round-to-nearest-even assumption. Reading other MODE fields or hardware registers throws.
