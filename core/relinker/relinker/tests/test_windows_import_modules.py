@@ -668,6 +668,7 @@ def main():
             run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
             assert run.returncode != 0 and 'Failed to load module:' in run.stderr and 'missing.prx' in run.stderr, (run.returncode, run.stderr)
             assert run.stderr.startswith('Failed to load module:'), run.stderr
+            assert 'GetLastError: 126' in run.stderr and 'hint: the module or one of its dependent DLLs was not found' in run.stderr, run.stderr
 
         for index, (symbol, module_name) in enumerate([('shared#A#B', None), ('shared', None), ('shared#A#B', 'libSceJson')]):
             case = work / ('missing-unused-dependency-' + str(index))

@@ -215,6 +215,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     const auto failedModule = addString("Failed to load module: ");
     const auto skippedModule = addString(" -> not found; nothing is imported from it, continuing without it\n");
     const auto errorPrefix = addString("GetLastError: ");
+    const auto moduleNotFoundHint = addString("hint: the module or one of its dependent DLLs was not found; a self-built libs/ also needs libgcc_s_seh-1.dll, libstdc++-6.dll and libwinpthread-1.dll from the toolchain's mingw64/bin next to it\n");
     const auto messageSeparator = addString(" - ");
     const auto newline = addString("\n");
     const auto searched = addString("Searched libraries:\n");
@@ -486,6 +487,11 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         writeString(resolvedPaths[index], true);
         writeString(newline, true);
         writeLastError();
+        code.Rip({0x8b, 0x05}, lastError);
+        code.Emit({0x83, 0xf8, 0x7e});
+        const auto notModuleNotFound = code.Branch({0x0f, 0x85});
+        writeString(moduleNotFoundHint, true);
+        code.PatchBranch(notModuleNotFound, code.GetRva());
         if (dependencyDiagnostics) {
             code.Rip({0x48, 0x8d, 0x0d}, resolvedPaths[index]);
             code.Rip({0x48, 0x8d, 0x15}, programText);
