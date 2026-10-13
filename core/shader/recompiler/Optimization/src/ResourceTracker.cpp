@@ -149,14 +149,15 @@ public:
             for (std::uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
                 plan.handle->ReplaceArgument(dword, plan.key);
             }
-            for (const auto index : plan.memory) {
-                m_program.Resources().memoryInfo[index].planningOnly = true;
+            for (std::uint32_t dword = 0; dword < plan.memory.size(); dword++) {
+                if (!plan.live[dword]) m_program.Resources().memoryInfo[plan.memory[dword]].planningOnly = true;
             }
         }
         std::erase_if(m_program.Metadata().dynamicReads, [&](IrValue* value) {
             const IrValue* inst = value->Resolve();
             return std::ranges::any_of(m_indirectImages, [&](const IndirectImagePlan& plan) {
-                return std::ranges::find(plan.reads, inst) != plan.reads.end();
+                const auto found = std::ranges::find(plan.reads, inst);
+                return found != plan.reads.end() && !plan.live[static_cast<std::size_t>(found - plan.reads.begin())];
             });
         });
         m_program.Resources().descriptorSources = std::move(m_sources);
@@ -184,6 +185,8 @@ private:
         std::array<IrValue*, 8> roots {};
         std::array<std::uint32_t, 8> memory {};
         std::array<const IrValue*, 8> reads {};
+        // A read the shader also uses as data (it masks descriptor fields itself) stays a real load.
+        std::array<bool, 8> live {};
     };
 
     void MakeSource(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust, DescriptorSource& descriptor) {
@@ -548,8 +551,15 @@ private:
             }
             return true;
         };
-        for (const auto* read : heapReads) {
-            if (read->Uses().empty() || !std::ranges::all_of(read->Uses(), sameEntry)) {
+        // Other users (PPSA03671's meshlet shaders mask T# fields as data) keep the read as a real load;
+        // APS5_STRICT_BINDLESS_USERS restores the rejection.
+        static const bool strictUsers = std::getenv("APS5_STRICT_BINDLESS_USERS") != nullptr;
+        for (std::uint32_t dword = 0; dword < heapReads.size(); dword++) {
+            const auto* read = heapReads[dword];
+            const bool onlyEntries = std::ranges::all_of(read->Uses(), sameEntry);
+            const bool dataUsers = !strictUsers && !read->Uses().empty() && std::ranges::none_of(read->Uses(), [](const IrValue* user) { return user->Opcode() == IrOpcode::Phi || user->Opcode() == IrOpcode::WriteLane; });
+            plan.live[dword] = !onlyEntries;
+            if (read->Uses().empty() || (!onlyEntries && !dataUsers)) {
                 std::string users;
                 for (const IrValue* user : read->Uses()) {
                     users += " ";
@@ -612,7 +622,10 @@ private:
 
     bool IsIndirectPlanningMemory(std::uint32_t index) const {
         return std::ranges::any_of(m_indirectImages, [&](const IndirectImagePlan& plan) {
-            return std::ranges::find(plan.memory, index) != plan.memory.end();
+            for (std::uint32_t dword = 0; dword < plan.memory.size(); dword++) {
+                if (plan.memory[dword] == index && !plan.live[dword]) return true;
+            }
+            return false;
         });
     }
 
