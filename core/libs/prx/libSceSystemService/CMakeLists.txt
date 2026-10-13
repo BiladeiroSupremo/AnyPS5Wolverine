@@ -3,6 +3,17 @@ target_include_directories(libSceSystemService PRIVATE ${LIBS_INCLUDE_DIR})
 configure_windows_unwind(libSceSystemService)
 
 if(BUILD_TESTING)
+    if(WIN32)
+        add_test_executable(guest_system_service_path_boundary_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemServicePathBoundary.cpp)
+        target_include_directories(guest_system_service_path_boundary_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_system_service_path_boundary_tests PRIVATE libSceSystemService libc)
+        configure_windows_unwind(guest_system_service_path_boundary_tests)
+        add_test(NAME guest_system_service_path_boundary COMMAND guest_system_service_path_boundary_tests)
+        set_tests_properties(guest_system_service_path_boundary PROPERTIES TIMEOUT 20)
+        set_tests_properties(guest_system_service_path_boundary PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(guest_system_exit_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemExit.cpp)
     target_include_directories(guest_system_exit_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_system_exit_tests PRIVATE libSceSystemService libc)
