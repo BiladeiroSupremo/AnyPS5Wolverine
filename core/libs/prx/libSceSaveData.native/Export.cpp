@@ -896,9 +896,9 @@ int APS5_VABI sceSaveDataDirNameSearch2(const SaveDataDirNameSearchCond* cond, S
     return rc;
 }
 
-APS5_EXPORT("RvID8BVeg+g", sceSaveDataUnknown_RvID8BVeg);
-int APS5_VABI sceSaveDataUnknown_RvID8BVeg() {
-    NotImplemented_nid_no_patch("RvID8BVeg+g");
+APS5_EXPORT("RvID8BVeg+g", sceSaveDataPrepareForTransferring);
+int APS5_VABI sceSaveDataPrepareForTransferring() {
+    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
