@@ -631,6 +631,23 @@ class ImportAuditTests(unittest.TestCase):
         struct.pack_into("<H", image, 0x200 + 56 + 2, 0)
         self.assertEqual(import_audit.pe_exports(Path("lib.prx"), image), {"alpha", "beta"})
 
+    def test_module_dependencies_stop_at_dynamic_terminator(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        image = bytearray(build_elf([], ["libc.prx", "libSceGhost.prx"]))
+        sections = struct.unpack_from("<Q", image, 40)[0]
+        dynamic = struct.unpack_from("<Q", image, sections + 192 + 24)[0]
+        struct.pack_into("<qQ", image, dynamic, 0, 0)
+        (work.modules / "module.prx").write_bytes(image)
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        code, _, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(result.read_text())["missing_libraries"], {})
+        struct.pack_into("<qQ", image, dynamic, 1, 1)
+        struct.pack_into("<qQ", image, dynamic + 16, 0, 0)
+        self.assertEqual(import_audit.elf_imports("module.prx", image)[1], {"libc.prx"})
+
     def test_pe32_uses_its_own_directory_layout(self):
         image = bytearray(build_pe(["alpha"]))
         struct.pack_into("<H", image, 0x58, 0x10b)

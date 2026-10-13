@@ -206,6 +206,8 @@ def elf_imports(path, data):
             take(data, strings_offset, strings_size, path, "dynamic string table")
             for position in range(0, size, 16):
                 tag, value = unpack("<qQ", data, offset + position, path, "dynamic entry")
+                if tag == 0:
+                    break
                 if tag == 1:
                     needed.add(cstring(data, strings_offset + value, strings_offset + strings_size, path, "needed library name"))
     return symbols, needed
