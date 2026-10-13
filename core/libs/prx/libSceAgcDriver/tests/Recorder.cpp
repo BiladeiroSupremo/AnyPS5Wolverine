@@ -4257,6 +4257,10 @@ bool keptUnitSettleTests(const Device& device, Recorder& recorder) {
             std::cout << "host import of the direct memory refused: units stored next to a unit kept for the CPU in " << what << " not tested\n";
             continue;
         }
+        if (direct && !AgcDriver::GuestMemory::Watched(address, surfaceBytes)) {
+            std::cout << "the host import of the direct memory took it out of the write watch (its imports are compared): units stored next to a unit kept for the CPU in " << what << " not tested\n";
+            continue;
+        }
         Require(direct || HostImportFor(context, address, surfaceBytes) == nullptr, "(k) watched memory was imported although host imports are off for it");
         {
             auto image = StorageTexture::Create(context, detiler, resource, 0);
