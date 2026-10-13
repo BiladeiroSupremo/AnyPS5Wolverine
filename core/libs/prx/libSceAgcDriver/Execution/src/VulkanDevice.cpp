@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeapTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
@@ -278,6 +279,8 @@ struct VulkanDevice::State {
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
+    bool bindlessHeaps = false;
+    std::unique_ptr<Graphics::BindlessHeapTable> bindlessTable;
     bool storageBufferUpdateAfterBind = false;
     bool descriptorBindingPartiallyBound = false;
     bool descriptorBindingVariableDescriptorCount = false;
@@ -688,6 +691,7 @@ struct VulkanDevice::State {
             workgroupMemory.reset();
             if (workgroupMemoryLayout != VK_NULL_HANDLE) reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(deviceProc(device, "vkDestroyDescriptorSetLayout"))(device, workgroupMemoryLayout, nullptr);
             descriptorCache.reset();
+            bindlessTable.reset();
             emptyBuffer.reset();
             placeholderImages.reset();
             samplerCache.reset();
@@ -1433,6 +1437,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->descriptorBindingPartiallyBound = compileOnly && descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
         state->descriptorBindingVariableDescriptorCount = compileOnly && descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
         state->runtimeDescriptorArray = compileOnly && descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE;
+        // The bindless heap set (Graphics::BindlessHeapTable) needs runtime arrays it updates while
+        // bound. APS5_NO_BINDLESS_HEAPS=1 leaves wide tables rejected as before.
+        state->bindlessHeaps = !compileOnly && state->descriptorIndexing && descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE && descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE
+            && descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE && descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending == VK_TRUE
+            && std::getenv("APS5_NO_BINDLESS_HEAPS") == nullptr;
         if (state->storageBufferUpdateAfterBind) {
             VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &state->descriptorIndexingProperties};
             state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
@@ -1455,6 +1464,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->runtimeDescriptorArray) {
         state->capabilities.push_back(spv::CapabilityRuntimeDescriptorArray);
         if (!state->descriptorIndexing) state->spirvExtensions.push_back("SPV_EXT_descriptor_indexing");
+    }
+    if (state->bindlessHeaps) {
+        descriptorIndexingFeatures.runtimeDescriptorArray = VK_TRUE;
+        descriptorIndexingFeatures.descriptorBindingPartiallyBound = VK_TRUE;
+        descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+        if (!state->runtimeDescriptorArray) state->capabilities.push_back(spv::CapabilityRuntimeDescriptorArray);
     }
     state->samplerAnisotropy = true;
     state->textureCompressionBC = true;
@@ -1671,6 +1687,16 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->descriptorCache = std::make_unique<Graphics::DescriptorCache>(graphicsContext());
     state->samplerCache = std::make_unique<Graphics::SamplerCache>();
     state->CreateWorkgroupMemoryLayout();
+    if (state->bindlessHeaps) {
+        try {
+            state->bindlessTable = std::make_unique<Graphics::BindlessHeapTable>(graphicsContext());
+            ShaderRecompiler::BindlessHeaps::SetEnabled(true);
+            std::fprintf(stderr, "[bindless] image heaps enabled: %u slots per kind, set %u\n", ShaderRecompiler::BindlessHeaps::SlotsPerKind, ShaderRecompiler::BindlessHeaps::DescriptorSet);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[bindless] heap set unavailable, wide bindless tables stay rejected: %s\n", error.what());
+            state->bindlessTable.reset();
+        }
+    }
     if (!state->shaderProfile->NullDescriptors()) {
         std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
         if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
@@ -3170,6 +3196,10 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.drawIndirectCount = state->drawIndirectCount;
     context.occlusionQueryPrecise = state->occlusionQueryPrecise;
     context.emptyBuffer = state->emptyBuffer ? state->emptyBuffer->Handle() : VK_NULL_HANDLE;
+    context.bindlessHeaps = state->bindlessTable.get();
+    context.bindlessLayout = state->bindlessTable ? state->bindlessTable->Layout() : VK_NULL_HANDLE;
+    context.bindlessSet = state->bindlessTable ? state->bindlessTable->Set() : VK_NULL_HANDLE;
+    context.bindlessEmptyLayout = state->bindlessTable ? state->bindlessTable->EmptyLayout() : VK_NULL_HANDLE;
     context.copiedWriters = state->copiedWriters.get();
     context.functions = state->functionsReady ? &state->deviceFunctions : nullptr;
     context.descriptorIndexing = state->descriptorIndexing;
@@ -3978,6 +4008,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    // Heap keys requested by earlier dispatches: their slots are published before this one.
+    Graphics::ResolveBindlessHeapRequests(context, recorder);
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);
@@ -4034,6 +4066,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
     resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    if (context.bindlessSet != VK_NULL_HANDLE) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::BindlessHeaps::DescriptorSet, 1, &context.bindlessSet, 0, nullptr);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
         auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
@@ -4308,10 +4341,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         moduleInfo.pCode = shader.spirv.data();
         check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
         timing.Mark("validate_shader_module");
-        const std::array<VkDescriptorSetLayout, 2> setLayouts{resources->Layout(), shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : VK_NULL_HANDLE};
+        // Set 2 is the bindless heap set (BindlessHeaps::DescriptorSet) when the device has one; an
+        // empty layout stands in for the workgroup memory set a shader does not use.
+        static_assert(ShaderRecompiler::BindlessHeaps::DescriptorSet == ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1);
+        const bool heaps = context.bindlessLayout != VK_NULL_HANDLE;
+        const std::array<VkDescriptorSetLayout, 3> setLayouts{resources->Layout(), shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : (heaps ? context.bindlessEmptyLayout : VK_NULL_HANDLE), context.bindlessLayout};
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.setLayoutCount = shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
+        layoutInfo.setLayoutCount = heaps ? ShaderRecompiler::BindlessHeaps::DescriptorSet + 1 : shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;

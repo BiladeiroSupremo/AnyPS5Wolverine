@@ -3,6 +3,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Optimization/BindlessHeaps.hpp"
 #include "PipelineSpecialization.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -165,10 +166,87 @@ std::uint32_t ImageViewSizeType(SpirvEmitterState& state, RdnaImageDimension dim
     }
 }
 
+namespace {
+
+// Descriptor indexing for the heap set: runtime arrays indexed with a non-uniform slot.
+void RequireBindlessHeapCapabilities(SpirvEmitterState& state) {
+    const auto supported = [&](std::uint32_t capability) {
+        return std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), capability) != state.supportedCapabilities.end();
+    };
+    const bool extension = state.spirvVersion < 0x00010500u;
+    if (!supported(spv::CapabilityRuntimeDescriptorArray) || !supported(spv::CapabilityShaderNonUniform) || !supported(spv::CapabilitySampledImageArrayNonUniformIndexing)
+        || (extension && std::find(state.supportedExtensions.begin(), state.supportedExtensions.end(), "SPV_EXT_descriptor_indexing") == state.supportedExtensions.end())) {
+        FailEmit("bindless image heap: the device lacks runtime descriptor arrays or non-uniform image indexing");
+    }
+    state.module.EmitCapability(spv::CapabilityRuntimeDescriptorArray);
+    state.module.EmitCapability(spv::CapabilityShaderNonUniform);
+    state.module.EmitCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+    if (extension) state.module.EmitExtension("SPV_EXT_descriptor_indexing");
+}
+
+// `struct { uint words[]; }`, the block type of the heap's translation and feedback buffers.
+std::uint32_t BindlessHeapBlockType(SpirvEmitterState& state) {
+    const auto array = state.module.DecoratedType(spv::OpTypeRuntimeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, TypeU32(state));
+    return state.module.DecoratedType(spv::OpTypeStruct, {{spv::OpDecorate, {spv::DecorationBlock}}, {spv::OpMemberDecorate, {0u, spv::DecorationOffset, 0u}}}, array);
+}
+
+std::uint32_t DefineBindlessHeapVariable(SpirvEmitterState& state, std::uint32_t type, std::uint32_t storageClass, std::uint32_t binding, const char* name) {
+    const auto variable = state.module.DefineGlobalVariable(TypePointer(state, storageClass, type), storageClass);
+    state.module.AddName(variable, name);
+    state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, BindlessHeaps::DescriptorSet);
+    state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+    return variable;
+}
+
+// The image at heap slot `slot` (a non-uniform index into the kind's runtime array). Each image type
+// a mode asks for gets its own variable aliasing the kind's binding.
+std::uint32_t LoadBindlessHeapImage(SpirvEmitterState& state, const ImageResource& root, const ImageResource& image, std::uint32_t slot) {
+    // The kind follows the table root (HeapEligible tested its dimension), the type the mode.
+    const auto kind = BindlessHeapKind(root);
+    const auto imageType = ImageType(state, image);
+    auto& variable = state.bindlessHeapImageVariables[{kind, imageType}];
+    if (variable == 0u) {
+        RequireBindlessHeapCapabilities(state);
+        static constexpr const char* names[] = {"bindless_heap_2d", "bindless_heap_2d_array", "bindless_heap_3d"};
+        variable = DefineBindlessHeapVariable(state, state.module.Type(spv::OpTypeRuntimeArray, imageType), spv::StorageClassUniformConstant, kind, names[kind]);
+    }
+    const auto pointer = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, state.module.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, imageType), pointer, variable, slot);
+    state.module.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+    const auto loaded = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, imageType, loaded, pointer);
+    state.module.AddAnnotation(spv::OpDecorate, loaded, spv::DecorationNonUniform);
+    return loaded;
+}
+
+}
+
+std::uint32_t BindlessHeapKind(const ImageResource& image) {
+    switch (image.dimension) {
+    case RdnaImageDimension::Dim2D: return BindlessHeaps::ImageBinding2D;
+    case RdnaImageDimension::Dim2DArray: return BindlessHeaps::ImageBinding2DArray;
+    case RdnaImageDimension::Dim3D: return BindlessHeaps::ImageBinding3D;
+    default: FailEmit("bindless image heap: unsupported image dimension");
+    }
+}
+
+std::uint32_t BindlessHeapBuffer(SpirvEmitterState& state, bool feedback) {
+    auto& variable = feedback ? state.bindlessHeapFeedbackVariable : state.bindlessHeapTranslationVariable;
+    if (variable == 0u) {
+        RequireBindlessHeapCapabilities(state);
+        variable = DefineBindlessHeapVariable(state, BindlessHeapBlockType(state), spv::StorageClassStorageBuffer, feedback ? BindlessHeaps::FeedbackBinding : BindlessHeaps::TranslationBinding, feedback ? "bindless_heap_feedback" : "bindless_heap_translation");
+    }
+    return variable;
+}
+
 std::uint32_t LoadSampledImageDescriptor(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t slotId) {
     const auto& imageResource = state.runtimeImage != nullptr ? *state.runtimeImage : state.program.Info().images.at(resource);
     if (imageResource.resourceClass != ImageResourceClass::Sampled) {
         FailEmit("sampled image descriptor requested for a non-sampled image");
+    }
+    // The heap branch of a table root (EmitImage): the entry comes from the heap set.
+    if (state.bindlessHeapSlot != 0u && state.program.Info().images.at(resource).indirectRoot == resource) {
+        return LoadBindlessHeapImage(state, state.program.Info().images.at(resource), imageResource, state.bindlessHeapSlot);
     }
     const auto kind = DescriptorBindingForImage(imageResource);
     const auto arrayIndex = ResourceForDescriptor(state, kind, resource);
@@ -211,6 +289,7 @@ std::uint32_t MakeSampledImage(SpirvEmitterState& state, std::uint32_t resource,
     const auto sampledType = state.module.Type(spv::OpTypeSampledImage, ImageType(state, imageResource));
     state.module.AddFunction(spv::OpSampledImage, sampledType, sampledImage, image, samplerId);
     DecorateTableNonUniform(state, slotId, sampledImage);
+    if (state.bindlessHeapSlot != 0u && state.program.Info().images.at(resource).indirectRoot == resource) state.module.AddAnnotation(spv::OpDecorate, sampledImage, spv::DecorationNonUniform);
     return sampledImage;
 }
 

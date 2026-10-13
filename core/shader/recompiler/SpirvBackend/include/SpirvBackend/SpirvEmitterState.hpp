@@ -155,6 +155,17 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 2> vectorWindowVariable {};
     std::array<std::uint32_t, ImageBindingCount> imageVariables {};
     std::uint32_t samplerVariable = 0;
+    // The bindless heap set (Optimization/BindlessHeaps.hpp), defined on first use: a runtime image
+    // array per (kind, image type), the translation and the feedback buffer.
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> bindlessHeapImageVariables;
+    std::uint32_t bindlessHeapTranslationVariable = 0;
+    std::uint32_t bindlessHeapFeedbackVariable = 0;
+    // Inside the heap branch of a table root (EmitImage): the heap slot id the root's image loads
+    // from, and the selection TableSlot returns for the root instead of searching its mapping.
+    std::uint32_t bindlessHeapSlot = 0;
+    std::uint32_t bindlessHeapMapped = 0;
+    // While EmitImage emits either branch of a table root, so the branches do not branch again.
+    bool bindlessHeapBranch = false;
     std::uint32_t mainFunc = 0;
     std::uint32_t meshGuestFunc = 0;
     std::uint32_t meshAllocation = 0;

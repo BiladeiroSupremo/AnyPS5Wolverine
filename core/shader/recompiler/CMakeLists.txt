@@ -103,6 +103,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/TessellationLowering.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ResourceTracker.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ResourceMaterializer.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/BindlessHeaps.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/BindingAllocator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/RequestMemoryView.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DescriptorBindingBuilder.cpp
@@ -216,6 +217,12 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            BindlessHeaps::Enabled
+            BindlessHeaps::HeapEligible
+            BindlessHeaps::RegionBase
+            BindlessHeaps::Regions
+            BindlessHeaps::RegionsGeneration
+            BindlessHeaps::SetEnabled
             BindlessTableRejected
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey

@@ -27,6 +27,7 @@ class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
+class BindlessHeapTable;
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -158,6 +159,14 @@ struct Context {
     bool conservativeRasterization = false;
     bool meshWave32 = false;
     VkBuffer emptyBuffer = VK_NULL_HANDLE;
+    // The bindless heap set (BindlessHeapTable), null without descriptor indexing: every compute
+    // pipeline layout takes bindlessLayout as set ShaderRecompiler::BindlessHeaps::DescriptorSet
+    // (bindlessEmptyLayout standing in for an unused set below it), and every compute dispatch
+    // binds bindlessSet there.
+    BindlessHeapTable* bindlessHeaps = nullptr;
+    VkDescriptorSetLayout bindlessLayout = VK_NULL_HANDLE;
+    VkDescriptorSet bindlessSet = VK_NULL_HANDLE;
+    VkDescriptorSetLayout bindlessEmptyLayout = VK_NULL_HANDLE;
     // The device's list of recorded dispatches whose copied written buffers await a CPU write-back
     // (VulkanDevice's State::copiedWriters; the draw counterpart is DrawCopiedWriters): an indirect
     // draw whose records one of them produces reads them on the CPU. Null in tests.

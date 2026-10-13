@@ -1,4 +1,5 @@
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Optimization/BindlessHeaps.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -15,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -293,7 +295,16 @@ void reportBindless() {
 struct TableResolution {
     std::vector<DescriptorValue> slots;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> mapping;
+    // A table sampled through the bindless heap set (BindlessHeaps.hpp) instead of its slots, which
+    // then all hold the heap's representative entry.
+    bool heap = false;
+    std::uint64_t heapBase = 0;
+    std::uint32_t entryOffset = 0;
+    std::uint32_t entries = 0;
 };
+
+// The heap entries a heap table reads to find a representative entry for its slots.
+constexpr std::uint32_t HeapShapeScan = 4096u;
 
 struct TableTrace {
     bool material = false;
@@ -342,6 +353,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     };
 
     auto& counters = bindlessCounters();
+    const bool heapEligible = BindlessHeaps::HeapEligible(plan.stage == IrShaderStage::Compute, static_cast<std::uint32_t>(image.dimension), image.resourceClass == ImageResourceClass::Sampled, image.depthCompare, image.r128);
     std::vector<std::uint32_t> keys;
     bool materialMode = false;
     std::uint32_t materialEntries = 0;
@@ -373,9 +385,41 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
             std::sort(keys.begin(), keys.end());
             keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
             if (keys.size() > slots) {
-                rejectTable(BindlessRejection::Capacity, "bindless image table: " + std::to_string(keys.size()) + " distinct keys exceed the " + std::to_string(slots) + " slots");
+                if (!heapEligible) rejectTable(BindlessRejection::Capacity, "bindless image table: " + std::to_string(keys.size()) + " distinct keys exceed the " + std::to_string(slots) + " slots");
+                materialMode = false;
             }
         }
+    }
+    // Too wide to bind slot by slot: the table is sampled through the heap set. Only a representative
+    // entry is taken here (for the slots the static interface still binds); the driver resolves the
+    // keys the shader requests through the feedback buffer.
+    if (!materialMode && entries > slots && heapEligible) {
+        const std::uint64_t base = heap.Base48();
+        for (std::uint32_t key = 0; key < std::min(entries, HeapShapeScan); key++) {
+            DescriptorValue candidate;
+            candidate.dwordCount = 8u;
+            const std::uint64_t address = base + table.entryOffset + static_cast<std::uint64_t>(key) * TableEntryBytes;
+            for (std::uint32_t dword = 0; dword < 8u; dword++) readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
+            if (nullImageDescriptor(candidate) || !validImageDescriptor(candidate, image.r128)) continue;
+            try {
+                const auto decoded = decodeImageDescriptor(candidate, image, plan.srgbDecodeFormats);
+                if (decoded.fmask || decoded.numericClass != IrTextureNumericClass::Float || decoded.dimension != image.dimension) continue;
+                static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, candidate, plan.info.runtimeImageModes.at(imageIndex)));
+            } catch (const std::exception&) {
+                continue;
+            }
+            resolution.slots.assign(slots, candidate);
+            resolution.mapping.clear();
+            resolution.heap = true;
+            resolution.heapBase = base;
+            resolution.entryOffset = table.entryOffset;
+            resolution.entries = entries;
+            resolved = candidate;
+            counters.tablesWhole.fetch_add(1, std::memory_order_relaxed);
+            if (BindlessTraced()) traceTable(plan, image, table, base, materialBase, {false, entries, materialEntries, 0u});
+            return;
+        }
+        rejectTable(BindlessRejection::NoEntry, "bindless image heap: no float entry of the instruction's dimension among the first " + std::to_string(std::min(entries, HeapShapeScan)));
     }
     if (!materialMode) {
         if (entries > slots) {
@@ -602,6 +646,18 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
         const auto slots = ResourceMaterializer::BindlessSlots();
         if (table.slots.size() != slots) throw std::runtime_error("runtime table size differs from the static interface");
         const auto mappingOffset = snapshot.flattenedSrt.size();
+        if (table.heap) {
+            // The heap header the SPIR-V heap path reads (BindlessHeaps.hpp); the slots all bind the
+            // representative entry and are never sampled through.
+            snapshot.flattenedSrt.insert(snapshot.flattenedSrt.end(), {BindlessHeaps::HeapMarker, BindlessHeaps::RegionBase(table.heapBase, table.entryOffset, table.entries), table.entries});
+            static std::mutex tracedMutex;
+            static std::set<std::pair<std::uint64_t, std::uint32_t>> traced;
+            std::unique_lock tracedLock(tracedMutex);
+            if (traced.insert({plan.shaderHash, i}).second) std::fprintf(stderr, "[bindless] shader %llx image %u: heap header at SRT word %zu (static %u), region %u, %u entries\n", static_cast<unsigned long long>(plan.shaderHash), i, mappingOffset, image.indirectMappingOffset, snapshot.flattenedSrt[mappingOffset + 1u], table.entries);
+            snapshot.flattenedSrt.resize(mappingOffset + 1u + 2u * slots, 0u);
+            snapshot.images.insert(snapshot.images.end(), table.slots.begin() + 1u, table.slots.end());
+            continue;
+        }
         snapshot.flattenedSrt.push_back(static_cast<std::uint32_t>(table.mapping.size()));
         for (const auto& [key, slot] : table.mapping) {
             if (slot >= slots) throw std::runtime_error("runtime table slot exceeds its static capacity");

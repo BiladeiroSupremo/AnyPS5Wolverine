@@ -14,7 +14,13 @@ std::uint32_t ImageScalarType(SpirvEmitterState& state, IrTextureNumericClass nu
 std::uint32_t ImageVectorType(SpirvEmitterState& state, IrTextureNumericClass numericClass, std::uint32_t components);
 std::uint32_t ImageType(SpirvEmitterState& state, const ImageResource& image);
 std::uint32_t ImageViewSizeType(SpirvEmitterState& state, RdnaImageDimension dimension);
+// While `state.bindlessHeapSlot` is set (the heap branch of a table root, see EmitImage), the root's
+// image comes from the bindless heap set at that slot instead.
 std::uint32_t LoadSampledImageDescriptor(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t slotId);
+// The bindless heap translation (`feedback` false) or feedback buffer variable, defined on first use.
+std::uint32_t BindlessHeapBuffer(SpirvEmitterState& state, bool feedback);
+// The heap image kind (BindlessHeaps::ImageBinding*) of a table root's dimension.
+std::uint32_t BindlessHeapKind(const ImageResource& image);
 std::uint32_t LoadSamplerDescriptor(SpirvEmitterState& state, std::uint32_t sampler);
 std::uint32_t MakeSampledImage(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t sampler, std::uint32_t slotId);
 std::uint32_t StorageImageDescriptorPointer(SpirvEmitterState& state, std::uint32_t resource);

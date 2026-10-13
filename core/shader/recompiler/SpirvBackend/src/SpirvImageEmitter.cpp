@@ -7,6 +7,13 @@
 #include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
+#include "Optimization/BindlessHeaps.hpp"
+#include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
+#include <atomic>
+#include <cstdio>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <span>
 #include <initializer_list>
 #include <algorithm>
@@ -1533,6 +1540,10 @@ TableSelection TableSlot(SpirvValueEmitContext& ctx, const IrValue& inst, const 
     if (image.indirectRoot != mem.resource) {
         return {};
     }
+    // The heap branch (EmitHeapBranchedImage): the image comes from the heap slot, zeros unmapped.
+    if (state.bindlessHeapSlot != 0u) {
+        return {0u, state.bindlessHeapMapped};
+    }
     const auto* handle = inst.Argument(0);
     const auto& sources = state.program.Resources().descriptorSources;
     if (handle == nullptr || image.source >= sources.size() || !sources[image.source].indirectImage.has_value() || sources[image.source].indirectImage->keyArg >= handle->ArgumentCount()) {
@@ -1628,10 +1639,104 @@ void EmitImageMode(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageR
     }
 }
 
+// Whether a table root access is emitted with the bindless heap path beside its slot search
+// (Optimization/BindlessHeaps.hpp; the materializer applies the same test).
+bool HeapBranched(const SpirvEmitterState& state, const MemoryInfo& memory, const ImageResource& image) {
+    if (image.indirectRoot != memory.resource || state.flattenedSrtVariable == 0u) return false;
+    const auto& sources = state.program.Resources().descriptorSources;
+    if (image.source >= sources.size() || !sources[image.source].indirectImage.has_value()) return false;
+    return BindlessHeaps::HeapEligible(StageOf(state) == IrShaderStage::Compute, static_cast<std::uint32_t>(image.dimension), image.resourceClass == ImageResourceClass::Sampled, image.depthCompare, image.r128);
+}
+
+void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst);
+
+// A table root access with both paths, chosen per dispatch by its mapping block: the heap header
+// (HeapMarker, region base, entry count) selects `translation[region + key]` from the heap set;
+// otherwise the usual search of the key/slot list. An unresolved key in the heap path writes its
+// feedback word (the driver then resolves it) and samples zeros like any unmapped key.
+void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageResource& image) {
+    auto& state = ctx.state;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto* handle = inst.Argument(0);
+    const auto& indirect = *state.program.Resources().descriptorSources[image.source].indirectImage;
+    if (handle == nullptr || indirect.keyArg >= handle->ArgumentCount()) {
+        ctx.Fail(inst, "has invalid bindless image table key provenance");
+    }
+    const auto key = ctx.Def(handle->Argument(indirect.keyArg));
+    const auto loadSrt = [&](std::uint32_t index) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.flattenedSrtVariable, ConstantU32(state, 0), ConstantU32(state, index));
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, pointer);
+        return value;
+    };
+    static std::mutex tracedMutex;
+    static std::set<std::tuple<std::uint64_t, std::uint32_t, bool>> traced;
+    std::unique_lock tracedLock(tracedMutex);
+    if (traced.insert({state.program.Resources().shaderHash, image.indirectRoot, state.registrationModules}).second) std::fprintf(stderr, "[bindless] heap path emitted: shader %llx image %u, header at SRT word %u%s\n", static_cast<unsigned long long>(state.program.Resources().shaderHash), image.indirectRoot, image.indirectMappingOffset, state.registrationModules ? " (registration module)" : "");
+    const auto heap = Binary(state, spv::OpIEqual, boolean, loadSrt(image.indirectMappingOffset), ConstantU32(state, BindlessHeaps::HeapMarker));
+    const bool returnsValue = inst.Opcode() != IrOpcode::ImageWrite;
+    const auto heapLabel = state.module.AllocateId();
+    const auto slotLabel = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, heap, heapLabel, slotLabel);
+    state.bindlessHeapBranch = true;
+
+    EmitLabel(state, heapLabel);
+    const auto region = loadSrt(image.indirectMappingOffset + 1u);
+    const auto entries = loadSrt(image.indirectMappingOffset + 2u);
+    const auto inTable = Binary(state, spv::OpULessThan, boolean, key, entries);
+    const auto entry = Binary(state, spv::OpIAdd, u32, region, Select(state, u32, inTable, key, ConstantU32(state, 0u)));
+    const auto wordPointer = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), wordPointer, BindlessHeapBuffer(state, false), ConstantU32(state, 0), entry);
+    const auto word = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, u32, word, wordPointer);
+    const auto request = Binary(state, spv::OpLogicalAnd, boolean, inTable, Binary(state, spv::OpIEqual, boolean, word, ConstantU32(state, BindlessHeaps::Pending)));
+    EmitIfCondition(state, request, [&]() {
+        const auto feedback = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), feedback, BindlessHeapBuffer(state, true), ConstantU32(state, 0), entry);
+        state.module.AddFunction(spv::OpStore, feedback, ConstantU32(state, 1u));
+    });
+    const auto kind = Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::KindShift));
+    const auto mapped = Binary(state, spv::OpLogicalAnd, boolean, inTable, Binary(state, spv::OpIEqual, boolean, kind, ConstantU32(state, BindlessHeapKind(image))));
+    const auto slot = Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, BindlessHeaps::IndexMask)), ConstantU32(state, 0u));
+    state.module.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
+    state.bindlessHeapSlot = slot;
+    state.bindlessHeapMapped = mapped;
+    EmitImage(ctx, inst);
+    state.bindlessHeapSlot = 0u;
+    state.bindlessHeapMapped = 0u;
+    const auto heapValue = returnsValue ? ctx.Def(&inst) : 0u;
+    ctx.definitions.erase(&inst);
+    const auto heapEnd = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+
+    EmitLabel(state, slotLabel);
+    EmitImage(ctx, inst);
+    const auto slotValue = returnsValue ? ctx.Def(&inst) : 0u;
+    ctx.definitions.erase(&inst);
+    const auto slotEnd = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    state.bindlessHeapBranch = false;
+
+    EmitLabel(state, merge);
+    if (returnsValue) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, TypeId(state, inst.Type()), result, heapValue, heapEnd, slotValue, slotEnd);
+        ctx.definitions.emplace(&inst, result);
+    }
+}
+
 void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto& memory = ctx.Memory(inst);
     const auto& base = ImageResourceOf(state, memory);
+    if (!state.bindlessHeapBranch && HeapBranched(state, memory, base)) {
+        EmitHeapBranchedImage(ctx, inst, base);
+        return;
+    }
     const auto modes = ResourceMaterializer::RuntimeImageModes(base);
     state.runtimeImageMetadata = ConstantU32(state, memory.resource);
     const auto table = TableSlot(ctx, inst, memory, base);
