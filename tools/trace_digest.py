@@ -8,7 +8,8 @@ from pathlib import Path
 
 DESCRIPTION = """Digest of an APS5_TRACE_FRAMES / APS5_TRACE_SECONDS capture (aps5-trace-*.json.gz) for an issue or a
 pull request: the summary line, the slowest frames with their largest slices, the busy and wait time of each
-thread, the largest slices per frame, the longest waits and, with --stacks, the hottest functions of an
+thread, the largest slices per frame, the longest waits, the largest GPU batches with the CPU slices that
+recorded them (when the trace carries batch ids) and, with --stacks, the hottest functions of an
 APS5_SAMPLE_WORKER collapsed-stack file. The summary line is read from aps5-summary.jsonl next to the trace
 unless --summary names another file.
 
@@ -29,12 +30,16 @@ class Trace:
         self.slices = collections.defaultdict(list)
         self.presents = []
         self.folded = collections.defaultdict(float)
+        self.batched = []
         for event in document["traceEvents"]:
             phase = event.get("ph")
             if phase == "M" and event.get("name") == "thread_name":
                 self.threads[event["tid"]] = event["args"]["name"]
             elif phase == "X":
                 self.slices[event["tid"]].append([float(event["ts"]), float(event["dur"]), event["name"], 0, False])
+                batch = event.get("args", {}).get("batch")
+                if batch:
+                    self.batched.append((event["tid"], float(event["ts"]), float(event["dur"]), event["name"], batch))
             elif phase == "i" and event.get("name") == "present":
                 self.presents.append((float(event["ts"]), event.get("args", {}).get("present")))
             elif phase == "C":
@@ -138,6 +143,23 @@ def digest(trace, summary=None, stacks=None, worst=5, top=10):
                                 "present": trace.presents[bisect.bisect_right(starts, ts) - 1][1] if starts and ts >= starts[0] else None}
                                for dur, name, thread, ts in sorted(waits, reverse=True)[:top]]
 
+    gpu = {tid for tid, name in trace.threads.items() if name == "gpu"}
+    batches = [entry for entry in trace.batched if entry[0] in gpu and entry[3] == "batch"]
+    if batches:
+        ranges = collections.defaultdict(collections.Counter)
+        recorded = collections.defaultdict(collections.Counter)
+        for tid, ts, dur, name, batch in trace.batched:
+            if tid in gpu:
+                if name != "batch":
+                    ranges[batch][name] += dur
+            else:
+                recorded[batch][(name, trace.name(tid))] += dur
+        result["largest_gpu_batches"] = [{"batch": batch, "ms": dur / 1000.0, "at_ms": ts / 1000.0,
+                                          "present": trace.presents[bisect.bisect_right(starts, ts) - 1][1] if starts and ts >= starts[0] else None,
+                                          "gpu_ranges": [{"name": name, "ms": us / 1000.0} for name, us in ranges[batch].most_common(3)],
+                                          "recorded_by": [{"name": name, "thread": thread, "ms": us / 1000.0} for (name, thread), us in recorded[batch].most_common(4)]}
+                                         for _, ts, dur, _, batch in sorted(batches, key=lambda entry: -entry[2])[:worst]]
+
     if stacks is not None:
         samples = sum(count for _, count in stacks)
         own = collections.Counter()
@@ -203,6 +225,14 @@ def markdown(result):
     lines.append("")
     for wait in result["longest_waits"]:
         lines.append(f"- {wait['name']} ({wait['thread']}) {wait['ms']:.1f} ms at {wait['at_ms']:.0f} ms, present {wait['present']}")
+    if "largest_gpu_batches" in result:
+        lines.append("")
+        lines.append("**Largest GPU batches** (GPU ranges inside, and the CPU slices that recorded each, inclusive)")
+        lines.append("")
+        for batch in result["largest_gpu_batches"]:
+            ranges = ", ".join(f"{entry['name']} {entry['ms']:.1f}" for entry in batch["gpu_ranges"]) or "no ranges"
+            recorded = ", ".join(f"{entry['name']} ({entry['thread']}) {entry['ms']:.1f}" for entry in batch["recorded_by"]) or "no CPU slices"
+            lines.append(f"- batch {batch['batch']}: {batch['ms']:.1f} ms at {batch['at_ms']:.0f} ms, present {batch['present']}: GPU {ranges}; recorded by {recorded}")
     if "stacks" in result:
         stacks = result["stacks"]
         lines.append("")

@@ -206,6 +206,34 @@ class TraceDigestTests(unittest.TestCase):
         self.assertNotIn("a.prx+0x10", total)
         self.assertEqual(total, {"a.prx+0x20": 60.0, "a.prx+0x30": 40.0, "a.prx+0x40": 20.0})
 
+    def test_largest_gpu_batches_with_their_recording(self):
+        def tagged(tid, name, ts, dur, batch):
+            return dict(complete(tid, name, ts, dur), args={"batch": batch})
+        events = EVENTS + [
+            {"name": "thread_name", "ph": "M", "ts": 0, "pid": 7, "tid": 3, "args": {"name": "gpu"}},
+            tagged(1, "Driver.Packet.dispatch", 4500, 2000, 11),
+            tagged(1, "Driver.Packet.dispatch", 13000, 3000, 12),
+            tagged(3, "batch", 6000, 9000, 11),
+            tagged(3, "draw", 7000, 4000, 11),
+            tagged(3, "batch", 16000, 3000, 12),
+        ]
+        with gzip.open(self.trace, "wt", encoding="utf-8") as handle:
+            json.dump({"traceEvents": events}, handle)
+        batches = self.result()["largest_gpu_batches"]
+        self.assertEqual([batch["batch"] for batch in batches], [11, 12])
+        self.assertAlmostEqual(batches[0]["ms"], 9.0)
+        self.assertEqual(batches[0]["present"], 600)
+        self.assertEqual(batches[0]["gpu_ranges"], [{"name": "draw", "ms": 4.0}])
+        self.assertEqual(batches[0]["recorded_by"], [{"name": "Driver.Packet.dispatch", "thread": "queue worker 0x0", "ms": 2.0}])
+        self.assertEqual(batches[1]["present"], 601)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            trace_digest.main([str(self.trace)])
+        self.assertIn("**Largest GPU batches**", output.getvalue())
+
+    def test_no_batch_section_without_batch_ids(self):
+        self.assertNotIn("largest_gpu_batches", self.result())
+
     def test_command_line_markdown_and_json(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
