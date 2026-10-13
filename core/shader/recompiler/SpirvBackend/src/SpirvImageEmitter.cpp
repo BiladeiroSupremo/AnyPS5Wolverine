@@ -1699,6 +1699,13 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
         state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), feedback, BindlessHeapBuffer(state, true), ConstantU32(state, 0), entry);
         state.module.AddFunction(spv::OpStore, feedback, ConstantU32(state, 1u));
     });
+    // Diagnostic word: the last key that fell outside its table, in the feedback buffer's last
+    // word (the driver reports it, BindlessHeapTable).
+    EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, inTable), [&]() {
+        const auto outside = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), outside, BindlessHeapBuffer(state, true), ConstantU32(state, 0), ConstantU32(state, BindlessHeaps::TranslationEntries - 1u));
+        state.module.AddFunction(spv::OpStore, outside, key);
+    });
     const auto kind = Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::KindShift));
     const auto mapped = Binary(state, spv::OpLogicalAnd, boolean, inTable, Binary(state, spv::OpIEqual, boolean, kind, ConstantU32(state, BindlessHeapKind(image))));
     const auto slot = Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, BindlessHeaps::IndexMask)), ConstantU32(state, 0u));

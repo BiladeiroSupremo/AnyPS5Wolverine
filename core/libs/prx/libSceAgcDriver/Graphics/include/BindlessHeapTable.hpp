@@ -44,6 +44,21 @@ public:
     bool Claim(std::uint32_t index);
     std::mutex& Mutex() { return mutex; }
 
+    // A published entry, revalidated over time (ResolveBindlessHeapRequests): a guest texture the
+    // CPU or GPU keeps writing (a glyph atlas gaining glyphs) is looked up again, which refreshes an
+    // image-backed view in place or, when the cache hands back another texture or the T# changed,
+    // publishes it again under a new slot.
+    struct Entry {
+        std::uint32_t index = 0;
+        std::uint64_t address = 0;
+        std::array<std::uint32_t, 8> words{};
+        std::shared_ptr<Texture> texture;
+    };
+    std::vector<Entry>& Entries() { return entries; }
+    std::size_t& RevalidateCursor() { return revalidateCursor; }
+    // Whether a revalidation pass is due (at most one per interval).
+    bool RevalidateDue();
+
 private:
     void createPlaceholders();
     void release() noexcept;
@@ -65,6 +80,9 @@ private:
     std::vector<std::shared_ptr<Texture>> pinned;
     std::vector<std::uint8_t> claimed;
     std::chrono::steady_clock::time_point lastScan{};
+    std::vector<Entry> entries;
+    std::size_t revalidateCursor = 0;
+    std::chrono::steady_clock::time_point lastRevalidate{};
     std::mutex mutex;
 };
 

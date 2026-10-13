@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeapTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <stdexcept>
 
 namespace AgcDriver::Graphics {
@@ -21,6 +23,9 @@ namespace {
 constexpr auto ScanInterval = std::chrono::milliseconds(2);
 // Textures resolved per scan: each may record an upload, so a burst of requests spreads over frames.
 constexpr std::uint32_t ScanBudget = 256u;
+// Published entries are looked up again at most this often, this many per pass (round robin).
+constexpr auto RevalidateInterval = std::chrono::milliseconds(30);
+constexpr std::size_t RevalidateBudget = 128u;
 
 }
 
@@ -207,6 +212,13 @@ bool BindlessHeapTable::Claim(std::uint32_t index) {
     return true;
 }
 
+bool BindlessHeapTable::RevalidateDue() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastRevalidate < RevalidateInterval) return false;
+    lastRevalidate = now;
+    return true;
+}
+
 bool BindlessHeapTable::ScanDue() {
     const auto now = std::chrono::steady_clock::now();
     if (now - lastScan < ScanInterval) return false;
@@ -229,28 +241,55 @@ bool integerViewFormat(VkFormat format) {
     }
 }
 
-// The translation word of one heap entry: the entry's texture in a slot of the kind its view has,
-// or Unusable (null, unreadable, integer or of a kind the heap set lacks).
-std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table, std::uint64_t address) {
-    std::array<std::uint32_t, 8> words{};
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(words))) return Heaps::Unusable;
+bool readHeapWords(std::uint64_t address, std::array<std::uint32_t, 8>& words) {
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(words))) return false;
     GuestMemory::Read(address, std::as_writable_bytes(std::span(words)));
-    if (words[0] == 0u && (words[1] & 0xffu) == 0u) return Heaps::Unusable;
+    return !(words[0] == 0u && (words[1] & 0xffu) == 0u);
+}
+
+// The translation word of one heap entry: the entry's texture in a slot of the kind its view has,
+// or Unusable (null, unreadable, integer or of a kind the heap set lacks). A usable entry is
+// recorded for revalidation (`existing`: the entry being revalidated, updated in place).
+std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table, std::uint32_t index, std::uint64_t address, BindlessHeapTable::Entry* existing = nullptr) {
+    std::array<std::uint32_t, 8> words{};
+    if (!readHeapWords(address, words)) return Heaps::Unusable;
     const auto texture = CachedSampledTexture(context, words);
+    // Revalidation: the same T# served by the same texture needs nothing (the lookup refreshed an
+    // image-backed view in place).
+    if (existing != nullptr && existing->words == words && existing->texture == texture) return Heaps::Pending;
     if (texture == nullptr || integerViewFormat(texture->ViewFormat())) return Heaps::Unusable;
     const auto range = texture->SampledViewRange(false);
     std::uint32_t kind = Heaps::KindCount;
     if (range.type == VK_IMAGE_VIEW_TYPE_2D) kind = Heaps::ImageBinding2D;
     else if (range.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY) kind = Heaps::ImageBinding2DArray;
     else if (range.type == VK_IMAGE_VIEW_TYPE_3D) kind = Heaps::ImageBinding3D;
-    if (kind == Heaps::KindCount) return Heaps::Unusable;
-    return table.Publish(kind, texture, texture->View(), texture->Layout());
+    // Diagnostic: APS5_TRACE_HEAP_ENTRIES=1 prints every published entry.
+    static const bool traceEntries = std::getenv("APS5_TRACE_HEAP_ENTRIES") != nullptr;
+    if (kind == Heaps::KindCount) {
+        if (traceEntries) std::fprintf(stderr, "[bindless] entry 0x%llx: %ux%u guest format %u, view type %d unusable\n", static_cast<unsigned long long>(address), DecodeTextureResource(words).width, DecodeTextureResource(words).height, DecodeTextureResource(words).format, static_cast<int>(range.type));
+        return Heaps::Unusable;
+    }
+    const auto word = table.Publish(kind, texture, texture->View(), texture->Layout());
+    if (word != Heaps::Unusable) {
+        if (existing != nullptr) {
+            existing->words = words;
+            existing->texture = texture;
+        } else {
+            table.Entries().push_back({index, address, words, texture});
+        }
+    }
+    if (traceEntries) {
+        const auto resource = DecodeTextureResource(words);
+        std::fprintf(stderr, "[bindless] entry 0x%llx -> T# 0x%llx %ux%u guest format %u tile %d sel %u%u%u%u, view %d format %d layers %u, word 0x%x\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dstSelX, resource.dstSelY, resource.dstSelZ, resource.dstSelW, static_cast<int>(range.type), static_cast<int>(texture->ViewFormat()), range.layers, word);
+    }
+    return word;
 }
 
 struct HeapCounters {
     std::atomic<std::uint64_t> requests{0};
     std::atomic<std::uint64_t> usable{0};
     std::atomic<std::uint64_t> failed{0};
+    std::atomic<std::uint64_t> republished{0};
     std::atomic<long long> lastReport{0};
 };
 
@@ -266,8 +305,9 @@ void reportHeaps() {
     auto last = counters.lastReport.load(std::memory_order_relaxed);
     if (now - last < 10 || !counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     const auto requests = counters.requests.exchange(0, std::memory_order_relaxed);
-    if (requests == 0) return;
-    std::fprintf(stderr, "[bindless] heap (10 s): %llu requests, %llu published, %llu unusable\n", static_cast<unsigned long long>(requests), static_cast<unsigned long long>(counters.usable.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.failed.exchange(0, std::memory_order_relaxed)));
+    const auto republished = counters.republished.exchange(0, std::memory_order_relaxed);
+    if (requests == 0 && republished == 0) return;
+    std::fprintf(stderr, "[bindless] heap (10 s): %llu requests, %llu published, %llu unusable, %llu republished\n", static_cast<unsigned long long>(requests), static_cast<unsigned long long>(counters.usable.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.failed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(republished));
 }
 
 }
@@ -295,6 +335,7 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             }
             std::fprintf(stderr, "[bindless] probe: region %u (%u entries): %u requested, %u pending, %u mapped\n", region.base, region.entries, requested, pending, mapped);
         }
+        std::fprintf(stderr, "[bindless] probe: last out-of-table key 0x%x\n", feedback[Heaps::TranslationEntries - 1u]);
     }
     std::vector<std::pair<std::uint32_t, std::uint32_t>> published;
     for (const auto& region : regions) {
@@ -306,7 +347,7 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             if (!table->Claim(index)) continue;
             std::uint32_t word = Heaps::Unusable;
             try {
-                word = resolveHeapEntry(context, *table, region.heapBase + region.entryOffset + static_cast<std::uint64_t>(key) * 32u);
+                word = resolveHeapEntry(context, *table, index, region.heapBase + region.entryOffset + static_cast<std::uint64_t>(key) * 32u);
             } catch (const std::exception& error) {
                 static std::atomic<int> reported{0};
                 if (reported.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[bindless] heap 0x%llx key %u is unusable: %s\n", static_cast<unsigned long long>(region.heapBase), key, error.what());
@@ -314,15 +355,53 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             published.emplace_back(index, word);
         }
     }
-    reportHeaps();
-    if (published.empty()) return;
     counters.requests.fetch_add(published.size(), std::memory_order_relaxed);
     for (const auto& entry : published) (entry.second != Heaps::Unusable ? counters.usable : counters.failed).fetch_add(1, std::memory_order_relaxed);
+    // Revalidation: published entries whose T# or texture changed are published again.
+    // APS5_NO_HEAP_REVALIDATE=1 keeps every entry as first resolved.
+    static const bool revalidate = std::getenv("APS5_NO_HEAP_REVALIDATE") == nullptr;
+    auto& entries = table->Entries();
+    if (revalidate && !entries.empty() && table->RevalidateDue()) {
+        auto& cursor = table->RevalidateCursor();
+        for (std::size_t visited = 0; visited < std::min(RevalidateBudget, entries.size()); ++visited) {
+            if (cursor >= entries.size()) cursor = 0;
+            auto& entry = entries[cursor++];
+            try {
+                const auto word = resolveHeapEntry(context, *table, entry.index, entry.address, &entry);
+                if (word == Heaps::Pending) continue;
+                published.emplace_back(entry.index, word);
+                counters.republished.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::exception&) {
+            }
+        }
+    }
+    reportHeaps();
+    if (published.empty()) return;
     // The words reach the shaders through the GPU, after the uploads the lookups recorded (the
     // batch is taken after them: a lookup may have submitted the previous one).
     const auto commands = recorder.Commands();
     const auto updateBuffer = context.Function<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer");
     for (const auto& [index, word] : published) updateBuffer(commands, table->TranslationBuffer(), static_cast<VkDeviceSize>(index) * sizeof(std::uint32_t), sizeof(std::uint32_t), &word);
+    // Diagnostic: APS5_TRACE_HEAP_ENTRIES=2 also reads back each newly published image-backed entry.
+    static const bool dumpEntries = [] { const char* text = std::getenv("APS5_TRACE_HEAP_ENTRIES"); return text != nullptr && text[0] == '2'; }();
+    if (dumpEntries) {
+        static std::set<const StorageTexture*> dumped;
+        std::vector<std::shared_ptr<StorageTexture>> images;
+        for (const auto& [index, word] : published) {
+            for (const auto& entry : table->Entries()) {
+                if (entry.index != index || entry.texture == nullptr || !entry.texture->ViewsStorageImage()) continue;
+                if (dumped.insert(entry.texture->StorageSource()).second) images.push_back(entry.texture->SharedStorageSource());
+            }
+        }
+        if (!images.empty()) {
+            recorder.Sync();
+            for (const auto& image : images) {
+                const bool done = image->DumpImage("heap");
+                std::fprintf(stderr, "[bindless] dumped heap image 0x%llx %ux%u format %u%s\n", static_cast<unsigned long long>(image->Descriptor().baseAddress), image->Descriptor().width, image->Descriptor().height, image->Descriptor().format, done ? "" : " (format not dumped)");
+            }
+            return;
+        }
+    }
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
