@@ -719,6 +719,17 @@ static void CheckFloatRounding(float value, std::int64_t expected, bool invalid)
     }
 }
 
+static void CheckLongDoubleRounding(long double value, std::int64_t expected, bool invalid) {
+    std::feclearexcept(FE_ALL_EXCEPT);
+    errno = 12345;
+    const std::int64_t result = llroundl_nid_postfix(value);
+    if (result != expected || (std::fetestexcept(FE_INVALID) != 0) != invalid || errno != 12345) {
+        std::fprintf(stderr, "llroundl failed for %La: expected %lld, got %lld\n", value,
+            static_cast<long long>(expected), static_cast<long long>(result));
+        std::abort();
+    }
+}
+
 static void CheckNoConversionIsPositiveZero() {
     for (const char* text : {"", " ", "-", "+", "-.", "+.", "-x", "-.e1", "-e5", "- 1", "  -."}) {
         char* end = nullptr;
@@ -840,6 +851,21 @@ int main() {
     Require(std::abs(lgamma_nid_postfix(-0.5) - 1.2655121234846454) < 1e-15);
     Require(llroundl_nid_postfix(2.5L) == 3 && llroundl_nid_postfix(-2.5L) == -3 && llroundl_nid_postfix(0.49999999999999999L) == 0);
     Require(llroundl_nid_postfix(9007199254740993.0L) == 9007199254740993LL && llroundl_nid_postfix(-1e30L) == INT64_MIN);
+    for (const int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        Require(std::fesetround(mode) == 0);
+        CheckLongDoubleRounding(9223372036854775807.0L, INT64_MAX, false);
+        CheckLongDoubleRounding(9223372036854775806.5L, INT64_MAX, false);
+        CheckLongDoubleRounding(9223372036854775806.0L, INT64_MAX - 1, false);
+        CheckLongDoubleRounding(-0x1p63L, INT64_MIN, false);
+        CheckLongDoubleRounding(-9223372036854775807.5L, INT64_MIN, false);
+        CheckLongDoubleRounding(-9223372036854775807.0L, INT64_MIN + 1, false);
+        for (const long double value : {9223372036854775807.5L, 0x1p63L, -9223372036854775809.0L,
+            std::numeric_limits<long double>::infinity(), -std::numeric_limits<long double>::infinity(),
+            std::numeric_limits<long double>::quiet_NaN()}) {
+            CheckLongDoubleRounding(value, INT64_MIN, true);
+        }
+    }
+    Require(std::fesetround(FE_TONEAREST) == 0);
     Require(logbf_nid_postfix(8.f) == 3.f && logbf_nid_postfix(-0.75f) == -1.f);
     Require(logbf_nid_postfix(std::numeric_limits<float>::denorm_min()) == -149.f);
     Require(logbf_nid_postfix(0.f) == -std::numeric_limits<float>::infinity());
