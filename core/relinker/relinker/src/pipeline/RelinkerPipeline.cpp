@@ -42,6 +42,9 @@ std::string RelinkerPipeline::relocationTypeName(std::uint32_t type) {
         case 6: return "R_X86_64_GLOB_DAT";
         case 7: return "R_X86_64_JUMP_SLOT";
         case 10: return "R_X86_64_32";
+        case 16: return "R_X86_64_DTPMOD64";
+        case 17: return "R_X86_64_DTPOFF64";
+        case 18: return "R_X86_64_TPOFF64";
         default: {
             std::ostringstream oss;
             oss << "UNKNOWN(" << type << ")";
@@ -272,6 +275,31 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         return (raw[symOff + 4] & 0xf) == 3 && value == 0;
     };
 
+    const auto isTlsRelocation = [](const std::uint32_t type) {
+        return type == R_X86_64_DTPMOD64 || type == R_X86_64_DTPOFF64 || type == R_X86_64_TPOFF64;
+    };
+
+    const bool hasTlsSegment = std::any_of(programHeaders.begin(), programHeaders.end(),
+                                           [](const ProgramHeader& ph) { return ph.Type == PT_TLS; });
+
+    const auto definedTlsSymbolValue = [&](const std::uint32_t symIdx, const FileByteOffset pos) -> std::optional<std::uint64_t> {
+        const FileByteOffset symOff = dynSymTabOffset + static_cast<FileByteOffset>(symIdx) * symEntSize;
+        if (symOff < dynSymTabOffset || symOff > raw.size() || raw.size() - symOff < symEntSize)
+            throw RelinkerException("Symbol table entry out of bounds", symOff);
+        std::uint16_t section = 0;
+        std::memcpy(&section, raw.data() + symOff + 6, sizeof(section));
+        if (section == SHN_UNDEF)
+            return std::nullopt;
+        if ((raw[symOff + 4] & 15) != STT_TLS)
+            throw RelinkerException("TLS relocation names a defined symbol that is not STT_TLS", pos);
+        std::uint64_t value = 0;
+        std::memcpy(&value, raw.data() + symOff + 8, sizeof(value));
+        return value;
+    };
+    const auto definedTlsSymbol = [&](const std::uint32_t symIdx, const FileByteOffset pos) {
+        return definedTlsSymbolValue(symIdx, pos).has_value();
+    };
+
     auto extractRela = [&](const FileByteOffset relaOff, const ByteCount relaSize) {
         for (ByteCount off = 0; relaSize >= relaEntSize && off <= relaSize - relaEntSize; off += relaEntSize) {
             const FileByteOffset pos = relaEntryPos(relaOff, off);
@@ -293,6 +321,9 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
                     throw RelinkerException("RELATIVE relocation has a nonzero symbol index", pos);
                 continue;
             }
+
+            if (isTlsRelocation(relType) && (symIdx == 0 || definedTlsSymbol(symIdx, pos)))
+                continue;
 
             const FileByteOffset symOff = dynSymTabOffset + static_cast<FileByteOffset>(symIdx) * symEntSize;
             if (symOff < dynSymTabOffset || symOff > raw.size() || raw.size() - symOff < 5)
@@ -428,7 +459,7 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         std::memcpy(buf.data() + pos + 16, &addend, 8);
     };
 
-    auto extractRelative = [&](const FileByteOffset relaOff, const ByteCount relaSize) {
+    auto extractLocal = [&](const FileByteOffset relaOff, const ByteCount relaSize) {
         for (ByteCount off = 0; relaSize >= relaEntSize && off <= relaSize - relaEntSize; off += relaEntSize) {
             const FileByteOffset pos = relaEntryPos(relaOff, off);
             std::uint64_t rOffset = 0, rInfo = 0;
@@ -436,14 +467,32 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
             std::memcpy(&rOffset, raw.data() + pos, 8);
             std::memcpy(&rInfo, raw.data() + pos + 8, 8);
             std::memcpy(&rAddend, raw.data() + pos + 16, 8);
+            const std::uint32_t symIdx = static_cast<std::uint32_t>(rInfo >> 32);
             const std::uint32_t relType = static_cast<std::uint32_t>(rInfo & 0xffffffff);
-            if (relType == R_X86_64_RELATIVE)
+            if (relType == R_X86_64_RELATIVE) {
                 appendRela(dynSection.RelaData, rOffset, static_cast<std::uint64_t>(R_X86_64_RELATIVE), rAddend);
+                continue;
+            }
+            if (!isTlsRelocation(relType))
+                continue;
+            std::uint64_t offset = 0;
+            if (symIdx != 0) {
+                const auto value = definedTlsSymbolValue(symIdx, pos);
+                if (!value)
+                    continue;
+                offset = *value;
+            }
+            if (!hasTlsSegment)
+                throw RelinkerException("TLS relocation in an executable without a PT_TLS segment", pos);
+            if (relType == R_X86_64_DTPMOD64 && rAddend != 0)
+                throw RelinkerException("DTPMOD64 relocation has a nonzero addend", pos);
+            const auto addend = relType == R_X86_64_DTPMOD64 ? 0 : static_cast<std::int64_t>(offset + static_cast<std::uint64_t>(rAddend));
+            appendRela(dynSection.RelaData, rOffset, static_cast<std::uint64_t>(relType), addend);
         }
     };
 
-    extractRelative(dynRelaOffset, dynRelaSize);
-    extractRelative(dynJmpRelOffset, dynJmpRelSize);
+    extractLocal(dynRelaOffset, dynRelaSize);
+    extractLocal(dynJmpRelOffset, dynJmpRelSize);
 
     std::vector<CallRegistryEntry> entries;
     entries.reserve(nidRefs.size());

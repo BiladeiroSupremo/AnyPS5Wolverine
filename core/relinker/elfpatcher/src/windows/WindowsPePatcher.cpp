@@ -44,7 +44,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
         image.GetRva(originalPltGotVaddr, 8);
     report(500);
     const WindowsRelocationBuilder relocationBuilder;
-    auto relocations = relocationBuilder.Apply(image, dynamicSection);
+    auto relocations = relocationBuilder.Apply(image, dynamicSection, originalHeaders);
     report(1000);
     auto sections = image.BuildSections();
     report(1500);
