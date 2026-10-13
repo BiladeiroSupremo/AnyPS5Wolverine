@@ -238,8 +238,9 @@ void requireUnconditionalEntry(const ControlFlowGraph& original, const ControlFl
     throw std::runtime_error(std::string(name) + ": the entry block does not run unconditionally first");
 }
 
-void requireSameStructuredExecutions(const std::vector<std::vector<std::uint32_t>>& successors, const char* name) {
-    const auto original = makeGraph(successors);
+void requireSameStructuredExecutions(const std::vector<std::vector<std::uint32_t>>& successors, const char* name, const std::map<std::uint32_t, std::uint32_t>& words = {}) {
+    auto original = makeGraph(successors);
+    for (const auto& [blockId, count] : words) original.blocks[blockId].estimatedSpirvWords = count;
     auto graph = original;
     Structurizer{}.Structurize(graph);
     requireExactPostDominators(graph, name);
@@ -248,6 +249,17 @@ void requireSameStructuredExecutions(const std::vector<std::vector<std::uint32_t
     requireOriginalBranches(graph, successors, name);
     requireSameExecutions(original, graph, name);
     requireUnconditionalEntry(original, graph, name);
+}
+
+void requireGrowthBudgetRefusal(ControlFlowGraph graph, const char* name) {
+    const std::string growthBudget = "CFG shared merge splitting exceeded growth budget";
+    try {
+        Structurizer{}.Structurize(graph);
+    } catch (const std::runtime_error& error) {
+        if (std::string(error.what()).starts_with(growthBudget)) return;
+        throw std::runtime_error(std::string(name) + ": refused with \"" + error.what() + "\" instead of the shared merge splitting growth budget");
+    }
+    throw std::runtime_error(std::string(name) + ": was structurized instead of refused at the shared merge splitting growth budget");
 }
 
 std::vector<std::vector<std::uint32_t>> originalPostDominators(const ControlFlowGraph& graph) {
@@ -440,6 +452,13 @@ int main() {
         requireSameStructuredExecutions({{1, 2}, {2, 0}, {1}}, "a cycle entered at both blocks inside a loop that never ends");
         requireSameStructuredExecutions({{1, 3}, {2}, {1}, {}}, "a branch that returns or enters a loop that never ends");
         requireSameStructuredExecutions({{1}, {1}}, "a block that branches to itself forever");
+        requireSameStructuredExecutions({{1, 13}, {2, 8}, {3, 6}, {4, 0}, {5, 4}, {6}, {}, {}, {5, 9}, {10, 0}, {11}, {11, 12}, {}, {14}, {15}, {16, 17}, {4}, {18, 19}, {7, 0}, {}}, "merge splitting that adds one forwarder per round until its budget runs out");
+        const std::vector<std::vector<std::uint32_t>> junctionLoop{{1, 2}, {}, {3, 10}, {4, 8}, {6, 0}, {}, {7, 8}, {0}, {5, 9}, {7}, {9, 11}, {11}};
+        requireSameStructuredExecutions(junctionLoop, "a loop whose latch is too large to clone, so merge splitting keeps adding junctions", {{7u, 2000u}});
+        auto unsupportedExit = makeGraph(junctionLoop);
+        unsupportedExit.blocks[7].estimatedSpirvWords = 2000u;
+        unsupportedExit.blocks[5].terminator.kind = TerminatorKind::Unsupported;
+        requireGrowthBudgetRefusal(std::move(unsupportedExit), "a junction loop whose unsupported exit keeps the reach-flag fallback out");
         requireOriginalDominanceSets(makeGraph(diamonds), "raw diamond chain");
         requireOriginalDominanceSets(makeGraph({{1}, {2, 3}, {1}, {}}), "a loop with an exit");
         requireOriginalDominanceSets(makeGraph({{1}, {2}, {1}}), "a non-exiting SCC");
