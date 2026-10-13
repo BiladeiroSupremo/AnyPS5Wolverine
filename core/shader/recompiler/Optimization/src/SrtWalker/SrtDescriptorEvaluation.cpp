@@ -136,8 +136,17 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
                         zeroedSources.emplace_back(sourceIndex, inaccessible);
                         break;
                     }
-                    std::string detail = DescribeValue(source->dwords[index], 4);
                     const IrValue* dword = source->dwords[index]->Resolve();
+                    // A dword that is the Unreachable value lies on a path the shader never takes:
+                    // the source stays a null descriptor instead of failing the whole draw.
+                    // APS5_STRICT_UNREACHABLE_SOURCES restores the failure.
+                    static const bool strictUnreachable = std::getenv("APS5_STRICT_UNREACHABLE_SOURCES") != nullptr;
+                    if (!strictUnreachable && dword->Opcode() == IrOpcode::Unreachable) {
+                        if (debug) std::fprintf(stderr, "[srt] descriptor source %u dword %u is unreachable: zero words\n", sourceIndex, index);
+                        value.dwords.fill(0u);
+                        break;
+                    }
+                    std::string detail = DescribeValue(source->dwords[index], 4);
                     if (dword->Opcode() == IrOpcode::ReadConst && dword->ArgumentCount() == 2 && dword->Argument(1)->Resolve()->HasImmediate()) {
                         const auto slot = dword->Argument(1)->Resolve()->ImmediateU32();
                         if (slot < program.srtReads.size()) detail += " where slot " + std::to_string(slot) + " = " + DescribeValue(program.srtReads[slot].value, 8);

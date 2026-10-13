@@ -41,7 +41,10 @@ void SetEnabled(bool enabled) {
 bool HeapEligible(bool compute, std::uint32_t dimension, bool sampled, bool depthCompare, bool r128) {
     const auto shape = static_cast<RdnaImageDimension>(dimension);
     const bool kind = shape == RdnaImageDimension::Dim2D || shape == RdnaImageDimension::Dim2DArray || shape == RdnaImageDimension::Dim3D;
-    return compute && Enabled() && kind && sampled && !depthCompare && !r128;
+    // Graphics stages take the heap too (every graphics pipeline layout carries the set); the
+    // driver resolves their requests before the next draw or dispatch.
+    (void)compute;
+    return Enabled() && kind && sampled && !depthCompare && !r128;
 }
 
 std::uint32_t RegionBase(std::uint64_t heapBase, std::uint32_t entryOffset, std::uint32_t entries) {
