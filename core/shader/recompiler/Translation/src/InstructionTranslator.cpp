@@ -231,7 +231,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             const std::uint32_t waves = std::min((totalThreads + waveSize - 1u) / waveSize, 0x3fu);
             IrValue& localIndex = builtin(StageInputKind::LocalInvocationIndex);
             IrValue& waveId = entryIr.Emit(IrOpcode::UDiv32, IrOpcodeType(IrOpcode::UDiv32), {&localIndex, &entryIr.Constant(waveSize)});
-            IrValue& waveBits = entryIr.ShiftLeftLogical(waveId, entryIr.Constant(20u));
+            IrValue& waveBits = entryIr.BitwiseOr(entryIr.ShiftLeftLogical(waveId, entryIr.Constant(6u)), entryIr.ShiftLeftLogical(waveId, entryIr.Constant(20u)));
             IrValue& firstBit = entryIr.Select(entryIr.IEqual(waveId, entryIr.Constant(0u)), entryIr.Constant(0x80000000u), entryIr.Constant(0u));
             entryIr.SetScalarReg(static_cast<ScalarReg>(cs->workgroupRegister + regOffset), entryIr.BitwiseOr(entryIr.BitwiseOr(waveBits, entryIr.Constant(waves)), firstBit));
         }
