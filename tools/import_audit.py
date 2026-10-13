@@ -327,12 +327,23 @@ def built_libraries(directories):
     return {name: sorted(files) for name, files in exports.items()}, libraries
 
 
+def module_files(directory):
+    for file in directory_files(directory, "*"):
+        with file.open("rb") as handle:
+            magic = handle.read(4)
+        if magic == b"\x7fELF":
+            yield file
+        elif (file.suffix.lower() in (".prx", ".sprx", ".suprx", ".debug_prx", ".elf")
+              or magic.startswith(b"MZ") or magic in (b"\x4f\x15\x3d\x1d", b"\x54\x14\xf5\xee")):
+            raise AuditError(f"{file}: expected ELF module (first bytes {magic!r})")
+
+
 def read_modules(directories):
     imports = {}
     exports = defaultdict(set)
     images = {}
     for directory in directories:
-        for file in directory_files(directory, "*"):
+        for file in module_files(directory):
             data = file.read_bytes()
             digest = hashlib.sha256(data).digest()
             if file.name in images:
