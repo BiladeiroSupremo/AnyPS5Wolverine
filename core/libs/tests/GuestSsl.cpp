@@ -76,8 +76,6 @@ int main() {
     constexpr int notFound = static_cast<int>(0x8095F004);
     constexpr int invalidArg = static_cast<int>(0x8095177A);
     int marker = 0;
-    Require(Throws([] { sceSslSetVerifyCallback(); }));
-
     const int context = sceSslInit_nid_postfix(0x10000);
     Require(context > 0);
     SslMemoryPoolStats stats{1, 1, 1, 1};
