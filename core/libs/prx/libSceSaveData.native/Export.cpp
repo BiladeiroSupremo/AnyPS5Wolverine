@@ -18,6 +18,7 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "SaveData.hpp"
 #include "prx/libSceSaveData/SaveDataFile.hpp"
 
@@ -321,6 +322,9 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
     const std::uint32_t key = cond->key;
     if ((key > SAVE_DATA_SORT_KEY_MTIME && key != SAVE_DATA_SORT_KEY_FREE_BLOCKS) || cond->order > SAVE_DATA_SORT_ORDER_DESCENT) {
         return SAVE_DATA_ERROR_PARAMETER;
+    }
+    if (cond->title_id != nullptr && std::strncmp(cond->title_id->data, GetAppTitleId_nid_postfix().value, sizeof(cond->title_id->data)) != 0) {
+        return SAVE_DATA_OK;
     }
     const char* pattern = (cond->dir_name != nullptr) ? cond->dir_name->data : nullptr;
     const std::string root = save_root();

@@ -1,6 +1,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -125,6 +126,42 @@ static void TrailingWildcards() {
     Require(SearchPattern("TRAIL_%") == Names{"TRAIL1"}, "_ must still match exactly one character");
 }
 
+static std::uint32_t SearchTitle(const char* titleId, bool second) {
+    SceSaveDataTitleId title{};
+    std::snprintf(title.data, sizeof(title.data), "%s", titleId != nullptr ? titleId : "");
+    SceSaveDataDirName pattern{};
+    std::snprintf(pattern.data, sizeof(pattern.data), "OTHER_%%");
+    SaveDataDirNameSearchCond cond{};
+    cond.user_id = 1;
+    cond.title_id = titleId != nullptr ? &title : nullptr;
+    cond.dir_name = &pattern;
+    std::array<SceSaveDataDirName, 1> names{};
+    names[0].data[0] = '!';
+    SaveDataDirNameSearchResult result{};
+    result.dir_names = names.data();
+    result.dir_names_num = 1;
+    result.hit_num = 7;
+    result.set_num = 7;
+    Require((second ? sceSaveDataDirNameSearch2(&cond, &result) : sceSaveDataDirNameSearch(&cond, &result)) == 0, "title search failed");
+    Require(result.set_num == std::min<std::uint32_t>(result.hit_num, 1), "title search must set the names it found");
+    Require(result.set_num == 1 ? std::string(names[0].data) == "OTHER_A" : names[0].data[0] == '!', "title search returned the wrong name");
+    return result.hit_num;
+}
+
+static void OtherTitle() {
+    std::filesystem::create_directories("app0/sce_sys");
+    std::FILE* param = std::fopen("app0/sce_sys/param.json", "wb");
+    Require(param != nullptr, "param.json was not created");
+    std::fputs("{\"titleId\":\"PPSA00000\",\"localizedParameters\":{\"en-US\":{\"titleName\":\"Example\"}}}", param);
+    std::fclose(param);
+    std::filesystem::create_directories(std::filesystem::path("_sd") / "OTHER_A");
+    for (const bool second : {false, true}) {
+        Require(SearchTitle(nullptr, second) == 1, "a search without a title id must find the running title's save");
+        Require(SearchTitle("PPSA00000", second) == 1, "a search for the running title must find its save");
+        Require(SearchTitle("PPSA17221", second) == 0, "a search for another title must find none of the running title's saves");
+    }
+}
+
 static void SearchAndMount() {
     const std::array names{std::string(31, 'A'), std::string(31, 'B')};
     for (const auto& name : names) std::filesystem::create_directories(std::filesystem::path("_sd") / name);
@@ -245,6 +282,7 @@ int main() {
     try {
         SearchAndMount();
         SortByKey();
+        OtherTitle();
         TrailingWildcards();
         SaveSize();
     } catch (const std::exception& error) {
