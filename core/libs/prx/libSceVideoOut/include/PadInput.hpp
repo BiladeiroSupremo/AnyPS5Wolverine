@@ -15,7 +15,7 @@ public:
     ~PadInput();
     void HandleEvent(const SDL_Event& event, DisplayWindow& window);
     void Update();
-    bool MouseModeEnabled() const { return mouseEnabled; }
+    bool MouseModeEnabled() const { return keyboardMouse.MouseMode(); }
 
 private:
     explicit PadInput(Pad::InputConfiguration configuration);
