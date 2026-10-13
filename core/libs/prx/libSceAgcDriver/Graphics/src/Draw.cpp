@@ -2311,7 +2311,16 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             memoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
             if (dumpLimit > 0) {
                 std::lock_guard lock(dumpMutex);
-                if (dumped[binding.color.address] < dumpLimit) {
+                // APS5_DUMP_TARGETS_SKIP=<n> leaves out each target's first n renders, and
+                // APS5_DUMP_TARGETS_ADDRESS=<hex> keeps only that target.
+                static const int skip = [] { const char* text = std::getenv("APS5_DUMP_TARGETS_SKIP"); return text ? std::atoi(text) : 0; }();
+                static const std::uint64_t only = [] { const char* text = std::getenv("APS5_DUMP_TARGETS_ADDRESS"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
+                // APS5_DUMP_TARGETS_AFTER=<s> leaves out renders in the first s seconds of the first dump check.
+                static const auto after = [] { const char* text = std::getenv("APS5_DUMP_TARGETS_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
+                static const auto firstCheck = std::chrono::steady_clock::now();
+                static std::map<std::uint64_t, int> renders;
+                const bool wanted = (only == 0 || binding.color.address == only) && renders[binding.color.address]++ >= skip && std::chrono::steady_clock::now() - firstCheck >= after;
+                if (wanted && dumped[binding.color.address] < dumpLimit) {
                     binding.dump = std::make_unique<Buffer>(context, binding.linearDevice->Size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
                     CopyBuffer(context, commands, binding.linearDevice->Handle(), 0, binding.dump->Handle(), 0, binding.linearDevice->Size());
                 }
