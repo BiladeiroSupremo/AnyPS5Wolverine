@@ -315,7 +315,7 @@ void RunGuestTextureResourceTests() {
 
     Fields badMsaa = base;
     badMsaa.msaaDepth = true;
-    rejectFields(badMsaa, "MSAA");
+    rejectFields(badMsaa, "ITERATE_256");
 
     Fields blockSize = base;
     blockSize.maxUncompBlkSize = 1;
