@@ -2828,7 +2828,8 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     if (bytes == 0) return;
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel)) return;
-        publishPendingWrites();
+        const std::array ranges{std::pair{address, address + bytes}};
+        publishPendingWrites(ranges);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return;
     }
@@ -2840,7 +2841,10 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeValues.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
-    if (!SnapshotCovers(address, address + bytes)) publishPendingWrites();
+    if (!SnapshotCovers(address, address + bytes)) {
+        const std::array ranges{std::pair{address, address + bytes}};
+        publishPendingWrites(ranges);
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -2853,7 +2857,8 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
     if (!noteWrite(address, bytes)) return;
-    publishPendingWrites();
+    const std::array ranges{std::pair{address, address + bytes}};
+    publishPendingWrites(ranges);
     // The note precedes this thread's vkQueueSubmit and the label another queue polls for; the
     // fence makes that order hold without relying on x86 store ordering.
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2861,7 +2866,8 @@ void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
 
 void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value) {
     if (!noteWrite(address, bytes, false, value)) return;
-    publishPendingWrites();
+    const std::array ranges{std::pair{address, address + bytes}};
+    publishPendingWrites(ranges);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -2871,26 +2877,55 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
         if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin))) publish = true;
     }
     if (!publish) return;
-    publishPendingWrites();
+    publishPendingWrites(ranges);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
-void Recorder::publishPendingWrites() const {
-    // Only the active recorder owns the snapshot: one torn down after its successor was activated,
-    // or one a worker still dispatches into after device.reset(), must not publish its ranges.
-    if (activeRecorder != this) return;
-    const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    auto merged = std::make_shared<WriteRanges>();
-    if (open != nullptr) merged->insert(merged->end(), open->writes.begin(), open->writes.end());
-    for (const auto& batch : inFlight) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
-    for (const auto* batch : finishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
-    std::sort(merged->begin(), merged->end());
-    std::size_t out = 0;
-    for (const auto& [begin, end] : *merged) {
-        if (out != 0 && begin <= (*merged)[out - 1].second) (*merged)[out - 1].second = std::max((*merged)[out - 1].second, end);
-        else (*merged)[out++] = {begin, end};
+void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
+    if (activeRecorder != this) {
+        publishedWriteRangesValid = false;
+        return;
     }
-    merged->resize(out);
+    const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto previous = pendingWrites.load(std::memory_order_acquire);
+    const auto owned = publishedWriteRanges.lock();
+    const bool extend = !additions.empty() && previous != nullptr && previous == owned && publishedWriteRangesValid &&
+        std::all_of(additions.begin(), additions.end(), [](const auto& range) { return range.second > range.first; });
+    publishedWriteRangesValid = false;
+    auto merged = std::make_shared<WriteRanges>();
+    if (extend && additions.size() == 1) {
+        auto range = additions.front();
+        const auto first = std::partition_point(previous->begin(), previous->end(), [&](const auto& entry) { return entry.second < range.first; });
+        auto last = first;
+        while (last != previous->end() && last->first <= range.second) {
+            range.first = std::min(range.first, last->first);
+            range.second = std::max(range.second, last->second);
+            ++last;
+        }
+        merged->reserve(previous->size() - static_cast<std::size_t>(last - first) + 1);
+        merged->insert(merged->end(), previous->begin(), first);
+        merged->push_back(range);
+        merged->insert(merged->end(), last, previous->end());
+    } else {
+        if (extend) {
+            merged->reserve(previous->size() + additions.size());
+            merged->insert(merged->end(), previous->begin(), previous->end());
+            merged->insert(merged->end(), additions.begin(), additions.end());
+        } else {
+            if (open != nullptr) merged->insert(merged->end(), open->writes.begin(), open->writes.end());
+            for (const auto& batch : inFlight) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
+            for (const auto* batch : finishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
+        }
+        std::sort(merged->begin(), merged->end());
+        std::size_t out = 0;
+        for (const auto& [begin, end] : *merged) {
+            if (out != 0 && begin <= (*merged)[out - 1].second) (*merged)[out - 1].second = std::max((*merged)[out - 1].second, end);
+            else (*merged)[out++] = {begin, end};
+        }
+        merged->resize(out);
+    }
+    publishedWriteRangesValid = std::all_of(merged->begin(), merged->end(), [](const auto& range) { return range.second > range.first; });
+    publishedWriteRanges = merged;
     pendingWrites.store(std::move(merged), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
