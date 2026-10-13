@@ -29,6 +29,7 @@ int APS5_VABI _ZN3sce4Json11Initializer10initializeEPKNS0_13InitParameterE(void*
 int APS5_VABI _ZN3sce4Json11Initializer9terminateEv(void*);
 int APS5_VABI _ZN3sce4Json11Initializer27setGlobalNullAccessCallBackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_(void*, NullAccessCallback, void*);
 int APS5_VABI _ZN3sce4Json11Initializer27setGlobalNullAccessCallbackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_(void*, NullAccessCallback, void*);
+void APS5_VABI _ZN3sce4Json5Value21setNullAccessCallBackEPFRKS1_NS0_9ValueTypeEPS2_PvES6_(NullAccessCallback, void*);
 void APS5_VABI _ZN3sce4Json6StringC1Ev(String*);
 void APS5_VABI _ZN3sce4Json6StringC1EPKc(String*, const char*);
 void APS5_VABI _ZN3sce4Json6StringD1Ev(String*);
@@ -688,6 +689,33 @@ static void StreamParse() {
     _ZN3sce4Json5ValueD1Ev(&root);
 }
 
+static void StaticNullAccess() {
+    callbackCalls = 0;
+    lastRequested = -1;
+    lastParent = nullptr;
+    lastContext = nullptr;
+    int context = 0;
+    _ZN3sce4Json5Value21setNullAccessCallBackEPFRKS1_NS0_9ValueTypeEPS2_PvES6_(OnNullAccess, &context);
+    _ZN3sce4Json5ValueC1Ev(&fallback);
+    Require(_ZN3sce4Json5Value3setEl(&fallback, 99) == 0);
+
+    Value root{};
+    _ZN3sce4Json5ValueC1Ev(&root);
+    const char text[] = "{\"present\":\"text\"}";
+    Require(_ZN3sce4Json6Parser5parseERNS0_5ValueEPKcm(&root, text, sizeof(text) - 1) == 0);
+    Require(&Member(root, "missing") == &fallback);
+    Require(callbackCalls == 1 && lastRequested == TypeNull && lastParent == &root && lastContext == &context);
+    Require(*_ZNK3sce4Json5Value10getIntegerEv(&Member(root, "present")) == 99);
+    Require(callbackCalls == 2 && lastRequested == TypeInteger);
+
+    _ZN3sce4Json5Value21setNullAccessCallBackEPFRKS1_NS0_9ValueTypeEPS2_PvES6_(nullptr, nullptr);
+    const Value& unhandled = Member(root, "missing");
+    Require(&unhandled != &fallback && _ZNK3sce4Json5Value7getTypeEv(&unhandled) == TypeNull);
+    Require(callbackCalls == 2);
+    _ZN3sce4Json5ValueD1Ev(&root);
+    _ZN3sce4Json5ValueD1Ev(&fallback);
+}
+
 int main() {
     ParseAndRoundTrip();
     NestingDepth();
@@ -698,6 +726,7 @@ int main() {
     AllocatorNotifyError();
     NullAccess(_ZN3sce4Json11Initializer27setGlobalNullAccessCallBackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_);
     NullAccess(_ZN3sce4Json11Initializer27setGlobalNullAccessCallbackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_);
+    StaticNullAccess();
     ValueAccess();
     InitParameter2BaseConstructor();
     InitParameters();

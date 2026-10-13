@@ -873,9 +873,11 @@ void APS5_VABI _ZN3sce4Json12MemAllocator11notifyErrorEimPv(void* self, int erro
     (void)userData;
 }
 
-int APS5_VABI _ZN3sce4Json5Value21setNullAccessCallBackEPFRKS1_NS0_9ValueTypeEPS2_PvES6_() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+void APS5_VABI _ZN3sce4Json5Value21setNullAccessCallBackEPFRKS1_NS0_9ValueTypeEPS2_PvES6_(NullAccessCallback callback, void* context) {
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    state.callback = callback;
+    state.context = context;
 }
 
 int APS5_VABI _ZN3sce4Json5Value30setElementAccessFailureHandlerEPFviPKNS0_6StringEPKmPKS1_S8_PvES9_(void) {
