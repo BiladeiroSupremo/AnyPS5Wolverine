@@ -548,6 +548,7 @@ void ShareDescriptor(int from, int to) {
     auto status = Materialize(from).status;
     g_entries[to] = Entry{false, std::move(status)};
 #ifdef _WIN32
+    File::SharePositionedTransfer(from, to);
     GuestFileLockShare_nid_no_patch(from, to);
 #endif
 }
