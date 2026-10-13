@@ -10,6 +10,7 @@
 #include <system_error>
 #if defined(__linux__)
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -59,6 +60,11 @@ private:
     int descriptor = -1;
     int error = 0;
 };
+
+bool RegularFile(int descriptor) {
+    struct stat status{};
+    return ::fstat(descriptor, &status) == 0 && S_ISREG(status.st_mode);
+}
 #endif
 
 bool RoundLength(std::size_t length, std::size_t& rounded) {
@@ -124,7 +130,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
     const int accessMode = descriptorFlags & O_ACCMODE;
     if ((protection & 1) != 0 && accessMode == O_WRONLY) return failed(GuestAccess);
     if (kind == GuestShared && (protection & 2) != 0 && accessMode == O_RDONLY) return failed(GuestAccess);
-    if (!File::IsSharedMemoryDescriptor_nid_no_patch(mappingDescriptor)) return failed(GuestNotSupported);
+    if (!File::IsSharedMemoryDescriptor_nid_no_patch(mappingDescriptor) && !RegularFile(mappingDescriptor)) return failed(GuestNotSupported);
 #else
     const int mappingDescriptor = descriptor;
     if (!File::IsSharedMemoryDescriptor_nid_no_patch(mappingDescriptor)) return failed(GuestNotSupported);
