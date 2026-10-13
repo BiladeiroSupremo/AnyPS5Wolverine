@@ -2847,7 +2847,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
                 frames += text;
             }
 #endif
-            std::fprintf(stderr, "[write-image] 0x%llx %ux%u marked written (traceKeyStore at %p) caller %p dirty-caller %p:%s\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, reinterpret_cast<void*>(&traceKeyStore), __builtin_return_address(0), markDirtyCaller, frames.c_str());
+            std::fprintf(stderr, "[write-image] 0x%llx %ux%u image %p marked written (traceKeyStore at %p) caller %p dirty-caller %p:%s\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, static_cast<const void*>(this), reinterpret_cast<void*>(&traceKeyStore), __builtin_return_address(0), markDirtyCaller, frames.c_str());
         }
     }
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;

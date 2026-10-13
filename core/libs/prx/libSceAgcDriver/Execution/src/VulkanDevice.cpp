@@ -3509,7 +3509,7 @@ void FlushAfterDispatch(std::uint64_t programAddress, const Graphics::ShaderReso
     std::snprintf(tag, sizeof(tag), "%llx_%d", static_cast<unsigned long long>(programAddress), done[programAddress]);
     for (const auto& image : images) {
         const bool dumped = image->DumpImage(tag);
-        std::fprintf(stderr, "[flush-dump]   0x%llx %ux%u format %u%s\n", static_cast<unsigned long long>(image->Descriptor().baseAddress), image->Descriptor().width, image->Descriptor().height, image->Descriptor().format, dumped ? "" : " (format not dumped)");
+        std::fprintf(stderr, "[flush-dump]   0x%llx image %p %ux%u format %u%s\n", static_cast<unsigned long long>(image->Descriptor().baseAddress), static_cast<const void*>(image.get()), image->Descriptor().width, image->Descriptor().height, image->Descriptor().format, dumped ? "" : " (format not dumped)");
     }
 }
 

@@ -608,10 +608,15 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
             return StoreWrite{destination, {}, copyDataSource(packet, bytes)};
         }
         case 0x50: {
-            if (packet.size() < 7 || dmaDestination(packet) == DmaSelectGds) return std::nullopt;
+            if (packet.size() < 7) return std::nullopt;
             if (dmaDestination(packet) == DmaSelectNowhere) return StoreWrite{address(packet[2], packet[3]), {}, {}};
             const std::size_t bytes = packet[6] & 0x3ffffffu;
-            const auto destination = address(packet[4], packet[5]);
+            // The GDS is guest-visible memory (GdsAddress): a write into it (the title resets its
+            // counters before each pass) is a store like any other, ordered on the GPU instead of
+            // draining the device. APS5_GDS_DRAIN=1 restores the drain.
+            static const bool gdsDrain = std::getenv("APS5_GDS_DRAIN") != nullptr;
+            if (dmaDestination(packet) == DmaSelectGds && (gdsDrain || packet[5] != 0 || !gdsRange(packet[4], bytes))) return std::nullopt;
+            const auto destination = dmaDestination(packet) == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
             if (!fits(destination, bytes)) return std::nullopt;
             return StoreWrite{destination, {}, dmaSourceBytes(packet)};
         }

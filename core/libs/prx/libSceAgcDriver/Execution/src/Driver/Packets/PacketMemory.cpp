@@ -166,6 +166,19 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             }
         }
         if (drained) ++storesDrained;
+        // Debug aid: APS5_TRACE_DRAINS names the first stores and copies that drain the device.
+        static const bool traceDrains = std::getenv("APS5_TRACE_DRAINS") != nullptr;
+        static std::atomic<int> tracedDrains{0};
+        if (drained && traceDrains && tracedDrains.fetch_add(1, std::memory_order_relaxed) < 200) {
+            std::string words;
+            for (std::size_t i = 0; i < std::min<std::size_t>(packet.size(), 8); ++i) {
+                char text[12];
+                std::snprintf(text, sizeof(text), " %08x", packet[i]);
+                words += text;
+            }
+            const auto copy = opcode == 0x50 ? Pm4::DecodeMemoryCopy(packet) : std::nullopt;
+            std::fprintf(stderr, "[drain] opcode 0x%x queue 0x%x%s%s\n", opcode, submission.queue, words.c_str(), copy.has_value() ? (" copy " + std::to_string(copy->bytes) + " bytes").c_str() : " (not a memory copy)");
+        }
     }
 
     static const bool drawDrain = std::getenv("APS5_DRAW_DRAIN") != nullptr;
