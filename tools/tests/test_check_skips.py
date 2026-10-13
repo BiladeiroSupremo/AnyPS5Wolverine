@@ -34,6 +34,41 @@ OTHER = [
 
 
 class CheckSkipsTests(unittest.TestCase):
+    def test_missing_high_refresh_display_is_expected_in_both_jobs(self):
+        reason = "current display does not provide 120 Hz"
+        reports = (
+            f'<skipped/><system-out>skipped, {reason}</system-out>',
+            f'<skipped message="{reason}"/>',
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            junit = Path(directory) / "junit.xml"
+            for report in reports:
+                junit.write_text(f'<testsuite><testcase name="guest_video_out_high_frame_rate">{report}</testcase></testsuite>', encoding="utf-8")
+                for job in ("linux", "windows"):
+                    with self.subTest(job=job, report=report):
+                        result = subprocess.run(
+                            [sys.executable, "-I", str(TOOL), str(junit), "--job", job],
+                            capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn("1 test(s) skipped, all expected", result.stdout)
+
+    def test_unknown_display_reasons_stay_unexpected_in_both_jobs(self):
+        reasons = (
+            "current display is broken",
+            "current display does not provide 120 Hz because the test is flaky",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            junit = Path(directory) / "junit.xml"
+            for reason in reasons:
+                junit.write_text(f'<testsuite><testcase name="guest_video_out_high_frame_rate"><skipped/><system-out>skipped, {reason}</system-out></testcase></testsuite>', encoding="utf-8")
+                for job in ("linux", "windows"):
+                    with self.subTest(job=job, reason=reason):
+                        result = subprocess.run(
+                            [sys.executable, "-I", str(TOOL), str(junit), "--job", job],
+                            capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn("error: guest_video_out_high_frame_rate skipped", result.stdout)
+
     def test_disabled_tests_fail_in_both_jobs_including_agc(self):
         xml = '<testsuite><testcase name="agc_disabled" status="disabled"/></testsuite>'
         with tempfile.TemporaryDirectory() as directory:
