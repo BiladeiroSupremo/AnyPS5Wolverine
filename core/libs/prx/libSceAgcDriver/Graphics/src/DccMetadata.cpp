@@ -350,7 +350,10 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
             break;
         }
     }
-    if (AnyShadowedOverlaps(begin, count)) return std::nullopt;
+    if (AnyShadowedOverlaps(begin, count)) {
+        PublishShadow(begin, count, PublishScope::Whole, PublishReason::Keys);
+        if (AnyShadowedOverlaps(begin, count)) return std::nullopt;
+    }
     if (note != 0 && recorder.NewestWriteNote(begin, count) == note) return keys;
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count)) return std::nullopt;
     const auto landed = KeysAfterPendingWrites(recorder, begin, count);
