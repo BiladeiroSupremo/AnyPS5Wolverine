@@ -230,9 +230,26 @@ static void TestRelinkedModuleNames() {
     std::filesystem::remove_all(root);
 }
 
+static void TestRelinkedModuleNameCase() {
+    const auto root = std::filesystem::path("anyps5-relinked-case-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Require(std::filesystem::create_directories(root));
+    { std::ofstream file(root / "librenoircore.ps5.prx.guest.prx"); file << "relinked"; }
+    const auto requested = (root / "libRenoirCore.PS5.prx").generic_string();
+    FileStat status{};
+    Require(sceKernelStat(requested.c_str(), &status) == 0 && status.st_size == 8);
+    Require(stat_nid_postfix(requested.c_str(), &status) == 0 && status.st_size == 8);
+    Require(sceKernelCheckReachability(requested.c_str()) == 0);
+    const int opened = sceKernelOpen(requested.c_str(), 0, 0);
+    Require(opened >= 0 && sceKernelClose(opened) == 0);
+    Require(sceKernelStat((root / "libRenoirCore.PS5.prx2").generic_string().c_str(), &status) == static_cast<int>(0x80020002u));
+    std::filesystem::remove_all(root);
+}
+
 int main() {
     TestParentTraversal();
     TestRelinkedModuleNames();
+    TestRelinkedModuleNameCase();
     Require(chmod_nid_postfix(nullptr, 0600) == -1 && *__error_nid_postfix() == 14);
     Require(sceKernelChmod_nid_postfix(nullptr, 0600) == static_cast<int>(0x8002000eu));
     Require(chmod_nid_postfix("", 0600) == -1 && *__error_nid_postfix() == 2);

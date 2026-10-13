@@ -391,6 +391,16 @@ extern "C" std::filesystem::path RelinkedModulePath_nid_no_patch(const std::file
     relinked += ".guest.prx";
     std::error_code error;
     if (std::filesystem::is_regular_file(relinked, error)) return relinked;
+    const auto name = relinked.filename().string();
+    std::optional<std::filesystem::path> matched;
+    std::filesystem::directory_iterator entry(relinked.parent_path().empty() ? "." : relinked.parent_path(), error), end;
+    for (; !error && entry != end; entry.increment(error)) {
+        if (!SameName(entry->path().filename().string(), name)) continue;
+        if (matched) throw std::runtime_error("Ambiguous case-insensitive guest path: " + relinked.string());
+        matched = entry->path();
+    }
+    error.clear();
+    if (matched && std::filesystem::is_regular_file(*matched, error)) return *matched;
     // The relinker converts only modules in sce_module/ or sce_modules/, so a module the title keeps
     // elsewhere in app0 (PPSA03671 loads /app0/libcohtml.Prospero.prx) is relinked from there; loading
     // that file returns the instance already loaded as a dependency.
