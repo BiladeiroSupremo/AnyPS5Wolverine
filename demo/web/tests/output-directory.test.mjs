@@ -87,9 +87,14 @@ test("aborts an open file before removing the incomplete output tree", async () 
     async removeEntry(name, options) { calls.push(["remove", name, options]); }
   };
   const transaction = await OutputDirectoryTransaction.create(parent, "partial-linux");
-  const sink = { async abort() { calls.push(["abort"]); } };
+  let finishAbort;
+  const sink = { abort() { calls.push(["abort"]); return new Promise(resolve => { finishAbort = resolve; }); } };
 
-  assert.deepEqual(await abortAndDiscardOutput(transaction, sink), []);
+  const cleanup = abortAndDiscardOutput(transaction, sink);
+  await Promise.resolve();
+  assert.deepEqual(calls, [["abort"]]);
+  finishAbort();
+  assert.deepEqual(await cleanup, []);
   assert.deepEqual(calls, [["abort"], ["remove", "partial-linux", { recursive: true }]]);
 });
 

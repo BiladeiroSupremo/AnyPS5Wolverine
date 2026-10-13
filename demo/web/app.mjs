@@ -6,6 +6,7 @@ let worker;
 let file;
 let summary;
 let working = false;
+let failing = false;
 let sink;
 let outputDirectory;
 let outputTransaction;
@@ -41,7 +42,7 @@ function update() {
   $("save").querySelector('[value="memory"]').disabled = Boolean(tooLarge);
   const memoryBlocked = $("save").value === "memory" && tooLarge;
   if (summary) $("archive-info").textContent = `${summary.files} files · ${bytes(summary.totalBytes)} expanded · ${summary.modules} modules · ${bytes(selectedBytes)} ${target} conversion input` + (summary.root ? ` · Root: ${summary.root}` : "");
-  $("save-note").textContent = $("save").value === "disk" ? "Creates a subfolder with the executable, libs and app0. No ZIP compression. Browsers may block DLL and other restricted files; use ZIP for those apps." : $("save").value === "zip" ? "Writes a compressed ZIP directly to disk without holding the whole archive in memory." : "Up to 256 MiB including expanded files and output overhead.";
+  $("save-note").textContent = $("save").value === "disk" ? "Creates a subfolder with the executable, libs and app0. No ZIP compression. Incomplete output folders are removed after cancellation or failure. Browsers may block DLL and other restricted files; use ZIP for those apps." : $("save").value === "zip" ? "Writes a compressed ZIP directly to disk without holding the whole archive in memory." : "Up to 256 MiB including expanded files and output overhead.";
   $("browser-note").hidden = supported && canStream && canSaveZip && !memoryBlocked && !folderBlocked && !conversionBlocked;
   $("browser-note").textContent = !supported ? "This browser or connection does not support the converter. Use a current browser over HTTPS, or use the native relinker." : folderBlocked ? "Browsers block direct DLL creation. Windows output requires ZIP. Choose Save ZIP to disk or Download in memory." : iconTooLarge ? "The Windows icon exceeds 16 MiB. Choose Linux or use the native relinker." : conversionTooLarge ? `This ${target} conversion input exceeds 256 MiB. Use the native relinker for this app.` : memoryBlocked ? "This archive exceeds the memory-download limit. Choose Save ZIP to disk. If that option is unavailable, open this page in desktop Chrome or Edge." : "Some direct disk saving options are unavailable in this browser or context. Small apps can still be downloaded in memory. For larger apps, use desktop Chrome or Edge over HTTPS.";
   $("convert").disabled = !supported || working || !summary || !release || conversionBlocked || memoryBlocked || folderBlocked || (summary.warnings.length > 0 && !$("acknowledge").checked);
@@ -53,13 +54,19 @@ function lock(value) {
 }
 
 async function fail(message) {
+  if (failing) return;
+  failing = true;
   worker?.terminate();
   worker = null;
-  working = false;
+  working = true;
   summary = null;
   const transaction = outputTransaction;
   outputTransaction = null;
   outputDirectory = null;
+  if (transaction) {
+    $("status").hidden = false;
+    $("phase").textContent = "Removing incomplete output folder";
+  }
   const activeSink = sink;
   sink = null;
   for (const failure of await abortAndDiscardOutput(transaction, activeSink)) message += `\n${failure}`;
@@ -69,6 +76,8 @@ async function fail(message) {
   $("cancel").hidden = true;
   $("drop").hidden = false;
   $("file").value = "";
+  working = false;
+  failing = false;
   lock(false);
   update();
 }
