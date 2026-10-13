@@ -135,7 +135,7 @@ int APS5_VABI sysctl_nid_postfix(const int* name, std::uint32_t nameLength, void
         if (model.empty()) throw std::runtime_error(std::string(__func__) + ": the host CPU has no CPUID brand string for hw.model");
         return CopyOut(model.c_str(), model.size() + 1, oldValue, oldLength);
     }
-    if (nameLength == 2 && name[0] == 6 && name[1] == 5) {
+    if (nameLength == 2 && name[0] == 6 && (name[1] == 5 || name[1] == 12)) {
         if (newValue != nullptr) {
             *__error_nid_postfix() = 1;
             return -1;
@@ -240,6 +240,10 @@ int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::si
     }
     if (std::strcmp(name, "hw.physmem") == 0) {
         static constexpr int mib[] = {6, 5};
+        return sysctl_nid_postfix(mib, 2, oldValue, oldLength, newValue, newLength);
+    }
+    if (std::strcmp(name, "hw.realmem") == 0) {
+        static constexpr int mib[] = {6, 12};
         return sysctl_nid_postfix(mib, 2, oldValue, oldLength, newValue, newLength);
     }
     throw std::runtime_error(std::string(__func__) + ": unsupported name " + name);

@@ -66,8 +66,8 @@ static void CheckProcessorCountSysctl() {
     }
     Require(threw);
 }
-static void CheckPhysicalMemorySysctl() {
-    const int mib[] = {6, 5};
+static void CheckPhysicalMemorySysctl(int number, const char* name) {
+    const int mib[] = {6, number};
     const std::uint64_t expected = static_cast<std::uint64_t>(sysconf_nid_postfix(121)) * 0x4000;
     *__error_nid_postfix() = 13;
     std::size_t length = 0;
@@ -77,15 +77,15 @@ static void CheckPhysicalMemorySysctl() {
     Require(sysctl_nid_postfix(mib, 2, &value, &length, nullptr, 0) == 0 && value == expected && length == sizeof(std::uint64_t));
     value = 0;
     length = 16;
-    Require(sysctlbyname_nid_postfix("hw.physmem", &value, &length, nullptr, 0) == 0 && value == expected && length == sizeof(std::uint64_t));
+    Require(sysctlbyname_nid_postfix(name, &value, &length, nullptr, 0) == 0 && value == expected && length == sizeof(std::uint64_t));
     Require(*__error_nid_postfix() == 13);
     unsigned char bytes[8] = {0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa};
     length = 4;
-    Require(sysctlbyname_nid_postfix("hw.physmem", bytes, &length, nullptr, 0) == -1 && *__error_nid_postfix() == 12);
+    Require(sysctlbyname_nid_postfix(name, bytes, &length, nullptr, 0) == -1 && *__error_nid_postfix() == 12);
     Require(length == 4 && bytes[4] == 0xaa);
     length = sizeof(value);
     Require(sysctl_nid_postfix(mib, 2, &value, &length, &value, sizeof(value)) == -1 && *__error_nid_postfix() == 1);
-    Require(sysctlbyname_nid_postfix("hw.physmem", &value, &length, &value, sizeof(value)) == -1 && *__error_nid_postfix() == 1);
+    Require(sysctlbyname_nid_postfix(name, &value, &length, &value, sizeof(value)) == -1 && *__error_nid_postfix() == 1);
 }
 #if defined(__x86_64__) || defined(__i386__)
 static void CheckModelSysctl() {
@@ -282,7 +282,8 @@ static void CheckArandomSysctl() {
 }
 int main() {
     CheckProcessorCountSysctl();
-    CheckPhysicalMemorySysctl();
+    CheckPhysicalMemorySysctl(5, "hw.physmem");
+    CheckPhysicalMemorySysctl(12, "hw.realmem");
 #if defined(__x86_64__) || defined(__i386__)
     CheckModelSysctl();
 #endif
