@@ -74,6 +74,7 @@ int APS5_VABI socket_nid_postfix(int, int, int);
 int APS5_VABI bind_nid_postfix(int, const void*, std::uint32_t);
 int APS5_VABI close_nid_postfix(int);
 int APS5_VABI setsockopt_nid_postfix(int, int, int, const void*, std::uint32_t);
+int APS5_VABI fcntl_nid_postfix(int, int, ...);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceNetInetPton(int, const char*, void*);
 const char* APS5_VABI sceNetInetNtop(int, const void*, char*, std::uint32_t);
@@ -506,6 +507,26 @@ static void CheckKernelTimeouts() {
     Require(sceNetSocketClose(descriptor) == 0);
 }
 
+static void CheckKernelStatusFlags() {
+    const int descriptor = sceNetSocket("kernel-status", 2, 1, 6);
+    Require(descriptor >= 0);
+    Require(fcntl_nid_postfix(descriptor, 3) == 2);
+    Require(fcntl_nid_postfix(descriptor, 4, 2 | 4) == 0);
+    Require(fcntl_nid_postfix(descriptor, 3) == (2 | 4));
+    int enabled = 0;
+    std::uint32_t length = sizeof(enabled);
+    Require(sceNetGetsockopt(descriptor, 0xffff, 0x1200, &enabled, &length) == 0 && enabled == 1);
+    Require(fcntl_nid_postfix(descriptor, 4, 2) == 0);
+    Require(fcntl_nid_postfix(descriptor, 3) == 2);
+    length = sizeof(enabled);
+    Require(sceNetGetsockopt(descriptor, 0xffff, 0x1200, &enabled, &length) == 0 && enabled == 0);
+    *__error_nid_postfix() = 0;
+    Require(fcntl_nid_postfix(descriptor, 4, 0x100) == -1 && *__error_nid_postfix() == 45);
+    *__error_nid_postfix() = 0;
+    Require(fcntl_nid_postfix(descriptor, 1) == -1 && *__error_nid_postfix() == 22);
+    Require(close_nid_postfix(descriptor) == 0);
+}
+
 static void CheckAddressText(int family, const char* text) {
     std::array<std::uint8_t, 16> address{};
     Require(sceNetInetPton(family, text, address.data()) == 1);
@@ -861,6 +882,7 @@ int main() {
     Require(Failed(sceNetSocketClose(closed), 9));
     CheckKernelTimeouts();
     CheckSocketError();
+    CheckKernelStatusFlags();
 
     const int listener = sceNetSocket(nullptr, 2, 1, 6);
     Require(listener >= 0);

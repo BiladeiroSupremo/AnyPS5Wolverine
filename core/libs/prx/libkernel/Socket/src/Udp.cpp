@@ -755,6 +755,11 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
             va_end(arguments);
 #endif
         }
+        int result = 0;
+        int netError = 0;
+        if (KernelControlSocketStatus_nid_no_patch(descriptor, command, static_cast<int>(argument), &result, &netError)) {
+            return netError == 0 ? result : Fail(netError);
+        }
         return File::Fcntl(descriptor, command, argument);
     }
     const auto socket = Lookup(descriptor);
