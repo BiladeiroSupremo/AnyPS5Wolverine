@@ -1,5 +1,6 @@
 import os
 import json
+import stat
 import sys
 import tarfile
 import tempfile
@@ -194,6 +195,41 @@ class ReleasePackageTests(unittest.TestCase):
                     else:
                         self.assertEqual(destination.read_bytes(), b"old " + name.encode())
                 self.assertEqual((output / "unrelated.txt").read_bytes(), b"unrelated")
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only replacement semantics")
+    def test_readonly_destinations_preserve_all_existing_assets(self):
+        names = ["prx-linux-v1.zip", "prx-linux-v1.tar.gz", "relinker-v1"]
+        for index, blocked in enumerate(names):
+            with self.subTest(blocked=blocked):
+                output = self.output / str(index)
+                output.mkdir(parents=True)
+                previous = {name: b"old " + name.encode() for name in names}
+                previous["unrelated.txt"] = b"unrelated"
+                for name, content in previous.items():
+                    (output / name).write_bytes(content)
+                destination = output / blocked
+                destination.chmod(stat.S_IREAD)
+                try:
+                    with self.assertRaises((OSError, RuntimeError)) as error:
+                        package_release.package("linux", self.build, output, "v1")
+                    self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, previous)
+                    self.assertIn("read-only", str(error.exception))
+                    self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+                finally:
+                    destination.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    @unittest.skipIf(os.name == "nt", "POSIX allows replacement in a writable directory")
+    def test_posix_readonly_destination_can_be_replaced(self):
+        self.output.mkdir()
+        destination = self.output / "prx-linux-v1.zip"
+        destination.write_bytes(b"old archive")
+        destination.chmod(stat.S_IREAD)
+        try:
+            package_release.package("linux", self.build, self.output, "v1")
+            with zipfile.ZipFile(destination) as archive:
+                self.assertEqual(archive.read("libs/libc.prx"), b"library bytes")
+        finally:
+            destination.chmod(stat.S_IREAD | stat.S_IWRITE)
 
     def test_invalid_tag_creates_no_assets(self):
         with self.assertRaises(ValueError):
