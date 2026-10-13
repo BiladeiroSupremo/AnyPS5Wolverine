@@ -7,23 +7,12 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
-namespace {
-
-constexpr std::uint32_t kRegisterDefaultsVersionCount = 14;
-constexpr std::uint32_t kRegisterDefaultsFallbackVersion = kRegisterDefaultsVersionCount - 1;
-
-std::uint32_t ResolveRegisterDefaultsVersion(std::uint32_t version) {
-    return version < kRegisterDefaultsVersionCount ? version : kRegisterDefaultsFallbackVersion;
-}
-
-}
-
 extern "C" {
 
 int APS5_VABI sceAgcInit(std::uint32_t version) {
-    const std::uint32_t defaultsVersion = ResolveRegisterDefaultsVersion(version);
-    Agc::Command::GetRegisterDefaults(defaultsVersion, false, __func__);
-    Agc::Command::GetRegisterDefaults(defaultsVersion, true, __func__);
+    if (version >= 14) version = 13;
+    Agc::Command::GetRegisterDefaults(version, false, __func__);
+    Agc::Command::GetRegisterDefaults(version, true, __func__);
     return 0;
 }
 
