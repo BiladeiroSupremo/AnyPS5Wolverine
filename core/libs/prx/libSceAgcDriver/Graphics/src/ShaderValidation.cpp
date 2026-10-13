@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "Optimization/BindlessHeaps.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <cstdio>
@@ -494,6 +495,9 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             }
             typeId = outer[2];
         }
+        // The bindless heap set (BindlessHeaps::DescriptorSet) is the device's, bound to every
+        // pipeline layout; its variables alias per image type and are not plan bindings.
+        if ((variable.storage == spv::StorageClassUniformConstant || variable.storage == spv::StorageClassStorageBuffer) && decoration.set && *decoration.set == ShaderRecompiler::BindlessHeaps::DescriptorSet) continue;
         const auto& type = module.Type(typeId);
         Require(!decoration.index || (fragment && output && state.dualSourceBlend && decoration.location == 0u && *decoration.index == 1u), "only the second dual-source blend color may use the Index decoration, at location 0 index 1");
         if (variable.storage == spv::StorageClassInput || variable.storage == spv::StorageClassOutput) {

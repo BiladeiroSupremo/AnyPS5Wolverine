@@ -423,7 +423,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     }
     if (!materialMode) {
         if (entries > slots) {
-            rejectTable(table.hasMaterial ? BindlessRejection::MaterialScan : BindlessRejection::Capacity, "bindless image table has " + std::to_string(entries) + " entries (" + std::to_string(materialEntries) + " materials), limit " + std::to_string(slots));
+            rejectTable(table.hasMaterial ? BindlessRejection::MaterialScan : BindlessRejection::Capacity, "bindless image table has " + std::to_string(entries) + " entries (" + std::to_string(materialEntries) + " materials), limit " + std::to_string(slots) + " (dim " + std::to_string(static_cast<std::uint32_t>(image.dimension)) + (image.resourceClass == ImageResourceClass::Sampled ? "" : ", storage") + (image.depthCompare ? ", depth compare" : "") + (image.r128 ? ", r128" : "") + ")");
         }
         keys.resize(entries);
         for (std::uint32_t key = 0; key < entries; key++) keys[key] = key;
