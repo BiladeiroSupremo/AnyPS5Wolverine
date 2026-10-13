@@ -52,7 +52,7 @@ public:
         if (total > MaximumSmallBytes) {
             blockBytes = alignUp(total, LargeGranuleBytes);
             if (void* cached = _large.Take(blockBytes)) return cached;
-            void* raw = GuestArena::GuestArenaAllocate_nid_postfix(blockBytes, PageBytes);
+            void* raw = arenaAllocate(blockBytes, PageBytes);
             commit(raw, blockBytes);
             return raw;
         }
@@ -65,7 +65,7 @@ public:
             return block;
         }
         if (sizeClass.bump == nullptr || sizeClass.bytes > static_cast<std::size_t>(sizeClass.bumpEnd - sizeClass.bump)) {
-            auto* span = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(SpanBytes, PageBytes));
+            auto* span = static_cast<std::uint8_t*>(arenaAllocate(SpanBytes, PageBytes));
             commit(span, SpanBytes);
             sizeClass.bump = span;
             sizeClass.bumpEnd = span + SpanBytes;
@@ -109,6 +109,14 @@ private:
     std::size_t classIndex(std::size_t bytes) const {
         const auto found = std::lower_bound(_classes.begin(), _classes.end(), bytes, [](const SizeClass& sizeClass, std::size_t value) { return sizeClass.bytes < value; });
         return static_cast<std::size_t>(found - _classes.begin());
+    }
+
+    static void* arenaAllocate(std::size_t bytes, std::size_t alignment) {
+        try {
+            return GuestArena::GuestArenaAllocate_nid_postfix(bytes, alignment);
+        } catch (const std::runtime_error&) {
+            throw std::bad_alloc();
+        }
     }
 
     static void commit(void* pointer, std::size_t bytes) {
