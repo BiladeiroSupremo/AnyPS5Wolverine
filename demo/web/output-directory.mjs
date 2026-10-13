@@ -29,3 +29,16 @@ export class OutputDirectoryTransaction {
     this.#state = "discarded";
   }
 }
+
+export async function abortAndDiscardOutput(transaction, sink) {
+  const failures = [];
+  if (sink) {
+    try { await sink.abort(); }
+    catch (error) { failures.push(`Could not discard the output file: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  if (transaction) {
+    try { await transaction.discard(); }
+    catch (error) { failures.push(`Could not remove incomplete output folder ${transaction.name}/: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  return failures;
+}

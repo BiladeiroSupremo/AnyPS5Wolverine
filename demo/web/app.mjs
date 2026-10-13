@@ -1,4 +1,4 @@
-import { OutputDirectoryTransaction } from "./output-directory.mjs";
+import { abortAndDiscardOutput, OutputDirectoryTransaction } from "./output-directory.mjs";
 
 const $ = id => document.getElementById(id);
 const stages = ["Converting executable", "Converting PRX modules", "Scanning syscalls", "Scanning instructions", "Converting instructions", "Analysing imports", "Building output image", "Writing output"];
@@ -60,15 +60,9 @@ async function fail(message) {
   const transaction = outputTransaction;
   outputTransaction = null;
   outputDirectory = null;
-  if (sink) {
-    const active = sink;
-    sink = null;
-    try { await active.abort(); } catch (error) { message += `\nCould not discard the output file: ${error.message}`; }
-  }
-  if (transaction) {
-    try { await transaction.discard(); }
-    catch (error) { message += `\nCould not remove incomplete output folder ${transaction.name}/: ${error.message}`; }
-  }
+  const activeSink = sink;
+  sink = null;
+  for (const failure of await abortAndDiscardOutput(transaction, activeSink)) message += `\n${failure}`;
   $("error").textContent = message;
   $("error").hidden = false;
   $("status").hidden = true;

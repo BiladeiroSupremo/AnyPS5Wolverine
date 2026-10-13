@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { OutputDirectoryTransaction } from "../output-directory.mjs";
+import { abortAndDiscardOutput, OutputDirectoryTransaction } from "../output-directory.mjs";
 
 function missingDirectory() {
   const error = new Error("not found");
@@ -75,4 +75,37 @@ test("keeps completed output and reports cleanup failures", async () => {
   const failed = await OutputDirectoryTransaction.create(parent, "partial-linux");
   await assert.rejects(failed.discard(), /permission denied/u);
   assert.equal(removeCount, 1);
+});
+
+test("aborts an open file before removing the incomplete output tree", async () => {
+  const calls = [];
+  const parent = {
+    async getDirectoryHandle(name, options) {
+      if (!options) throw missingDirectory();
+      return { name };
+    },
+    async removeEntry(name, options) { calls.push(["remove", name, options]); }
+  };
+  const transaction = await OutputDirectoryTransaction.create(parent, "partial-linux");
+  const sink = { async abort() { calls.push(["abort"]); } };
+
+  assert.deepEqual(await abortAndDiscardOutput(transaction, sink), []);
+  assert.deepEqual(calls, [["abort"], ["remove", "partial-linux", { recursive: true }]]);
+});
+
+test("returns sink and folder cleanup failures without hiding either", async () => {
+  const parent = {
+    async getDirectoryHandle(name, options) {
+      if (!options) throw missingDirectory();
+      return { name };
+    },
+    async removeEntry() { throw new Error("directory permission denied"); }
+  };
+  const transaction = await OutputDirectoryTransaction.create(parent, "partial-linux");
+  const sink = { async abort() { throw new Error("file is busy"); } };
+
+  assert.deepEqual(await abortAndDiscardOutput(transaction, sink), [
+    "Could not discard the output file: file is busy",
+    "Could not remove incomplete output folder partial-linux/: directory permission denied"
+  ]);
 });
