@@ -493,6 +493,49 @@ private:
         return scale == 32u;
     }
 
+    // A waterfall loop's descriptor (PPSA03671's 0x11d1418800, ~300 skipped draws a run without it):
+    // Phi-webbed T# words resolved to their table read, and reads kept in VGPR lanes kept as real
+    // loads. APS5_NO_BINDLESS_LANE_USERS=1 turns both off.
+    static bool laneUsersEnabled() {
+        static const bool enabled = std::getenv("APS5_NO_BINDLESS_LANE_USERS") == nullptr;
+        return enabled;
+    }
+
+    // A descriptor word that reaches its image through a Phi web (a waterfall loop carries the T# it
+    // loads with readfirstlane in its registers, and spills it to VGPR lanes): the one table read
+    // among the web's leaves, ignoring leaves that are plain data (a constant, or a value used as
+    // data, the register on paths that loaded no descriptor). Kyty's ResolveDescriptorPhi.
+    IrValue* resolveDescriptorPhi(IrValue* value) {
+        if (auto* invariant = ResolveInvariantPhi(m_program.Resources(), value); invariant != nullptr) return invariant;
+        IrValue* found = nullptr;
+        std::vector<IrValue*> pending{value->Resolve()};
+        std::unordered_set<const IrValue*> seen;
+        while (!pending.empty()) {
+            auto* phi = pending.back();
+            pending.pop_back();
+            if (!seen.insert(phi).second) continue;
+            for (std::size_t index = 0; index < phi->ArgumentCount(); index++) {
+                auto* leaf = phi->Argument(index)->Resolve();
+                if (leaf->IsPhi()) {
+                    pending.push_back(leaf);
+                    continue;
+                }
+                const bool data = leaf->HasImmediate() || std::ranges::any_of(leaf->Uses(), [](const IrValue* user) {
+                    return user->Opcode() != IrOpcode::Phi && user->Opcode() != IrOpcode::GetImageResource && user->Opcode() != IrOpcode::WriteLane;
+                });
+                if (data) continue;
+                std::uint32_t memoryIndex = 0;
+                if (ScalarReadMemory(*leaf, memoryIndex) == nullptr) {
+                    if (leaf->Opcode() == IrOpcode::GetUserData) return nullptr;
+                    continue;
+                }
+                if (found != nullptr && !EquivalentValue(m_program.Resources(), found, leaf)) return nullptr;
+                found = leaf;
+            }
+        }
+        return found;
+    }
+
     // A T# whose eight dwords are scalar reads of one V# (the table) at `entryOffset + key * 32`
     // with a wave-uniform runtime key: a bindless image table. The key stays an ordinary value
     // (the SPIR-V selects the bound slot from it); the eight reads become planning-only.
@@ -507,6 +550,9 @@ private:
         std::uint32_t immediateOffset = 0;
         for (std::uint32_t dword = 0; dword < heapReads.size(); dword++) {
             heapReads[dword] = handle.Argument(dword)->Resolve();
+            if (heapReads[dword]->IsPhi() && laneUsersEnabled()) {
+                if (auto* read = resolveDescriptorPhi(heapReads[dword]); read != nullptr) heapReads[dword] = read;
+            }
             std::uint32_t memoryIndex = 0;
             const MemoryInfo* memory = ScalarReadMemory(*heapReads[dword], memoryIndex);
             if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
@@ -554,10 +600,12 @@ private:
         // Other users (PPSA03671's meshlet shaders mask T# fields as data) keep the read as a real load;
         // APS5_STRICT_BINDLESS_USERS restores the rejection.
         static const bool strictUsers = std::getenv("APS5_STRICT_BINDLESS_USERS") != nullptr;
+        // Reads that go through Phi/WriteLane (T# words kept in VGPR lanes) stay real loads too.
+        const bool laneUsers = laneUsersEnabled();
         for (std::uint32_t dword = 0; dword < heapReads.size(); dword++) {
             const auto* read = heapReads[dword];
             const bool onlyEntries = std::ranges::all_of(read->Uses(), sameEntry);
-            const bool dataUsers = !strictUsers && !read->Uses().empty() && std::ranges::none_of(read->Uses(), [](const IrValue* user) { return user->Opcode() == IrOpcode::Phi || user->Opcode() == IrOpcode::WriteLane; });
+            const bool dataUsers = !strictUsers && !read->Uses().empty() && (laneUsers || std::ranges::none_of(read->Uses(), [](const IrValue* user) { return user->Opcode() == IrOpcode::Phi || user->Opcode() == IrOpcode::WriteLane; }));
             plan.live[dword] = !onlyEntries;
             if (read->Uses().empty() || (!onlyEntries && !dataUsers)) {
                 std::string users;
