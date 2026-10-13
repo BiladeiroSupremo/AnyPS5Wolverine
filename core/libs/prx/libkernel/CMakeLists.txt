@@ -47,6 +47,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Socket/src/Udp.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Socket/src/SocketOptions.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Socket/src/AddressConversion.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Socket/src/SocketConnect.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/EventFlag/src/EventFlag.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Module/src/Module.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Module/src/DynamicLoader.cpp
@@ -97,6 +98,7 @@ target_link_libraries(libkernel PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(libkernel PRIVATE libc)
 if(WIN32)
     target_link_libraries(libkernel PRIVATE ws2_32 shell32 advapi32 wbemuuid ole32 oleaut32)
+    target_link_libraries(libkernel PRIVATE iphlpapi)
     target_compile_definitions(libkernel PRIVATE _WIN32_WINNT=0x0602)
 endif()
 configure_windows_unwind(libkernel)
