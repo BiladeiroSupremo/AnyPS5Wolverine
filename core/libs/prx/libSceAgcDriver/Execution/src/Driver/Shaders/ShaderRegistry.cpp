@@ -22,6 +22,8 @@
 #include <exception>
 #include <functional>
 #include <list>
+#include <mutex>
+#include <set>
 #include <atomic>
 #include <pthread.h>
 #include <sstream>
@@ -53,6 +55,24 @@ void RejectSkippedShader(const ShaderSnapshot& snapshot) {
     char reason[128];
     std::snprintf(reason, sizeof(reason), "shader 0x%llx (hash 0x%016" PRIx64 ") is skipped (APS5_SKIP_SHADERS)", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash);
     throw std::runtime_error(reason);
+}
+
+namespace {
+
+// A shader the recompiler cannot prepare fails no title call (an ABI resolve the game makes while it
+// sets up a draw): it is reported once and left without artifacts, so the draws that use it report
+// the failure and are skipped. APS5_STRICT_PREPARE=1 keeps it fatal.
+bool TolerateFailedPreparation(const char* where, const std::exception& error) {
+    static const bool strict = std::getenv("APS5_STRICT_PREPARE") != nullptr;
+    if (strict) return false;
+    static std::mutex reportedMutex;
+    static std::set<std::string> reported;
+    const std::string what = error.what();
+    std::lock_guard lock(reportedMutex);
+    if (reported.insert(what).second) std::fprintf(stderr, "[shader-prepare] %s left unprepared: %s\n", where, what.substr(0, 300).c_str());
+    return true;
+}
+
 }
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
@@ -1074,15 +1094,27 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         for (const auto& stage : abi.stages) {
             const auto snapshot = stage.lock();
             require(snapshot != nullptr, "prepared graphics ABI lost a registered stage");
-            if (snapshot->type != 1) ResolvePreparedGraphics(*snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
+            if (snapshot->type == 1) continue;
+            try {
+                ResolvePreparedGraphics(*snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
+            } catch (const std::exception& error) {
+                if (!TolerateFailedPreparation("graphics ABI", error)) throw;
+            }
         }
         transaction.Commit();
         return;
     }
     DrawDecode decoded{};
-    decoded.state.stages = Graphics::DecodeShaderStages(state, VertexWorkgroupRequired(state, *registry));
-    DecodeGraphicsPrograms(decoded, state, *registry, true, false);
-    auto prepared = PrepareGraphicsStages(decoded, localDevice->Target());
+    std::vector<PreparedGraphicsStage> prepared;
+    try {
+        decoded.state.stages = Graphics::DecodeShaderStages(state, VertexWorkgroupRequired(state, *registry));
+        DecodeGraphicsPrograms(decoded, state, *registry, true, false);
+        prepared = PrepareGraphicsStages(decoded, localDevice->Target());
+    } catch (const std::exception& error) {
+        if (!TolerateFailedPreparation("graphics ABI", error)) throw;
+        transaction.Commit();
+        return;
+    }
     for (auto& stage : prepared) {
         const auto& entries = transaction.Read(*stage.snapshot).entries;
         const auto duplicate = std::ranges::any_of(entries, [&](const auto& existing) { return existing.codeOffset == stage.entry.codeOffset && existing.handle->artifact == stage.entry.handle->artifact; });
@@ -1090,7 +1122,11 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     }
     for (const auto& stage : prepared) {
         if (stage.snapshot->type == 1) continue;
-        ResolvePreparedGraphics(*stage.snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
+        try {
+            ResolvePreparedGraphics(*stage.snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
+        } catch (const std::exception& error) {
+            if (!TolerateFailedPreparation("graphics ABI", error)) throw;
+        }
     }
     if (decoded.state.stages.path == Graphics::ShaderPath::Vertex) {
         for (const auto& stage : prepared) {
@@ -1138,10 +1174,15 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, RegisteredAbiKeyStorage>();
     BuildRegisteredAbiKey(state, *localDevice, key);
     const auto prepare = [&] {
-        const auto plan = PlanRegistered(*snapshot, *localDevice, state, false);
-        if (plan == nullptr) return std::vector<PreparedShaders::Entry>{};
-        plan->prebuildDevice = localDevice;
-        return PrepareRegistered(*plan);
+        try {
+            const auto plan = PlanRegistered(*snapshot, *localDevice, state, false);
+            if (plan == nullptr) return std::vector<PreparedShaders::Entry>{};
+            plan->prebuildDevice = localDevice;
+            return PrepareRegistered(*plan);
+        } catch (const std::exception& error) {
+            if (!TolerateFailedPreparation("static ABI", error)) throw;
+            return std::vector<PreparedShaders::Entry>{};
+        }
     };
     const bool committedAbi = CommittedAbi(*snapshot, key);
     auto entries = committedAbi ? std::vector<PreparedShaders::Entry>{} : prepare();
@@ -1200,7 +1241,11 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
     require(front != fragment, "rectangle stages refer to the same shader");
     const auto localDevice = device.Load();
     require(localDevice != nullptr, "shader registration device is missing");
-    ResolvePreparedGraphics(*front, fragment, primitiveType, localDevice->Target());
+    try {
+        ResolvePreparedGraphics(*front, fragment, primitiveType, localDevice->Target());
+    } catch (const std::exception& error) {
+        if (!TolerateFailedPreparation("rectangle ABI", error)) throw;
+    }
     transaction.Commit();
 }
 
