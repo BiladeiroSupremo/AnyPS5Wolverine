@@ -1280,7 +1280,7 @@ int APS5_VABI sendfile_nid_postfix(int file, int descriptor, std::int64_t offset
 int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t count, int timeout) {
     if (timeout < -1) return Fail(22);
     if (count && !descriptors) return Fail(14);
-    std::vector<std::shared_ptr<Socket>> held;
+    std::vector<std::shared_ptr<void>> held;
     std::vector<NativePollDescriptor> native;
     std::vector<std::uint32_t> owners;
     std::vector<std::uint32_t> pipes;
@@ -1291,8 +1291,12 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
         if (entry.descriptor < 0) continue;
         if ((entry.events & ~GuestPollAccepted) != 0)
             throw std::runtime_error("poll: unsupported event flags " + std::to_string(entry.events));
-        auto socket = Find(entry.descriptor);
-        if (!socket) {
+        std::shared_ptr<void> owner;
+        std::uintptr_t value = 0;
+        if (auto socket = Find(entry.descriptor)) {
+            value = static_cast<std::uintptr_t>(socket->value);
+            owner = std::move(socket);
+        } else if (!KernelFindSocketNative_nid_no_patch(entry.descriptor, &owner, &value)) {
             if (!DescriptorIsOpen_nid_no_patch(entry.descriptor)) {
                 entry.revents = GuestPollInvalid;
                 ++ready;
@@ -1309,12 +1313,12 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
             continue;
         }
         NativePollDescriptor request{};
-        request.fd = socket->value;
+        request.fd = static_cast<decltype(request.fd)>(value);
         for (const auto& flag : RequestFlags)
             if (entry.events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
         native.push_back(request);
         owners.push_back(i);
-        held.push_back(std::move(socket));
+        held.push_back(std::move(owner));
     }
 #ifndef _WIN32
     const std::size_t socketCount = native.size();

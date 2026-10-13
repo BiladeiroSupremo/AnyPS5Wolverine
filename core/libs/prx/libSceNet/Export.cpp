@@ -632,6 +632,17 @@ bool ControlSocketStatusForKernel(int descriptor, int command, int flags, int* r
 
 const bool g_socketStatusControlRegistered = (KernelSetSocketStatusControl_nid_no_patch(&ControlSocketStatusForKernel), true);
 
+bool FindSocketNativeForKernel(int descriptor, std::shared_ptr<void>* owner, std::uintptr_t* native) {
+    std::lock_guard lk(g_mutex);
+    const auto it = g_socks.find(descriptor);
+    if (it == g_socks.end() || !it->second.native) return false;
+    *native = static_cast<std::uintptr_t>(it->second.native->value);
+    *owner = it->second.native;
+    return true;
+}
+
+const bool g_socketNativeLookupRegistered = (KernelSetSocketNativeLookup_nid_no_patch(&FindSocketNativeForKernel), true);
+
 int APS5_VABI sceNetInit_nid_postfix(void) {
     std::lock_guard lk(g_mutex);
     g_net_inited = true;

@@ -75,6 +75,12 @@ int APS5_VABI bind_nid_postfix(int, const void*, std::uint32_t);
 int APS5_VABI close_nid_postfix(int);
 int APS5_VABI setsockopt_nid_postfix(int, int, int, const void*, std::uint32_t);
 int APS5_VABI fcntl_nid_postfix(int, int, ...);
+struct GuestPollEntry {
+    int descriptor;
+    short events;
+    short revents;
+};
+int APS5_VABI poll_nid_postfix(GuestPollEntry*, std::uint32_t, int);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceNetInetPton(int, const char*, void*);
 const char* APS5_VABI sceNetInetNtop(int, const void*, char*, std::uint32_t);
@@ -1026,6 +1032,13 @@ int main() {
     Require(select_nid_postfix(std::max(kernel_socket, udp_sender) + 1, nullptr, mixed_writable, nullptr, wait_second) == 2);
     Require(((mixed_writable[kernel_socket / 64] >> (kernel_socket % 64)) & 1u) != 0);
     Require(((mixed_writable[udp_sender / 64] >> (udp_sender % 64)) & 1u) != 0);
+    GuestPollEntry net_read{udp_receiver, 1, 0};
+    Require(poll_nid_postfix(&net_read, 1, 0) == 0 && net_read.revents == 0);
+    Require(sceNetSendto(udp_sender, datagram, sizeof(datagram), 0, address.data(), address.size()) == sizeof(datagram));
+    Require(poll_nid_postfix(&net_read, 1, 1000) == 1 && net_read.revents == 1);
+    Require(sceNetRecvfrom(udp_receiver, datagram_result, sizeof(datagram_result), 0, nullptr, nullptr) == sizeof(datagram_result));
+    GuestPollEntry mixed_poll[2]{{kernel_socket, 4, 0}, {udp_sender, 4, 0}};
+    Require(poll_nid_postfix(mixed_poll, 2, 1000) == 2 && mixed_poll[0].revents == 4 && mixed_poll[1].revents == 4);
     Require(close_nid_postfix(kernel_socket) == 0);
     std::uint64_t stdio_readable[16]{1};
     std::uint64_t stdio_writable[16]{6};
