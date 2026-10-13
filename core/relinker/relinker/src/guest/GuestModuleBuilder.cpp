@@ -213,7 +213,11 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         }
         for (std::size_t symbolIndex = 0; symbolIndex < images[index].Symbols.size(); ++symbolIndex) {
             const auto& symbol = images[index].Symbols[symbolIndex];
-            if (symbol.Section != 0 || symbol.Name.empty() || declaresHost(symbol.Library)) continue;
+            if (symbol.Section != 0 || symbol.Name.empty()) continue;
+            if (declaresHost(symbol.Library)) {
+                systemImports[index].insert(symbolIndex);
+                continue;
+            }
             const auto declared = symbol.Library.empty() ? guestNames.end() : findGuest(symbol.Library);
             const auto shared = sharedExports.find(symbol.Name);
             if (shared == sharedExports.end() || declared == guestNames.end() || !shared->second.contains(declared->second))
@@ -343,7 +347,9 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         std::vector<Domain::CallRegistryEntry> imports;
         for (const auto* table : {&image.Dynamic.RelaData, &image.Dynamic.RelaPltData}) {
             for (std::size_t position = 0; position < table->size(); position += 24) {
-                const auto symbolIndex = static_cast<std::size_t>(Io::ReadU64(*table, position + 8) >> 32);
+                const auto info = Io::ReadU64(*table, position + 8);
+                if ((info & 0xffffffffu) == 0) continue;
+                const auto symbolIndex = static_cast<std::size_t>(info >> 32);
                 if (!systemImports[index].contains(symbolIndex)) continue;
                 const auto& symbol = image.Symbols[symbolIndex];
                 imports.push_back({symbol.Name, symbol.Library, {}, 0, {}, Io::ReadU64(*table, position), {}, false});
