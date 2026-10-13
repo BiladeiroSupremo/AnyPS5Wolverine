@@ -117,6 +117,8 @@ void Ngs2ApplyCustomParam(Ngs2Voice& voice, const Ngs2VoiceParamHeader& param) {
             filter.frequency = custom.param.fcq.frequency;
             filter.q = custom.param.fcq.q;
             filter.level = custom.param.fcq.level;
+        } else {
+            throw std::runtime_error("NGS2: custom filter type " + std::to_string(custom.type) + " is not implemented");
         }
         Ngs2SetFilter(voice, filter);
         return;
