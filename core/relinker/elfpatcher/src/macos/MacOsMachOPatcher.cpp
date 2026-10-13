@@ -68,7 +68,7 @@ std::vector<std::uint8_t> MacOsMachOPatcher::Patch(const std::vector<std::uint8_
     input.Image = &image;
     input.Rebases = relocations.BaseRelocations;
     for (const auto& import : relocations.Imports)
-        input.Binds.push_back({"_" + import.Name, import.TargetRva, static_cast<std::int64_t>(import.Addend)});
+        input.Binds.push_back({"_" + import.Name, import.TargetRva, static_cast<std::int64_t>(import.Addend), import.Weak});
     for (const auto& library : ReadNeededLibraries(dynamicSection))
         input.Dylibs.push_back(MachODependency(library, "@executable_path"));
     if (std::find(input.Dylibs.begin(), input.Dylibs.end(), "@rpath/libkernel.prx") == input.Dylibs.end())

@@ -14,6 +14,7 @@ struct MacOsBind {
     std::string Symbol;
     std::uint32_t Rva;
     std::int64_t Addend = 0;
+    bool Weak = false;
 };
 
 struct MacOsExport {
