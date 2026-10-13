@@ -329,7 +329,6 @@ static constexpr int GUEST_EDEADLK = 11;
 static constexpr int GUEST_ELOOP = 62;
 static constexpr int GUEST_EDQUOT = 69;
 static constexpr int GUEST_EOVERFLOW = 84;
-static constexpr int GUEST_EOPNOTSUPP = 45;
 
 static int SceErrorFromErrno(int error);
 
