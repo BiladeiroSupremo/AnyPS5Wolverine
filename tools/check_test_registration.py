@@ -6,6 +6,8 @@ from pathlib import Path
 TEST_OUTPUT = r"tests[\\/]"
 COMMAND = re.compile(r"^\s*(add_test|set_tests_properties|subdirs)\s*\(", re.M | re.I)
 ARGUMENT = re.compile(r'"(?:\\.|[^"\\])*"|\[(?P<equals>=*)\[.*?\](?P=equals)\]|[^\s()]+', re.S)
+LEXICAL = re.compile(r'\\.|"(?:\\.|[^"\\])*"|\[(?P<literal_equals>=*)\[.*?\](?P=literal_equals)\]'
+                     r'|(?P<comment>\#\[(?P<comment_equals>=*)\[.*?\](?P=comment_equals)\]|\#[^\n]*)', re.S)
 
 KNOWN_UNRUN = set()
 
@@ -40,6 +42,8 @@ def built(build):
 
 
 def commands(content):
+    content = LEXICAL.sub(lambda match: re.sub(r"[^\n]", " ", match.group())
+                          if match.group("comment") is not None else match.group(), content)
     parsed_until = 0
     for command in COMMAND.finditer(content):
         if command.start() < parsed_until:

@@ -18,6 +18,28 @@ class RegistrationTests(unittest.TestCase):
             (build / "CTestTestfile.cmake").write_text(content, encoding="utf-8")
             return check_test_registration.registered(build)
 
+    def test_bracket_comments_do_not_register_tests(self):
+        for equals in ("", "=", "==="):
+            with self.subTest(equals=equals):
+                content = (f"#[{equals}[\nadd_test(ghost /build/tests/missing_tests)\n]{equals}]\n"
+                           'add_test("real" "/build/tests/real_tests")\n')
+                self.assertEqual(self.registered(content), {"real_tests"})
+
+    def test_bracket_comment_does_not_disable_a_registered_test(self):
+        content = ('add_test("real" "/build/tests/real_tests")\n'
+                   '#[=[\nset_tests_properties("real" PROPERTIES DISABLED TRUE)\n]=]\n')
+        self.assertEqual(self.registered(content), {"real_tests"})
+
+    def test_bracket_comment_inside_arguments_does_not_end_the_command(self):
+        content = ('add_test("real" #[=[ )\nadd_test(ghost /build/tests/missing_tests)\n]=]\n'
+                   '"/build/tests/real_tests")\n')
+        self.assertEqual(self.registered(content), {"real_tests"})
+
+    def test_comment_markers_inside_literals_remain_arguments(self):
+        content = ('add_test("real" "/build/tests/real_tests" "#[[" [=[# comment]=] "\\\\#")\n')
+        self.assertEqual(list(check_test_registration.commands(content)),
+                         [("add_test", ["real", "/build/tests/real_tests", "#[[", "# comment", "\\#"])])
+
     def test_test_name_does_not_register_executable(self):
         names = self.registered('add_test("missing_tests" "/usr/bin/python3" "unrelated.py")\n')
         self.assertNotIn("missing_tests", names)
