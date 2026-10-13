@@ -813,6 +813,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (version >= 17u) result.request.target.registrationWordLimit = reader.ReadU32();
     if (version >= 18u) result.request.target.vertexSubgroups = reader.ReadBool();
     if (version >= 21u) {
+        if (version >= 22u) reader.Require(1u);
         if (reader.Remaining() == 1u) {
             const auto float16DenormPreserve = reader.ReadU8();
             if (float16DenormPreserve > 1u) throw std::runtime_error("RequestSerializer: invalid float16DenormPreserve value");
