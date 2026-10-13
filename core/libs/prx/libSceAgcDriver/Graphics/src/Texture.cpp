@@ -4542,7 +4542,24 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // the round trip through the CPU below would store stale texels over whatever the memory
     // holds now. Its selected units are dropped instead. APS5_NO_UNREGISTERED_DROP=1 stores.
     static const bool unregisteredDrop = std::getenv("APS5_NO_UNREGISTERED_DROP") == nullptr;
+    bool overhang = false;
     if (unregisteredDrop && !RegisteredReadableCovers(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+        const auto allocationEnd = RegisteredReadableEnd(descriptor.baseAddress);
+        const auto& level = mips.front();
+        const auto rowBytes = std::uint64_t{level.height} * level.pitchBytes;
+        const auto lastRowTail = mips.size() == 1 && arrayLayers == 1 && !level.tail && level.tiledSize > rowBytes ? level.tiledSize - rowBytes : 0;
+        const auto end = descriptor.baseAddress + guestBytes;
+        if (allocationEnd > descriptor.baseAddress && end - allocationEnd <= lastRowTail) {
+            auto covered = allocationEnd;
+            while (covered < end) {
+                const auto next = RegisteredReadableEnd(covered);
+                if (next <= covered) break;
+                covered = next;
+            }
+            overhang = covered >= end;
+        }
+    }
+    if (unregisteredDrop && !overhang && !RegisteredReadableCovers(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: memory no longer registered; %zu pending ranges dropped\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), keep.size());
         unregisteredDropped.fetch_add(1, std::memory_order_relaxed);
