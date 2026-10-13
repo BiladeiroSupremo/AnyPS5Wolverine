@@ -140,7 +140,6 @@ jobs:
             const pulls = [];
             const paths = [];
             let truncated = false;
-            let relinker = manual;
             for (const pull_number of numbers) {
               let { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
               for (let attempt = 0; pr.mergeable === null && attempt < 10; ++attempt) {
@@ -160,19 +159,34 @@ jobs:
               if (pr.mergeable === false) {
                 throw new Error(`Pull request #${pull_number} does not merge cleanly into main; rebase it first`);
               }
-              if (!manual) {
-                const { data: commits } = await github.rest.repos.listCommits({
-                  owner, repo, sha: 'main', author: pr.user.login, per_page: 1
-                });
-                relinker = commits.length > 0;
-              }
               const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number, per_page: 100 });
               truncated ||= files.length >= 3000;
               paths.push(...files.flatMap((file) => [file.filename, file.previous_filename].filter(Boolean)));
               pulls.push({ number: pull_number, head: pr.head.sha });
             }
             const run = select(paths, truncated);
-            relinker = relinker && run.relinker;
+            let relinker = run.relinker;
+            if (relinker && !manual) {
+              const author = context.payload.pull_request.user.login;
+              const { data: commits } = await github.rest.repos.listCommits({
+                owner, repo, sha: 'main', author, per_page: 1
+              });
+              relinker = commits.length > 0;
+              if (!relinker) {
+                try {
+                  const { data: mergedPRs } = await github.rest.search.issuesAndPullRequests({
+                    q: `repo:${owner}/${repo} is:pr is:merged base:main author:${author}`,
+                    per_page: 1
+                  });
+                  if (mergedPRs.incomplete_results) {
+                    throw new Error('the search results are incomplete');
+                  }
+                  relinker = mergedPRs.total_count > 0;
+                } catch (error) {
+                  core.warning(`Skipping the relinker: could not search the merged pull requests of ${author}: ${error.message}`);
+                }
+              }
+            }
             const registerContext = run.registerContext;
             const writeWatch = run.writeWatch;
             const { data: main } = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
@@ -188,7 +202,7 @@ jobs:
             merged.forEach((line) => core.info(line));
             await core.summary.addRaw(
               `${merged.join(', then ')}: full builds ${full ? 'enabled' : 'disabled'}, ` +
-              `relinker ${relinker ? (full ? (linux ? 'enabled on macOS (the full builds run the Linux and Windows relinker tests)' : 'enabled on Linux and macOS (the full Windows build runs the Windows relinker tests)') : 'enabled') : 'skipped: no relinker file changed or the author has no commit in main'}, ` +
+              `relinker ${relinker ? (full ? (linux ? 'enabled on macOS (the full builds run the Linux and Windows relinker tests)' : 'enabled on Linux and macOS (the full Windows build runs the Windows relinker tests)') : 'enabled') : 'skipped: no relinker file changed, or no commit or merged pull request in main was found for the author'}, ` +
               `register context tests ${registerContext ? 'enabled' : 'skipped'}, write watch tests ${writeWatch ? 'enabled' : 'skipped'}`
             ).write();
 
