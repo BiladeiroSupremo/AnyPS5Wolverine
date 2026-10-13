@@ -565,6 +565,29 @@ class ImportAuditTests(unittest.TestCase):
     def test_nid_anchor_matches_the_known_pair(self):
         self.assertEqual(nid_names.compute_nid(MESSAGE_NAME), MESSAGE_NID)
 
+    def test_unsupported_elf_versions_preserve_the_audit_report(self):
+        work = self.work
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        library = work.libs / "libSceA.prx"
+        images = (exporting("AAAAAAAAAAA"),
+                  build_sectionless_elf([("AAAAAAAAAAA", 1, GLOBAL_FUNCTION)]),
+                  build_sectionless_elf([("AAAAAAAAAAA", 1, GLOBAL_FUNCTION)], gnu_hash=True))
+        previous = b'{"previous":"complete report"}\n'
+        for index, valid in enumerate(images):
+            for offset, layout in ((6, "<B"), (20, "<I")):
+                for version in (0, 2):
+                    with self.subTest(image=index, offset=offset, version=version):
+                        image = bytearray(valid)
+                        struct.pack_into(layout, image, offset, version)
+                        library.write_bytes(image)
+                        result.write_bytes(previous)
+                        code, out, err = work.run(registry, "--json", str(result))
+                        self.assertEqual((code, out), (2, ""))
+                        self.assertIn("ELF version", err)
+                        self.assertIn(str(library), err)
+                        self.assertEqual(result.read_bytes(), previous)
+
     def test_elf_reader(self):
         image = build_elf([("one", 1, GLOBAL_FUNCTION), ("weak", 1, 0x22), ("undefined", 0, GLOBAL_FUNCTION), ("local", 1, LOCAL_FUNCTION)])
         path = Path("lib.prx")

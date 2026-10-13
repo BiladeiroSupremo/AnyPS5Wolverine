@@ -49,6 +49,8 @@ def elf_sections(path, data):
     ident, section_offset, section_size, section_count = header[0], header[6], header[11], header[12]
     if ident[4] != 2 or ident[5] != 1 or section_size != 64:
         raise AuditError(f"{path}: only little-endian ELF64 with 64-byte section headers is supported (class {ident[4]}, data {ident[5]}, shentsize {section_size})")
+    if ident[6] != 1 or header[3] != 1:
+        raise AuditError(f"{path}: unsupported ELF version (identification {ident[6]}, object {header[3]})")
     if not section_offset:
         raise AuditError(f"{path}: ELF file without a section header table is not supported")
     if not section_count:
@@ -60,6 +62,8 @@ def elf_sections(path, data):
 def elf_program_dynamic_symbols(path, data):
     header = unpack("<16sHHIQQQIHHHHHH", data, 0, path, "ELF header")
     ident, program_offset, program_size, program_count = header[0], header[5], header[9], header[10]
+    if ident[6] != 1 or header[3] != 1:
+        raise AuditError(f"{path}: unsupported ELF version (identification {ident[6]}, object {header[3]})")
     if ident[4] != 2 or ident[5] != 1 or program_size != 56 or not program_offset or not program_count:
         raise AuditError(f"{path}: sectionless ELF needs little-endian ELF64 program headers")
     take(data, program_offset, program_count * program_size, path, "program header table")
