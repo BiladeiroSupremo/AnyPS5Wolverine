@@ -229,7 +229,10 @@ int ModifyKnote(const KernelEqueueRef& queue, KernelEvent& change) {
         if ((change.flags & EV_DISABLE) != 0) {
             event.enabled = false;
         }
-        event.event.flags = static_cast<std::uint16_t>(event.event.flags | (change.flags & (EV_ONESHOT | EV_CLEAR | EV_DISPATCH)));
+        if ((change.flags & EV_FORCEONESHOT) != 0) {
+            event.event.flags = static_cast<std::uint16_t>(event.event.flags | EV_ONESHOT);
+            event.triggered = true;
+        }
         if (change.filter == EVFILT_USER) {
             TouchUserKnote(event, change);
         } else if (change.filter == EVFILT_VNODE) {
@@ -247,9 +250,6 @@ int Register(const KernelEqueueRef& queue, int kqueueDescriptor, KernelEvent& ch
     }
     if (change.filter != EVFILT_READ && change.filter != EVFILT_WRITE && change.filter != EVFILT_VNODE && change.filter != EVFILT_TIMER && change.filter != EVFILT_USER) {
         NotImplemented_nid_no_patch(("kevent: filter " + std::to_string(change.filter)).c_str());
-    }
-    if ((change.flags & EV_FORCEONESHOT) != 0) {
-        change.flags = static_cast<std::uint16_t>(change.flags | EV_ONESHOT);
     }
     if (change.filter == EVFILT_READ || change.filter == EVFILT_WRITE || change.filter == EVFILT_VNODE) {
         if (const int error = DescriptorFilterError(kqueueDescriptor, change.ident)) {

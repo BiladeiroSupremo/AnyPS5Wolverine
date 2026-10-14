@@ -265,6 +265,9 @@ static void DisableAndDispatch() {
 
     Require(Apply(kq, Change(ident, EvfiltRead, EvAdd | EvForceoneshot)) == 0);
     Require(Poll(kq, events, 4) == 1 && events[0].data == 3);
+    Require(Poll(kq, events, 4) == 1 && events[0].data == 3);
+    Require(Apply(kq, Change(ident, EvfiltRead, EvAdd | EvForceoneshot)) == 0);
+    Require(Poll(kq, events, 4) == 1 && events[0].data == 3);
     Require(Poll(kq, events, 4) == 0);
     RequireFailure(Apply(kq, Change(ident, EvfiltRead, EvDelete)), GuestEnoent);
     Require(recv_nid_postfix(pair[0], buffer, sizeof(buffer), 0) == 3);
