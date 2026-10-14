@@ -248,8 +248,8 @@ jobs:
       CCACHE_COMPILERCHECK: content
       MESA_SHADER_CACHE_DIR: /var/cache/anyps5/mesa
       MESA_SHADER_CACHE_MAX_SIZE: 4G
-      CMAKE_BUILD_PARALLEL_LEVEL: 3
-      CTEST_PARALLEL_LEVEL: 3
+      CMAKE_BUILD_PARALLEL_LEVEL: 1
+      CTEST_PARALLEL_LEVEL: 1
     steps:
       - uses: actions/checkout@v7
         with:
