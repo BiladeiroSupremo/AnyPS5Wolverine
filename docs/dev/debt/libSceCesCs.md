@@ -7,4 +7,4 @@
 
 ### Unknown function info
 
-- [sceCesRefersUcsProfileCp1250](../../../core/libs/prx/libSceCesCs/Export.cpp) (libSceCesCs) - declared without parameters and returning a pointer, following `sceCesRefersUcsProfileCp1251`; the signature and behavior are unverified. PPSA34501 fails to load without this export (`qYu6y1E0Qbg`).
+- [sceCesRefersUcsProfileCp1250](../../../core/libs/prx/libSceCesCs/Export.cpp) (libSceCesCs) - declared without parameters and returning a pointer, following `sceCesRefersUcsProfileCp1251`; the signature and behavior are unverified. PPSA34501 fails to start without this export (`qYu6y1E0Qbg`).
