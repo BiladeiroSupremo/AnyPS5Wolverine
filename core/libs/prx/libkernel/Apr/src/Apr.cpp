@@ -842,6 +842,9 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
             break;
         case Apr::Opcode::WriteAddress: {
             const auto command = _read<Apr::WriteAddressCommand>(buffer, cursor);
+            // APS5_TRACE_APR_WRITES=1: every WriteAddress, with the executing thread.
+            static const bool traceWrites = std::getenv("APS5_TRACE_APR_WRITES") != nullptr;
+            if (traceWrites) std::fprintf(stderr, "[apr-write] 0x%llx <- 0x%llx (thread %zx at %.4f s)\n", static_cast<unsigned long long>(command.address), static_cast<unsigned long long>(command.value), std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffffu, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
             _writeAddress(command);
             break;
         }
@@ -1001,11 +1004,14 @@ std::uint32_t _submit(const std::uint8_t* base, std::uint32_t bytes, bool amm) {
         }
         queue.ready.notify_one();
     };
+    static const bool traceQueue = std::getenv("APS5_TRACE_APR_WRITES") != nullptr;
     if (queued) {
+        if (traceQueue) std::fprintf(stderr, "[apr-queue] %s id %u queued behind the running buffer at %.4f s\n", amm ? "amm" : "generic", id, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
         enqueue({});
         return id;
     }
     if (const auto deferred = _execute(Apr::CommandBufferObject{Apr::BufferType::Generic, 0, bytes, 0, bytes, const_cast<std::uint8_t*>(base)}, 0, {}, true)) {
+        if (traceQueue) std::fprintf(stderr, "[apr-queue] %s id %u deferred at byte 0x%x (an unmet wait) at %.4f s\n", amm ? "amm" : "generic", id, deferred->cursor, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
         enqueue(*deferred);
         return id;
     }

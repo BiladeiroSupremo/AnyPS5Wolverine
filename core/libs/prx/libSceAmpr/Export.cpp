@@ -14,6 +14,11 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <cstdio>
+#include <cwchar>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 static constexpr int SCE_AMPR_ERROR_BUFFER_FULL = 0x8002001C;
 static constexpr int SCE_KERNEL_ERROR_EINVAL = 0x80020016;
@@ -373,10 +378,46 @@ int APS5_VABI sceAmprAprCommandBufferMapEnd(Apr::CommandBufferObject* buffer) {
     return result;
 }
 
+// Diagnostic: a read into the first 4 GiB is never into guest memory here. PPSA03671 sometimes
+// streams texture mips to base-0 addresses (2026-10-14); report who built such reads.
+static void ReportLowDestination(const void* destination, std::uint64_t size, std::uint32_t fileId) {
+    static std::atomic<int> reports{0};
+    if (reports.fetch_add(1) >= 20) return;
+    std::string frames;
+#ifdef _WIN32
+    // The guest call thunk defeats the unwinder: list the stack words that point into app.exe.
+    const auto app = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* header = reinterpret_cast<const IMAGE_NT_HEADERS*>(app + reinterpret_cast<const IMAGE_DOS_HEADER*>(app)->e_lfanew);
+    const auto appEnd = app + header->OptionalHeader.SizeOfImage;
+    char text[96];
+    std::snprintf(text, sizeof(text), " ret %p;", __builtin_return_address(0));
+    frames += text;
+    volatile std::uintptr_t marker = 0;
+    const auto* words = reinterpret_cast<const std::uintptr_t*>(const_cast<std::uintptr_t*>(&marker));
+    // Only the stack's committed region, and only words into the code section (.elf0 of the
+    // relinked image: app.exe+0x10000..+0x5f32600).
+    MEMORY_BASIC_INFORMATION region{};
+    VirtualQuery(words, &region, sizeof(region));
+    const auto stackEnd = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+    const auto limit = static_cast<int>(std::min<std::uintptr_t>(16384u, (stackEnd - reinterpret_cast<std::uintptr_t>(words)) / 8u));
+    int found = 0;
+    for (int index = 0; index < limit && found < 24; ++index) {
+        const auto value = words[index];
+        if (value < app + 0x10000u || value >= app + 0x5f32600u || value >= appEnd) continue;
+        std::snprintf(text, sizeof(text), " [rsp+0x%x] app.exe+0x%llx", index * 8, static_cast<unsigned long long>(value - app));
+        frames += text;
+        ++found;
+    }
+#endif
+    std::fprintf(stderr, "[ampr] ReadFile into %p (size 0x%llx, file %u) built from:%s\n", destination, static_cast<unsigned long long>(size), fileId, frames.c_str());
+    std::fflush(stderr);
+}
+
 int APS5_VABI sceAmprAprCommandBufferReadFile(Apr::CommandBufferObject* buffer, uint64_t* gatherState, uint64_t* scatterState, uint32_t fileId, void* destination, uint64_t size, uint64_t offset) {
     (void)gatherState;
     (void)scatterState;
     if (!ValidRead(destination, size, offset)) return SCE_KERNEL_ERROR_EINVAL;
+    if (reinterpret_cast<std::uintptr_t>(destination) < 0x100000000ull) ReportLowDestination(destination, size, fileId);
     return AppendRead(buffer, Apr::Opcode::ReadFile, fileId, destination, size, offset);
 }
 
