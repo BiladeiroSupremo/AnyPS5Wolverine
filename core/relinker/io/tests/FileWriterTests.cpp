@@ -11,6 +11,7 @@
 #include <vector>
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -35,11 +36,23 @@ std::string readFile(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
 }
 
+std::vector<std::string> siblings(const std::filesystem::path& output) {
+    std::vector<std::string> names;
+    for (const auto& entry : std::filesystem::directory_iterator(output.parent_path())) {
+        const auto name = entry.path().filename().string();
+        if (name.starts_with(output.filename().string() + "."))
+            names.push_back(name);
+    }
+    return names;
+}
+
 template<typename TValue>
-void requireRunningReplacement(const std::filesystem::path& directory, const TValue& data) {
-    const auto output = directory / "running";
+void requireRunningReplacement(const std::filesystem::path& directory, const TValue& data, const bool leftover) {
+    const auto output = directory / (leftover ? "leftover" : "running");
+    if (leftover)
+        std::ofstream(directory / "leftover.tmp", std::ios::binary) << "killed";
     std::filesystem::copy_file("/bin/sleep", output);
-    const auto permissions = std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec;
+    const auto permissions = std::filesystem::perms::owner_all | std::filesystem::perms::group_all;
     std::filesystem::permissions(output, permissions);
     const auto previous = readFile(output);
     const pid_t child = fork();
@@ -59,11 +72,13 @@ void requireRunningReplacement(const std::filesystem::path& directory, const TVa
     const int descriptor = open(output.c_str(), O_RDONLY);
     std::string failure;
     if (started) {
+        const auto mask = umask(077);
         try {
             Io::FileWriter().Write(output.string(), data);
         } catch (const std::exception& e) {
             failure = e.what();
         }
+        umask(mask);
     }
     std::string kept(previous.size(), '\0');
     const bool keptPrevious = pread(descriptor, kept.data(), kept.size(), 0) == static_cast<ssize_t>(kept.size()) && kept == previous;
@@ -85,8 +100,10 @@ void requireRunningReplacement(const std::filesystem::path& directory, const TVa
         throw std::runtime_error("An open descriptor no longer reads the previous file");
     if (!running)
         throw std::runtime_error("Running executable stopped");
-    if (std::filesystem::exists(directory / "running.tmp"))
+    if (siblings(output) != (leftover ? std::vector<std::string>{"leftover.tmp"} : std::vector<std::string>{}))
         throw std::runtime_error("Temporary file left behind");
+    if (leftover && readFile(directory / "leftover.tmp") != "killed")
+        throw std::runtime_error("A file left by an earlier run was changed");
 }
 
 template<typename TValue>
@@ -109,7 +126,7 @@ void requireFailedReplacement(const std::filesystem::path& directory, const TVal
     std::signal(SIGXFSZ, handler);
     if (failure != "Failed to write file: " + output.string())
         throw std::runtime_error("Write past the file size limit did not fail: " + failure);
-    if (readFile(output) != "previous" || std::filesystem::exists(directory / "limited.tmp"))
+    if (readFile(output) != "previous" || !siblings(output).empty())
         throw std::runtime_error("Failed write did not keep the previous file");
 }
 
@@ -138,7 +155,8 @@ void requireReplacement(const TValue& data) {
     std::filesystem::remove_all(directory, error);
     std::filesystem::create_directory(directory);
     try {
-        requireRunningReplacement(directory, data);
+        requireRunningReplacement(directory, data, false);
+        requireRunningReplacement(directory, data, true);
         requireFailedReplacement(directory, data);
         requireInPlaceWrites(directory, data);
     } catch (...) {
