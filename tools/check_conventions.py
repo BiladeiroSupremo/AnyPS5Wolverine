@@ -49,7 +49,9 @@ STUB_BODY = re.compile(r"^(?:\(void\)\s*\w+\s*;|static_cast<void>\(\s*\w+\s*\)\s
 SYSTEM_DEPENDENCY = re.compile(r"\b(find_package\s*\((?!\s*(Python3|Threads|Git)\b)|pkg_check_modules\b|pkg_search_module\b|find_(library|path|program|file)\b)", re.I)
 TITLE = re.compile(r"\b(PPSA|CUSA)\d{5}\b")
 EXTENSION = re.compile(r"__attribute__|__declspec|#\s*pragma\s+(?!once\b)")
-LINK = re.compile(r"\]\(([^)\s]+)")
+LINK = re.compile(r"\[[^\]]+\]\(([^)\s]+)")
+FENCE = re.compile(r"^ {0,3}(```|~~~).*?^ {0,3}\1[ \t]*$|^ {0,3}(?:```|~~~).*\Z", re.S | re.M)
+INLINE = re.compile(r"`[^`\n]*`")
 SECTION = re.compile(r"^###(?!#)\s*(.+?)\s*$", re.M)
 KEY = re.compile(r"^( *)([A-Za-z0-9_-]+|'[^']*'|\"[^\"]*\"):(?:\s+(.*?))?\s*$")
 
@@ -182,10 +184,13 @@ class Check:
 
     def docs(self):
         for path, lines in self.files(lambda p: p.suffix == ".md"):
+            fenced = fenced_lines(self.show(path))
             for number, text in lines:
                 name = debt_name(text) if is_debt(path) and text.startswith("- ") else None
                 if name and path != f"{DEBT_DIR}{name}.md":
                     self.report("debt-file", path, number, f"{DEBT_DIR}{name}.md")
+                if number in fenced:
+                    continue
                 for target, resolved in links(path, text):
                     if resolved not in self.tree and resolved not in self.dirs:
                         self.report("doc-link", path, number, target)
@@ -235,8 +240,17 @@ def utf8(data):
     return True
 
 
+def fenced_lines(text):
+    inside = set()
+    for match in FENCE.finditer(text):
+        first = text.count("\n", 0, match.start()) + 1
+        inside.update(range(first, first + match.group(0).count("\n") + 1))
+    return inside
+
+
 def links(path, text):
     result = []
+    text = INLINE.sub("", FENCE.sub("", text))
     for target in LINK.findall(text):
         if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:|//|#", target):
             continue
