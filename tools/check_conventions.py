@@ -69,8 +69,11 @@ class Check:
         self.added = defaultdict(list)
         self.status = {}
         self.numstat = {}
-        entries = [entry.split("\t", 1) for entry in git("ls-tree", "-rz", "--full-tree", head).split("\0") if entry]
-        self.modes = {path: metadata.split()[0] for metadata, path in entries}
+        entries = [(metadata.split(), path) for metadata, path in
+                   (entry.split("\t", 1) for entry in git("ls-tree", "-rz", "--full-tree", head).split("\0") if entry)]
+        self.modes = {path: fields[0] for fields, path in entries}
+        self.objects = {path: fields[2] for fields, path in entries if fields[1] == "blob"}
+        self.blobs = {}
         self.tree = set(self.modes)
         self.dirs = {str(parent) for path in self.tree for parent in PurePosixPath(path).parents}
         statuses = git("diff", "--name-status", "--no-renames", "-z", self.base, head).split("\0")
@@ -91,6 +94,9 @@ class Check:
             elif path and number is not None and line.startswith("+"):
                 self.added[path].append((number, line[1:]))
                 number += 1
+        self.read([path for path in sorted(self.tree) if is_debt(path)] +
+                  [path for path, (added, _) in self.numstat.items() if self.status.get(path) != "D" and added != "-" and
+                   not path.startswith("3rdparty/") and PurePosixPath(path).suffix.lower() not in IMAGES])
 
     def report(self, rule, path, line, detail=""):
         self.findings.append((rule, path, line, detail))
@@ -98,8 +104,28 @@ class Check:
     def files(self, predicate):
         return [(path, lines) for path, lines in self.added.items() if not path.startswith("3rdparty/") and predicate(PurePosixPath(path))]
 
+    def read(self, paths):
+        pending = [path for path in dict.fromkeys(paths) if path in self.objects and path not in self.blobs]
+        if not pending:
+            return
+        data = subprocess.run(["git", "cat-file", "--batch"], input="".join(f"{self.objects[path]}\n" for path in pending).encode(),
+                              capture_output=True, check=True).stdout
+        offset = 0
+        for path in pending:
+            end = data.index(b"\n", offset)
+            header = data[offset:end].split()
+            offset = end + 1
+            if len(header) == 3 and header[1] == b"blob":
+                size = int(header[2])
+                self.blobs[path] = data[offset:offset + size]
+                offset += size + 1
+
+    def blob(self, path):
+        data = self.blobs.get(path)
+        return git("show", f"{self.head}:{path}", text=False) if data is None else data
+
     def show(self, path):
-        return git("show", f"{self.head}:{path}")
+        return self.blob(path).decode("utf-8", errors="replace")
 
     def code(self):
         debt = [entry for path in sorted(self.tree) if is_debt(path) for entry in silent_stub_debt(self.show(path), path)]
@@ -139,8 +165,9 @@ class Check:
             return
         pattern = r"(^|[^[:alnum:]_])APS5_VABI[[:space:]]+(" + "|".join(exports) + r")[[:space:]]*\("
         result = subprocess.run(["git", "grep", "-nE", "--full-name", pattern, self.head, "--", ":(top)core/libs/prx"], capture_output=True, encoding="utf-8", errors="replace")
-        for line in filter(None, result.stdout.split("\n")):
-            _, path, number, text = line.split(":", 3)
+        hits = [line.split(":", 3)[1:] for line in filter(None, result.stdout.split("\n"))]
+        self.read(path for path, _, _ in hits)
+        for path, number, text in hits:
             name = EXPORT.search(text).group(1)
             own, own_number = exports[name]
             if library(path) != library(own) and "tests" not in PurePosixPath(path).parts and function_body(self.show(path).splitlines(), int(number) - 1) is not None:
@@ -177,7 +204,7 @@ class Check:
                 self.report("system-dependency", path, 0, "submodule outside 3rdparty/")
                 continue
             suffix = PurePosixPath(path).suffix.lower()
-            if self.status.get(path) != "D" and (added == "-" or suffix in IMAGES or not utf8(git("show", f"{self.head}:{path}", text=False))):
+            if self.status.get(path) != "D" and (added == "-" or suffix in IMAGES or not utf8(self.blob(path))):
                 self.report("binary", path, 0)
             if self.status.get(path) == "A" and allowed_notes(path) is False:
                 self.report("notes-file", path, 0)
