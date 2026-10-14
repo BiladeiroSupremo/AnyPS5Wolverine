@@ -80,6 +80,22 @@ class CheckCompileTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(seen.read_text(encoding="utf-8")), ["-fsyntax-only", str(source)])
 
+    @unittest.skipUnless(os.name == "nt", "Windows command-line quoting")
+    def test_windows_paths_and_quoted_defines_survive_the_syntax_check(self):
+        source = self.source("unit.cpp")
+        script = self.compiler(
+            "import json\nimport sys\nfrom pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))\n")
+        seen = self.root / "arguments.json"
+        flags = ['-DNAME=quoted "value"', '-IC:\\sdk files\\include\\']
+        arguments = [sys.executable, str(script), str(seen), *flags,
+                     "-c", "-o", "unit.o", "-MD", "-MF", "unit.o.d", str(source)]
+        self.manifest([self.entry("unit.cpp", subprocess.list2cmdline(arguments))])
+        result = self.tool("unit.cpp")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(seen.read_text(encoding="utf-8")),
+                         [*flags, "-fsyntax-only", str(source)])
+
     def test_nothing_checked_is_a_failure(self):
         self.manifest([])
         result = self.tool("orphan.cpp")

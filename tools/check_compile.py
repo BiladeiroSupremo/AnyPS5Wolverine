@@ -70,8 +70,29 @@ def changed(root, base):
     return [name for name in names if name.endswith(CPP)]
 
 
+def command_arguments(command):
+    if os.name != "nt":
+        return shlex.split(command)
+    import ctypes
+    from ctypes import wintypes
+    count = ctypes.c_int()
+    split = ctypes.WinDLL("shell32", use_last_error=True).CommandLineToArgvW
+    split.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int))
+    split.restype = ctypes.POINTER(wintypes.LPWSTR)
+    free = ctypes.WinDLL("kernel32", use_last_error=True).LocalFree
+    free.argtypes = (wintypes.HLOCAL,)
+    free.restype = wintypes.HLOCAL
+    arguments = split(command, ctypes.byref(count))
+    if not arguments:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return [arguments[index] for index in range(count.value)]
+    finally:
+        free(arguments)
+
+
 def syntax_only(entry, source):
-    arguments = shlex.split(entry["command"])
+    arguments = command_arguments(entry["command"])
     directory = Path(entry["directory"])
     wanted = source.resolve()
     trimmed = []
