@@ -1,5 +1,6 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
+#include "prx/libkernel/File/include/CompressedFile.hpp"
 #include "prx/libc/include/General.hpp"
 
 #include <algorithm>
@@ -137,6 +138,10 @@ void FillFileStat(const std::filesystem::path& nativePath, FileStat* sb) {
         throw std::runtime_error(std::string("FillFileStat: stat failed for ") + nativePath.string());
     }
     CopyNativeStat(st, sb);
+    // A GDEF container (CompressedFile.hpp) has the size of the file it holds.
+    if ((sb->st_mode & 0170000) == 0100000 && sb->st_size >= 20) {
+        if (const auto uncompressed = CompressedFile::UncompressedSize(nativePath)) sb->st_size = static_cast<decltype(sb->st_size)>(*uncompressed);
+    }
 }
 
 void FillFileStat(int nativeDescriptor, FileStat* sb) {

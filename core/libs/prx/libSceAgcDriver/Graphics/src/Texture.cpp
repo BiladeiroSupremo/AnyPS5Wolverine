@@ -2872,7 +2872,15 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
             std::fprintf(stderr, "[write-image] 0x%llx %ux%u image %p marked written (traceKeyStore at %p) caller %p dirty-caller %p:%s\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, static_cast<const void*>(this), reinterpret_cast<void*>(&traceKeyStore), __builtin_return_address(0), markDirtyCaller, frames.c_str());
         }
     }
-    static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    static const bool eagerAll = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    // Experiment (APS5_EAGER_WRITEBACK_MAX_KB, 0 = off): images this small are stored right behind
+    // their writer, in the same batch, instead of at the next idle store. PPSA03671 waits for a
+    // small result every frame, and the idle store only runs once every queue drained.
+    static const std::uint64_t eagerLimit = [] {
+        const char* text = std::getenv("APS5_EAGER_WRITEBACK_MAX_KB");
+        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull) << 10u;
+    }();
+    const bool eager = eagerAll || (eagerLimit != 0 && guestBytes <= eagerLimit);
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in

@@ -12,6 +12,7 @@
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
+#include "prx/libkernel/File/include/CompressedFile.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <array>
@@ -67,6 +68,12 @@ std::string _foldCase(std::string text) {
     return text;
 }
 
+// The size the guest sees: a GDEF container's uncompressed size (its header), the host size else.
+std::uint64_t _guestSize(const std::filesystem::path& path, std::uint64_t hostBytes) {
+    if (hostBytes < 20) return hostBytes;
+    return CompressedFile::UncompressedSize(path).value_or(hostBytes);
+}
+
 bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
     {
         std::lock_guard lock(g_directoriesLock);
@@ -82,7 +89,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
                 do {
                     if ((entry.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) continue;
                     const auto size = (static_cast<std::uint64_t>(entry.nFileSizeHigh) << 32u) | entry.nFileSizeLow;
-                    sizes.emplace(_foldCase(std::filesystem::path(entry.cFileName).string()), size);
+                    sizes.emplace(_foldCase(std::filesystem::path(entry.cFileName).string()), _guestSize(path.parent_path() / entry.cFileName, size));
                 } while (FindNextFileW(find, &entry));
                 FindClose(find);
             }
@@ -92,7 +99,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
                 std::error_code entryError;
                 if (!it->is_regular_file(entryError)) continue;
                 const auto size = it->file_size(entryError);
-                if (!entryError) sizes.emplace(_foldCase(it->path().filename().string()), size);
+                if (!entryError) sizes.emplace(_foldCase(it->path().filename().string()), _guestSize(it->path(), size));
             }
 #endif
             listed = g_directories.emplace(directory, std::move(sizes)).first;
@@ -107,7 +114,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
     if (!std::filesystem::is_regular_file(path, error)) return false;
     FileStat stat{};
     File::FillFileStat(path, &stat);
-    bytes = static_cast<std::uint64_t>(stat.st_size);
+    bytes = _guestSize(path, static_cast<std::uint64_t>(stat.st_size));
     return true;
 }
 
@@ -207,6 +214,32 @@ std::uint64_t _readAt(HostFile handle, std::uint64_t offset, std::uint8_t* desti
     return done;
 }
 
+// A file's GDEF index (null for an ordinary file), probed on its first read and kept like its handle.
+std::mutex& g_compressedLock = *new std::mutex();
+std::vector<std::optional<std::shared_ptr<const CompressedFile::Index>>>& g_compressed = *new std::vector<std::optional<std::shared_ptr<const CompressedFile::Index>>>();
+
+std::shared_ptr<const CompressedFile::Index> _compressed(std::uint32_t id, const AprFile& file, HostFile handle) {
+    {
+        std::lock_guard lock(g_compressedLock);
+        if (id < g_compressed.size() && g_compressed[id].has_value()) return *g_compressed[id];
+    }
+#ifdef _WIN32
+    LARGE_INTEGER hostSize{};
+    if (!GetFileSizeEx(handle, &hostSize)) throw std::runtime_error("APR: cannot size " + file.path.string());
+    const auto hostBytes = static_cast<std::uint64_t>(hostSize.QuadPart);
+#else
+    struct stat hostStat {};
+    if (fstat(handle, &hostStat) != 0) throw std::runtime_error("APR: cannot size " + file.path.string());
+    const auto hostBytes = static_cast<std::uint64_t>(hostStat.st_size);
+#endif
+    const CompressedFile::RawRead read = [handle](std::uint64_t offset, void* destination, std::size_t bytes) { return _readAt(handle, offset, static_cast<std::uint8_t*>(destination), bytes) == bytes; };
+    auto index = CompressedFile::Probe(file.path.string(), hostBytes, read);
+    std::lock_guard lock(g_compressedLock);
+    if (g_compressed.size() <= id) g_compressed.resize(id + 1);
+    g_compressed[id] = index;
+    return index;
+}
+
 void _readFile(const Apr::ReadFileCommand& command) {
     const auto file = _file(command.fileId);
     static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
@@ -214,7 +247,15 @@ void _readFile(const Apr::ReadFileCommand& command) {
     const auto handle = _hostFile(command.fileId, file);
     const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
     if (!destination.Open()) throw std::runtime_error("APR: the read destination of " + file.path.string() + " is not writable guest memory");
-    const auto read = _readAt(handle, command.offset, reinterpret_cast<std::uint8_t*>(command.destination), command.size);
+    std::uint64_t read = 0;
+    if (const auto compressed = _compressed(command.fileId, file, handle)) {
+        // The uncompressed bytes in the file, then the same short-read failure as an ordinary file.
+        read = command.offset < compressed->uncompressedBytes ? std::min<std::uint64_t>(command.size, compressed->uncompressedBytes - command.offset) : 0;
+        const CompressedFile::RawRead raw = [handle](std::uint64_t offset, void* target, std::size_t bytes) { return _readAt(handle, offset, static_cast<std::uint8_t*>(target), bytes) == bytes; };
+        if (read != 0) CompressedFile::Read(*compressed, raw, command.offset, reinterpret_cast<void*>(command.destination), static_cast<std::size_t>(read));
+    } else {
+        read = _readAt(handle, command.offset, reinterpret_cast<std::uint8_t*>(command.destination), command.size);
+    }
     // Debug aid: APS5_APR_READ_DELAY_US=<us> slows every read down (load-order races).
     static const auto delay = [] { const char* text = std::getenv("APS5_APR_READ_DELAY_US"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul; }();
     if (delay != 0) PreciseSleepUs(delay);
@@ -928,7 +969,9 @@ int APS5_VABI sceKernelAprGetFileSize(uint32_t id, uint64_t* size) {
 
 int APS5_VABI sceKernelAprGetFileStat(uint32_t id, FileStat* stat) {
     if (!stat) return _fail(GUEST_EINVAL);
-    File::FillFileStat(_file(id).path, stat);
+    const auto file = _file(id);
+    File::FillFileStat(file.path, stat);
+    stat->st_size = static_cast<decltype(stat->st_size)>(file.size);
     return 0;
 }
 
