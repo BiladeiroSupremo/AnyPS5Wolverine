@@ -212,7 +212,8 @@ int32_t APS5_VABI sceKernelMapNamedFlexibleMemoryInternal(void** addr_in_out, si
 }
 
 int APS5_VABI sceKernelMprotect(const void* addr, size_t len, int prot) {
- return DoMprotect(addr, len, prot);
+ constexpr int DefinedProtection = 0x3F7;
+ return DoMprotect(addr, len, prot & DefinedProtection);
 }
 
 int APS5_VABI sceKernelMunmap(uint64_t vaddr, size_t len) {

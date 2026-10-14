@@ -202,6 +202,16 @@ static void CheckAudioCoprocessorProtection() {
     Require(rejected && undefined == nullptr);
 }
 
+static void CheckMprotectIgnoresUndefinedBits() {
+    constexpr std::size_t length = 0x4000;
+    void* mapping = nullptr;
+    Require(sceKernelMapFlexibleMemory(&mapping, length, 3, 0) == 0);
+    Require(sceKernelMprotect(mapping, length, static_cast<int>(0xfffffff2u)) == 0);
+    static_cast<volatile unsigned char*>(mapping)[length - 1] = 5;
+    Require(static_cast<volatile unsigned char*>(mapping)[length - 1] == 5);
+    Require(sceKernelMunmap(mapping, length) == 0);
+}
+
 static void CheckInternalNamedFlexibleMapping() {
     constexpr std::size_t length = 0x10000;
     std::size_t before = 0;
@@ -2342,6 +2352,7 @@ int main() {
     CheckBatchMapStopsAtInvalidEntry();
     CheckCheckedReleaseDirectMemory();
     CheckAudioCoprocessorProtection();
+    CheckMprotectIgnoresUndefinedBits();
     CheckDirectMemoryFollowsPhysicalPages();
     CheckSparseDirectMemoryBacking();
     CheckReleaseDirectMemoryClearsMappings();
