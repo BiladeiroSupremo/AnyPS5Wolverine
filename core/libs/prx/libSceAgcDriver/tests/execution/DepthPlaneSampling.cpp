@@ -72,13 +72,11 @@ constexpr float DrawnDepth = 0.25f;
 constexpr float DrawnD16Depth = 0.2f;
 constexpr std::uint32_t DrawnD16Bits = 13107;
 
-// image_load of row s13 (0 unless given), one texel per thread (x = thread id), slice / face from user data, stored as a dword per
-// thread into the buffer at s[0:3]. The T# is s[4:11], the slice s12.
 constexpr std::array<std::uint32_t, 3> LoadDims{1u, 3u, 5u};
 
 std::array<std::uint32_t, 11> LoadCode(std::uint32_t dim) {
     return {
-        0x7e02020d,                        // v_mov_b32 v1, s13 (y)
+        0x7e02020d,
         0x7e04020c,                        // v_mov_b32 v2, s12 (slice or face)
         0xf0001100u | (dim << 3u),         // image_load v3, v[0:2], s[4:11] dmask:0x1 unorm, dim 2D / CUBE / 2D_ARRAY
         0x00010300,
@@ -235,8 +233,6 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
     device.WaitIdle();
 }
 
-// Loads row `row` of `slice` of the texture `shape` describes at `texels` into `output` (one dword per thread). With
-// `shaderImage2D` the shader declares a 2D image whatever the T#'s type is.
 void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output, bool shaderImage2D = false, std::uint32_t row = 0) {
     const auto& code = shaderImage2D ? Load2D : shape.type == TypeCube ? LoadCube : shape.type == Type2DArray ? LoadArray : Load2D;
     std::vector<std::uint32_t> userData(16, 0u);
