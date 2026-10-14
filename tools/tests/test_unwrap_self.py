@@ -24,18 +24,19 @@ def pattern(seed, size):
     return bytes((seed + index * 7) % 251 for index in range(size))
 
 
-def build_elf(segments):
+def build_elf(segments, program_offset=PROGRAM_TABLE_OFFSET):
     header = bytearray(HEADER)
     struct.pack_into("<HHIQQQIHHHHHH", header, 0x10, 0xFE10, 0x3E, 1, 0x70,
-                     PROGRAM_TABLE_OFFSET, 0, 0, 0x40, 56, len(segments), 0x40, 0, 0)
+                     program_offset, 0, 0, 0x40, 56, len(segments), 0x40, 0, 0)
     body = bytearray(header)
-    body.extend(b"\x00" * (PROGRAM_TABLE_OFFSET - len(header)))
+    body.extend(b"\x00" * (program_offset - len(header)))
     for kind, flags, offset, vaddr, size, align in segments:
         body.extend(struct.pack("<IIQQQQQQ", kind, flags, offset, vaddr, vaddr, size, size, align))
     return bytes(body)
 
 
-def build_container(segments, records, payloads, magic=SELF_MAGIC, inner_elf=True):
+def build_container(segments, records, payloads, magic=SELF_MAGIC, inner_elf=True,
+                    program_offset=PROGRAM_TABLE_OFFSET):
     size = max([FIRST_REGION] + [offset + len(block) for offset, block in payloads.items()])
     data = bytearray(size)
     struct.pack_into("<I", data, 0, magic)
@@ -43,7 +44,7 @@ def build_container(segments, records, payloads, magic=SELF_MAGIC, inner_elf=Tru
         struct.pack_into("<QQQQ", data, unwrap_self.RECORD_OFFSET + index * unwrap_self.RECORD_SIZE,
                          flags, offset, block_size, block_size)
     if inner_elf:
-        elf = build_elf(segments)
+        elf = build_elf(segments, program_offset)
         data[ELF_HEADER_OFFSET:ELF_HEADER_OFFSET + len(elf)] = elf
     for offset, block in payloads.items():
         data[offset:offset + len(block)] = block
@@ -141,6 +142,24 @@ class UnwrapTest(unittest.TestCase):
         self.assertEqual(data[loads[1][2]:loads[1][2] + 0x40], pattern(5, 0x40))
         for kind, flags, offset, vaddr, _, size, _, align in loads:
             self.assertEqual(offset % align, vaddr % align)
+
+    def test_program_headers_do_not_overwrite_the_first_load_payload(self):
+        for count, program_offset in ((74, PROGRAM_TABLE_OFFSET), (3, 0xFF0)):
+            with self.subTest(count=count, program_offset=program_offset):
+                payload = pattern(3, 0x20) * 8
+                segments = [(PT_LOAD, 5, 0x1234, 0, len(payload), PAGE)]
+                segments.extend([(0, 0, 0, 0, 0, 0)] * (count - 1))
+                container = build_container(segments, [(0x2804, 0x2000, len(payload))],
+                                            {0x2000: payload}, program_offset=program_offset)
+                result, output = self.convert(container)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data, headers = read_program_headers(output)
+                load = headers[0]
+                self.assertEqual(data[load[2]:load[2] + load[5]], payload)
+                self.assertGreaterEqual(load[2], program_offset + count * 56)
+                self.assertEqual(load[2] % PAGE, load[3] % PAGE)
+                self.assertEqual(len(headers), count)
+                self.assertTrue(all(header[0] == 0 for header in headers[1:]))
 
     def test_the_verbose_report_names_every_program_header(self):
         container = build_container(default_segments(), default_records(), default_payloads())
