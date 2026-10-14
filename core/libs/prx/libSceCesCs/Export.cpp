@@ -1,8 +1,12 @@
 #include <cstdint>
 #include <cstddef>
+#include <algorithm>
 #include <cstring>
+#include <utility>
+#include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "JisX0208.hpp"
 
 namespace {
 
@@ -139,8 +143,29 @@ int decodeMbcs(const void* profile, const uint8_t* mbcs, uint32_t mbcsMax, uint3
         code = 0xFF61 + (mbcs[1] - 0xA1);
         return 0;
     }
-    if (lead == 0x8F || (lead >= 0xA1 && lead <= 0xFE)) NotImplemented_nid_no_patch("EUC-JP JIS X 0208/0212 characters");
+    if (lead >= 0xA1 && lead <= 0xFE) {
+        if (mbcsMax < 2) return CES_ERROR_SRC_BUFFER_END;
+        if (mbcs[1] < 0xA1 || mbcs[1] > 0xFE) return CES_ERROR_INVALID_ENCODE;
+        length = 2;
+        code = JisX0208::TO_UCS2[(lead - 0xA1) * 94 + (mbcs[1] - 0xA1)];
+        return code != 0 ? 0 : CES_ERROR_UNASSIGNED_CODE;
+    }
+    if (lead == 0x8F) NotImplemented_nid_no_patch("EUC-JP JIS X 0212 characters");
     return CES_ERROR_INVALID_ENCODE;
+}
+
+const std::vector<std::pair<uint16_t, uint16_t>>& jisX0208Reverse() {
+    static const auto reverse = [] {
+        std::vector<std::pair<uint16_t, uint16_t>> entries;
+        entries.reserve(94 * 94);
+        for (uint32_t cell = 0; cell < 94 * 94; ++cell) {
+            if (JisX0208::TO_UCS2[cell] != 0) entries.emplace_back(JisX0208::TO_UCS2[cell], static_cast<uint16_t>(cell));
+        }
+        std::stable_sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+        entries.erase(std::unique(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.first == right.first; }), entries.end());
+        return entries;
+    }();
+    return reverse;
 }
 
 int encodeMbcs(const void* profile, uint32_t code, uint8_t* mbcs, uint32_t& length) {
@@ -160,8 +185,13 @@ int encodeMbcs(const void* profile, uint32_t code, uint8_t* mbcs, uint32_t& leng
         return 0;
     }
     if (code > 0xFFFF) return CES_ERROR_UNASSIGNED_CODE;
-    NotImplemented_nid_no_patch("EUC-JP JIS X 0208/0212 characters");
-    return CES_ERROR_UNASSIGNED_CODE;
+    const auto& reverse = jisX0208Reverse();
+    const auto found = std::lower_bound(reverse.begin(), reverse.end(), static_cast<uint16_t>(code), [](const std::pair<uint16_t, uint16_t>& entry, uint16_t value) { return entry.first < value; });
+    if (found == reverse.end() || found->first != code) return CES_ERROR_UNASSIGNED_CODE;
+    length = 2;
+    mbcs[0] = static_cast<uint8_t>(0xA1 + found->second / 94);
+    mbcs[1] = static_cast<uint8_t>(0xA1 + found->second % 94);
+    return 0;
 }
 
 int decodeUcs2(const uint16_t* ucs2, uint32_t, uint32_t& length, uint32_t& code) {
