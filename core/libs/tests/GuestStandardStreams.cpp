@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdarg>
 #include <cstdint>
+#include <string_view>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -34,6 +35,10 @@ extern FileStream* __stdoutp_nid_postfix;
 extern FileStream* __stderrp_nid_postfix;
 extern int __isthreaded_nid_postfix;
 int APS5_VABI fprintf_nid_postfix(FileStream*, const char*, ...);
+int APS5_VABI fputs_nid_postfix(const char*, FileStream*);
+int APS5_VABI printf_nid_postfix(const char*, ...);
+int APS5_VABI vprintf_nid_postfix(const char*, void*);
+int APS5_VABI puts_nid_postfix(const char*);
 int APS5_VABI vfprintf_nid_postfix(FileStream*, const char*, void*);
 int APS5_VABI vsprintf_nid_postfix(char*, const char*, void*);
 int APS5_VABI fgetc_nid_postfix(FileStream*);
@@ -73,6 +78,22 @@ static int APS5_VABI WriteFormatted(FileStream* stream, const char* format, ...)
     va_start(args, format);
 #endif
     const int result = vfprintf_nid_postfix(stream, format, args);
+#ifdef _WIN32
+    __builtin_sysv_va_end(args);
+#else
+    va_end(args);
+#endif
+    return result;
+}
+static int APS5_VABI PrintStandard(const char* format, ...) {
+#ifdef _WIN32
+    __builtin_sysv_va_list args;
+    __builtin_sysv_va_start(args, format);
+#else
+    std::va_list args;
+    va_start(args, format);
+#endif
+    const int result = vprintf_nid_postfix(format, args);
 #ifdef _WIN32
     __builtin_sysv_va_end(args);
 #else
@@ -493,7 +514,38 @@ static void CheckDescriptorAccessModes() {
     Require(std::filesystem::remove(filename));
 }
 
-int main() {
+static void CheckClosedStreamWrites() {
+    FileStream stream(std::tmpfile());
+    Require(freopen_nid_postfix("missing-closed-stream-dir/out.log", "w", &stream) == nullptr);
+    Require(fputs_nid_postfix("text", &stream) == -1 && *__error_nid_postfix() == 9);
+    Require(fprintf_nid_postfix(&stream, "%d", 1) == -1 && *__error_nid_postfix() == 9);
+    Require(fwrite_nid_postfix("text", 1, 4, &stream) == 0 && *__error_nid_postfix() == 9);
+    Require(fputc_nid_postfix('t', &stream) == -1 && *__error_nid_postfix() == 9);
+    Require(putc_unlocked_nid_postfix('t', &stream) == -1 && *__error_nid_postfix() == 9);
+    Require(fflush_nid_postfix(&stream) == -1 && *__error_nid_postfix() == 9);
+    char buffer[8] = {};
+    Require(fread_nid_postfix(buffer, 1, sizeof(buffer), &stream) == 0 && *__error_nid_postfix() == 9);
+    Require(fgetc_nid_postfix(&stream) == -1 && *__error_nid_postfix() == 9);
+    Require(fgets_nid_postfix(buffer, sizeof(buffer), &stream) == nullptr && *__error_nid_postfix() == 9);
+    Require(fseeko_nid_postfix(&stream, 0, SEEK_SET) == -1 && *__error_nid_postfix() == 9);
+    Require(ftello_nid_postfix(&stream) == -1 && *__error_nid_postfix() == 9);
+    Require(fileno_nid_postfix(&stream) == -1 && *__error_nid_postfix() == 9);
+    Require(ferror_nid_postfix(&stream) == 0 && feof_nid_postfix(&stream) == 0);
+    Require(fclose_nid_postfix(&stream) == -1 && *__error_nid_postfix() == 9);
+}
+
+static int CheckClosedStandardOutput() {
+    Require(freopen_nid_postfix("missing-closed-stream-dir/out.log", "w", __stdoutp_nid_postfix) == nullptr);
+    Require(printf_nid_postfix("%d", 1) == -1 && *__error_nid_postfix() == 9);
+    Require(puts_nid_postfix("text") == -1 && *__error_nid_postfix() == 9);
+    Require(PrintStandard("%d", 1) == -1 && *__error_nid_postfix() == 9);
+    Require(fputs_nid_postfix("text", __stdoutp_nid_postfix) == -1 && *__error_nid_postfix() == 9);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string_view(argv[1]) == "--closed-stdout") return CheckClosedStandardOutput();
+    CheckClosedStreamWrites();
     CheckDescriptorAccessModes();
     Require(_Getmbcurmax_nid_postfix() == 1 && _Getmbcurmax_nid_postfix() == ___mb_cur_max_nid_postfix());
     CheckFlushWhileReading();
