@@ -128,7 +128,19 @@ class TraceThread {
 public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::size_t DefaultCapacity = 262144;
+    static constexpr std::size_t MaximumCapacity = 4194304;
     static constexpr Clock::duration MinimumSlice = std::chrono::microseconds(20);
+
+    static std::size_t ParseCapacity(const char* events) {
+        if (events == nullptr) return DefaultCapacity;
+        const std::string_view text = events;
+        std::size_t capacity = 0;
+        const auto end = text.data() + text.size();
+        const auto [last, error] = std::from_chars(text.data(), end, capacity);
+        if (text.empty() || error != std::errc{} || last != end || capacity == 0 || capacity > MaximumCapacity)
+            throw std::invalid_argument("APS5_TRACE_EVENTS=" + std::string(text) + " is not a whole number from 1 through " + std::to_string(MaximumCapacity));
+        return capacity;
+    }
 
     struct Slice {
         const char* scope;

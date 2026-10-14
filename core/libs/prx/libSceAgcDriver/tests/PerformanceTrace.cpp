@@ -60,6 +60,31 @@ void BufferCap() {
     Check(snapshot.totals.size() == 1 && snapshot.totals[0].count == 3 && snapshot.totals[0].length == microseconds(90), "totals missed a slice past the cap");
 }
 
+void CapacitySettings() {
+    Check(TraceThread::ParseCapacity(nullptr) == TraceThread::DefaultCapacity, "the default event capacity changed");
+    Check(TraceThread::ParseCapacity("1") == 1, "the smallest event capacity was rejected");
+    Check(TraceThread::ParseCapacity("3145728") == 3145728, "a larger event capacity was rejected");
+    Check(TraceThread::ParseCapacity("4194304") == TraceThread::MaximumCapacity, "the maximum event capacity was rejected");
+    std::atomic<std::uint64_t> presents{1};
+    const auto requested = std::to_string(TraceThread::DefaultCapacity + 1);
+    TraceThread thread("queue worker 0x0", presents, TraceThread::ParseCapacity(requested.c_str()));
+    const auto origin = Clock::now();
+    for (std::size_t index = 0; index <= TraceThread::DefaultCapacity; ++index)
+        thread.Add("Driver.Packet", nullptr, origin, origin + microseconds(30));
+    auto snapshot = thread.Collect();
+    Check(snapshot.slices.size() == TraceThread::DefaultCapacity + 1 && !snapshot.dropped, "the configured buffer stopped at the default capacity");
+    thread.Add("Driver.Packet", nullptr, origin, origin + microseconds(30));
+    snapshot = thread.Collect();
+    Check(snapshot.slices.size() == TraceThread::DefaultCapacity + 1 && snapshot.dropped, "the configured buffer grew beyond its capacity");
+    Check(snapshot.totals.size() == 1 && snapshot.totals[0].count == TraceThread::DefaultCapacity + 2, "totals lost the event past the configured capacity");
+    for (const auto* text : {"", "0", "-1", "+1", "1.5", " 1", "1 ", "1x", "4194305", "18446744073709551616"}) {
+        bool rejected = false;
+        try { TraceThread::ParseCapacity(text); }
+        catch (const std::invalid_argument& error) { rejected = std::string_view(error.what()).starts_with("APS5_TRACE_EVENTS="); }
+        Check(rejected, "an invalid event capacity did not report its setting");
+    }
+}
+
 void FoldShortSlices() {
     std::atomic<std::uint64_t> presents{1};
     TraceThread thread("queue worker 0x0", presents, 16);
@@ -298,6 +323,7 @@ int main() {
         WindowBySeconds();
         WindowRejects();
         BufferCap();
+        CapacitySettings();
         FoldShortSlices();
         EscapeStrings();
         EventsShape();

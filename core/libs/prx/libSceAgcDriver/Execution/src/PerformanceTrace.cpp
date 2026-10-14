@@ -138,6 +138,7 @@ double seconds(Clock::duration elapsed) {
 void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
     if (!Configured() || local != nullptr) return;
     const bool windowed = std::getenv("APS5_TRACE_FRAMES") != nullptr || std::getenv("APS5_TRACE_SECONDS") != nullptr;
+    if (windowed && capacity == TraceThread::DefaultCapacity) capacity = TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS"));
     auto bound = std::make_unique<TraceThread>(name, presentCount, windowed ? capacity : 0, buffering);
     auto& state = session();
     std::lock_guard lock(state.mutex);
