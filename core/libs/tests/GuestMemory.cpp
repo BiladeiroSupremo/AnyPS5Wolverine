@@ -909,7 +909,7 @@ static bool RegisteredGuestRange(const void* pointer, std::size_t bytes) {
 
 static void CheckGuestModuleImageProtection() {
     constexpr std::size_t page = 0x4000;
-    const auto path = std::filesystem::relative(GUEST_MEMORY_MODULE).generic_string();
+    const auto path = std::filesystem::relative(GUEST_MEMORY_ELF0_MODULE).generic_string();
     void* module = dlopen_nid_postfix(path.c_str(), 2);
     Require(module != nullptr);
     auto* target = GuestModulePage(module, page);
@@ -996,6 +996,20 @@ static void CheckGuestModuleImageProtection() {
     Require(dlclose_nid_postfix(foreignModule) == 0);
     Require(!RegisteredGuestRange(foreignTarget, page));
     std::filesystem::remove(prxPath);
+
+    const auto plainPath = std::filesystem::relative(GUEST_MEMORY_MODULE).generic_string();
+    void* plainModule = dlopen_nid_postfix(plainPath.c_str(), 2);
+    Require(plainModule != nullptr);
+    auto* plainTarget = GuestModulePage(plainModule, page);
+    rejected = false;
+    try {
+        sceKernelMprotect(plainTarget, page, 1);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    Require(rejected);
+    Require(!RegisteredGuestRange(plainTarget, page));
+    Require(dlclose_nid_postfix(plainModule) == 0);
 }
 #endif
 
