@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Breadcrumbs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -1320,11 +1321,13 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {
         context.Function<PFN_vkCmdDrawMeshTasksIndirectEXT>("vkCmdDrawMeshTasksIndirectEXT")(commands, argumentBuffer, argumentOffset, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
+        Breadcrumbs::Mark(commands, "draw-mesh-indirect", Breadcrumbs::Program(), draw.indexCount, draw.instanceCount, 0);
         return;
     }
     if (state.stages.mesh) {
         APS5_LOG_OUT_DEBUG("vkCmdDrawMeshTasksEXT groups=%u instances=%u", inputs.meshGroups, draw.instanceCount);
         context.Function<PFN_vkCmdDrawMeshTasksEXT>("vkCmdDrawMeshTasksEXT")(commands, inputs.meshGroups, draw.instanceCount, 1);
+        Breadcrumbs::Mark(commands, "draw-mesh", Breadcrumbs::Program(), inputs.meshGroups, draw.instanceCount, 0);
         return;
     }
     if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
@@ -1364,6 +1367,7 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
             }
         }
     }
+    Breadcrumbs::Mark(commands, args != nullptr ? "draw-indirect" : state.stages.mesh ? "draw-mesh" : "draw", Breadcrumbs::Program(), draw.indexCount, draw.instanceCount, args != nullptr ? args->count : 0u);
 }
 
 // The GPU-side records of an indirect draw, recorded outside the render pass: the stores that

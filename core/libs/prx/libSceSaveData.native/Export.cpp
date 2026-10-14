@@ -796,8 +796,11 @@ static int convert(const SaveDataConvert* param) {
     if (!std::filesystem::is_directory(save_root() + "/" + dirName)) {
         return SAVE_DATA_ERROR_NOT_FOUND;
     }
+    // Saves here are only ever in the current format. A result >= 0 means a conversion started,
+    // which the title then waits on without polling the progress: with a save present the title
+    // menu never came up (black screen at 14 FPS). NO_NEED_CONVERT lets it go on, as KytyPS5 does.
     g_convertProgress = 1.0f;
-    return SAVE_DATA_OK;
+    return SAVE_DATA_ERROR_NO_NEED_CONVERT;
 }
 
 int APS5_VABI sceSaveDataConvert(const SaveDataConvert* param) {

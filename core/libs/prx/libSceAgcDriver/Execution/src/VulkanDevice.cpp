@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Breadcrumbs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeapTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -295,6 +296,8 @@ struct VulkanDevice::State {
     bool pipelineLinkTimeOptimization = true;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    // VK_AMD_buffer_marker enabled for APS5_GPU_BREADCRUMBS.
+    bool bufferMarker = false;
     bool maintenance8 = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
@@ -1636,6 +1639,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         faultFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &faultFeatures;
     }
+    // APS5_GPU_BREADCRUMBS=1: completion markers after every command (Graphics/Breadcrumbs.hpp).
+    if (Graphics::Breadcrumbs::Requested() && hasExtension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+        state->bufferMarker = true;
+    }
     bdaFeatures.pNext = &byteFeatures;
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
@@ -1806,6 +1816,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
         state->scaler = std::make_unique<PresentationScaler>(graphicsContext(), VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM);
     }
+    if (state->bufferMarker) Graphics::Breadcrumbs::Attach(graphicsContext(), state->DeviceFunction<PFN_vkCmdWriteBufferMarkerAMD>("vkCmdWriteBufferMarkerAMD"));
 }
 
 VulkanDevice::~VulkanDevice() = default;
@@ -4306,6 +4317,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     recorder.EndGpuTiming(gpuTiming);
+    Graphics::Breadcrumbs::Mark(commands, argumentImport != nullptr ? "dispatch-indirect" : "dispatch", record.programAddress, record.x, record.y, record.z);
     const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);

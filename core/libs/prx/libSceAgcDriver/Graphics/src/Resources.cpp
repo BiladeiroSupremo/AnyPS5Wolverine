@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Breadcrumbs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -193,6 +194,7 @@ void ReportDeviceLost() {
     std::lock_guard lock(reporter.mutex);
     if (reporter.reported) return;
     reporter.reported = true;
+    Breadcrumbs::Report();
     if (reporter.getFaultInfo == nullptr) {
         std::fprintf(stderr, "[gpu] device lost (no VK_EXT_device_fault report)\n");
         return;
