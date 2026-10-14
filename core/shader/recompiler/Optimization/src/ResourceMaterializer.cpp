@@ -958,7 +958,45 @@ void ResourceMaterializer::PrepareImageModes(ShaderInfo& info) {
 
 namespace {
 
+// A control-flow condition whose value graph is larger than this many values is dropped from the
+// plan (APS5_PLAN_CONDITION_LIMIT, default 1024, 0 = keep all): the descriptor evaluation then takes
+// both successors, as it does for a condition it cannot evaluate from uniform memory. Conditions of
+// that size depend on per-thread data; in PPSA03671 they made plans ~5,700 values on average
+// (largest 207,884) and ~1.2 GB of plan values in all.
+std::size_t conditionLimit() {
+    static const std::size_t limit = [] {
+        const char* text = std::getenv("APS5_PLAN_CONDITION_LIMIT");
+        return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{1024};
+    }();
+    return limit;
+}
+
+bool graphLargerThan(const IrValue* root, std::size_t limit) {
+    std::unordered_map<const IrValue*, bool> seen;
+    std::vector<const IrValue*> pending{root};
+    while (!pending.empty()) {
+        const auto* value = pending.back();
+        pending.pop_back();
+        if (!seen.emplace(value, true).second) continue;
+        if (seen.size() > limit) return true;
+        for (const auto* argument : value->Arguments()) {
+            if (argument != nullptr) pending.push_back(argument);
+        }
+    }
+    return false;
+}
+
+std::atomic<std::uint64_t> droppedConditions{0};
+
 void ownPlanValues(IrResourcePlan& plan) {
+    if (const auto limit = conditionLimit(); limit != 0) {
+        for (auto& block : plan.controlFlow) {
+            if (block.condition != nullptr && graphLargerThan(block.condition, limit)) {
+                block.condition = nullptr;
+                droppedConditions.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     std::vector<IrValue**> roots;
     for (auto& source : plan.descriptorSources) {
         for (auto& dword : source.dwords) roots.push_back(&dword);
@@ -1013,6 +1051,23 @@ void ownPlanValues(IrResourcePlan& plan) {
     }
     for (auto* root : roots) {
         if (*root != nullptr) *root = clones.at(*root);
+    }
+    // The plan is immutable from here on and only its arguments are walked (the SRT evaluation),
+    // so the use lists go: with ~8 million plan values in PPSA03671 they held ~0.3 GB.
+    for (auto& value : plan.valueStorage) value->ReleaseUseLists();
+    // APS5_TRACE_PLAN_SIZES: plans made and their values, every 500 plans (the largest named).
+    static const bool traceSizes = std::getenv("APS5_TRACE_PLAN_SIZES") != nullptr;
+    if (traceSizes) {
+        static std::mutex mutex;
+        static std::uint64_t plans = 0, values = 0, largest = 0, largestHash = 0;
+        std::lock_guard lock(mutex);
+        ++plans;
+        values += plan.valueStorage.size();
+        if (plan.valueStorage.size() > largest) {
+            largest = plan.valueStorage.size();
+            largestHash = plan.shaderHash;
+        }
+        if (plans % 500 == 0) std::fprintf(stderr, "[plan] %llu plans, %llu values (%.0f each), largest %llu (shader hash 0x%llx), %llu conditions dropped; roots: %zu descriptor sources, %zu SRT reads, %zu control flow, %zu uniform fill\n", static_cast<unsigned long long>(plans), static_cast<unsigned long long>(values), static_cast<double>(values) / static_cast<double>(plans), static_cast<unsigned long long>(largest), static_cast<unsigned long long>(largestHash), static_cast<unsigned long long>(droppedConditions.load(std::memory_order_relaxed)), plan.descriptorSources.size(), plan.srtReads.size(), plan.controlFlow.size(), plan.uniformFill.values.size());
     }
 }
 

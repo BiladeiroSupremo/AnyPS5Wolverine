@@ -37,6 +37,13 @@ void IrValue::AddArgument(IrValue* argument) {
     argument->operandUses.push_back(IrUse{this, arguments.size() - 1});
 }
 
+void IrValue::ReleaseUseLists() {
+    std::vector<IrValue*>().swap(uses);
+    std::vector<IrUse>().swap(operandUses);
+    arguments.shrink_to_fit();
+    phiBlocks.shrink_to_fit();
+}
+
 void IrValue::ReplaceArgument(std::size_t index, IrValue* argument) {
     if (index >= arguments.size()) {
         throw std::out_of_range("IrValue::ReplaceArgument index is out of range");

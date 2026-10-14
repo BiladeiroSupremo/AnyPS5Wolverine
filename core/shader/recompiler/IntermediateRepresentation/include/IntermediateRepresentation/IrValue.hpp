@@ -41,6 +41,9 @@ public:
     [[nodiscard]] std::uint32_t ImmediateU32() const;
 
     void AddArgument(IrValue* argument);
+    // For a finished, immutable copy (a resource plan's values): frees the use lists, which only
+    // passes rewriting a program read, and trims the argument storage to its size.
+    void ReleaseUseLists();
     void ReplaceArgument(std::size_t index, IrValue* argument);
     void ReplaceAllUsesWith(IrValue* replacement);
     void SetImmediateU32(std::uint32_t value);
