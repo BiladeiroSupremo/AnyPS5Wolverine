@@ -3,6 +3,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Apr/src/Apr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/Equeue.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/EventAccessors.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/File/src/ArchivedFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/DescriptorControl.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/FileEvent.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/Kqueue.cpp
@@ -1187,6 +1188,18 @@ if(BUILD_TESTING)
         set_tests_properties(guest_socket_pair PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
+    add_test_executable(guest_kernel_app_archive_tests ${LIBS_INCLUDE_DIR}/tests/GuestKernelAppArchive.cpp)
+    target_include_directories(guest_kernel_app_archive_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_kernel_app_archive_tests PRIVATE libkernel libc zarchive)
+    configure_windows_unwind(guest_kernel_app_archive_tests)
+    foreach(mode archive plain)
+        add_test(NAME guest_kernel_app_archive_${mode} COMMAND guest_kernel_app_archive_tests ${mode})
+        set_tests_properties(guest_kernel_app_archive_${mode} PROPERTIES TIMEOUT 20)
+        if(WIN32)
+            set_tests_properties(guest_kernel_app_archive_${mode} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        endif()
+    endforeach()
     add_test_executable(guest_dup_tests ${LIBS_INCLUDE_DIR}/tests/GuestDup.cpp)
     target_include_directories(guest_dup_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_dup_tests PRIVATE libkernel libc)
