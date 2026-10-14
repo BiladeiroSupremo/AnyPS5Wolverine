@@ -40,6 +40,17 @@ int main() {
     Require(fcntl_nid_postfix(plain, SetDescriptorFlags, 0) == 0 && fcntl_nid_postfix(plain, GetDescriptorFlags) == 0, "F_SETFD 0 must clear FD_CLOEXEC");
     Require(close_nid_postfix(copy) == 0, "close failed");
 
+    const int target = socket_nid_postfix(2, Stream, 0);
+    Require(target >= 0, "socket failed");
+    Require(fcntl_nid_postfix(target, SetDescriptorFlags, CloseOnExec) == 0 && fcntl_nid_postfix(target, GetDescriptorFlags) == CloseOnExec, "F_SETFD on the dup2 target must succeed");
+    Require(fcntl_nid_postfix(plain, SetDescriptorFlags, CloseOnExec) == 0, "F_SETFD on a socket must succeed");
+    Require(dup2_nid_postfix(plain, target) == target, "dup2 onto another socket must return the target");
+    Require(fcntl_nid_postfix(target, GetDescriptorFlags) == 0, "dup2 must clear FD_CLOEXEC on the target");
+    Require(fcntl_nid_postfix(plain, GetDescriptorFlags) == CloseOnExec, "dup2 must leave the flag of the original");
+    Require(dup2_nid_postfix(plain, plain) == plain && fcntl_nid_postfix(plain, GetDescriptorFlags) == CloseOnExec, "dup2 onto the same descriptor must leave the flag");
+    Require(fcntl_nid_postfix(plain, SetDescriptorFlags, 0) == 0, "F_SETFD 0 must clear FD_CLOEXEC");
+    Require(close_nid_postfix(target) == 0, "close failed");
+
     const int marked = socket_nid_postfix(2, Stream | SocketCloseOnExec, 0);
     Require(marked >= 0 && fcntl_nid_postfix(marked, GetDescriptorFlags) == CloseOnExec, "SOCK_CLOEXEC must set FD_CLOEXEC");
     Require(close_nid_postfix(marked) == 0, "close failed");
