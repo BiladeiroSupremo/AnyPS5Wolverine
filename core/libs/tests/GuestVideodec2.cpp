@@ -446,12 +446,12 @@ void testVp9PictureMetadata() {
     }
     superframe.push_back(0xc9);
     decode(superframe, firstBuffer, firstOutput, 9000);
-    check(firstOutput.isValid && hashNv12(firstBuffer.data(), firstOutput.framePitch) == Vp9Hashes[0], "VP9 first superframe picture differs");
+    check(firstOutput.isValid && hashNv12(firstBuffer.data(), firstOutput.framePitch, firstOutput.frameHeight) == Vp9Hashes[0], "VP9 first superframe picture differs");
     const auto firstInfo = query(firstOutput);
     check(firstInfo.isValid && firstInfo.numFrames == 2 && firstInfo.keyFrameFlag == 1 && firstInfo.ptsData == 9000 && firstInfo.dtsData == 9001 && firstInfo.attachedData == 9002, "VP9 first superframe metadata differs");
     FrameBuffer frame{sizeof(FrameBuffer), secondBuffer.data(), secondBuffer.size(), false};
     check(sceVideodec2Flush_nid_postfix(handle, &frame, &secondOutput) == 0 && secondOutput.isValid, "VP9 second superframe picture missing");
-    check(hashNv12(secondBuffer.data(), secondOutput.framePitch) == Vp9Hashes[1], "VP9 second superframe picture differs");
+    check(hashNv12(secondBuffer.data(), secondOutput.framePitch, secondOutput.frameHeight) == Vp9Hashes[1], "VP9 second superframe picture differs");
     const auto secondInfo = query(secondOutput);
     check(secondInfo.numFrames == 2 && secondInfo.keyFrameFlag == 0 && secondInfo.ptsData == 9000, "VP9 second superframe metadata differs");
     firstOutput.frameWidth = 1;
@@ -464,7 +464,7 @@ void testVp9PictureMetadata() {
     decode(std::vector<std::uint8_t>{0x88}, secondBuffer, secondOutput, 9200);
     info = query(secondOutput);
     check(info.isValid && info.ptsData == 9200 && info.keyFrameFlag == 0 && info.frameWidth == Width, "VP9 existing reference metadata differs");
-    check(hashNv12(secondBuffer.data(), secondOutput.framePitch) == Vp9Hashes[0], "VP9 existing reference pixels differ");
+    check(hashNv12(secondBuffer.data(), secondOutput.framePitch, secondOutput.frameHeight) == Vp9Hashes[0], "VP9 existing reference pixels differ");
     check(sceVideodec2Reset_nid_postfix(handle) == 0, "VP9 reset failed");
     checkThrows([&] { decode(std::vector<std::uint8_t>{0x88}, firstBuffer, firstOutput, 9300); });
     checkThrows([&] { decode(std::vector<std::uint8_t>{0}, firstBuffer, firstOutput, 9400); });
@@ -484,7 +484,7 @@ void testVp9PictureMetadata() {
     decode(resized, firstBuffer, firstOutput, 9600);
     info = query(firstOutput);
     check(info.isValid && info.bitDepth == 8 && info.colorRange == 1 && info.frameWidth == Width && info.frameHeight == Height && info.renderWidth == Width * 2 && info.renderHeight == Height * 2, "VP9 render size or color range metadata differs");
-    check(hashNv12(firstBuffer.data(), firstOutput.framePitch) == Vp9Hashes[0], "VP9 render metadata changed coded pixels");
+    check(hashNv12(firstBuffer.data(), firstOutput.framePitch, firstOutput.frameHeight) == Vp9Hashes[0], "VP9 render metadata changed coded pixels");
     check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0 && !query(firstOutput).isValid, "VP9 delete retained picture ownership");
 }
 
