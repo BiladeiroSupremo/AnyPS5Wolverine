@@ -25,6 +25,7 @@ constexpr int GuestInvalid = 22;
 constexpr int GuestNoMemory = 12;
 constexpr int GuestBadDescriptor = 9;
 constexpr int GuestAccess = 13;
+constexpr int GuestFault = 14;
 constexpr int GuestIoError = 5;
 constexpr int GuestNotSupported = 45;
 constexpr int GuestShared = 0x1;
@@ -248,6 +249,25 @@ int APS5_VABI madvise_nid_postfix(void* address, std::size_t length, int advice)
         SetError(GuestInvalid);
         return -1;
     }
+    return 0;
+}
+
+int APS5_VABI mincore_nid_postfix(const void* address, std::size_t length, char* vec) {
+    const auto failed = [](int error) {
+        SetError(error);
+        return -1;
+    };
+    constexpr std::uintptr_t mask = PS5_PAGE_SIZE - 1;
+    const auto first = reinterpret_cast<std::uintptr_t>(address);
+    if ((first & mask) != 0) return failed(GuestInvalid);
+    if (length == 0) return 0;
+    if (vec == nullptr) return failed(GuestFault);
+    if (length > std::numeric_limits<std::uintptr_t>::max() - mask - first) return failed(GuestNoMemory);
+    const auto end = (first + length + mask) & ~mask;
+    if (end <= first) return failed(GuestNoMemory);
+    if (!GuestRangeMapped(first, end)) return failed(GuestNoMemory);
+    const std::size_t pages = (end - first) / PS5_PAGE_SIZE;
+    std::fill_n(vec, pages, static_cast<char>(1));
     return 0;
 }
 
