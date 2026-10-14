@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: true
+          submodules: recursive
       - id: toolchain
         if: matrix.platform == 'windows'
         uses: actions/cache@v6
