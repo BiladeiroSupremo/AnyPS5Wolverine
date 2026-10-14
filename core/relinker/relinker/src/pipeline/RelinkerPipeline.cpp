@@ -19,7 +19,9 @@ using namespace Elfpatcher;
 
 namespace {
 
+constexpr std::uint16_t kEtNone = 0;
 constexpr std::uint16_t kEtRel = 1;
+constexpr std::uint16_t kEtCore = 4;
 
 }
 
@@ -57,6 +59,11 @@ std::string RelinkerPipeline::relocationTypeName(std::uint32_t type) {
 RelinkResult RelinkerPipeline::Relink() {
     if (elfReader->ReadHeader().Type == kEtRel)
         throw RelinkerException("ET_REL relocatable inputs are not supported");
+    const auto inputType = elfReader->ReadHeader().Type;
+    if (inputType == kEtNone)
+        throw RelinkerException("ET_NONE inputs do not specify an ELF object type");
+    if (inputType == kEtCore)
+        throw RelinkerException("ET_CORE core dumps are not executable images");
 
     auto programHeaders = elfReader->ReadProgramHeaders();
 
