@@ -4186,11 +4186,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     // Thread dimensions: a kernel turns the thread counts into group counts in a scratch buffer the
     // dispatch reads instead (its barriers order it after the counts' writers and before the read).
+    // Group counts go through the same kernel (one thread per group) unless
+    // APS5_NO_INDIRECT_VALIDATE=1: it drops counts past the device limits or 2^24 groups, which the
+    // CPU path rejects too. Read unchecked, such counts hung the GPU (device lost, 2026-10-14).
+    static const bool validateGroups = std::getenv("APS5_NO_INDIRECT_VALIDATE") == nullptr;
     std::shared_ptr<Graphics::Buffer> threadGroups;
-    if (argumentImport != nullptr && record.threadDimensions) {
+    if (argumentImport != nullptr && (record.threadDimensions || (validateGroups && argumentImport->address != 0 && recorder.ThreadGroupsAvailable()))) {
         threadGroups = std::make_shared<Graphics::Buffer>(context, 16, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
         const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
-        const bool recorded = argumentImport->address != 0 && recorder.RecordThreadGroups(commands, argumentImport->address + (arguments - argumentImport->base), threadGroups->DeviceAddress(), record.threadsPerGroup, {limit[0], limit[1], limit[2]});
+        const auto perGroup = record.threadDimensions ? record.threadsPerGroup : std::array<std::uint32_t, 3>{1u, 1u, 1u};
+        const bool recorded = argumentImport->address != 0 && recorder.RecordThreadGroups(commands, argumentImport->address + (arguments - argumentImport->base), threadGroups->DeviceAddress(), perGroup, {limit[0], limit[1], limit[2]});
         if (!recorded) throw std::runtime_error("Vulkan dispatch: a thread-dimension indirect dispatch found no group-count kernel after the decision");
         recorder.NotePendingRead(arguments, 12, Graphics::Recorder::ReadKind::Indirect);
         recorder.Keep(threadGroups);
