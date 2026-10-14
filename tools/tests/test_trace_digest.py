@@ -64,6 +64,41 @@ class TraceDigestTests(unittest.TestCase):
     def test_summary_is_the_line_of_this_trace(self):
         self.assertEqual(self.result()["summary"]["trace"], "aps5-trace-abc-7.json.gz")
 
+    def test_decompressing_trace_preserves_the_complete_command_line_digest(self):
+        uncompressed = self.trace.with_suffix("")
+        uncompressed.write_bytes(gzip.decompress(self.trace.read_bytes()))
+        results = []
+        for trace in (self.trace, uncompressed):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(trace_digest.main([str(trace), "--json"]), 0)
+            results.append(json.loads(output.getvalue()))
+        self.assertEqual((results[0]["frames"], results[0]["window_ms"]), (3, 40.0))
+        self.assertEqual(results[1], results[0])
+
+    def test_compressed_trace_can_use_a_summary_named_for_its_plain_copy(self):
+        summary = dict(SUMMARY, trace=self.trace.with_suffix("").name)
+        path = self.trace.with_name("named-summary.jsonl")
+        path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+        self.assertEqual(trace_digest.load_summary(path, self.trace), summary)
+
+    def test_exact_trace_filename_wins_over_a_later_compression_alias(self):
+        uncompressed = self.trace.with_suffix("")
+        exact = dict(SUMMARY, trace=uncompressed.name, commit="exact")
+        alias = dict(SUMMARY, commit="alias")
+        path = self.trace.with_name("aps5-summary.jsonl")
+        path.write_text(json.dumps(exact) + "\n" + json.dumps(alias) + "\n", encoding="utf-8")
+        self.assertEqual(trace_digest.load_summary(None, uncompressed), exact)
+        self.assertEqual(trace_digest.load_summary(None, self.trace), alias)
+
+    def test_decompressed_trace_uses_the_latest_matching_alias_and_skips_other_traces(self):
+        uncompressed = self.trace.with_suffix("")
+        latest = dict(SUMMARY, commit="latest")
+        unrelated = dict(SUMMARY, trace="other.json.gz", commit="other")
+        path = self.trace.with_name("aps5-summary.jsonl")
+        path.write_text("\n".join(json.dumps(line) for line in (SUMMARY, latest, unrelated)) + "\n", encoding="utf-8")
+        self.assertEqual(trace_digest.load_summary(None, uncompressed), latest)
+
     def test_explicit_summary_selects_the_matching_trace(self):
         summary = Path(self.directory.name) / "relocated-summary.jsonl"
         other = dict(SUMMARY, trace="other.json.gz", presents=99)
