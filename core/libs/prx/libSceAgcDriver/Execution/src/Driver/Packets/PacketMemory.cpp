@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -109,7 +110,56 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     }
 
     static const bool cpuStores = std::getenv("APS5_CPU_STORES") != nullptr;
-    if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
+    // A small copy whose source recorded GPU work still writes is a transfer on the GPU: the store
+    // path reads the source on the CPU, which waits for that work (~5 ms each, hundreds per 10 s).
+    // APS5_NO_DMA_GPU_COPY=1 keeps such copies on the store path.
+    static const bool gpuCopies = std::getenv("APS5_NO_DMA_GPU_COPY") == nullptr;
+    bool copiedOnGpu = false;
+    if (!drainAll && !cpuStores && gpuCopies && opcode == 0x50) {
+        auto copy = Pm4::DecodeMemoryCopy(packet);
+        // A read of the global data share (the title copies a counter its dispatches maintain there
+        // into memory every frame) is the same transfer from the share's guest memory.
+        if (!copy.has_value() && packet.size() == 7 && Pm4::DmaSource(packet) == 1 && (Pm4::DmaDestination(packet) == 0 || Pm4::DmaDestination(packet) == 3)) {
+            const std::size_t bytes = packet[6] & 0x3ffffffu;
+            if (bytes != 0 && packet[2] <= Pm4::GdsBytes && bytes <= Pm4::GdsBytes - packet[2]) copy = Pm4::MemoryCopy{Pm4::GdsAddress() + packet[2], packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u), bytes};
+        }
+        if (copy.has_value() && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            auto* recorder = Graphics::Recorder::Active();
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> sourceRange{{{copy->source, copy->source + copy->bytes}}};
+            const auto localDevice = device.Load();
+            if (localDevice != nullptr && recorder != nullptr && (recorder->PendingWriteOverlaps(copy->source, copy->bytes) || Graphics::StorageTexture::AnyPendingOverlaps(sourceRange))) {
+                recordDeferredLabels(localDevice.get(), submission.queue);
+                const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                if (outcome.path == 1 || outcome.path == 3) {
+                    wroteOnGpu = true;
+                    copiedOnGpu = true;
+                    ++dmaCopiesOnGpu;
+                }
+            }
+        }
+        // Debug aid: APS5_TRACE_DMA_WAITS prints the first DMA packets left on the store path whose
+        // memory source recorded GPU work still writes (each such read waits for that work).
+        static const bool traceWaits = std::getenv("APS5_TRACE_DMA_WAITS") != nullptr;
+        static std::atomic<int> tracedWaits{0};
+        if (traceWaits && !copiedOnGpu && packet.size() >= 7 && Pm4::DmaSource(packet) != 2) {
+            const auto source = Pm4::DmaSource(packet) == 1 ? Pm4::GdsAddress() + packet[2] : packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+            const std::size_t bytes = packet[6] & 0x3ffffffu;
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            auto* recorder = Graphics::Recorder::Active();
+            if (recorder != nullptr && recorder->PendingWriteOverlaps(source, bytes) && tracedWaits.fetch_add(1, std::memory_order_relaxed) < 60) {
+                std::string words;
+                for (std::size_t i = 0; i < std::min<std::size_t>(packet.size(), 8); ++i) {
+                    char text[12];
+                    std::snprintf(text, sizeof(text), " %08x", packet[i]);
+                    words += text;
+                }
+                std::fprintf(stderr, "[dma-wait] queue 0x%x source 0x%llx %zu bytes, destination select %u:%s%s\n", submission.queue, static_cast<unsigned long long>(source), bytes, Pm4::DmaDestination(packet), words.c_str(), copy.has_value() ? " (memory copy)" : " (not a memory copy)");
+            }
+        }
+    }
+    if (!drainAll && !cpuStores && !copiedOnGpu && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
         if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
