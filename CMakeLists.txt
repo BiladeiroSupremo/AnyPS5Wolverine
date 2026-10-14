@@ -164,6 +164,9 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_agent_files.py)
         add_test(NAME check_compile COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_compile.py)
+        add_test(NAME performance_compare COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_performance_compare.py)
+        set_tests_properties(performance_compare PROPERTIES TIMEOUT 20)
     endif()
 endif()
 
