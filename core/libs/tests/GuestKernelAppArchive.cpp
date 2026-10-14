@@ -13,6 +13,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <vector>
 
 struct KernelIovec {
@@ -44,6 +45,19 @@ void* APS5_VABI fdopen_nid_postfix(int d, const char* mode);
 int APS5_VABI sceKernelAioSubmitReadCommands(KernelAioRwRequest* req, std::int32_t size, std::int32_t prio, std::int32_t* id);
 int APS5_VABI sceKernelAioWaitRequest(std::int32_t id, std::int32_t* state, std::uint32_t* usec);
 int APS5_VABI sceKernelAioDeleteRequest(std::int32_t id, std::int32_t* ret);
+int APS5_VABI flock_nid_postfix(int d, int operation);
+int APS5_VABI _fstatfs_nid_postfix(int d, void* buf);
+int APS5_VABI ftruncate_nid_postfix(int d, std::int64_t length);
+int APS5_VABI sceKernelFsync(int d);
+int APS5_VABI sceKernelFdatasync(int d);
+int APS5_VABI sceKernelGetdents(int d, char* buf, int nbytes);
+int APS5_VABI sceKernelFchmod(int d, std::uint16_t mode);
+int APS5_VABI sceKernelFutimes(int d, const void* times);
+void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protection, int flags, int descriptor, std::int64_t offset) noexcept;
+void* APS5_VABI __cxa_current_primary_exception_nid_postfix();
+std::type_info* APS5_VABI __cxa_current_exception_type_nid_postfix();
+using TerminateHandler = void (*)();
+TerminateHandler APS5_VABI _ZSt13set_terminatePFvvE_nid_postfix(TerminateHandler);
 }
 
 namespace {
@@ -55,6 +69,14 @@ void Require(bool value, int line) {
     }
 }
 #define Check(value) Require((value), __LINE__)
+
+void OnMmapRefused() {
+    const auto* type = __cxa_current_exception_type_nid_postfix();
+    const auto* error = static_cast<const std::runtime_error*>(__cxa_current_primary_exception_nid_postfix());
+    const bool refused = type != nullptr && error != nullptr && std::strcmp(type->name(), typeid(std::runtime_error).name()) == 0 &&
+        std::strstr(error->what(), "mmap on a file read from app0.zar") != nullptr && std::strstr(error->what(), "not implemented") != nullptr;
+    std::_Exit(refused ? 0 : 1);
+}
 
 template <typename TCall> bool NotImplemented(TCall call) {
     try {
@@ -175,6 +197,16 @@ void Refusals() {
     const int fd = sceKernelOpen("/app0/Data/Small.txt", SCE_KERNEL_O_RDONLY, 0);
     Check(fd >= 0);
     Check(NotImplemented([fd] { (void)fdopen_nid_postfix(fd, "r"); }));
+    Check(NotImplemented([fd] { (void)flock_nid_postfix(fd, 1); }));
+    Check(NotImplemented([fd] { alignas(8) char statfs[512]; (void)_fstatfs_nid_postfix(fd, statfs); }));
+    Check(NotImplemented([fd] { (void)ftruncate_nid_postfix(fd, 0); }));
+    Check(NotImplemented([fd] { (void)sceKernelFsync(fd); }));
+    Check(NotImplemented([fd] { (void)sceKernelFdatasync(fd); }));
+    Check(NotImplemented([fd] { char entries[512]; (void)sceKernelGetdents(fd, entries, sizeof(entries)); }));
+    Check(NotImplemented([fd] { (void)sceKernelFchmod(fd, 0444); }));
+    Check(NotImplemented([fd] { (void)sceKernelFutimes(fd, nullptr); }));
+    FileStat status{};
+    Check(sceKernelFstat(fd, &status) == 0 && status.st_size == 3);
     Check(sceKernelClose(fd) == 0);
 }
 
@@ -206,6 +238,13 @@ int main(int argc, char** argv) {
         Reads();
         Status();
         Refusals();
+    } else if (mode == "mmap") {
+        Archive(root);
+        const int fd = sceKernelOpen("/app0/Data/Small.txt", SCE_KERNEL_O_RDONLY, 0);
+        Check(fd >= 0);
+        _ZSt13set_terminatePFvvE_nid_postfix(OnMmapRefused);
+        (void)mmap_nid_postfix(nullptr, 16384, 1, 2, fd, 0);
+        return 1;
     } else if (mode == "plain") {
         WithoutArchive();
     } else {
