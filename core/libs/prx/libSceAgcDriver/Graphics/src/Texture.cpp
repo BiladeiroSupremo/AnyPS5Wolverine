@@ -3111,13 +3111,15 @@ void StorageTexture::FlushAllPending(const char* reason) {
 }
 
 void StorageTexture::FlushIdlePending(const char* reason) {
-    // Experiment (APS5_IDLE_STORE_MAX_KB): the idle store is the safety net for CPU reads the
-    // driver cannot see; PPSA03671's per-frame one is presumably a small result (a readback), while
-    // its ~100 render targets a frame (~1.5 GB/s of GPU retiling) are only sampled on the GPU,
-    // which reads the images themselves. Larger images stay pending for the reads the driver sees.
+    // The idle store is the safety net for CPU reads the driver cannot see. PPSA03671's per-frame
+    // one is a small result (a readback), while its ~100 render targets a frame (~1.5 GB/s of GPU
+    // retiling through ~2.6 GB of pooled device buffers) are only sampled on the GPU, which reads
+    // the images themselves. So images over APS5_IDLE_STORE_MAX_KB (default 1024, 0 = every image)
+    // stay pending for the reads the driver sees. 2026-10-14: device memory 7.0 -> 5.4 GB, write-back
+    // device buffers 15 GB -> 0.3 GB per 10 s, same FPS and renders.
     static const std::uint64_t limit = [] {
         const char* value = std::getenv("APS5_IDLE_STORE_MAX_KB");
-        return value != nullptr ? std::strtoull(value, nullptr, 10) << 10u : 0ull;
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ull) << 10u;
     }();
     idleSizeLimit = limit;
     static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
