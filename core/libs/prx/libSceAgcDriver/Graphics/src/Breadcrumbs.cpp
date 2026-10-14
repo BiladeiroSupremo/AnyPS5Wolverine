@@ -18,7 +18,17 @@ struct Entry {
     const char* kind = "";
     std::uint64_t program = 0;
     std::uint32_t a = 0, b = 0, c = 0;
+    std::uint32_t slot = 0;
 };
+
+// Each recording thread (one per queue in practice) writes its own marker word, so one queue's
+// progress does not hide another's hang.
+constexpr std::uint32_t Slots = 16;
+std::atomic<std::uint32_t> nextSlot{0};
+std::uint32_t ThreadSlot() {
+    thread_local const std::uint32_t slot = nextSlot.fetch_add(1) % Slots;
+    return slot;
+}
 
 constexpr std::size_t RingSize = 1u << 16u;
 std::array<Entry, RingSize>& Ring() {
@@ -40,8 +50,8 @@ bool Requested() {
 
 void Attach(const Context& context, PFN_vkCmdWriteBufferMarkerAMD write) {
     if (!Requested() || write == nullptr) return;
-    markers = std::make_unique<Buffer>(context, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    std::memset(markers->Bytes().data(), 0, 16);
+    markers = std::make_unique<Buffer>(context, Slots * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::memset(markers->Bytes().data(), 0, Slots * 4u);
     writeMarker = write;
     std::fprintf(stderr, "[breadcrumbs] on: every draw and dispatch writes a completion marker\n");
 }
@@ -63,20 +73,37 @@ void Mark(VkCommandBuffer commands, const char* kind, std::uint64_t program, std
     entry.a = a;
     entry.b = b;
     entry.c = c;
+    entry.slot = ThreadSlot();
     entry.id.store(id, std::memory_order_release);
-    writeMarker(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, markers->Handle(), 0, id);
+    writeMarker(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, markers->Handle(), entry.slot * 4u, id);
 }
 
 void Report() {
     if (markers == nullptr) return;
-    std::uint32_t done = 0;
-    std::memcpy(&done, markers->Bytes().data(), 4);
     const auto last = next.load(std::memory_order_relaxed);
-    std::fprintf(stderr, "[breadcrumbs] the GPU finished command %u of %u recorded; the last finished and the next ones:\n", done, last);
-    for (std::uint32_t id = done > 8 ? done - 8 : 1; id <= last && id <= done + 24; ++id) {
-        const auto& entry = Ring()[id % RingSize];
-        if (entry.id.load(std::memory_order_acquire) != id) continue;
-        std::fprintf(stderr, "[breadcrumbs] %s %u %s program 0x%llx %u %u %u\n", id <= done ? "done" : "PENDING", id, entry.kind, static_cast<unsigned long long>(entry.program), entry.a, entry.b, entry.c);
+    for (std::uint32_t slot = 0; slot < Slots; ++slot) {
+        std::uint32_t done = 0;
+        std::memcpy(&done, markers->Bytes().data() + slot * 4u, 4);
+        if (done == 0) continue;
+        // The commands this recording thread recorded after the last one the GPU finished.
+        std::uint32_t pending = 0;
+        for (std::uint32_t id = done + 1; id <= last && last - id < RingSize; ++id) {
+            if (Ring()[id % RingSize].id.load(std::memory_order_acquire) == id && Ring()[id % RingSize].slot == slot) ++pending;
+        }
+        std::fprintf(stderr, "[breadcrumbs] slot %u: the GPU finished command %u of %u recorded; %u of this slot's commands pending\n", slot, done, last, pending);
+        std::uint32_t shownDone = 0, shownPending = 0;
+        for (std::uint32_t id = done; id >= 1 && shownDone < 4 && done - id < RingSize; --id) {
+            const auto& entry = Ring()[id % RingSize];
+            if (entry.id.load(std::memory_order_acquire) != id || entry.slot != slot) continue;
+            std::fprintf(stderr, "[breadcrumbs]   done %u %s program 0x%llx %u %u %u\n", id, entry.kind, static_cast<unsigned long long>(entry.program), entry.a, entry.b, entry.c);
+            ++shownDone;
+        }
+        for (std::uint32_t id = done + 1; id <= last && shownPending < 12 && last - id < RingSize; ++id) {
+            const auto& entry = Ring()[id % RingSize];
+            if (entry.id.load(std::memory_order_acquire) != id || entry.slot != slot) continue;
+            std::fprintf(stderr, "[breadcrumbs]   PENDING %u %s program 0x%llx %u %u %u\n", id, entry.kind, static_cast<unsigned long long>(entry.program), entry.a, entry.b, entry.c);
+            ++shownPending;
+        }
     }
 }
 

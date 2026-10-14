@@ -635,16 +635,40 @@ void _ammAllocatePrt(const Apr::AmmProtectCommand& command) {
     }
 }
 
+// APS5_APR_TIMING=1 also reports, every 10 s, how long each command opcode took in total.
+struct OpcodeTiming {
+    std::array<std::atomic<std::uint64_t>, 32> ns{};
+    std::array<std::atomic<std::uint64_t>, 32> count{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+OpcodeTiming* _opcodeTiming() {
+    static OpcodeTiming* const timing = std::getenv("APS5_APR_TIMING") != nullptr ? new OpcodeTiming() : nullptr;
+    return timing;
+}
+
 void _ammMap(const Apr::AmmMapCommand& command, bool direct) {
     auto& state = _amm();
     const std::lock_guard lock(state.lock);
     _ammCheckRange(state, command.address, command.size);
+    auto* timing = _opcodeTiming();
+    const auto reserveStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     _reserve(command.address, command.size);
+    // APS5_APR_TIMING: slot 30 = the reserve, slot 31 = the map of AmmMap.
+    const auto mapStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (timing != nullptr) {
+        timing->ns[30] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(mapStarted - reserveStarted).count());
+        timing->count[30] += 1;
+    }
     _forgetPages(state, command.address, command.size);
     _clearPrt(state, command.address, command.size);
     const auto physical = direct ? command.directOffset : _takePoolPages(state, command.size);
     try {
         _mapRun(command.address, physical, command.size, command.protection);
+        if (timing != nullptr) {
+            timing->ns[31] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mapStarted).count());
+            timing->count[31] += 1;
+        }
     } catch (...) {
         _reserve(command.address, command.size);
         if (!direct) _returnPoolPages(state, physical, command.size);
@@ -751,6 +775,19 @@ void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor&
     // into 0x4000 or 0x8000 (2026-10-14, with a save loaded). Report the command and its buffer.
     if (command.destination < 0x10000u) {
         std::fprintf(stderr, "[apr] read into 0x%llx: opcode %u file %u (%s) size 0x%llx offset 0x%llx; cursor valid %d file %u next destination 0x%llx next offset 0x%llx\n", static_cast<unsigned long long>(command.destination), static_cast<unsigned>(opcode), command.fileId, _file(command.fileId).path.string().c_str(), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.offset), read.valid ? 1 : 0, read.fileId, static_cast<unsigned long long>(read.nextDestination), static_cast<unsigned long long>(read.nextOffset));
+        {
+            // How full the AMM is: pooled physical memory still free, pages mapped.
+            auto& state = _amm();
+            const std::lock_guard lock(state.lock);
+            std::uint64_t poolFree = 0, largest = 0;
+            for (const auto& [offset, bytes] : state.pool) {
+                poolFree += bytes;
+                largest = std::max(largest, bytes);
+            }
+            std::size_t pooledPages = 0;
+            for (const auto& [address, page] : state.pages) pooledPages += page.pooled ? 1u : 0u;
+            std::fprintf(stderr, "[apr]   AMM pool: %.1f MiB free in %zu runs (largest %.1f MiB); %zu pages mapped, %zu of them pooled (%.1f MiB)\n", static_cast<double>(poolFree) / 1048576.0, state.pool.size(), static_cast<double>(largest) / 1048576.0, state.pages.size(), pooledPages, static_cast<double>(pooledPages) * PS5_PAGE_SIZE / 1048576.0);
+        }
         // APS5_APR_SKIP_BAD_DESTINATION=1: drop the read and go on (diagnostic).
         static const bool skip = std::getenv("APS5_APR_SKIP_BAD_DESTINATION") != nullptr;
         if (skip) {
@@ -777,11 +814,32 @@ struct Deferred {
     ReadCursor read;
 };
 
+void _noteOpcode(OpcodeTiming& timing, std::uint32_t opcode, std::chrono::steady_clock::time_point started) {
+    const auto now = std::chrono::steady_clock::now();
+    timing.ns[opcode & 31u] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - started).count());
+    timing.count[opcode & 31u] += 1;
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    auto last = timing.lastReport.load(std::memory_order_relaxed);
+    if (seconds - last < 10 || !timing.lastReport.compare_exchange_strong(last, seconds)) return;
+    std::string text;
+    for (std::uint32_t index = 0; index < 32u; ++index) {
+        const auto count = timing.count[index].exchange(0);
+        const auto ns = timing.ns[index].exchange(0);
+        if (count == 0) continue;
+        char entry[96];
+        std::snprintf(entry, sizeof(entry), " op%u: %llu in %.0f ms (%.3f ms each);", index, static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6, static_cast<double>(ns) / 1e6 / static_cast<double>(count));
+        text += entry;
+    }
+    std::fprintf(stderr, "[apr-opcodes] 10 s:%s\n", text.c_str());
+}
+
 std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::uint32_t start = 0, ReadCursor read = {}, bool defer = false) {
     std::uint32_t cursor = start;
     g_executing = &buffer;
+    auto* opcodeTiming = _opcodeTiming();
     while (cursor < buffer.offset) {
         g_executingCursor = cursor;
+        const auto opcodeStarted = opcodeTiming != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (cursor + sizeof(Apr::CommandHeader) > buffer.offset) throw std::runtime_error("APR: truncated command buffer");
         Apr::CommandHeader header;
         std::memcpy(&header, buffer.base + cursor, sizeof(header));
@@ -889,6 +947,10 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
         default:
             throw std::runtime_error("APR: unknown opcode " + std::to_string(static_cast<std::uint32_t>(header.opcode)));
         }
+        if (opcodeTiming != nullptr) _noteOpcode(*opcodeTiming, static_cast<std::uint32_t>(header.opcode), opcodeStarted);
+        // Experiment: APS5_APR_AMM_DELAY_US=<us> sleeps after every AMM map/unmap/remap command.
+        static const auto ammDelayUs = [] { const char* text = std::getenv("APS5_APR_AMM_DELAY_US"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul; }();
+        if (ammDelayUs != 0 && static_cast<std::uint32_t>(header.opcode) >= 17u && static_cast<std::uint32_t>(header.opcode) <= 28u) PreciseSleepUs(ammDelayUs);
         cursor += header.bytes;
     }
     return std::nullopt;
@@ -903,6 +965,7 @@ int APS5_VABI sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchE
 int AmmGiveDirectMemory_nid_no_patch(std::int64_t searchStart, std::int64_t searchEnd, std::size_t size, std::size_t alignment, int usage, std::int64_t* offset) {
     if (!offset || (usage != 0 && usage != 1)) return SCE_KERNEL_ERROR_EINVAL;
     const int result = sceKernelAllocateDirectMemory(searchStart, searchEnd, size, alignment, 0, offset);
+    std::fprintf(stderr, "[amm] give direct memory 0x%zx bytes (%.1f MiB) usage %d -> 0x%x offset 0x%llx\n", size, static_cast<double>(size) / 1048576.0, usage, static_cast<unsigned>(result), static_cast<unsigned long long>(result == 0 ? *offset : 0));
     if (result != 0 || usage == 0) return result;
     auto& state = _amm();
     const std::lock_guard lock(state.lock);
@@ -936,9 +999,12 @@ struct AprQueue {
     std::uint32_t completed = 0;
 };
 
-AprQueue* _startQueue() {
+AprQueue* _startQueue(bool amm) {
     auto* created = new AprQueue();
-    std::thread([created] {
+    std::thread([created, amm] {
+#ifdef _WIN32
+        SetThreadDescription(GetCurrentThread(), amm ? L"APR queue (AMM)" : L"APR queue (generic)");
+#endif
         for (;;) {
             AprQueue::Work work;
             {
@@ -968,7 +1034,7 @@ AprQueue* _startQueue() {
 }
 
 AprQueue& _queue(bool amm) {
-    static AprQueue* const queues[2] = {_startQueue(), _startQueue()};
+    static AprQueue* const queues[2] = {_startQueue(false), _startQueue(true)};
     return *queues[amm ? 1 : 0];
 }
 
