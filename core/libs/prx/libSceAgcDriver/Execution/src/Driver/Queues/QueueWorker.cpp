@@ -232,7 +232,7 @@ void Driver::run(std::uint32_t id) noexcept {
                         lock.lock();
                         if (ready()) break;
                         if (id == 0 && allQueuesIdle() && !completionsPending()
-                            && (!storeIdleResults || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
+                            && ((!storeIdleResults && Graphics::StorageTexture::AnyPending()) || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
                         if (id == 0) TraceIdle("dormant");
