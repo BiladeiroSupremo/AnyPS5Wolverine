@@ -165,25 +165,9 @@ long double AsinDenominator(long double t) {
     return 1.0L + t * (q[0] + t * (q[1] + t * (q[2] + t * (q[3] + t * q[4]))));
 }
 
-struct GuestFloatingPointEnvironment {
-    std::uint32_t control;
-    std::uint32_t status;
-    std::uint32_t tag;
-    unsigned char other[16];
-    std::uint32_t mxcsr;
-};
-static_assert(sizeof(GuestFloatingPointEnvironment) == 32 && offsetof(GuestFloatingPointEnvironment, mxcsr) == 28);
-
 }
 
 extern "C" {
-
-int APS5_VABI fegetenv_nid_postfix(GuestFloatingPointEnvironment* environment) {
-    if (environment == nullptr) throw std::invalid_argument("fegetenv: null environment");
-    asm volatile("fnstenv %0\n\tfldcw %0" : "+m"(*environment));
-    environment->mxcsr = _mm_getcsr();
-    return 0;
-}
 
 std::lldiv_t APS5_VABI lldiv_nid_postfix(long long numerator, long long denominator) {
     return std::lldiv(numerator, denominator);
@@ -566,6 +550,22 @@ double APS5_VABI _Sinh_nid_postfix(double x, double y) {
 
 int APS5_VABI _Fltrounds_nid_postfix(void) {
     return SonyFltrounds();
+}
+
+struct GuestFloatingPointEnvironment {
+    std::uint32_t control;
+    std::uint32_t status;
+    std::uint32_t tag;
+    unsigned char other[16];
+    std::uint32_t mxcsr;
+};
+static_assert(sizeof(GuestFloatingPointEnvironment) == 32 && offsetof(GuestFloatingPointEnvironment, mxcsr) == 28);
+
+int APS5_VABI fegetenv_nid_postfix(GuestFloatingPointEnvironment* environment) {
+    if (environment == nullptr) throw std::invalid_argument("fegetenv: null environment");
+    asm volatile("fnstenv %0\n\tfldcw %0" : "+m"(*environment));
+    environment->mxcsr = _mm_getcsr();
+    return 0;
 }
 
 union SonyDconst {
