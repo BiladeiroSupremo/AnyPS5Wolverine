@@ -905,10 +905,10 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     return 0;
 }
 
-static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool zero);
+static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool zero, bool exclusive);
 
-int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
-    return MapAnonymous(addr, len, prot, flags, alignment, false);
+int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive) {
+    return MapAnonymous(addr, len, prot, flags, alignment, false, exclusive);
 }
 
 int DoMapZero(void** addr, size_t len, int prot, int flags) {
@@ -918,13 +918,14 @@ int DoMapZero(void** addr, size_t len, int prot, int flags) {
 #else
     const bool zero = false;
 #endif
-    return MapAnonymous(addr, len, prot, flags, PS5_PAGE_SIZE, zero);
+    return MapAnonymous(addr, len, prot, flags, PS5_PAGE_SIZE, zero, false);
 }
 
-static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool zero) {
+static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool zero, bool exclusive) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
+    if (exclusive && mutation.Overlaps(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, -1, zero)) {
