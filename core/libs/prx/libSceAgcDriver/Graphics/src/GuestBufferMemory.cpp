@@ -591,8 +591,17 @@ struct ImportRun {
     std::vector<std::shared_ptr<const GuestAllocations::Range>> ranges;
 };
 
+// A range the GPU can read: CPU-readable, or GPU-only memory (no CPU access for the guest; the
+// title keeps its UI render-target pools there, which were CPU-copied into a host buffer on every
+// use, ~57 GB per 7 minutes of its cinematic, most of it under the GPU lock). The registry's lease
+// (GuestAllocationsAcquire) includes them; APS5_NO_GPU_ONLY_IMPORT=1 leaves them to the copies.
+bool importable(const GuestAllocations::Range& range) {
+    static const bool gpuOnly = std::getenv("APS5_NO_GPU_ONLY_IMPORT") == nullptr;
+    return range.readable || (gpuOnly && range.gpu);
+}
+
 bool continuesRun(const GuestAllocations::Range& before, const GuestAllocations::Range& after) {
-    return before.address + before.bytes == after.address && before.readable && after.readable && before.writable == after.writable && before.gpu == after.gpu;
+    return before.address + before.bytes == after.address && importable(before) && importable(after) && before.readable == after.readable && before.writable == after.writable && before.gpu == after.gpu;
 }
 
 std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uint64_t address) {
@@ -600,7 +609,7 @@ std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uin
     if (found == lease.begin()) return lease.size();
     const auto index = static_cast<std::size_t>(std::prev(found) - lease.begin());
     const auto& range = *lease[index];
-    return range.readable && address < range.address + range.bytes ? index : lease.size();
+    return importable(range) && address < range.address + range.bytes ? index : lease.size();
 }
 
 std::atomic<std::uint64_t> importWindow{0};
