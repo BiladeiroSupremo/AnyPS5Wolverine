@@ -240,8 +240,16 @@ jobs:
   linux:
     needs: eligibility
     if: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.linux)) && needs.eligibility.outputs.full == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: [self-hosted, linux, x64, anyps5]
+    timeout-minutes: 60
+    env:
+      CCACHE_DIR: /var/cache/anyps5/ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_COMPILERCHECK: content
+      MESA_SHADER_CACHE_DIR: /var/cache/anyps5/mesa
+      MESA_SHADER_CACHE_MAX_SIZE: 4G
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
+      CTEST_PARALLEL_LEVEL: 3
     steps:
       - uses: actions/checkout@v7
         with:
@@ -259,45 +267,35 @@ jobs:
           read -ra heads <<< "$PR_HEAD"
           refspecs=()
           for number in "${numbers[@]}"; do refspecs+=("refs/pull/$number/head:refs/remotes/pull/$number"); done
-          git fetch --no-tags --unshallow origin "${refspecs[@]}"
+          fetch_options=()
+          if [ "$(git rev-parse --is-shallow-repository)" = true ]; then fetch_options+=(--unshallow); fi
+          git fetch --no-tags "${fetch_options[@]}" origin "${refspecs[@]}"
           for i in "${!numbers[@]}"; do
             if [ "$(git rev-parse "refs/remotes/pull/${numbers[i]}")" != "${heads[i]}" ]; then echo "::error::Pull request #${numbers[i]} has newer commits; start a new build"; exit 1; fi
             if ! git -c user.name=ci -c user.email=ci@localhost merge --no-ff --no-edit "refs/remotes/pull/${numbers[i]}"; then echo "::error::Pull request #${numbers[i]} does not merge cleanly into main and the pull requests before it; rebase it first"; exit 1; fi
           done
           git submodule update --init --recursive
-      - uses: hendrikmuhs/ccache-action@v1.2.24
-        with:
-          key: linux
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          evict-old-files: job
-      - name: Install lavapipe and the SDL audio, XRandR and Wayland development files
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev
-      - id: mesa
+      - name: Prepare persistent caches
         run: |
-          echo "version=$(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)" >> "$GITHUB_OUTPUT"
+          mkdir -p "$CCACHE_DIR" "$MESA_SHADER_CACHE_DIR"
+          test -w "$CCACHE_DIR" && test -w "$MESA_SHADER_CACHE_DIR"
+          ccache --zero-stats
+          ccache --show-config
+          dpkg-query -W mesa-vulkan-drivers
           grep -m1 '^model name' /proc/cpuinfo
-          echo "cpu=$(grep -E '^(vendor_id|cpu family|model|flags)[[:space:]]*:' /proc/cpuinfo | sort -u | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v6
-        with:
-          path: .mesa-shader-cache
-          key: mesa-${{ steps.mesa.outputs.version }}-${{ steps.mesa.outputs.cpu }}-${{ github.sha }}
-          restore-keys: mesa-${{ steps.mesa.outputs.version }}-${{ steps.mesa.outputs.cpu }}-
       - run: cmake -S . -B build $CONFIGURE -DANYPS5_ENABLE_SPIRV_TOOLS=ON
       - name: Check that every test executable is registered with ctest
         run: python3 tools/check_test_registration.py build
       - run: cmake --build build
       - run: cmake --build build --target libs
-      - run: ctest --test-dir build --output-on-failure --timeout 120 --parallel 4 --output-log ctest.log --output-junit ctest.xml
+      - run: ctest --test-dir build --output-on-failure --timeout 120 --output-log ctest.log --output-junit ctest.xml
         env:
           ANYPS5_REQUIRE_VULKAN: 1
           GALLIUM_OVERRIDE_CPU_CAPS: avx
-          MESA_SHADER_CACHE_DIR: ${{ github.workspace }}/.mesa-shader-cache
-      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && !cancelled() }}
-        uses: actions/cache/save@v6
-        with:
-          path: .mesa-shader-cache
-          key: mesa-${{ steps.mesa.outputs.version }}-${{ steps.mesa.outputs.cpu }}-${{ github.sha }}
       - run: python3 tools/check_skips.py build/ctest.xml
+      - name: Report compiler cache statistics
+        if: ${{ !cancelled() }}
+        run: ccache --show-stats
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
         shell: bash
