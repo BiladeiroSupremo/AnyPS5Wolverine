@@ -26,6 +26,14 @@ int main() {
         auto second = load; second.MappedAddress = 0x1048; second.Offset = 72; second.FileSize = 56;
         auto first = load; first.FileSize = 72;
         Require(Relinker::UnusedNidFilter::ReadExceptionFunctions(Fixture(), {first, second, eh}, {}, {}).size() == 1);
+        auto belowBytes = Fixture();
+        belowBytes[3] = 0x30;
+        Io::WriteU64(belowBytes, 16, 0x800 - 0x1000);
+        Io::WriteU64(belowBytes, 24, 0x1060 - 0x1000);
+        Io::WriteU64(belowBytes, 104, 0x800);
+        Domain::ProgramHeader funcSeg{}; funcSeg.Type = 1; funcSeg.MappedAddress = 0x800; funcSeg.FileSize = 0x20;
+        const auto below = Relinker::UnusedNidFilter::ReadExceptionFunctions(belowBytes, {funcSeg, load, eh}, {}, {});
+        Require(below.size() == 1 && below[0].Begin == 0x800 && below[0].End == 0x810);
         for (int kind = 0; kind < 10; ++kind) {
             auto bytes = Fixture(); auto segment = load;
             switch (kind) {
@@ -38,13 +46,13 @@ int main() {
                 case 6: Io::WriteU32(bytes, 64, 8); break;
                 case 7: Io::WriteU32(bytes, 100, 0); break;
                 case 8: bytes[3] = 0x1B; Io::WriteU32(bytes, 16, 0xFFFFE000); break;
-                case 9: bytes[3] = 0x10; Io::WriteU64(bytes, 16, std::numeric_limits<std::uint64_t>::max() - 0x10); break;
+                case 9: bytes[3] = 0x1C; Io::WriteU64(bytes, 16, 0x8000000000000000ULL); break;
             }
             bool rejected = false;
             try { Relinker::UnusedNidFilter::ReadExceptionFunctions(bytes, {segment, eh}, {}, {}); }
             catch (const std::exception&) { rejected = true; }
             Require(rejected);
         }
-        std::cout << "12 unwind record cases passed\n";
+        std::cout << "13 unwind record cases passed\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
