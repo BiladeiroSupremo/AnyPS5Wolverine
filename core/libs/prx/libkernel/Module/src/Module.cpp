@@ -115,21 +115,26 @@ bool FillKnownUnwindImage(std::uint64_t address, ModuleInfoForUnwind* info) {
 }
 
 extern "C" void ForgetUnloadedUnwindImages_nid_no_patch() {
-  std::vector<std::uintptr_t> bases;
-  {
+  try {
+    std::vector<std::uintptr_t> bases;
+    {
+      std::lock_guard lock(unwindImagesMutex);
+      for (const auto& image : UnwindImages()) bases.push_back(image.first);
+    }
+    std::vector<std::uintptr_t> unloaded;
+    for (const auto base : bases) {
+      HMODULE loaded = nullptr;
+      const bool present = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(base), &loaded) != 0 &&
+                           reinterpret_cast<std::uintptr_t>(loaded) == base;
+      if (!present) unloaded.push_back(base);
+    }
+    if (unloaded.empty()) return;
     std::lock_guard lock(unwindImagesMutex);
-    for (const auto& image : UnwindImages()) bases.push_back(image.first);
+    for (const auto base : unloaded) UnwindImages().erase(base);
+  } catch (...) {
+    std::lock_guard lock(unwindImagesMutex);
+    UnwindImages().clear();
   }
-  std::vector<std::uintptr_t> unloaded;
-  for (const auto base : bases) {
-    HMODULE loaded = nullptr;
-    const bool present = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(base), &loaded) != 0 &&
-                         reinterpret_cast<std::uintptr_t>(loaded) == base;
-    if (!present) unloaded.push_back(base);
-  }
-  if (unloaded.empty()) return;
-  std::lock_guard lock(unwindImagesMutex);
-  for (const auto base : unloaded) UnwindImages().erase(base);
 }
 #elif !defined(__APPLE__)
 extern "C" int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info);

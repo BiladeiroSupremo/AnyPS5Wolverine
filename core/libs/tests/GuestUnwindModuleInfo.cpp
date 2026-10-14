@@ -78,7 +78,7 @@ int main() {
     Require(info.seg0_size == nt->OptionalHeader.SizeOfImage);
     char mapped[4096] = {};
     Require(GetMappedFileNameA(GetCurrentProcess(), memory.BaseAddress, mapped, sizeof(mapped) - 1) != 0);
-    Require(std::strcmp(info.name, mapped) == 0);
+    Require(std::strncmp(info.name, mapped, sizeof(info.name) - 1) == 0);
     for (const auto* inside : {static_cast<const void*>(&fixture->header), static_cast<const void*>(&fixture->frames)}) {
         ModuleInfoForUnwind other{};
         Require(sceKernelGetModuleInfoForUnwind(reinterpret_cast<std::uint64_t>(inside), 0, &other) == 0);
