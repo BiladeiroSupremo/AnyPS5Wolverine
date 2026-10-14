@@ -2533,7 +2533,12 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
             }
             return;
         case BaseOverlap::Partial:
-            if (readOnly && !mirrorOverlaps(space->base, begin, end)) break;
+            // A read-only range keeps the space only while no written range of this build overlaps
+            // it: its copy and the base region's import would be two views of the same bytes.
+            if (readOnly && !mirrorOverlaps(space->base, begin, end) && !WritesOverlap(begin, static_cast<std::size_t>(end - begin))) {
+                readsOverBase.emplace_back(begin, end);
+                break;
+            }
             Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
             dissolveSpace(false);
             break;
@@ -2599,6 +2604,12 @@ bool GuestBufferMemory::bindSparseMirror(Region& region, const GuestAllocations:
 }
 
 void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
+    // A written range over a read-only range copied across base regions: the space dissolves, so the
+    // two share one merged region as they do without the space.
+    if (space != nullptr && std::any_of(readsOverBase.begin(), readsOverBase.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; })) {
+        Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
+        dissolveSpace(false);
+    }
     addDescriptorRegion(address, bytes, atomic, swept, false);
     writes.emplace_back(address, address + bytes);
 }
