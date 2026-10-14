@@ -7,6 +7,14 @@
 
 extern "C" {
 
+APS5_EXPORT("YNw9Xk5iNWo", sceVideoOutUnknown_YNw9Xk5iNWo);
+int APS5_VABI sceVideoOutUnknown_YNw9Xk5iNWo(int handle, void* status) {
+    (void)handle;
+    (void)status;
+    NotImplemented_nid_no_patch("YNw9Xk5iNWo");
+    return 0;
+}
+
 int APS5_VABI sceVideoOutSetFlipMaster() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
