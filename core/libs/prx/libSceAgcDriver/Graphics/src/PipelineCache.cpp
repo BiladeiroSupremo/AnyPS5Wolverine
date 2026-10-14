@@ -32,7 +32,11 @@ bool profiling() {
 
 PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties) : context(context), properties(properties) {
     const auto directory = ShaderRecompiler::ShaderCacheDirectory();
-    if (!directory.empty()) {
+    // APS5_NO_PIPELINE_FILE=1: no pipeline cache file (experiment: the driver holds the loaded data,
+    // ~490 MiB for PPSA03671, for the whole run, and every save reads it all back; AMD's driver
+    // keeps its own on-disk shader cache).
+    static const bool noFile = std::getenv("APS5_NO_PIPELINE_FILE") != nullptr;
+    if (!directory.empty() && !noFile) {
         std::string uuid;
         for (const auto byte : properties.pipelineCacheUUID) {
             char digits[3];

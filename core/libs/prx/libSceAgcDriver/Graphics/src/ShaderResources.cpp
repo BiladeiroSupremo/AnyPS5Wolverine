@@ -491,7 +491,17 @@ std::uint64_t forcedCacheBudget() {
 
 std::uint64_t storageBudget(const Context& context) {
     const auto forced = forcedCacheBudget();
-    return forced != 0 ? forced : TextureCacheBudget(context.memory);
+    if (forced != 0) return forced;
+    // A ceiling on the storage image cache (APS5_STORAGE_CACHE_CEILING_MIB, default 1024, 0 = none),
+    // whose budget is a quarter of VRAM (4 GiB on a 16 GiB card): PPSA03671 held ~1.5 GiB of them,
+    // and at 1 GiB its cinematic kept its frame rate (4.07 -> 4.02 FPS, same scene) with device
+    // memory 5.4 -> 4.3 GB and process private memory ~1 GB lower (2026-10-14).
+    static const std::uint64_t ceiling = [] {
+        const char* text = std::getenv("APS5_STORAGE_CACHE_CEILING_MIB");
+        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 1024ull) << 20u;
+    }();
+    const auto budget = TextureCacheBudget(context.memory);
+    return ceiling != 0 ? std::min(budget, ceiling) : budget;
 }
 
 std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
