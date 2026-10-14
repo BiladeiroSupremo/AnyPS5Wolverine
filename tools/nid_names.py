@@ -149,7 +149,6 @@ def nid_arguments(arguments, options):
     return normalized
 
 
-
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Suggest real names for Unknown NID stubs")
@@ -165,13 +164,15 @@ def main(argv=None):
     arguments = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(nid_arguments(arguments, options))
     if args.name:
+        if args.nid:
+            parser.error("--name/--symbol cannot be combined with --nid")
         rows = [{"name": name, "nid": compute_nid(name)} for name in args.name]
         if args.json:
             print(json.dumps({"symbols": rows}, indent=1))
         else:
             print("%-40s %s" % ("NAME", "NID"))
             for row in rows:
-                print("%-40s %s" % (row["name"][:40], row["nid"]))
+                print("%-40s %s" % (row["name"], row["nid"]))
         return 0
     requested_nids = any(option_name(argument, options) == "--nid" for argument in arguments)
     for nid in args.nid or []:
