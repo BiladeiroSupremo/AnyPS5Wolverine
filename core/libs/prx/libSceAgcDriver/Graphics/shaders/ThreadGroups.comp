@@ -1,0 +1,30 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+// DISPATCH_INDIRECT with COMPUTE_DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS: the arguments are thread
+// counts; the dispatch takes ceil(threads / threads per group) groups on each axis. A count past the
+// device's limits or more than 2^24 groups in all (the title's corrupt-argument case the driver
+// rejects for direct dispatches) dispatches nothing.
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
+layout(push_constant) uniform Parameters {
+    Words source;
+    Words destination;
+    uvec4 threadsPerGroup;
+    uvec4 limits;
+} parameters;
+
+void main() {
+    uvec3 groups;
+    for (int axis = 0; axis < 3; ++axis) {
+        uint threads = parameters.source.words[axis];
+        uint size = max(parameters.threadsPerGroup[axis], 1u);
+        groups[axis] = threads / size + (threads % size != 0u ? 1u : 0u);
+    }
+    bool valid = all(lessThanEqual(groups, parameters.limits.xyz));
+    const uint most = 1u << 24;
+    if (valid && groups.x != 0u && groups.y != 0u && groups.z != 0u) valid = groups.y <= most && groups.z <= most / groups.y && groups.x <= most / (groups.y * groups.z);
+    parameters.destination.words[0] = valid ? groups.x : 0u;
+    parameters.destination.words[1] = valid ? groups.y : 0u;
+    parameters.destination.words[2] = valid ? groups.z : 0u;
+}

@@ -70,6 +70,18 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcThreadGroupsShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/ThreadGroups.comp)
+set(agcThreadGroupsShaderSpv ${agcTextureDetileGeneratedDir}/ThreadGroups.spv)
+set(agcThreadGroupsShaderHeader ${agcTextureDetileGeneratedDir}/ThreadGroups_spv.h)
+add_custom_command(
+        OUTPUT "${agcThreadGroupsShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcThreadGroupsShaderSpv}" "${agcThreadGroupsShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcThreadGroupsShaderSpv} -DOUTPUT=${agcThreadGroupsShaderHeader}
+        -DSYMBOL=THREAD_GROUPS_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcThreadGroupsShaderSource}" glslang-standalone
+        VERBATIM
+)
 set(agcCmaskClearShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/CmaskClear.comp)
 set(agcCmaskClearShaderSpv ${agcTextureDetileGeneratedDir}/CmaskClear.spv)
 set(agcCmaskClearShaderHeader ${agcTextureDetileGeneratedDir}/CmaskClear_spv.h)
@@ -210,6 +222,7 @@ set(agcDriverSources
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
+        ${agcThreadGroupsShaderHeader}
         ${agcTextureDetileImageShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}

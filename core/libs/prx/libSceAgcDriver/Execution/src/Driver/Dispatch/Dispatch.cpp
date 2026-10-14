@@ -427,14 +427,22 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     phaseTiming.Phase(PhaseSnapshots);
 
+    // A thread-dimension indirect dispatch (initiator bit 0x20): its arguments are thread counts the
+    // device converts into groups on the GPU (VulkanDevice::SetIndirectThreads); recipes replay a
+    // plain indirect dispatch, so such dispatches take none.
+    const bool threadDimensions = indirectArguments != 0 && (packet.back() & 0x20u) != 0;
+    std::array<std::uint32_t, 3> threadsPerGroup{};
+    if (threadDimensions) {
+        for (std::uint32_t axis = 0; axis < 3; ++axis) threadsPerGroup[axis] = std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u);
+    }
     std::shared_ptr<RecipeHit> recipeHit;
-    if (cached && keepVariant != nullptr && !stampValidate()) {
+    if (cached && keepVariant != nullptr && !stampValidate() && !threadDimensions) {
         recipeHit = localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
 
     std::shared_ptr<const Recipe> builtRecipe;
-    auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    auto* const attachTo = stampValidate() || threadDimensions ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
@@ -487,6 +495,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 }
                 if (indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else if (indirectArguments != 0) {
+                struct ThreadsScope {
+                    explicit ThreadsScope(const std::array<std::uint32_t, 3>* threads) { VulkanDevice::SetIndirectThreads(threads); }
+                    ~ThreadsScope() { VulkanDevice::SetIndirectThreads(nullptr); }
+                } threadsScope(threadDimensions ? &threadsPerGroup : nullptr);
                 const auto outcome = localDevice->DispatchIndirect(compiled, indirectArguments, snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
                 countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else {

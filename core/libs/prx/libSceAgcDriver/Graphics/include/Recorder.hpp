@@ -190,6 +190,11 @@ public:
     void Sync();
     void CountSamples();
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
+    // A DISPATCH_INDIRECT with thread dimensions: converts the thread counts at source into group
+    // counts at destination (ceil(threads / threadsPerGroup), zero past limits or 2^24 groups),
+    // ordered before an indirect read. False when the kernel is unavailable.
+    bool ThreadGroupsAvailable();
+    bool RecordThreadGroups(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress destination, const std::array<std::uint32_t, 3>& threadsPerGroup, const std::array<std::uint32_t, 3>& limits);
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
     void NoteSampledDraw(VkCommandBuffer commands);
@@ -678,6 +683,9 @@ private:
     int meshArgumentState = 0;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;
+    int threadGroupState = 0;
+    VkPipelineLayout threadGroupLayout = VK_NULL_HANDLE;
+    VkPipeline threadGroupPipeline = VK_NULL_HANDLE;
     int sampleCounterState = 0;
     std::unique_ptr<Buffer> sampleCounter;
     VkPipelineLayout sampleLayout = VK_NULL_HANDLE;

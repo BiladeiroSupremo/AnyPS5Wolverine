@@ -3819,7 +3819,22 @@ struct RecordedDispatch {
     // Whether the data refresh recorded anything.
     bool refreshed = false;
     bool resourceKeyMatched = false;
+    // A DISPATCH_INDIRECT with thread dimensions (COMPUTE_DISPATCH_INITIATOR bit 0x20): the
+    // arguments are thread counts, divided by these per-group sizes (COMPUTE_NUM_THREAD_X..Z).
+    bool threadDimensions = false;
+    std::array<std::uint32_t, 3> threadsPerGroup{};
 };
+
+namespace {
+// Set by the driver around a thread-dimension indirect dispatch (VulkanDevice::SetIndirectThreads).
+thread_local bool indirectThreadDimensions = false;
+thread_local std::array<std::uint32_t, 3> indirectThreadsPerGroup{};
+}
+
+void VulkanDevice::SetIndirectThreads(const std::array<std::uint32_t, 3>* threadsPerGroup) {
+    indirectThreadDimensions = threadsPerGroup != nullptr;
+    if (threadsPerGroup != nullptr) indirectThreadsPerGroup = *threadsPerGroup;
+}
 
 VkDevice VulkanDevice::Device() const {
     return state->device;
@@ -4074,6 +4089,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         hold.maxWriters = std::max(hold.maxWriters, state->copiedWriters->size());
     }
     timer.phase(PhaseDecide);
+    if (outcome.cpuReason == 0 && record.threadDimensions && !recorder.ThreadGroupsAvailable()) outcome.cpuReason = 4;
     if (outcome.cpuReason == 0) return;
     // The read waits for the producing batch through the flush hook, as the driver's resolve
     // did for every indirect dispatch before; the counts then go through the direct checks.
@@ -4081,6 +4097,15 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
     std::array<std::uint32_t, 3> groups{};
     GuestMemory::Read(arguments, std::as_writable_bytes(std::span(groups)), 4);
     outcome.argumentReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
+    if (record.threadDimensions) {
+        // Thread counts: groups as the GPU path's kernel computes them (none past 2^24 groups, the
+        // title's corrupt-argument case).
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            const auto size = std::max(record.threadsPerGroup[axis], 1u);
+            groups[axis] = groups[axis] / size + (groups[axis] % size != 0u ? 1u : 0u);
+        }
+        if (static_cast<std::uint64_t>(groups[0]) * groups[1] * groups[2] > (std::uint64_t{1} << 24u)) groups = {0u, 0u, 0u};
+    }
     record.x = groups[0];
     record.y = groups[1];
     record.z = groups[2];
@@ -4159,7 +4184,18 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto images = resources.StorageImages();
         recorder.NoteAccess(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease()});
     }
-    if (argumentImport != nullptr) {
+    // Thread dimensions: a kernel turns the thread counts into group counts in a scratch buffer the
+    // dispatch reads instead (its barriers order it after the counts' writers and before the read).
+    std::shared_ptr<Graphics::Buffer> threadGroups;
+    if (argumentImport != nullptr && record.threadDimensions) {
+        threadGroups = std::make_shared<Graphics::Buffer>(context, 16, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
+        const bool recorded = argumentImport->address != 0 && recorder.RecordThreadGroups(commands, argumentImport->address + (arguments - argumentImport->base), threadGroups->DeviceAddress(), record.threadsPerGroup, {limit[0], limit[1], limit[2]});
+        if (!recorded) throw std::runtime_error("Vulkan dispatch: a thread-dimension indirect dispatch found no group-count kernel after the decision");
+        recorder.NotePendingRead(arguments, 12, Graphics::Recorder::ReadKind::Indirect);
+        recorder.Keep(threadGroups);
+    }
+    if (argumentImport != nullptr && threadGroups == nullptr) {
         // The group counts were stored by earlier recorded work (a dispatch in place, a fill) or the
         // host; the indirect read follows all of it.
         const auto timing = recorder.BeginGpuTiming(CommandClass::IndirectArguments);
@@ -4220,7 +4256,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
-    if (argumentImport != nullptr) {
+    if (threadGroups != nullptr) {
+        context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, threadGroups->Handle(), 0);
+    } else if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     } else {
         const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
@@ -4527,6 +4565,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     auto& recorder = *state->recorder;
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer};
+    if (arguments != 0 && indirectThreadDimensions) {
+        record.threadDimensions = true;
+        record.threadsPerGroup = indirectThreadsPerGroup;
+    }
     record.resourceKeyMatched = fromCache;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
