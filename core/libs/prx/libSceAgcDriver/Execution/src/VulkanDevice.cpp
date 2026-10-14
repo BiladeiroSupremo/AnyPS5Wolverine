@@ -423,12 +423,22 @@ struct VulkanDevice::State {
 
     template<typename TFunction>
     TFunction DeviceFunction(const char* name) const {
+        // Cached per thread by device and name literal, as Graphics::Context::Function.
+        struct Entry {
+            VkDevice device;
+            const char* name;
+            PFN_vkVoidFunction function;
+        };
+        thread_local std::array<Entry, 128> cache{};
+        auto& entry = cache[((reinterpret_cast<std::uintptr_t>(name) >> 3u) ^ reinterpret_cast<std::uintptr_t>(device)) & 127u];
+        if (entry.device == device && entry.name == name && entry.function != nullptr) return reinterpret_cast<TFunction>(entry.function);
         ++Graphics::DeviceProcLookups();
-        auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+        auto function = deviceProc(device, name);
         if (function == nullptr) {
             throw std::runtime_error(std::string("Vulkan device function missing: ") + name);
         }
-        return function;
+        entry = {device, name, function};
+        return reinterpret_cast<TFunction>(function);
     }
 
     void CreateWorkgroupMemoryLayout() {

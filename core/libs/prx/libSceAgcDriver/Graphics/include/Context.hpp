@@ -5,6 +5,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -200,11 +201,22 @@ struct Context {
     template<typename TFunction>
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
+        // A per-thread cache by device and name literal: every lookup otherwise walks the loader and
+        // each implicit layer (RivaTuner's, Steam's) before the driver, thousands of times a second.
+        struct Entry {
+            VkDevice device;
+            const char* name;
+            PFN_vkVoidFunction function;
+        };
+        thread_local std::array<Entry, 256> cache{};
+        auto& entry = cache[((reinterpret_cast<std::uintptr_t>(name) >> 3u) ^ reinterpret_cast<std::uintptr_t>(device)) & 255u];
+        if (entry.device == device && entry.name == name && entry.function != nullptr) return reinterpret_cast<TFunction>(entry.function);
         ++DeviceProcLookups();
         const auto real = deviceProc(device, name);
         if (real == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
-        if (const auto traced = TracedMemoryFunction(name, real)) return reinterpret_cast<TFunction>(traced);
-        return reinterpret_cast<TFunction>(real);
+        const auto traced = TracedMemoryFunction(name, real);
+        entry = {device, name, traced != nullptr ? traced : real};
+        return reinterpret_cast<TFunction>(entry.function);
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.
