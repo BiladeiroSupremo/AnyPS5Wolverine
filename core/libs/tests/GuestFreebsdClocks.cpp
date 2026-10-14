@@ -254,8 +254,21 @@ static void SettimeValidatesLikeFreebsd() {
     Require(SettimeThrows(KernelTimespec{1, NANOS_PER_SECOND - 1}, "1.999999999"));
 }
 
-static void RequireZone(const char* zone, std::int64_t utc, std::int64_t east, std::int32_t daylight, std::int32_t zoneDaylight) {
+static std::int32_t RuntimeDaylight(std::int32_t daylight) {
+#ifdef _WIN32
+    long bias = 0;
+    Require(_get_dstbias(&bias) == 0);
+    return daylight == 0 ? 0 : static_cast<std::int32_t>(-bias);
+#else
+    return daylight;
+#endif
+}
+
+static void RequireZone(const char* zone, std::int64_t utc, std::int64_t standardEast, std::int32_t zoneDaylight, std::int32_t daylightInEffect) {
     SetTimeZone(zone);
+    zoneDaylight = RuntimeDaylight(zoneDaylight);
+    const std::int32_t daylight = daylightInEffect == 0 ? 0 : zoneDaylight;
+    const std::int64_t east = standardEast + daylight;
     std::int64_t local = -1;
     KernelTimesec universal{-1, 0xa5a5a5a5u, 0xa5a5a5a5u};
     std::int32_t universalDst = -1;
@@ -276,8 +289,8 @@ static void CalendarConversionsFollowTheHostZone() {
     RequireZone("UTC0", summer, 0, 0, 0);
     RequireZone("IST-5:30", winter, 19800, 0, 0);
     RequireZone("BRT+3", summer, -10800, 0, 0);
-    RequireZone("EST5EDT", winter, -18000, 0, 3600);
-    RequireZone("EST5EDT", summer, -14400, 3600, 3600);
+    RequireZone("EST5EDT", winter, -18000, 3600, 0);
+    RequireZone("EST5EDT", summer, -18000, 3600, 3600);
     SetTimeZone("UTC0");
 }
 
