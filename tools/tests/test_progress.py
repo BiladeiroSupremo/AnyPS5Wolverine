@@ -283,7 +283,8 @@ class ProgressTests(unittest.TestCase):
     def test_qualified_calls_match_only_the_global_wrapper(self):
         wrapper = "static void Fail() { NotImplemented_nid_no_patch(__func__); }\n"
         cases = {"obj->Fail();": "done", "obj.Fail();": "done", "X::Fail();": "done",
-                 "Foo<int>::Fail();": "done", "::Fail();": "todo", ":: Fail ();": "todo", "Fail();": "todo"}
+                 "Foo<int>::Fail();": "done", "::Fail();": "todo", ":: Fail ();": "todo", "Fail();": "todo",
+                 "return ::Fail();": "todo", "else ::Fail();": "todo", "if (obj) ::Fail();": "todo"}
         for call, expected in cases.items():
             with self.subTest(call=call), tempfile.TemporaryDirectory() as directory:
                 library = Path(directory) / "libSceExample"
