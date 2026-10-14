@@ -51,7 +51,17 @@ void RejectSkippedShader(const ShaderSnapshot& snapshot) {
         for (const auto hash : hashes) std::fprintf(stderr, "[gpu] skipping the draws and dispatches of shader hash 0x%016" PRIx64 " (APS5_SKIP_SHADERS)\n", hash);
         return hashes;
     }();
-    if (snapshot.contentHash == 0 || std::find(skipped.begin(), skipped.end(), snapshot.contentHash) == skipped.end()) return;
+    // An entry may also be a code address (as the GPU breadcrumbs and APS5_TRACE_VARIANTS name a
+    // shader); the content hash is then reported once, for a stable list.
+    const bool byHash = snapshot.contentHash != 0 && std::find(skipped.begin(), skipped.end(), snapshot.contentHash) != skipped.end();
+    const bool byAddress = !byHash && std::find(skipped.begin(), skipped.end(), static_cast<std::uint64_t>(snapshot.codeAddress)) != skipped.end();
+    if (!byHash && !byAddress) return;
+    if (byAddress) {
+        static std::mutex reportedMutex;
+        static std::set<std::uint64_t> reported;
+        std::lock_guard lock(reportedMutex);
+        if (reported.insert(snapshot.codeAddress).second) std::fprintf(stderr, "[gpu] skipping shader 0x%llx by address: its hash is 0x%016" PRIx64 "\n", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash);
+    }
     char reason[128];
     std::snprintf(reason, sizeof(reason), "shader 0x%llx (hash 0x%016" PRIx64 ") is skipped (APS5_SKIP_SHADERS)", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash);
     throw std::runtime_error(reason);

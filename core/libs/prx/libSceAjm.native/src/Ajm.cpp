@@ -1387,7 +1387,13 @@ int APS5_VABI sceAjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t i
 }
 
 int APS5_VABI sceAjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_t instance, float ratio_start, float ratio_change_per_sample, uint32_t flags, void* result) {
-    if (ratio_change_per_sample != 0.0f) throw std::runtime_error("sceAjmBatchJobSetResampleParametersEx: a ratio change per sample is unsupported");
+    // A ratio that slides per sample (pitch glides) runs at its starting ratio: the resampler keeps
+    // one ratio per job. PPSA03671 asks for it in gameplay (2026-10-14); KytyPS5 ignores the ratio
+    // altogether. Reported once.
+    if (ratio_change_per_sample != 0.0f) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[ajm] resample ratio change per sample %g (start %g) runs at the start ratio\n", static_cast<double>(ratio_change_per_sample), static_cast<double>(ratio_start));
+    }
     return sceAjmBatchJobSetResampleParameters(info, instance, ratio_start, flags, result);
 }
 

@@ -418,9 +418,30 @@ std::array<std::uint32_t, 3> partialThreads(const RecompileRequest& request) {
     return request.context.compute ? request.context.compute->partialThreads : std::array<std::uint32_t, 3>{};
 }
 
+// Debug aid: APS5_TRACE_VARIANTS=1 prints which shader each variant id (the pipeline id the GPU
+// breadcrumbs report) belongs to.
+thread_local std::uint64_t variantSubjectAddress = 0;
+thread_local std::uint32_t variantSubjectStage = 0;
+
+struct VariantSubject {
+    std::uint64_t previousAddress;
+    std::uint32_t previousStage;
+    VariantSubject(std::uint64_t address, std::uint32_t stage) : previousAddress(variantSubjectAddress), previousStage(variantSubjectStage) {
+        variantSubjectAddress = address;
+        variantSubjectStage = stage;
+    }
+    ~VariantSubject() {
+        variantSubjectAddress = previousAddress;
+        variantSubjectStage = previousStage;
+    }
+};
+
 std::uint64_t nextVariantId() {
     static std::atomic<std::uint64_t> variants{0};
-    return variants.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto id = variants.fetch_add(1, std::memory_order_relaxed) + 1;
+    static const bool trace = std::getenv("APS5_TRACE_VARIANTS") != nullptr;
+    if (trace) std::fprintf(stderr, "[variant] 0x%llx = shader 0x%llx stage %u\n", static_cast<unsigned long long>(id), static_cast<unsigned long long>(variantSubjectAddress), variantSubjectStage);
+    return id;
 }
 
 CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr) try {
@@ -628,6 +649,8 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     module->spirv = std::move(materialized);
     module->specializationId = constants.empty() ? 0u : nextVariantId();
+    static const bool traceVariants = std::getenv("APS5_TRACE_VARIANTS") != nullptr;
+    if (traceVariants && module->specializationId != 0) std::fprintf(stderr, "[variant] 0x%llx specializes 0x%llx\n", static_cast<unsigned long long>(module->specializationId), static_cast<unsigned long long>(artifact.variantId));
     return module;
 }
 
@@ -1151,6 +1174,7 @@ std::shared_ptr<const RecompileResult> RecompileImpl(const RecompileRequest& req
 
 template <typename Impl>
 auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltype(impl()) {
+    const VariantSubject subject(request.shader.codeAddress, static_cast<std::uint32_t>(request.shader.stage));
     try {
         return impl();
     } catch (const std::exception& e) {
