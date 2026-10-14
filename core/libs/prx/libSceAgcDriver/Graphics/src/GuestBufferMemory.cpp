@@ -662,8 +662,30 @@ ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, s
     return run;
 }
 
+struct ImportRun;
+ImportRun spanRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
+
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
-    return !joinedRun(lease, begin, end).ranges.empty();
+    return !joinedRun(lease, begin, end).ranges.empty() || !spanRun(lease, begin, end).ranges.empty();
+}
+
+// The whole contiguous run of like registered ranges around [begin, end), when that run spans more
+// than one range and covers the region: a buffer the title binds across several registrations (a
+// 16 KiB range followed by a 1.75 MiB one) is neither one window-aligned run nor a joined run of
+// ranges larger than the window, so it was CPU-copied on every use. Taking the maximal run keeps the
+// import the same whichever region asks. APS5_NO_SPAN_IMPORT=1 leaves such regions to the copies.
+ImportRun spanRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    static const bool enabled = std::getenv("APS5_NO_SPAN_IMPORT") == nullptr;
+    const auto index = leasedIndexContaining(lease, begin);
+    if (!enabled || index == lease.size()) return {};
+    auto first = index;
+    while (first > 0 && continuesRun(*lease[first - 1], *lease[first])) --first;
+    auto last = index;
+    while (last + 1 < lease.size() && continuesRun(*lease[last], *lease[last + 1])) ++last;
+    if (first == last || lease[last]->address + lease[last]->bytes < end) return {};
+    ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
+    run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    return run;
 }
 
 template<typename Entry>
@@ -710,6 +732,7 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
     if (const auto* low = findImport(state, begin, begin + 1); low != nullptr && low->joined) begin = low->base;
     if (const auto* high = findImport(state, end - 1, end); high != nullptr && high->joined) end = high->base + high->bytes;
     auto run = joinedRun(lease, begin, end);
+    if (run.ranges.empty()) run = spanRun(lease, begin, end);
     if (run.ranges.empty()) return nullptr;
     if (const auto failed = state.failedJoins.find(run.base); failed != state.failedJoins.end() && sameRun(failed->second, run)) return nullptr;
     return importRunAt(context, state, std::move(run), true, begin, lease);
@@ -3112,7 +3135,18 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
-                if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, importRanges());
+                const bool covered = runCovers(importRanges(), region.begin, region.end);
+                if (covered) entry = importAllocation(context, state, region.begin, importRanges());
+                else entry = importJoined(context, state, region.begin, region.end, importRanges());
+                // Debug aid: APS5_TRACE_IMPORT_MISSES names the first regions served by CPU copies, the
+                // registered range around each and the next one.
+                static const bool traceMisses = std::getenv("APS5_TRACE_IMPORT_MISSES") != nullptr;
+                static std::atomic<int> tracedMisses{0};
+                if (traceMisses && entry == nullptr && tracedMisses.fetch_add(1, std::memory_order_relaxed) < 60) {
+                    const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(region.begin), false);
+                    const auto next = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(range ? range->address + range->bytes : region.begin), true);
+                    std::fprintf(stderr, "[import-miss] 0x%llx+0x%llx covered %d; registered 0x%llx+0x%llx r%d w%d gpu%d; next 0x%llx+0x%llx r%d w%d gpu%d\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), covered ? 1 : 0, static_cast<unsigned long long>(range ? range->address : 0), static_cast<unsigned long long>(range ? range->bytes : 0), range && range->readable ? 1 : 0, range && range->writable ? 1 : 0, range && range->gpu ? 1 : 0, static_cast<unsigned long long>(next ? next->address : 0), static_cast<unsigned long long>(next ? next->bytes : 0), next && next->readable ? 1 : 0, next && next->writable ? 1 : 0, next && next->gpu ? 1 : 0);
+                }
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
