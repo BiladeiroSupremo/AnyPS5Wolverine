@@ -2285,6 +2285,83 @@ void drawSnapshotPatchTests(const Device& device) {
     }
 }
 
+void drawSnapshotEpochTests(const Device& device) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 4 * 65536;
+    std::unique_lock gpu(GpuMutex());
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports unavailable: draw snapshot reuse within a collect epoch not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<std::uint8_t>(at * 7u + 3u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the block refused: draw snapshot reuse within a collect epoch not tested\n";
+        return;
+    }
+    constexpr std::size_t elementOffset = 4096;
+    constexpr std::size_t elementBytes = 2 * 65536;
+    const auto element = address + elementOffset;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    binding.bufferWritten = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    Recorder snapshotRecorder(snapshotContext);
+    snapshotRecorder.Activate();
+    {
+        ShaderResources resources(snapshotContext, compute);
+        const auto snapshot = [&] {
+            auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
+            auto buffer = bindings->snapshots[0].buffer;
+            const auto contents = buffer->Bytes();
+            Require(contents.size() == elementBytes && std::memcmp(contents.data(), reinterpret_cast<const void*>(element), elementBytes) == 0, "a draw snapshot does not hold the guest bytes of its draw");
+            return buffer;
+        };
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto first = snapshot();
+        Require(snapshot() == first, "a second draw in the same collect epoch copied its unchanged input again");
+        guest[elementOffset + 65536 + 17] ^= 0xffu;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto changed = snapshot();
+        Require(changed != first, "a draw after a store and a new collect epoch reused the snapshot taken before the store");
+        Require(snapshot() == changed, "a second draw after the store copied its input again");
+        snapshotRecorder.Sync();
+    }
+    std::cout << "draw snapshot reuse within a collect epoch: ok\n";
+}
+
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
@@ -6812,6 +6889,10 @@ int main(int argc, char** argv) {
             std::cout << "Draw snapshot cap tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {
+            drawSnapshotEpochTests(device);
+            return 0;
+        }
 
         if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
             return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) == "--vertex-target-range-imported") ? 0 : 77;
@@ -6882,6 +6963,7 @@ int main(int argc, char** argv) {
         gpu.unlock();
         hostImportUnmapTests(device, recorder);
         drawSnapshotPatchTests(device);
+        drawSnapshotEpochTests(device);
         gpu.lock();
         recorder.Activate();
         std::cout << "Recorder read tracking and label tests passed\n";
