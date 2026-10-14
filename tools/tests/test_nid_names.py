@@ -97,9 +97,12 @@ class NidArgumentTests(unittest.TestCase):
     def test_name_and_nid_modes_conflict_even_with_empty_filters(self):
         for name_option in ("--name", "--symbol", "--na", "--sym"):
             for nid_option in ("--nid", "--ni"):
-                for name_values, nid_values in (([], []), (["ceilf"], []), ([], ["AAAAAAAAAAA"])):
-                    names = [name_option, *name_values]
-                    nids = [nid_option, *nid_values]
+                for names, nids in (
+                        ([name_option], [nid_option]),
+                        ([name_option, "ceilf"], [nid_option]),
+                        ([name_option + "=ceilf"], [nid_option]),
+                        ([name_option], [nid_option, "AAAAAAAAAAA"]),
+                        ([name_option], [nid_option + "=AAAAAAAAAAA"])):
                     for arguments in (names + nids, nids + names):
                         with self.subTest(arguments=arguments), \
                                 contextlib.redirect_stdout(io.StringIO()) as output, \
