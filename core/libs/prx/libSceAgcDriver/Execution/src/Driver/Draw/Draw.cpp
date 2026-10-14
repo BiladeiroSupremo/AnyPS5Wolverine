@@ -94,6 +94,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;
+    // Debug aid: draws of APS5_TRACE_DRAW_PROGRAMS print their resources ([draw-io]) and skip recipes.
+    const bool tracedPrograms = std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return Graphics::TraceDrawProgram(program.binary.codeAddress); });
+    struct TracedDrawMark {
+        bool on;
+        const std::string& rejected;
+        std::uint64_t program;
+        TracedDrawMark(bool traced, const std::string& reason, std::uint64_t address) : on(traced), rejected(reason), program(address) { if (on) Graphics::MarkTracedDraw(true); }
+        ~TracedDrawMark() {
+            if (!on) return;
+            Graphics::MarkTracedDraw(false);
+            static std::atomic<int> printed{0};
+            if (!rejected.empty() && printed.fetch_add(1, std::memory_order_relaxed) < 200) std::fprintf(stderr, "[draw-io] traced draw (program 0x%llx) rejected: %s\n", static_cast<unsigned long long>(program), rejected.c_str());
+        }
+    } tracedMark(tracedPrograms, rejected, programs.empty() ? 0 : programs.front().binary.codeAddress);
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
         auto& words = programs.front().userData;
@@ -371,7 +385,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
     std::shared_ptr<const DrawRecipe> recipe;
-    if (drawHit && !recipeStages.empty()) {
+    if (drawHit && !recipeStages.empty() && !tracedPrograms) {
         recipe = findDrawRecipe(drawKey, recipeStages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }

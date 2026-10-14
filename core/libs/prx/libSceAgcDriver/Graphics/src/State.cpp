@@ -15,6 +15,8 @@
 #include <limits>
 #include <span>
 #include <array>
+#include <mutex>
+#include <set>
 #include <sstream>
 
 namespace AgcDriver::Graphics {
@@ -220,6 +222,17 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     zero(cx, 0x011, 0x00001000u, "partially resident stencil (DB_STENCIL_INFO)");
     const auto zFormat = read(cx, 0x010) & 3u;
     const bool stencil = (read(cx, 0x011) & 1u) != 0;
+    // Debug aid: APS5_TRACE_DEPTH_REGISTERS prints each new combination of the raw depth/stencil
+    // registers (DB_DEPTH_CONTROL, DB_Z_INFO, DB_STENCIL_INFO, DB_STENCIL_CONTROL, DB_STENCILREFMASK(_BF),
+    // DB_RENDER_CONTROL, DB_SHADER_CONTROL-derived stencil export).
+    static const bool traceRegisters = std::getenv("APS5_TRACE_DEPTH_REGISTERS") != nullptr;
+    if (traceRegisters) {
+        static std::mutex seenMutex;
+        static std::set<std::array<std::uint32_t, 8>> seen;
+        const std::array<std::uint32_t, 8> key{depthControl, read(cx, 0x010), read(cx, 0x011), read(cx, 0x10b), read(cx, 0x10c), read(cx, 0x10d), read(cx, 0x000), testValExport ? 1u : 0u};
+        std::lock_guard lock(seenMutex);
+        if (seen.size() < 256 && seen.insert(key).second) std::fprintf(stderr, "[depth-regs] DB_DEPTH_CONTROL 0x%08x Z_INFO 0x%08x STENCIL_INFO 0x%08x STENCIL_CONTROL 0x%08x REFMASK 0x%08x REFMASK_BF 0x%08x RENDER_CONTROL 0x%08x export %u\n", key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
+    }
     Require(zFormat != 2, "Z_24 depth is unsupported");
     if (zFormat == 0) depthControl &= ~6u;
     if (!stencil) depthControl &= ~1u;

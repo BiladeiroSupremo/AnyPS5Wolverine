@@ -1652,8 +1652,22 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     });
 }
 
-bool TraceDrawIoTarget(std::uint64_t address, VkFormat format);
-bool TraceDrawIoBudget();
+// [draw-io] detail: the stencil test of a draw (front and back faces: fail/pass/depth-fail ops,
+// compare, reference, compare and write masks), or nothing when the test is off.
+std::string DescribeStencil(const State& state) {
+    if (!state.stencilTest) return {};
+    char text[192];
+    const auto& f = state.stencilFront;
+    const auto& b = state.stencilBack;
+    std::snprintf(text, sizeof(text), " stencil stencil 0x%llx front %d/%d/%d cmp %d ref 0x%x mask 0x%x/0x%x back %d/%d/%d cmp %d ref 0x%x mask 0x%x/0x%x cull %d", static_cast<unsigned long long>(state.depth ? state.depth->stencilAddress : 0), f.failOp, f.passOp, f.depthFailOp, f.compareOp, f.reference, f.compareMask, f.writeMask, b.failOp, b.passOp, b.depthFailOp, b.compareOp, b.reference, b.compareMask, b.writeMask, static_cast<int>(state.cullMode));
+    return text;
+}
+
+bool TraceDrawIoTarget(std::uint64_t address, VkFormat format);bool TraceDrawIoBudget();
+namespace {
+// The calling thread's current draw is one of APS5_TRACE_DRAW_PROGRAMS (MarkTracedDraw).
+thread_local bool tracedDraw = false;
+}
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
@@ -1762,10 +1776,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     if (context.bindlessSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::BindlessHeaps::DescriptorSet, 1, &context.bindlessSet, 0, nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); }) && TraceDrawIoBudget()) {
+    if (!state.colors.empty() && (tracedDraw || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); })) && TraceDrawIoBudget()) {
         std::string stages;
         for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
-        std::fprintf(stderr, "[draw-io] recorded target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s depth 0x%llx vk%d test %d write %d op %d htile 0x%llx:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), static_cast<unsigned long long>(state.depth ? state.depth->address : 0), state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth ? state.depth->htileAddress : 0), resources.Describe().c_str());
+        std::fprintf(stderr, "[draw-io] recorded target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s depth 0x%llx vk%d test %d write %d op %d htile 0x%llx%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), static_cast<unsigned long long>(state.depth ? state.depth->address : 0), state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth ? state.depth->htileAddress : 0), DescribeStencil(state).c_str(), resources.Describe().c_str());
     }
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
@@ -1872,6 +1886,8 @@ bool TraceDrawIoTarget(std::uint64_t address, VkFormat format) {
     static const auto after = [] { const char* text = std::getenv("APS5_TRACE_DRAW_IO_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
     return std::chrono::steady_clock::now() - start >= after;
 }
+
+
 
 bool TraceDrawIoBudget() {
     static const int max = [] { const char* text = std::getenv("APS5_TRACE_DRAW_IO_MAX"); return text ? std::atoi(text) : 40; }();
@@ -2330,10 +2346,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     if (context.bindlessSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::BindlessHeaps::DescriptorSet, 1, &context.bindlessSet, 0, nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    if (std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); }) && TraceDrawIoBudget()) {
+    if (!state.colors.empty() && (tracedDraw || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); })) && TraceDrawIoBudget()) {
         std::string stages;
         for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
-        std::fprintf(stderr, "[draw-io] target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s depth 0x%llx vk%d test %d write %d op %d htile 0x%llx:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), static_cast<unsigned long long>(state.depth ? state.depth->address : 0), state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth ? state.depth->htileAddress : 0), resources->Describe().c_str());
+        std::fprintf(stderr, "[draw-io] target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s depth 0x%llx vk%d test %d write %d op %d htile 0x%llx%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), static_cast<unsigned long long>(state.depth ? state.depth->address : 0), state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth ? state.depth->htileAddress : 0), DescribeStencil(state).c_str(), resources != nullptr ? resources->Describe().c_str() : " (no resources)");
     }
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
@@ -2653,6 +2669,27 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         }
         storeClearTexels(context, color, texel);
     }
+}
+
+}
+
+namespace AgcDriver::Graphics {
+
+bool TraceDrawProgram(std::uint64_t address) {
+    static const std::vector<std::uint64_t> programs = [] {
+        std::vector<std::uint64_t> parsed;
+        for (const char* text = std::getenv("APS5_TRACE_DRAW_PROGRAMS"); text != nullptr && *text != '\0';) {
+            char* end = nullptr;
+            parsed.push_back(std::strtoull(text, &end, 16) & 0xfffffffffull);
+            text = *end == ',' ? end + 1 : nullptr;
+        }
+        return parsed;
+    }();
+    return !programs.empty() && std::find(programs.begin(), programs.end(), address & 0xfffffffffull) != programs.end();
+}
+
+void MarkTracedDraw(bool traced) {
+    tracedDraw = traced;
 }
 
 }
