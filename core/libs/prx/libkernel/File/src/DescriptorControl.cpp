@@ -567,4 +567,10 @@ void ForgetDescriptor(int fd) {
     g_entries.erase(fd);
 }
 
+bool Appends(int fd) {
+    std::lock_guard lock(g_mutex);
+    const auto found = g_entries.find(fd);
+    return found != g_entries.end() && found->second.status && (*found->second.status & Append) != 0;
+}
+
 }

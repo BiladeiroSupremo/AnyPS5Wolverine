@@ -248,6 +248,27 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
     const auto positioned = File::LockPositionedTransfer(descriptor);
     return NativePositionedTransfer(descriptor, buf, nbytes, offset, write);
 }
+std::int64_t File::WriteAtEnd(int descriptor, const void* buf, std::size_t nbytes) {
+    if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
+        throw std::runtime_error("WriteAtEnd: nbytes exceeds platform limit");
+    }
+    const auto handle = reinterpret_cast<HANDLE>(WithoutParameterHandler([descriptor] { return ::_get_osfhandle(descriptor); }));
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    if (::GetFileType(handle) != FILE_TYPE_DISK) return -2;
+    OVERLAPPED end{};
+    end.Offset = 0xFFFFFFFF;
+    end.OffsetHigh = 0xFFFFFFFF;
+    DWORD done = 0;
+    if (!::WriteFile(handle, buf, static_cast<DWORD>(nbytes), &done, &end)) {
+        const DWORD error = ::GetLastError();
+        errno = error == ERROR_ACCESS_DENIED ? EBADF : error == ERROR_DISK_FULL || error == ERROR_HANDLE_DISK_FULL ? ENOSPC : EIO;
+        return -1;
+    }
+    return done;
+}
 static std::int64_t NativeTransferBuffer(int descriptor, void* buf, std::size_t nbytes, bool write) {
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("NativeTransfer: nbytes exceeds platform limit");
@@ -262,6 +283,10 @@ static std::int64_t NativeTransferBuffer(int descriptor, void* buf, std::size_t 
     if (write) {
         const auto result = File::WriteSharedMemory_nid_no_patch(descriptor, buf, nbytes);
         if (result != -2) return result;
+        if (File::Appends(descriptor)) {
+            const auto appended = File::WriteAtEnd(descriptor, buf, nbytes);
+            if (appended != -2) return appended;
+        }
     }
     return write ? ::_write(descriptor, buf, static_cast<unsigned int>(nbytes)) : ::_read(descriptor, buf, static_cast<unsigned int>(nbytes));
 }
@@ -1121,6 +1146,16 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* iov, int iovcnt, co
         return result < 0 ? SceErrorFromErrno(errno) : 0;
     }
     if (!write && offset == nullptr && File::DirectoryDescriptorPath(d)) return SceErrorFromErrno(GUEST_EISDIR);
+    if (write && offset == nullptr && iovcnt > 1 && total <= static_cast<std::size_t>(std::numeric_limits<int>::max()) && File::Appends(d)) {
+        std::vector<char> gathered;
+        gathered.reserve(total);
+        for (int i = 0; i < iovcnt; ++i) {
+            const auto* base = static_cast<const char*>(iov[i].base);
+            gathered.insert(gathered.end(), base, base + iov[i].length);
+        }
+        const auto result = NativeTransferBuffer(d, gathered.data(), gathered.size(), true);
+        return result < 0 ? SceErrorFromErrno(errno) : result;
+    }
     const bool whole = write || offset != nullptr || NativeIsDisk(d);
     std::int64_t done = 0;
     for (int i = 0; i < iovcnt; ++i) {

@@ -77,6 +77,10 @@ static int NativeWrite(int fd, const void* buf, std::size_t n) {
     const auto positioned = File::LockPositionedTransfer(fd);
     const auto shared = File::WriteSharedMemory_nid_no_patch(fd, buf, n);
     if (shared != -2) return static_cast<int>(shared);
+    if (File::Appends(fd)) {
+        const auto appended = File::WriteAtEnd(fd, buf, n);
+        if (appended != -2) return static_cast<int>(appended);
+    }
     const int result = ::_write(fd, buf, static_cast<unsigned int>(n));
     if (result < 0 && errno == ENOSPC && _doserrno == 0 && ::GetFileType(reinterpret_cast<HANDLE>(::_get_osfhandle(fd))) == FILE_TYPE_PIPE) errno = EAGAIN;
     return result;
