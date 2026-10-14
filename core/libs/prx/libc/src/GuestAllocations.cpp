@@ -226,43 +226,42 @@ void GuestAllocationsRegisterImage_nid_postfix(void*, const void* image) {
     registerImage(image);
 }
 
-void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* image) {
-    auto& state = registry();
-    const auto found = state.registeredImages.find(reinterpret_cast<std::uintptr_t>(image));
-    if (found == state.registeredImages.end()) return;
-    const auto [begin, end] = *found;
-    GuestAllocationsRequireUnpinned_nid_postfix(mutation, image, end - begin);
-    recordChange(mutation, image, end - begin);
-    std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
-    state.registeredImages.erase(found);
-}
 #else
-void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
-    auto& state = registry();
-    if (state.mainImageRegistered) return;
+namespace {
+struct ImagePages {
     struct Page {
         bool readable = false;
         bool writable = false;
     };
+    std::uintptr_t base = 0;
+    bool main = false;
+    bool found = false;
+    std::uint64_t pageSize = 0;
     std::map<std::uint64_t, Page> pages;
-    const auto pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
-    std::pair<std::map<std::uint64_t, Page>*, std::uint64_t> collection{&pages, pageSize};
-    dl_iterate_phdr([](dl_phdr_info* image, std::size_t, void* data) {
-        auto& collected = *static_cast<std::pair<std::map<std::uint64_t, Page>*, std::uint64_t>*>(data);
-        for (int index = 0; index < image->dlpi_phnum; ++index) {
-            const auto& header = image->dlpi_phdr[index];
-            if (header.p_type != PT_LOAD || header.p_memsz == 0) continue;
-            const auto start = (image->dlpi_addr + header.p_vaddr) & ~(collected.second - 1);
-            const auto end = (image->dlpi_addr + header.p_vaddr + header.p_memsz + collected.second - 1) & ~(collected.second - 1);
-            for (auto page = start; page < end; page += collected.second) {
-                auto& entry = (*collected.first)[page];
-                entry.readable = entry.readable || (header.p_flags & (PF_R | PF_W)) != 0;
-                entry.writable = entry.writable || (header.p_flags & PF_W) != 0;
-            }
+};
+
+int collectImagePages(dl_phdr_info* image, std::size_t, void* data) {
+    auto& collected = *static_cast<ImagePages*>(data);
+    if (!collected.main && image->dlpi_addr != collected.base) return 0;
+    collected.found = true;
+    for (int index = 0; index < image->dlpi_phnum; ++index) {
+        const auto& header = image->dlpi_phdr[index];
+        if (header.p_type != PT_LOAD || header.p_memsz == 0) continue;
+        const auto start = (image->dlpi_addr + header.p_vaddr) & ~(collected.pageSize - 1);
+        const auto end = (image->dlpi_addr + header.p_vaddr + header.p_memsz + collected.pageSize - 1) & ~(collected.pageSize - 1);
+        for (auto page = start; page < end; page += collected.pageSize) {
+            auto& entry = collected.pages[page];
+            entry.readable = entry.readable || (header.p_flags & (PF_R | PF_W)) != 0;
+            entry.writable = entry.writable || (header.p_flags & PF_W) != 0;
         }
-        return 1;
-    }, &collection);
-    require(!pages.empty(), "main guest image has no loadable segments");
+    }
+    return 1;
+}
+
+std::uintptr_t registerImagePages(const ImagePages& collected) {
+    auto& state = registry();
+    const auto pageSize = collected.pageSize;
+    const auto& pages = collected.pages;
     auto replacement = state.ranges;
     for (auto page = pages.begin(); page != pages.end();) {
         auto last = page;
@@ -279,9 +278,44 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
         page = std::next(last);
     }
     state.ranges.swap(replacement);
+    return static_cast<std::uintptr_t>(std::prev(pages.end())->first + pageSize);
+}
+}
+
+void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
+    auto& state = registry();
+    if (state.mainImageRegistered) return;
+    ImagePages collected{.main = true, .pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE))};
+    dl_iterate_phdr(collectImagePages, &collected);
+    require(!collected.pages.empty(), "main guest image has no loadable segments");
+    registerImagePages(collected);
     state.mainImageRegistered = true;
 }
+
+void GuestAllocationsRegisterImage_nid_postfix(void*, const void* image) {
+    require(image != nullptr, "cannot register a guest image without a base");
+    auto& state = registry();
+    const auto base = reinterpret_cast<std::uintptr_t>(image);
+    if (state.registeredImages.contains(base)) return;
+    ImagePages collected{.base = base, .pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE))};
+    dl_iterate_phdr(collectImagePages, &collected);
+    require(collected.found, "cannot locate a guest image");
+    require(!collected.pages.empty(), "guest image has no loadable segments");
+    require(collected.pages.begin()->first == base, "guest image does not start at its base");
+    state.registeredImages.emplace(base, registerImagePages(collected));
+}
 #endif
+
+void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* image) {
+    auto& state = registry();
+    const auto found = state.registeredImages.find(reinterpret_cast<std::uintptr_t>(image));
+    if (found == state.registeredImages.end()) return;
+    const auto [begin, end] = *found;
+    GuestAllocationsRequireUnpinned_nid_postfix(mutation, image, end - begin);
+    recordChange(mutation, image, end - begin);
+    std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
+    state.registeredImages.erase(found);
+}
 
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu) {
     recordChange(mutation, pointer, bytes);
