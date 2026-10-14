@@ -145,9 +145,6 @@ inline constexpr std::uint32_t R_X86_64_DTPOFF64 = 17;
 inline constexpr std::uint32_t R_X86_64_TPOFF64 = 18;
 inline constexpr std::uint32_t R_X86_64_GOTPCRELX = 41;
 inline constexpr std::uint32_t R_X86_64_REX_GOTPCRELX = 42;
-inline constexpr std::uint32_t R_X86_64_DTPMOD64 = 16;
-inline constexpr std::uint32_t R_X86_64_DTPOFF64 = 17;
-inline constexpr std::uint32_t R_X86_64_TPOFF64 = 18;
 inline constexpr std::uint32_t R_X86_64_IRELATIVE = 37;
 
 inline constexpr std::uint8_t STB_GLOBAL = 1;
@@ -156,7 +153,6 @@ inline constexpr std::uint8_t STT_NOTYPE = 0;
 inline constexpr std::uint8_t STT_FUNC = 2;
 inline constexpr std::uint8_t STT_TLS = 6;
 inline constexpr std::uint8_t STV_DEFAULT = 0;
-inline constexpr std::uint8_t STT_TLS = 6;
 inline constexpr std::uint16_t SHN_UNDEF = 0;
 inline constexpr std::uint16_t SHN_LORESERVE = 0xff00;
 inline constexpr std::uint16_t SHN_ABS = 0xfff1;
