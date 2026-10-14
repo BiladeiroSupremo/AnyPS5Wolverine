@@ -149,6 +149,41 @@ class TraceDigestTests(unittest.TestCase):
         self.assertAlmostEqual(waits[0]["ms"], 14.5)
         self.assertEqual(waits[1]["name"], "Driver.WorkerWait")
 
+    def test_gpu_mutex_waits_with_site_names(self):
+        for site in ("other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"):
+            with self.subTest(site=site):
+                name = f"GpuMutex.wait.{site}"
+                events = [
+                    complete(1, "Driver.Packet", 0, 10000),
+                    complete(1, name, 1000, 4000),
+                    complete(1, "Driver.Packet.memory_wait", 2000, 1000),
+                    {"name": "present", "ph": "i", "ts": 0, "tid": 1, "args": {"present": 600}},
+                    {"name": "present", "ph": "i", "ts": 10000, "tid": 1, "args": {"present": 601}},
+                ]
+                result = trace_digest.digest(trace_digest.Trace({"traceEvents": events}))
+                thread = result["threads"][0]
+                self.assertAlmostEqual(thread["wait_ms_per_frame"], 4.0)
+                self.assertAlmostEqual(thread["busy_ms_per_frame"], 6.0)
+                self.assertAlmostEqual(thread["wait_pct"], 40.0)
+                self.assertAlmostEqual(thread["busy_pct"], 60.0)
+                self.assertEqual(result["longest_waits"], [
+                    {"name": name, "thread": "tid 1", "ms": 4.0, "at_ms": 1.0, "present": 600},
+                ])
+                self.assertIn(f"- {name} (tid 1) 4.0 ms", trace_digest.markdown(result))
+
+    def test_top_level_gpu_mutex_wait_is_not_busy_work(self):
+        events = [
+            complete(1, "GpuMutex.wait.draw", 0, 4000),
+            complete(1, "GpuMutex.hold.draw", 4000, 6000),
+            {"name": "present", "ph": "i", "ts": 0, "tid": 1, "args": {"present": 600}},
+            {"name": "present", "ph": "i", "ts": 10000, "tid": 1, "args": {"present": 601}},
+        ]
+        result = trace_digest.digest(trace_digest.Trace({"traceEvents": events}))
+        thread = result["threads"][0]
+        self.assertAlmostEqual(thread["busy_ms_per_frame"], 6.0)
+        self.assertAlmostEqual(thread["wait_ms_per_frame"], 4.0)
+        self.assertEqual(thread["top"], [{"name": "GpuMutex.hold.draw", "ms_per_frame": 6.0}])
+
     def test_stacks_self_and_total(self):
         stacks = self.result()["stacks"]
         self.assertEqual(stacks["samples"], 5)
