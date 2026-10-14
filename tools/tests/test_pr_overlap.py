@@ -77,6 +77,23 @@ class OpenPullRequestsTests(unittest.TestCase):
                 pr_overlap.open_prs("main")
 
 
+class TopInsertTests(unittest.TestCase):
+    def test_top_of_file_insertions_clash_on_line_one(self):
+        pr = {"tree": "t", "files": {"f.cpp"}, "added": set()}
+        with patch.object(pr_overlap, "git", return_value="@@ -0,0 +1 @@\n+x\n"):
+            self.assertEqual(pr_overlap.hunks(pr, "f.cpp"), [(1, 1)])
+            self.assertEqual(pr_overlap.clashes(pr, pr, "f.cpp"), [(1, 1)])
+
+    def test_top_of_file_span_links_to_line_one(self):
+        self.assertEqual(pr_overlap.spans({"f.cpp": [(1, 1)]}, "https://x/blob/sha"),
+                         "`f.cpp` [L1](https://x/blob/sha/f.cpp#L1)")
+
+    def test_ordinary_hunk_is_unchanged(self):
+        pr = {"tree": "t"}
+        with patch.object(pr_overlap, "git", return_value="@@ -3,2 +3,2 @@\n-a\n-b\n+c\n+d\n"):
+            self.assertEqual(pr_overlap.hunks(pr, "f.cpp"), [(3, 4)])
+
+
 class FetchTests(unittest.TestCase):
     def test_fetches_each_head_commit_the_api_reported(self):
         prs = {
