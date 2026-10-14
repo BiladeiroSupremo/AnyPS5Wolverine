@@ -284,6 +284,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     }
     result.stencilTest = (depthControl & 1u) != 0;
     if (stencilClear) {
+        static const bool traceStencilClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+        if (traceStencilClears) std::fprintf(stderr, "[depth-clear] stencil clear draw, stencil 0x%llx value 0x%x\n", static_cast<unsigned long long>(depth.stencilAddress), depth.clearStencil);
         VkStencilOpState clear{};
         clear.failOp = VK_STENCIL_OP_REPLACE;
         clear.passOp = VK_STENCIL_OP_REPLACE;

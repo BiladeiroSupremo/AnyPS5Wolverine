@@ -10,6 +10,7 @@
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -117,6 +118,34 @@ public:
         if (batch) batch->SubmitAndWait();
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
     }
+
+    // A fill of a whole depth or stencil plane in guest memory (the console UI resets a glyph
+    // cache's stencil to 1 and depth to 1.0 with DMA fills before each path): the host image takes
+    // the filled value, before any register (HTILE) fast clear that is also pending.
+    void ApplyPlaneFills() {
+        const auto aspects = pendingFill;
+        pendingFill = 0;
+        if (aspects == 0) return;
+        static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+        if (traceClears) std::fprintf(stderr, "[depth-clear] plane fill applied to depth 0x%llx (aspects 0x%x, depth %g, stencil 0x%x)\n", static_cast<unsigned long long>(target.address), static_cast<unsigned>(aspects), fillDepth, fillStencil);
+        written = ++depthWrites;
+        auto* recorder = RecorderFor(context);
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        const VkImageSubresourceRange range{aspects, 0, 1, 0, 1};
+        constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearDepthStencilValue clear{fillDepth, fillStencil};
+        context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, access);
+        if (batch) batch->SubmitAndWait();
+        else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    }
+
+    VkImageAspectFlags pendingFill = 0;
+    float fillDepth = 0.0f;
+    std::uint8_t fillStencil = 0;
 
     std::shared_ptr<Texture> Sampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
         std::array<std::uint32_t, 12> key{};
@@ -517,6 +546,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         surface->clearDepth = target.clearDepth;
         surface->clearStencil = target.clearStencil;
         if (cleared) surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        surface->ApplyPlaneFills();
         surface->ApplyFastClear();
         surface->written = ++depthWrites;
         drawnDepth = surface.get();
@@ -579,6 +609,8 @@ bool NoteHtileOverwrite(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
     bool cleared = false;
     for (const auto& surface : surfaces()) {
+        static const bool tracePlanes = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+        if (tracePlanes && (surface->target.stencilAddress == address || surface->target.address == address)) std::fprintf(stderr, "[depth-clear] dispatch writes the %s plane 0x%llx of depth 0x%llx without reading it\n", surface->target.stencilAddress == address ? "stencil" : "depth", static_cast<unsigned long long>(address), static_cast<unsigned long long>(surface->target.address));
         if (surface->target.htileAddress != address) continue;
         surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
         cleared = true;
@@ -695,7 +727,23 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
         const auto& target = surface->target;
         static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
         if (traceClears && target.htileAddress != 0 && target.htileAddress < address + bytes && address < target.htileAddress + HtileMetadataBytes(target.extent)) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x over htile 0x%llx of depth 0x%llx: %s\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.htileAddress), static_cast<unsigned long long>(target.address), HtileFillCovers(target.htileAddress, target.extent, address, bytes) ? "covers" : "partial, ignored");
-        if (!HtileFillCovers(target.htileAddress, target.extent, address, bytes)) continue;
+        // A fill of a whole plane is a clear of that aspect to the filled value: a depth plane of
+        // 32-bit floats (or 16-bit unorm), a stencil plane of one repeated byte.
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto covers = [&](std::uint64_t plane, std::uint64_t planeBytes) { return plane != 0 && address <= plane && address + bytes >= plane + planeBytes; };
+        if (covers(target.address, DepthSliceBytes(target.extent, d16 ? 2u : 4u)) && (!d16 || (pattern >> 16u) == (pattern & 0xffffu))) {
+            surface->pendingFill |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            surface->fillDepth = d16 ? static_cast<float>(pattern & 0xffffu) / 65535.0f : std::bit_cast<float>(pattern);
+            surface->pendingClear &= ~VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (traceClears) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x clears the depth plane of 0x%llx\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.address));
+        }
+        const auto byte = pattern & 0xffu;
+        if (covers(target.stencilAddress, DepthSliceBytes(target.extent, 1u)) && pattern == byte * 0x01010101u) {
+            surface->pendingFill |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            surface->fillStencil = static_cast<std::uint8_t>(byte);
+            surface->pendingClear &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (traceClears) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x clears the stencil plane 0x%llx of 0x%llx\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.address));
+        }        if (!HtileFillCovers(target.htileAddress, target.extent, address, bytes)) continue;
         const VkImageAspectFlags written = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         surface->pendingClear = (surface->pendingClear & ~written) | HtileFillClears(pattern, target.htileStencil);
     }
