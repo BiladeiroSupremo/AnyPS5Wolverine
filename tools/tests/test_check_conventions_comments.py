@@ -395,6 +395,20 @@ class TestFixtureExportTests(unittest.TestCase):
         self.assertIn("core/libs/prx/libSceAudioOut/src/Clock.cpp:1: error: [duplicate-export]", result.stdout)
         self.assertIn("sceKernelGetProcessTime is also in libkernel", result.stdout)
 
+    def test_comment_in_a_shader_is_reported(self):
+        for path in ("core/libs/prx/libSceAgcDriver/Graphics/shaders/Fill.comp", "core/libs/prx/libSceAgcDriver/tests/shaders/Fill.frag"):
+            for line in ("    // fill the target", "    /* fill the target */"):
+                with self.subTest(path=path, line=line):
+                    result = self.check(path, f"#version 450\nvoid main() {{\n{line}\n}}\n")
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(f"{path}:3: error: [comment]", result.stdout)
+
+    def test_shader_without_comments_passes(self):
+        result = self.check("core/libs/prx/libSceAgcDriver/Graphics/shaders/Fill.vert",
+                            '#version 450\n#define TEXT "a//b"\n#ifdef X\n#endif // X\nvoid main() {}\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("All conventions checks passed", result.stdout)
+
 
 class PullRequestTemplateTests(unittest.TestCase):
     def body_findings(self, body):

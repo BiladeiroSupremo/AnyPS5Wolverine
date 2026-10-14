@@ -191,6 +191,16 @@ class Check:
             if match and not match.group(1).startswith("3rdparty/"):
                 self.report("system-dependency", ".gitmodules", number, match.group(1))
 
+    def shaders(self):
+        if any(is_debt(path) for path in self.status):
+            return
+        for path, lines in self.files(lambda p: p.suffix in (".comp", ".frag", ".vert")):
+            masked = cpp_text(self.show(path), preserve_comments=True).split("\n")
+            for number, _ in lines:
+                bare = masked[number - 1]
+                if ("//" in bare or "/*" in bare) and not ALLOWED_COMMENT.match(bare):
+                    self.report("comment", path, number)
+
     def submodules(self):
         result = subprocess.run(["git", "config", "--no-includes", "-z", "--blob", f"{self.head}:.gitmodules", "--list"],
                                 capture_output=True, encoding="utf-8", errors="replace")
@@ -456,6 +466,7 @@ if __name__ == "__main__":
     check = Check(args.base, args.head)
     check.code()
     check.build()
+    check.shaders()
     check.repository()
     check.docs()
     check.workflows()
