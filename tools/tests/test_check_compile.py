@@ -16,7 +16,7 @@ class CheckCompileTests(unittest.TestCase):
     def setUp(self):
         holder = tempfile.TemporaryDirectory()
         self.addCleanup(holder.cleanup)
-        self.root = Path(holder.name)
+        self.root = Path(holder.name).resolve()
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(["git", "-C", str(self.root), "config", "user.email", "tests@example.com"], check=True)
         subprocess.run(["git", "-C", str(self.root), "config", "user.name", "tests"], check=True)
@@ -185,9 +185,14 @@ class CheckCompileTests(unittest.TestCase):
         entry = self.entry("unit.cpp", f'"{sys.executable}" "{script}" "{source}"')
         bin = self.root / "bin"
         bin.mkdir()
-        ninja = bin / "ninja"
-        ninja.write_text("#!/usr/bin/env python3\nimport json\nprint(json.dumps(%r))\n" % [entry], encoding="utf-8")
-        ninja.chmod(0o755)
+        stub = bin / "ninja_stub.py"
+        stub.write_text("import json\nprint(json.dumps(%r))\n" % [entry], encoding="utf-8")
+        if os.name == "nt":
+            (bin / "ninja.cmd").write_text(f'@"{sys.executable}" "{stub}"\n', encoding="utf-8")
+        else:
+            ninja = bin / "ninja"
+            ninja.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{stub}"\n', encoding="utf-8")
+            ninja.chmod(0o755)
         result = self.tool("unit.cpp", env={"PATH": f"{bin}{os.pathsep}{os.environ['PATH']}"})
         self.assertEqual(result.returncode, 0)
         self.assertIn("1 translation units compile", result.stdout)
