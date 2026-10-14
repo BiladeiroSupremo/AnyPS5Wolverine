@@ -505,7 +505,16 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     context.memoryProperties2(context.physical, &properties);
     const auto sampled = SampledTextureMemory();
     const auto storage = storageCacheBytes();
-    const auto budget = SampledTextureBudget(context.memory, &reported, sampled + storage);
+    // A ceiling on the memory-budget-derived figure: device-local memory is process commit on Windows
+    // drivers that back it (AMD), and freed VRAM stays with the driver, so the peak counts. 2 GiB of
+    // sampled textures cost the title's cinematic no frame rate and saved ~1.2 GB of commit (it
+    // floated at 3.2-5.4 GiB). APS5_TEXTURE_CACHE_CEILING_MIB=0 removes the ceiling.
+    static const std::uint64_t ceiling = [] {
+        const char* text = std::getenv("APS5_TEXTURE_CACHE_CEILING_MIB");
+        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 2048ull) << 20u;
+    }();
+    auto budget = SampledTextureBudget(context.memory, &reported, sampled + storage);
+    if (ceiling != 0) budget = std::min(budget, ceiling);
     const bool fresh = cache.budgetDevice != context.physical;
     if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(cache.reportedBudget, budget, now - cache.reportedAt))) {
         char was[48] = "";

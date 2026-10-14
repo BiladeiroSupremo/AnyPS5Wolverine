@@ -2124,6 +2124,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(*args, record));
             indirect.readMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
             indirect.records = records;
+            if (tracedDraw && TraceDrawIoBudget()) {
+                std::string text;
+                for (std::size_t i = 0; i < std::min<std::size_t>(records.size(), 8); ++i) text += " " + std::to_string(records[i].count) + "x" + std::to_string(records[i].instances);
+                std::fprintf(stderr, "[draw-io] traced indirect draw: %zu records (count x instances):%s%s\n", records.size(), text.c_str(), records.size() > 8 ? " ..." : "");
+            }
             if (std::none_of(records.begin(), records.end(), [](const Pm4::DrawArguments& record) { return record.count != 0 && record.instances != 0; })) {
                 CountIndirectDraw(indirect.path, indirect.readMs);
                 report(" indirect draw with empty records");
