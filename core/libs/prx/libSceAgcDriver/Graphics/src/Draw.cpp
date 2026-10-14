@@ -1781,7 +1781,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         for (const auto& shader : shaders) stages += " stage" + std::to_string(static_cast<int>(shader.stage));
         std::fprintf(stderr, "[draw-io] recorded target 0x%llx %ux%u vkformat %d, %zu targets, %u indices x%u,%s depth 0x%llx vk%d test %d write %d op %d htile 0x%llx%s:%s\n", static_cast<unsigned long long>(state.colors[0].address), state.colors[0].extent.width, state.colors[0].extent.height, static_cast<int>(state.colors[0].format), state.colors.size(), draw.indexCount, draw.instanceCount, stages.c_str(), static_cast<unsigned long long>(state.depth ? state.depth->address : 0), state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth ? state.depth->htileAddress : 0), DescribeStencil(state).c_str(), resources.Describe().c_str());
     }
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    if (state.colors.empty() && state.depth && (tracedDraw || TraceDrawIoTarget(state.depth->address, state.depth->format)) && TraceDrawIoBudget()) {
+        std::fprintf(stderr, "[draw-io] depth-only draw depth 0x%llx %ux%u vk%d, %u indices x%u, test %d write %d op %d htile 0x%llx%s:%s\n", static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format), draw.indexCount, draw.instanceCount, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth->htileAddress), DescribeStencil(state).c_str(), resources.Describe().c_str());
+    }    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
@@ -1880,9 +1882,18 @@ bool TraceDrawIoTarget(std::uint64_t address, VkFormat format) {
     // "*" (parsed as 0) traces every target.
     const bool all = std::find(addresses.begin(), addresses.end(), 0ull) != addresses.end();
     if (addresses.empty() || (!all && std::find(addresses.begin(), addresses.end(), address) == addresses.end())) return false;
-    // APS5_TRACE_DRAW_IO_FORMAT=<VkFormat> keeps only targets of that format.
-    static const int onlyFormat = [] { const char* text = std::getenv("APS5_TRACE_DRAW_IO_FORMAT"); return text ? std::atoi(text) : -1; }();
-    if (onlyFormat >= 0 && static_cast<int>(format) != onlyFormat) return false;
+    // APS5_TRACE_DRAW_IO_FORMAT=<VkFormat>[,<VkFormat>...] keeps only targets of those formats (a
+    // depth-only draw is matched by its depth format).
+    static const std::vector<int> onlyFormats = [] {
+        std::vector<int> parsed;
+        for (const char* text = std::getenv("APS5_TRACE_DRAW_IO_FORMAT"); text != nullptr && *text != '\0';) {
+            char* end = nullptr;
+            parsed.push_back(static_cast<int>(std::strtol(text, &end, 10)));
+            text = *end == ',' ? end + 1 : nullptr;
+        }
+        return parsed;
+    }();
+    if (!onlyFormats.empty() && std::find(onlyFormats.begin(), onlyFormats.end(), static_cast<int>(format)) == onlyFormats.end()) return false;
     static const auto after = [] { const char* text = std::getenv("APS5_TRACE_DRAW_IO_AFTER"); return std::chrono::seconds(text ? std::atoi(text) : 0); }();
     return std::chrono::steady_clock::now() - start >= after;
 }
