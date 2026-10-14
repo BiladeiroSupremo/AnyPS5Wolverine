@@ -1161,6 +1161,39 @@ class ImportAuditTests(unittest.TestCase):
             self.assertEqual(import_audit.git_stamp(self.work.source), ("abcdef", True))
         self.assertEqual([call.args[0][2] for call in run.call_args_list], [str(self.work.source), str(self.work.source)])
 
+    def test_json_keeps_source_commit_when_a_broken_submodule_prevents_status(self):
+        work = self.work
+        command = ["git", "-C", str(work.source)]
+        identity = ["-c", "user.name=Audit test", "-c", "user.email=audit@example.invalid"]
+        subprocess.run(command + ["init", "-q"], check=True, capture_output=True)
+        subprocess.run(command + identity + ["commit", "--allow-empty", "-qm", "Source fixture"], check=True, capture_output=True)
+        commit = subprocess.check_output(command + ["rev-parse", "HEAD"], text=True).strip()
+        (work.source / ".gitmodules").write_text(
+            '[submodule "damaged"]\n\tpath = damaged\n\turl = https://example.invalid/damaged.git\n', encoding="utf-8")
+        subprocess.run(command + ["add", ".gitmodules"], check=True, capture_output=True)
+        subprocess.run(command + ["update-index", "--add", "--cacheinfo", "160000", commit, "damaged"], check=True, capture_output=True)
+        subprocess.run(command + identity + ["commit", "-qm", "Submodule fixture"], check=True, capture_output=True)
+        damaged = work.source / "damaged"
+        damaged.mkdir()
+        (damaged / ".git").write_text("gitdir: ../missing-submodule-git\n", encoding="utf-8")
+        commit = subprocess.check_output(command + ["rev-parse", "HEAD"], text=True).strip()
+        status = subprocess.run(command + ["status", "--porcelain"], capture_output=True)
+        self.assertNotEqual(status.returncode, 0)
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry, report = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        code, _, err = work.run(registry, "--json", str(report))
+        self.assertEqual((code, err), (0, ""))
+        data = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(data["source_commit"], commit)
+        self.assertIsNone(data["source_dirty"])
+        self.assertEqual(data["unique_by_class"], {"implemented": 1, "stub": 0, "absent": 0, "module": 0})
+
+    def test_git_stamp_keeps_commit_when_status_cannot_start(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="abcdef\n")
+        with patch.object(import_audit.subprocess, "run", side_effect=[completed, OSError("status unavailable")]):
+            self.assertEqual(import_audit.git_stamp(self.work.source), ("abcdef", None))
+
     def test_library_directories(self):
         work = self.work
         (work.libs / "libSceA.prx").write_bytes(build_pe(["AAAAAAAAAAA"]))
