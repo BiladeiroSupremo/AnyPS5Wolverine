@@ -97,6 +97,10 @@ jobs:
                 await new Promise((resolve) => setTimeout(resolve, 3000));
                 ({ data: pr } = await github.rest.pulls.get({ owner, repo, pull_number }));
               }
+              if (!manual && pr.state !== 'open') {
+                await core.summary.addRaw(`PR #${pull_number} was ${pr.merged ? 'merged' : 'closed'} before this run started: nothing to build`).write();
+                return;
+              }
               if (pr.state !== 'open' || pr.base.ref !== 'main') {
                 throw new Error(`Pull request #${pull_number} must be open and target main`);
               }
