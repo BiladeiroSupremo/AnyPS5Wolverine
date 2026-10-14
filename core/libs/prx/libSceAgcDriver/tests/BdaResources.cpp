@@ -578,8 +578,6 @@ void spaceReadAcrossImportsWrittenTests(const Context& context) {
         else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     };
-    // A written V# in the lower import whose tail a read-only V# across both imports also binds,
-    // added after it and before it: both must map the shared bytes through one buffer.
     for (const bool writtenFirst : {false, true}) {
         for (std::size_t index = 0; index < 3; ++index) change(guest + index * piece, true);
         for (int build = 0; build < 2; ++build) {
