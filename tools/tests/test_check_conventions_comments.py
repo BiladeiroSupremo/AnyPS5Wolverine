@@ -381,6 +381,16 @@ class PullRequestTemplateTests(unittest.TestCase):
     def test_checked_item_is_accepted(self):
         self.assertEqual(self.findings("- [x] all"), [])
 
+    def test_depends_on_answered_as_a_list_is_accepted(self):
+        for answer in ("\n  - #3\n  - #4", "\r\n  - #3\r\n  - #4", "\n- #3", "\n  * none"):
+            with self.subTest(answer=answer):
+                body = f"### What\nx\n### Tested\nLinux\n### Checklist\n- [x] Depends on:{answer}\n- [x] AI-assisted: no\n"
+                self.assertEqual(self.body_findings(body), [])
+
+    def test_depends_on_left_empty_before_the_next_item_is_reported(self):
+        body = "### What\nx\n### Tested\nLinux\n### Checklist\n- [x] Depends on:\n- [x] AI-assisted: no\n"
+        self.assertEqual(self.body_findings(body), [("pr-template", "", 0, "fill Depends on with #N or none")])
+
     def test_subsections_stay_inside_their_section(self):
         body = "### What\nx\n### Tested\n#### Linux\nctest\n#### Windows\nctest\n### Checklist\n- [x] Depends on: none\n- [x] AI-assisted: no\n"
         self.assertEqual(self.body_findings(body), [])
