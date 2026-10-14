@@ -2,6 +2,8 @@ import contextlib
 import gzip
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -116,6 +118,16 @@ class TraceDigestTests(unittest.TestCase):
         result = self.result()
         self.assertEqual(result["frames"], 3)
         self.assertAlmostEqual(result["window_ms"], 40.0)
+
+    def test_command_line_prints_non_ascii_names_on_a_legacy_console(self):
+        events = [dict(event, args={"name": "メイン"}) if event["name"] == "thread_name" and event["tid"] == 1 else event for event in EVENTS]
+        with gzip.open(self.trace, "wt", encoding="utf-8") as handle:
+            json.dump({"traceEvents": events}, handle)
+        tool = Path(trace_digest.__file__).resolve()
+        result = subprocess.run([sys.executable, str(tool), str(self.trace)], capture_output=True,
+                                env=dict(os.environ, PYTHONIOENCODING="cp1252"), timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertIn("メイン", result.stdout.decode("utf-8"))
 
     def test_slowest_frame_lists_its_slices(self):
         slowest = self.result()["slowest_frames"]
