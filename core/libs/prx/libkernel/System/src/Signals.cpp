@@ -585,6 +585,37 @@ int APS5_VABI pause_nid_postfix(void) {
     }
 }
 
+int APS5_VABI sigsuspend_nid_postfix(const GuestSignalSet* set) {
+    if (set == nullptr) { *__error_nid_postfix() = 14; return -1; }
+    std::uint32_t previous = 0;
+    {
+        std::lock_guard lock(registration);
+        previous = blockedMask.exchange(set->bits[0]);
+    }
+    auto& pending = Pending();
+    for (;;) {
+        int guest = 0;
+        {
+            std::unique_lock lock(pending.lock);
+            if (!TakePendingUnblocked(&guest)) {
+                pending.changed.wait(lock);
+                continue;
+            }
+        }
+        if (DeliverPendingSignal(guest)) break;
+    }
+    {
+        std::lock_guard lock(registration);
+        blockedMask.store(previous);
+    }
+    for (int guest = 1; guest <= MaxSignal; ++guest) {
+        if (SignalBlocked(guest) || !Deliverable(guest) || !TakePending(guest)) continue;
+        DeliverPendingSignal(guest);
+    }
+    *__error_nid_postfix() = GuestEintr;
+    return -1;
+}
+
 int APS5_VABI sigpending_nid_postfix(GuestSignalSet* set) {
     if (set == nullptr) { *__error_nid_postfix() = 14; return -1; }
     auto& pending = Pending();
