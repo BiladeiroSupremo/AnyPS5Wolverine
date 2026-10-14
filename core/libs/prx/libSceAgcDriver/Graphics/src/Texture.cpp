@@ -1905,6 +1905,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     comparedGuestBytes = {};
+    if (original.size() != guestBytes) original.resize(static_cast<std::size_t>(guestBytes));
     std::vector<bool> selected(trackedLayers, true);
     if (layers != nullptr) selected = *layers;
     for (const auto& [begin, end] : unitRuns(selected)) GuestMemory::FlushGpuWrites(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
@@ -1971,7 +1972,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
-    original.resize(static_cast<std::size_t>(guestBytes));
+    // `original` is sized where it is filled (captureGuestBytes, the CPU paths): an image over write-
+    // watched memory never needs it, and the zeroed copies held ~1.5 GB in Wolverine.
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
@@ -2001,8 +2003,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
         static_cast<void>(HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) layerOriginal.assign(trackedLayers, false);
-        else captureGuestBytes(nullptr);
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            layerOriginal.assign(trackedLayers, false);
+            std::vector<std::byte>().swap(original);
+        } else captureGuestBytes(nullptr);
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
@@ -2050,8 +2054,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         return;
     }
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) layerOriginal.assign(trackedLayers, false);
-        else captureGuestBytes(layers);
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            layerOriginal.assign(trackedLayers, false);
+            std::vector<std::byte>().swap(original);
+        } else captureGuestBytes(layers);
         stampLayers(true);
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
         // shadow holds part of the surface (the detile then reads the slabs; a new image has no
@@ -2175,6 +2181,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     layerOriginal.assign(trackedLayers, true);
     forgetBorrowed(0, trackedLayers);
     stampLayers(false);
+    if (original.size() != guestBytes) original.resize(static_cast<std::size_t>(guestBytes));
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     {
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -4423,6 +4430,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
     Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+    if (original.size() != guestBytes) original.resize(static_cast<std::size_t>(guestBytes));
     std::vector<bool> unsaved = layerOriginal;
     unsaved.flip();
     for (const auto& [begin, end] : unitRuns(unsaved)) GuestMemory::ReadCommitted(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
