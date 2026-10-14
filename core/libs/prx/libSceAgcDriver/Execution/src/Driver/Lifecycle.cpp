@@ -194,8 +194,8 @@ void Driver::ReportFailure(std::exception_ptr error) {
             worker.unfinishedWrites.clear();
             worker.queued.store(0, std::memory_order_release);
         }
+        if (first) PrintFailure(error);
     }
-    if (first) PrintFailure(error);
     changed.notify_all();
 }
 
