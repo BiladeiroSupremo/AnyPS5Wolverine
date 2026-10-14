@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <string>
 #include <windows.h>
 #include <psapi.h>
 
@@ -25,36 +26,52 @@ static bool Throws(std::uint64_t address) {
     return false;
 }
 
-static void ReloadedModuleIsRead() {
+struct FixtureCopy {
+    void* handle;
+    UnwindFixture* fixture;
+    std::uint64_t address;
+};
+
+static std::string FixtureCopyPath() {
     HMODULE linked = nullptr;
     Require(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         reinterpret_cast<LPCWSTR>(GetUnwindFixture()), &linked));
     wchar_t original[MAX_PATH] = {};
     Require(GetModuleFileNameW(linked, original, MAX_PATH) != 0);
-    const auto copy = std::filesystem::path(original).replace_filename("unwind_fixture_reload.dll");
+    const auto copy = std::filesystem::path(original).replace_filename("unwind_fixture_copy.dll");
     std::filesystem::copy_file(original, copy, std::filesystem::copy_options::overwrite_existing);
-    const auto path = copy.string();
+    return copy.string();
+}
 
+static FixtureCopy LoadFixtureCopy(const std::string& path) {
+    void* handle = dlopen_nid_postfix(path.c_str(), 2);
+    Require(handle != nullptr);
+    const auto get = reinterpret_cast<UnwindFixture* (*)()>(dlsym_nid_postfix(handle, "GetUnwindFixture_nid_no_patch"));
+    Require(get != nullptr);
+    auto* fixture = get();
+    return {handle, fixture, reinterpret_cast<std::uint64_t>(fixture)};
+}
+
+template <typename Edit>
+static void LookupOfEditedCopy(const std::string& path, Edit edit, bool throws) {
+    const auto copy = LoadFixtureCopy(path);
+    edit(*copy.fixture);
+    Require(Throws(copy.address) == throws);
+    Require(dlclose_nid_postfix(copy.handle) == 0);
+}
+
+static void ReloadedModuleIsRead(const std::string& path) {
     for (int round = 0; round < 2; ++round) {
-        void* handle = dlopen_nid_postfix(path.c_str(), 2);
-        Require(handle != nullptr);
-        const auto get = reinterpret_cast<UnwindFixture* (*)()>(dlsym_nid_postfix(handle, "GetUnwindFixture_nid_no_patch"));
-        Require(get != nullptr);
-        auto* fixture = get();
-        const auto address = reinterpret_cast<std::uint64_t>(fixture);
-        MEMORY_BASIC_INFORMATION memory{};
-        Require(VirtualQuery(reinterpret_cast<LPCVOID>(address), &memory, sizeof(memory)) != 0);
-        const auto base = reinterpret_cast<std::uint64_t>(memory.AllocationBase);
+        const auto copy = LoadFixtureCopy(path);
         if (round == 0) {
-            fixture->frames.terminator = 12;
-            fixture->frames.spare[0] = 1;
+            copy.fixture->frames.terminator = 12;
+            copy.fixture->frames.spare[0] = 1;
         }
         ModuleInfoForUnwind info{};
-        Require(sceKernelGetModuleInfoForUnwind(address, 0, &info) == 0);
+        Require(sceKernelGetModuleInfoForUnwind(copy.address, 0, &info) == 0);
         Require(info.eh_frame_size == (round == 0 ? 4 + 12 + 4 + 12 : 4 + 12));
-        Require(dlclose_nid_postfix(handle) == 0);
+        Require(dlclose_nid_postfix(copy.handle) == 0);
     }
-    std::filesystem::remove(copy);
 }
 
 int main() {
@@ -90,20 +107,15 @@ int main() {
         Require(std::memcmp(&again, &info, sizeof(info)) == 0);
     }
 
-    fixture->header.version = 2;
-    Require(Throws(address));
-    fixture->header.version = 1;
+    const auto path = FixtureCopyPath();
+    LookupOfEditedCopy(path, [](UnwindFixture& edited) { edited.header.version = 2; }, true);
     for (const std::uint8_t encoding : {0x3b, 0x9b, 0x0f, 0xff}) {
-        fixture->header.framePointerEncoding = encoding;
-        Require(Throws(address));
+        LookupOfEditedCopy(path, [encoding](UnwindFixture& edited) { edited.header.framePointerEncoding = encoding; }, true);
     }
-    fixture->header.framePointerEncoding = 0x1b;
-    fixture->frames.cieLength = 0xffffffffu;
-    Require(Throws(address));
-    fixture->frames.cieLength = 12;
-    Require(!Throws(address));
-
-    ReloadedModuleIsRead();
+    LookupOfEditedCopy(path, [](UnwindFixture& edited) { edited.frames.cieLength = 0xffffffffu; }, true);
+    LookupOfEditedCopy(path, [](UnwindFixture&) {}, false);
+    ReloadedModuleIsRead(path);
+    std::filesystem::remove(path);
 
     ModuleInfoForUnwind host{};
     Require(sceKernelGetModuleInfoForUnwind(reinterpret_cast<std::uint64_t>(&GetModuleHandleW), 0, &host) == 0);

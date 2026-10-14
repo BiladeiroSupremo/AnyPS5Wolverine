@@ -28,12 +28,9 @@
 #ifdef _WIN32
 namespace {
 struct UnwindImage {
-  bool filled = false;
   DWORD size = 0;
   bool hasTables = false;
   EhFrame::Tables tables;
-  std::uint32_t headerWord = 0;
-  std::uint32_t framesWord = 0;
   std::string name;
 };
 
@@ -41,17 +38,6 @@ std::mutex unwindImagesMutex;
 std::unordered_map<std::uintptr_t, UnwindImage>& UnwindImages() {
   static auto& images = *new std::unordered_map<std::uintptr_t, UnwindImage>();
   return images;
-}
-
-std::uint32_t ReadWord(std::uint64_t address) {
-  std::uint32_t value;
-  std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
-  return value;
-}
-
-bool UnwindImageCurrent(const UnwindImage& image, const IMAGE_NT_HEADERS64& nt) {
-  return image.filled && image.size == nt.OptionalHeader.SizeOfImage &&
-         (!image.hasTables || (ReadWord(image.tables.header) == image.headerWord && ReadWord(image.tables.frames) == image.framesWord));
 }
 
 void WriteUnwindInfo(const UnwindImage& image, const std::uint8_t* base, ModuleInfoForUnwind* info) {
@@ -68,30 +54,25 @@ void WriteUnwindInfo(const UnwindImage& image, const std::uint8_t* base, ModuleI
 
 void FillUnwindImage(void* allocationBase, ModuleInfoForUnwind* info) {
   const auto* base = static_cast<const std::uint8_t*>(allocationBase);
-  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-  if (dos->e_magic != IMAGE_DOS_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without a DOS header");
-  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-  if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without an NT header");
   const auto key = reinterpret_cast<std::uintptr_t>(base);
   {
     std::lock_guard lock(unwindImagesMutex);
     const auto found = UnwindImages().find(key);
-    if (found != UnwindImages().end() && UnwindImageCurrent(found->second, *nt)) {
+    if (found != UnwindImages().end()) {
       WriteUnwindInfo(found->second, base, info);
       return;
     }
   }
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without a DOS header");
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without an NT header");
   UnwindImage fresh;
   fresh.size = nt->OptionalHeader.SizeOfImage;
   fresh.hasTables = EhFrame::ReadEhmeta(key, *nt, "sceKernelGetModuleInfoForUnwind", fresh.tables);
-  if (fresh.hasTables) {
-    fresh.headerWord = ReadWord(fresh.tables.header);
-    fresh.framesWord = ReadWord(fresh.tables.frames);
-  }
   char path[4096] = {};
   const DWORD length = GetMappedFileNameA(GetCurrentProcess(), allocationBase, path, sizeof(path) - 1);
   fresh.name.assign(path, length);
-  fresh.filled = true;
   std::lock_guard lock(unwindImagesMutex);
   const auto& image = UnwindImages().insert_or_assign(key, std::move(fresh)).first->second;
   WriteUnwindInfo(image, base, info);
@@ -101,13 +82,9 @@ bool FillKnownUnwindImage(std::uint64_t address, ModuleInfoForUnwind* info) {
   PVOID allocationBase = nullptr;
   if (RtlPcToFileHeader(reinterpret_cast<PVOID>(address), &allocationBase) == nullptr || allocationBase == nullptr) return false;
   const auto* base = static_cast<const std::uint8_t*>(allocationBase);
-  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-  if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
   std::lock_guard lock(unwindImagesMutex);
   const auto found = UnwindImages().find(reinterpret_cast<std::uintptr_t>(base));
-  if (found == UnwindImages().end() || !found->second.hasTables || !UnwindImageCurrent(found->second, *nt)) return false;
+  if (found == UnwindImages().end() || !found->second.hasTables) return false;
   info->st_size = sizeof(ModuleInfoForUnwind);
   WriteUnwindInfo(found->second, base, info);
   return true;
@@ -115,26 +92,21 @@ bool FillKnownUnwindImage(std::uint64_t address, ModuleInfoForUnwind* info) {
 }
 
 extern "C" void ForgetUnloadedUnwindImages_nid_no_patch() {
-  try {
-    std::vector<std::uintptr_t> bases;
-    {
-      std::lock_guard lock(unwindImagesMutex);
-      for (const auto& image : UnwindImages()) bases.push_back(image.first);
-    }
-    std::vector<std::uintptr_t> unloaded;
-    for (const auto base : bases) {
-      HMODULE loaded = nullptr;
-      const bool present = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(base), &loaded) != 0 &&
-                           reinterpret_cast<std::uintptr_t>(loaded) == base;
-      if (!present) unloaded.push_back(base);
-    }
-    if (unloaded.empty()) return;
+  std::vector<std::uintptr_t> bases;
+  {
     std::lock_guard lock(unwindImagesMutex);
-    for (const auto base : unloaded) UnwindImages().erase(base);
-  } catch (...) {
-    std::lock_guard lock(unwindImagesMutex);
-    UnwindImages().clear();
+    for (const auto& image : UnwindImages()) bases.push_back(image.first);
   }
+  std::vector<std::uintptr_t> unloaded;
+  for (const auto base : bases) {
+    HMODULE loaded = nullptr;
+    const bool present = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(base), &loaded) != 0 &&
+                         reinterpret_cast<std::uintptr_t>(loaded) == base;
+    if (!present) unloaded.push_back(base);
+  }
+  if (unloaded.empty()) return;
+  std::lock_guard lock(unwindImagesMutex);
+  for (const auto base : unloaded) UnwindImages().erase(base);
 }
 #elif !defined(__APPLE__)
 extern "C" int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info);
