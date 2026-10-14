@@ -757,6 +757,7 @@ public:
                     hits.fetch_add(1, std::memory_order_relaxed);
                     bytesRead.fetch_add(file.size(), std::memory_order_relaxed);
                     loaded = true;
+                    makeEvictable(directory / name, key, variant);
                     break;
                 case LoadStatus::Absent:
                 case LoadStatus::KeyMismatch:
@@ -773,6 +774,28 @@ public:
         loadNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         report(false);
         return loaded;
+    }
+
+    // The loaded SPIR-V can be read again from its entry, so it may be dropped while unused
+    // (SharedSpirv::MakeEvictable). APS5_NO_SPIRV_EVICTION=1 keeps every module's words.
+    static void makeEvictable(const std::filesystem::path& path, std::span<const std::byte> key, CompiledVariant& variant) {
+        static const bool disabled = std::getenv("APS5_NO_SPIRV_EVICTION") != nullptr;
+        if (disabled || variant.artifact.spirv.empty()) return;
+        struct Source {
+            std::filesystem::path path;
+            std::vector<std::byte> key;
+        };
+        auto* source = new Source{path, std::vector<std::byte>(key.begin(), key.end())};
+        std::vector<std::uint32_t> words = variant.artifact.spirv.Words();
+        variant.artifact.spirv = SharedSpirv::MakeEvictable(std::move(words), [](const void* context) {
+            const auto& source = *static_cast<const Source*>(context);
+            std::vector<std::byte> file;
+            CompiledVariant reloaded;
+            if (!ReadWholeFile(source.path, file) || DecodeEntry(file, source.key, reloaded) != LoadStatus::Loaded) {
+                throw std::runtime_error("shader disk cache: cannot reload the SPIR-V of " + source.path.string());
+            }
+            return std::vector<std::uint32_t>(reloaded.artifact.spirv.Words());
+        }, source, [](const void* context) { delete static_cast<const Source*>(context); });
     }
 
     void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant) {
@@ -1030,6 +1053,126 @@ void Flush() {
 
 Counters Totals() {
     return store().Totals();
+}
+
+}
+
+namespace ShaderRecompiler {
+
+struct SharedSpirv::Evictable {
+    std::mutex mutex;
+    std::shared_ptr<std::vector<std::uint32_t>> words;
+    std::size_t count = 0;
+    std::atomic<std::int64_t> lastUse{0};
+    Loader loader = nullptr;
+    const void* context = nullptr;
+    void (*release)(const void*) = nullptr;
+    ~Evictable() {
+        if (release != nullptr) release(context);
+    }
+};
+
+namespace {
+
+std::int64_t nowSeconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Every evictable module, and the words dropped lately: a dropped vector lives another minute, so a
+// reference Words() handed out just before the drop stays valid while it is used.
+struct EvictionState {
+    std::mutex mutex;
+    std::vector<std::weak_ptr<SharedSpirv::Evictable>> modules;
+    std::deque<std::pair<std::int64_t, std::shared_ptr<std::vector<std::uint32_t>>>> graveyard;
+    std::atomic<std::uint64_t> residentBytes{0}, evictions{0}, reloads{0};
+};
+
+EvictionState& evictionState() {
+    static auto* state = new EvictionState();
+    return *state;
+}
+
+std::int64_t idleSeconds() {
+    static const std::int64_t seconds = [] {
+        const char* text = std::getenv("APS5_SPIRV_IDLE_SECONDS");
+        return text != nullptr ? std::max<std::int64_t>(5, std::strtoll(text, nullptr, 10)) : std::int64_t{60};
+    }();
+    return seconds;
+}
+
+void sweepEvictable() {
+    auto& state = evictionState();
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        const auto now = nowSeconds();
+        std::vector<std::shared_ptr<SharedSpirv::Evictable>> live;
+        {
+            std::lock_guard lock(state.mutex);
+            std::erase_if(state.modules, [&](const auto& weak) {
+                auto module = weak.lock();
+                if (module == nullptr) return true;
+                live.push_back(std::move(module));
+                return false;
+            });
+            while (!state.graveyard.empty() && now - state.graveyard.front().first > idleSeconds()) state.graveyard.pop_front();
+        }
+        for (const auto& module : live) {
+            std::shared_ptr<std::vector<std::uint32_t>> dropped;
+            {
+                std::lock_guard lock(module->mutex);
+                if (module->words == nullptr || now - module->lastUse.load(std::memory_order_relaxed) < idleSeconds()) continue;
+                dropped = std::move(module->words);
+            }
+            state.residentBytes.fetch_sub(dropped->size() * sizeof(std::uint32_t), std::memory_order_relaxed);
+            state.evictions.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard lock(state.mutex);
+            state.graveyard.emplace_back(now, std::move(dropped));
+        }
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) std::fprintf(stderr, "[spirv] %zu evictable modules, %.1f MiB resident, %llu evictions, %llu reloads\n", live.size(), state.residentBytes.load() / 1048576.0, static_cast<unsigned long long>(state.evictions.load()), static_cast<unsigned long long>(state.reloads.load()));
+    }
+}
+
+}
+
+SharedSpirv SharedSpirv::MakeEvictable(std::vector<std::uint32_t> words, Loader loader, const void* context, void (*release)(const void*)) {
+    SharedSpirv result;
+    auto module = std::make_shared<Evictable>();
+    module->count = words.size();
+    module->words = std::make_shared<std::vector<std::uint32_t>>(std::move(words));
+    module->lastUse.store(nowSeconds(), std::memory_order_relaxed);
+    module->loader = loader;
+    module->context = context;
+    module->release = release;
+    auto& state = evictionState();
+    state.residentBytes.fetch_add(module->count * sizeof(std::uint32_t), std::memory_order_relaxed);
+    {
+        std::lock_guard lock(state.mutex);
+        state.modules.push_back(module);
+        static const bool started = [] {
+            std::thread(sweepEvictable).detach();
+            return true;
+        }();
+        static_cast<void>(started);
+    }
+    result.evictable = std::move(module);
+    return result;
+}
+
+const std::vector<std::uint32_t>& SharedSpirv::EvictableWords(Evictable& module) {
+    std::lock_guard lock(module.mutex);
+    module.lastUse.store(nowSeconds(), std::memory_order_relaxed);
+    if (module.words == nullptr) {
+        module.words = std::make_shared<std::vector<std::uint32_t>>(module.loader(module.context));
+        auto& state = evictionState();
+        state.residentBytes.fetch_add(module.words->size() * sizeof(std::uint32_t), std::memory_order_relaxed);
+        state.reloads.fetch_add(1, std::memory_order_relaxed);
+    }
+    return *module.words;
+}
+
+std::size_t SharedSpirv::EvictableSize(const Evictable& module) {
+    return module.count;
 }
 
 }

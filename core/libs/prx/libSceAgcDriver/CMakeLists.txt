@@ -206,6 +206,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/AllocationProfile.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
@@ -273,6 +274,11 @@ endif()
 
 set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(libSceAgcDriver)
+if(WIN32)
+    # The driver's own operator new/delete (Graphics/src/AllocationProfile.cpp) stay private: exported,
+    # other modules would link them through the driver's import library.
+    target_link_options(libSceAgcDriver PRIVATE "SHELL:-Xlinker --exclude-symbols -Xlinker _Znwy,_Znay,_ZnwyRKSt9nothrow_t,_ZnayRKSt9nothrow_t,_ZdlPv,_ZdaPv,_ZdlPvy,_ZdaPvy,_ZdlPvRKSt9nothrow_t,_ZdaPvRKSt9nothrow_t")
+endif()
 
 if(BUILD_TESTING)
     add_test_executable(agc_write_watch_coverage_tests tests/WriteWatchCoverage.cpp)

@@ -432,19 +432,31 @@ struct BarycentricEmulationLayout {
 // The non-const data(), operator[], begin() and end() count as writes: on a shared holder (every
 // cached result) they clone the module, so a consumer that only reads takes the result by const
 // reference, or the per-dispatch copy this class removes comes back without a compiler hint.
+// The words of a SPIR-V module, shared by every holder. An evictable module (one the shader disk cache
+// can load again) drops its words after a minute unused and reloads them on the next access: the
+// game registers ten times more shaders than it draws with, and their words held ~2.5 GB.
 class SharedSpirv {
 public:
+    using Loader = std::vector<std::uint32_t> (*)(const void* context);
+    struct Evictable;
+
     SharedSpirv() = default;
     SharedSpirv(std::vector<std::uint32_t> words) : words(std::make_shared<std::vector<std::uint32_t>>(std::move(words))) {}
     SharedSpirv& operator=(std::vector<std::uint32_t> other) {
         words = std::make_shared<std::vector<std::uint32_t>>(std::move(other));
+        evictable.reset();
         return *this;
     }
+    // Words that `loader(context)` can produce again; `context` is owned (freed with `release`).
+    static SharedSpirv MakeEvictable(std::vector<std::uint32_t> words, Loader loader, const void* context, void (*release)(const void*));
 
-    [[nodiscard]] const std::vector<std::uint32_t>& Words() const { return words ? *words : Empty(); }
+    [[nodiscard]] const std::vector<std::uint32_t>& Words() const {
+        if (evictable) return EvictableWords(*evictable);
+        return words ? *words : Empty();
+    }
     operator const std::vector<std::uint32_t>&() const { return Words(); }
-    [[nodiscard]] std::size_t size() const { return Words().size(); }
-    [[nodiscard]] bool empty() const { return Words().empty(); }
+    [[nodiscard]] std::size_t size() const { return evictable ? EvictableSize(*evictable) : Words().size(); }
+    [[nodiscard]] bool empty() const { return size() == 0; }
     [[nodiscard]] const std::uint32_t* data() const { return Words().data(); }
     [[nodiscard]] std::uint32_t* data() { return Mutable().data(); }
     [[nodiscard]] const std::uint32_t& operator[](std::size_t index) const { return Words()[index]; }
@@ -455,20 +467,29 @@ public:
     [[nodiscard]] std::vector<std::uint32_t>::iterator end() { return Mutable().end(); }
     void resize(std::size_t count) { Mutable().resize(count); }
     std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
-    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return left.words == right.words || left.Words() == right.Words(); }
+    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) {
+        if (left.evictable != nullptr && left.evictable == right.evictable) return true;
+        return (left.evictable == nullptr && right.evictable == nullptr && left.words == right.words) || left.Words() == right.Words();
+    }
 
 private:
     static const std::vector<std::uint32_t>& Empty() {
         static const std::vector<std::uint32_t> empty;
         return empty;
     }
+    static const std::vector<std::uint32_t>& EvictableWords(Evictable& evictable);
+    static std::size_t EvictableSize(const Evictable& evictable);
     // Copy on write: a holder whose words are shared gets its own copy before the first write.
     std::vector<std::uint32_t>& Mutable() {
-        if (words == nullptr || words.use_count() != 1) words = std::make_shared<std::vector<std::uint32_t>>(Words());
+        if (evictable != nullptr || words == nullptr || words.use_count() != 1) {
+            words = std::make_shared<std::vector<std::uint32_t>>(Words());
+            evictable.reset();
+        }
         return *words;
     }
 
     std::shared_ptr<std::vector<std::uint32_t>> words;
+    std::shared_ptr<Evictable> evictable;
 };
 
 struct VertexInput {
