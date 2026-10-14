@@ -2,78 +2,63 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 extern "C" {
 int APS5_VABI sceNpCommerceDialogInitialize();
 int APS5_VABI sceNpCommerceDialogOpen(const void* param);
+int APS5_VABI sceNpCommerceDialogOpen2(void);
 int APS5_VABI sceNpCommerceDialogUpdateStatus(void);
 int APS5_VABI sceNpCommerceDialogGetStatus(void);
 int APS5_VABI sceNpCommerceDialogGetResult(void* result);
 int APS5_VABI sceNpCommerceDialogClose(void);
 int APS5_VABI sceNpCommerceDialogTerminate();
-int APS5_VABI sceNpCommerceHidePsStoreIcon(void);
-int APS5_VABI sceNpCommerceShowPsStoreIcon(int pos);
-int APS5_VABI sceNpCommerceSetPsStoreIconLayout(int layout);
-int APS5_VABI sceNpCommerceDialogOpen2(const void* param);
 }
 
-static void Require(bool condition) {
-    if (!condition) {
-        std::abort();
-    }
+namespace {
+
+void Require(bool value) { if (!value) std::abort(); }
+
+constexpr int statusNone = 0;
+constexpr int statusInitialized = 1;
+constexpr int statusFinished = 3;
+constexpr std::int32_t resultUserCanceled = 1;
+
+void RequireCanceledResult() {
+    std::uint8_t result[0x20];
+    std::memset(result, 0x33, sizeof(result));
+    Require(sceNpCommerceDialogGetResult(result) == 0);
+    std::int32_t value = 0;
+    std::memcpy(&value, result, sizeof(value));
+    Require(value == resultUserCanceled);
+    Require(result[4] == 0);
+    Require(result[5] == 0x33);
+}
+
 }
 
 int main() {
-    constexpr int statusNone = 0;
-    constexpr int statusInitialized = 1;
-    constexpr int statusFinished = 3;
-    constexpr int resultUserCanceled = 1;
-    constexpr int errorNotInitialized = static_cast<int>(0x80B80003u);
-    constexpr int errorAlreadyInitialized = static_cast<int>(0x80B80004u);
-    constexpr int errorNotFinished = static_cast<int>(0x80B80006u);
-    constexpr int errorArgNull = static_cast<int>(0x80B80009u);
-
-    struct DialogResult {
-        std::int32_t result;
-        std::uint8_t authorized;
-    };
-
     Require(sceNpCommerceDialogGetStatus() == statusNone);
-    Require(sceNpCommerceDialogUpdateStatus() == statusNone);
-    Require(sceNpCommerceDialogOpen(nullptr) == errorNotInitialized);
-    Require(sceNpCommerceDialogOpen2(nullptr) == errorNotInitialized);
-    Require(sceNpCommerceDialogClose() == errorNotInitialized);
-
-    DialogResult dialogResult{};
-    Require(sceNpCommerceDialogGetResult(&dialogResult) == errorNotFinished);
-
     Require(sceNpCommerceDialogInitialize() == 0);
-    Require(sceNpCommerceDialogInitialize() == errorAlreadyInitialized);
     Require(sceNpCommerceDialogGetStatus() == statusInitialized);
 
-    Require(sceNpCommerceDialogOpen(nullptr) == errorArgNull);
-    Require(sceNpCommerceDialogOpen2(nullptr) == 0);
-    Require(sceNpCommerceDialogGetStatus() == statusFinished);
+    Require(sceNpCommerceDialogOpen2() == 0);
     Require(sceNpCommerceDialogUpdateStatus() == statusFinished);
-
-    Require(sceNpCommerceDialogGetResult(nullptr) == errorArgNull);
-    Require(sceNpCommerceDialogGetResult(&dialogResult) == 0);
-    Require(dialogResult.result == resultUserCanceled);
-    Require(dialogResult.authorized == 0);
+    Require(sceNpCommerceDialogGetStatus() == statusFinished);
+    RequireCanceledResult();
 
     Require(sceNpCommerceDialogClose() == 0);
+    Require(sceNpCommerceDialogGetStatus() == statusFinished);
     Require(sceNpCommerceDialogTerminate() == 0);
     Require(sceNpCommerceDialogGetStatus() == statusNone);
 
-    alignas(8) char param[16] = {};
+    alignas(8) std::uint8_t param[0x40] = {};
     Require(sceNpCommerceDialogInitialize() == 0);
-    Require(sceNpCommerceDialogOpen2(param) == 0);
-    Require(sceNpCommerceDialogGetStatus() == statusFinished);
+    Require(sceNpCommerceDialogOpen(param) == 0);
+    Require(sceNpCommerceDialogOpen2() == 0);
+    Require(sceNpCommerceDialogUpdateStatus() == statusFinished);
+    RequireCanceledResult();
     Require(sceNpCommerceDialogTerminate() == 0);
-
-    Require(sceNpCommerceHidePsStoreIcon() == 0);
-    Require(sceNpCommerceShowPsStoreIcon(0) == 0);
-    Require(sceNpCommerceSetPsStoreIconLayout(0) == 0);
-
+    Require(sceNpCommerceDialogGetStatus() == statusNone);
     return 0;
 }

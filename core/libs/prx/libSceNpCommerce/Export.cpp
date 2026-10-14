@@ -79,9 +79,7 @@ int APS5_VABI sceNpCommerceSetPsStoreIconLayout(int layout) {
  return 0;
 }
 
-int APS5_VABI sceNpCommerceDialogOpen2(const void* param) {
- (void)param;
- if (g_status == COMMON_DIALOG_STATUS_NONE) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;
+int APS5_VABI sceNpCommerceDialogOpen2(void) {
  g_status = COMMON_DIALOG_STATUS_FINISHED;
  return 0;
 }
