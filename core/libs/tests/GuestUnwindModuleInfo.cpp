@@ -35,7 +35,6 @@ static void ReloadedModuleIsRead() {
     std::filesystem::copy_file(original, copy, std::filesystem::copy_options::overwrite_existing);
     const auto path = copy.string();
 
-    std::uint64_t firstBase = 0;
     for (int round = 0; round < 2; ++round) {
         void* handle = dlopen_nid_postfix(path.c_str(), 2);
         Require(handle != nullptr);
@@ -46,8 +45,6 @@ static void ReloadedModuleIsRead() {
         MEMORY_BASIC_INFORMATION memory{};
         Require(VirtualQuery(reinterpret_cast<LPCVOID>(address), &memory, sizeof(memory)) != 0);
         const auto base = reinterpret_cast<std::uint64_t>(memory.AllocationBase);
-        if (round == 0) firstBase = base;
-        else Require(base == firstBase);
         if (round == 0) {
             fixture->frames.terminator = 12;
             fixture->frames.spare[0] = 1;

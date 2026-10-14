@@ -3,6 +3,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/specifics/linux/ElfTypes.hpp"
@@ -65,34 +66,35 @@ void WriteUnwindInfo(const UnwindImage& image, const std::uint8_t* base, ModuleI
   info->name[sizeof(info->name) - 1] = '\0';
 }
 
-const UnwindImage& CurrentUnwindImage(void* allocationBase, const IMAGE_NT_HEADERS64& nt) {
-  const auto* base = static_cast<const std::uint8_t*>(allocationBase);
-  auto& image = UnwindImages()[reinterpret_cast<std::uintptr_t>(base)];
-  if (!UnwindImageCurrent(image, nt)) {
-    UnwindImage fresh;
-    fresh.size = nt.OptionalHeader.SizeOfImage;
-    fresh.hasTables = EhFrame::ReadEhmeta(reinterpret_cast<std::uintptr_t>(base), nt, "sceKernelGetModuleInfoForUnwind", fresh.tables);
-    if (fresh.hasTables) {
-      fresh.headerWord = ReadWord(fresh.tables.header);
-      fresh.framesWord = ReadWord(fresh.tables.frames);
-    }
-    char path[4096] = {};
-    const DWORD length = GetMappedFileNameA(GetCurrentProcess(), allocationBase, path, sizeof(path) - 1);
-    fresh.name.assign(path, length);
-    fresh.filled = true;
-    image = std::move(fresh);
-  }
-  return image;
-}
-
 void FillUnwindImage(void* allocationBase, ModuleInfoForUnwind* info) {
   const auto* base = static_cast<const std::uint8_t*>(allocationBase);
   const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
   if (dos->e_magic != IMAGE_DOS_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without a DOS header");
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
   if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without an NT header");
+  const auto key = reinterpret_cast<std::uintptr_t>(base);
+  {
+    std::lock_guard lock(unwindImagesMutex);
+    const auto found = UnwindImages().find(key);
+    if (found != UnwindImages().end() && UnwindImageCurrent(found->second, *nt)) {
+      WriteUnwindInfo(found->second, base, info);
+      return;
+    }
+  }
+  UnwindImage fresh;
+  fresh.size = nt->OptionalHeader.SizeOfImage;
+  fresh.hasTables = EhFrame::ReadEhmeta(key, *nt, "sceKernelGetModuleInfoForUnwind", fresh.tables);
+  if (fresh.hasTables) {
+    fresh.headerWord = ReadWord(fresh.tables.header);
+    fresh.framesWord = ReadWord(fresh.tables.frames);
+  }
+  char path[4096] = {};
+  const DWORD length = GetMappedFileNameA(GetCurrentProcess(), allocationBase, path, sizeof(path) - 1);
+  fresh.name.assign(path, length);
+  fresh.filled = true;
   std::lock_guard lock(unwindImagesMutex);
-  WriteUnwindInfo(CurrentUnwindImage(allocationBase, *nt), base, info);
+  const auto& image = UnwindImages().insert_or_assign(key, std::move(fresh)).first->second;
+  WriteUnwindInfo(image, base, info);
 }
 
 bool FillKnownUnwindImage(std::uint64_t address, ModuleInfoForUnwind* info) {
@@ -112,9 +114,22 @@ bool FillKnownUnwindImage(std::uint64_t address, ModuleInfoForUnwind* info) {
 }
 }
 
-extern "C" void ForgetUnwindImage_nid_no_patch(const void* base) {
+extern "C" void ForgetUnloadedUnwindImages_nid_no_patch() {
+  std::vector<std::uintptr_t> bases;
+  {
+    std::lock_guard lock(unwindImagesMutex);
+    for (const auto& image : UnwindImages()) bases.push_back(image.first);
+  }
+  std::vector<std::uintptr_t> unloaded;
+  for (const auto base : bases) {
+    HMODULE loaded = nullptr;
+    const bool present = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(base), &loaded) != 0 &&
+                         reinterpret_cast<std::uintptr_t>(loaded) == base;
+    if (!present) unloaded.push_back(base);
+  }
+  if (unloaded.empty()) return;
   std::lock_guard lock(unwindImagesMutex);
-  UnwindImages().erase(reinterpret_cast<std::uintptr_t>(base));
+  for (const auto base : unloaded) UnwindImages().erase(base);
 }
 #elif !defined(__APPLE__)
 extern "C" int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info);

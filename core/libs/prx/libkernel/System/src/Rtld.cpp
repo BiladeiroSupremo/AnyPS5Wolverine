@@ -20,7 +20,7 @@
 #endif
 
 #ifdef _WIN32
-extern "C" void ForgetUnwindImage_nid_no_patch(const void* base);
+extern "C" void ForgetUnloadedUnwindImages_nid_no_patch();
 #endif
 
 namespace {
@@ -74,7 +74,7 @@ int releaseThreadAtexitImage(const void* address, const char* caller) {
     if (!handle) return 0;
 #ifdef _WIN32
     const bool released = FreeLibrary(static_cast<HMODULE>(handle));
-    ForgetUnwindImage_nid_no_patch(handle);
+    ForgetUnloadedUnwindImages_nid_no_patch();
     if (!released)
 #else
     if (dlclose(handle) != 0)
