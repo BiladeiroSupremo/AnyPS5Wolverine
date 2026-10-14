@@ -95,6 +95,16 @@ int main() {
             Write<std::uint64_t>(bytes, 104, 0xd0);
             RejectProgramHeaders(std::move(bytes));
         }},
+        {"load and uncovered SCE RELRO ending at end of file", [] {
+            for (const std::uint32_t type : {1u, 0x61000010u}) {
+                auto bytes = Fixture();
+                Write<std::uint32_t>(bytes, 64, type);
+                Write<std::uint64_t>(bytes, 96, 0xc0);
+                Write<std::uint64_t>(bytes, 104, 0xc0);
+                const auto headers = Relinker::ElfReader(std::move(bytes)).ReadProgramHeaders();
+                Require(headers.size() == 1 && headers[0].Offset + headers[0].FileSize == 0x300);
+            }
+        }},
         {"uncovered SCE RELRO file size exceeds memory size", [] {
             auto bytes = Fixture();
             Write<std::uint32_t>(bytes, 64, 0x61000010);

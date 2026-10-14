@@ -159,7 +159,7 @@ std::vector<ProgramHeader> ElfReader::ReadProgramHeaders() const {
             if (relro.FileSize > relro.MemorySize)
                 throw RelinkerException("PT_SCE_RELRO file size exceeds memory size", relro.Offset);
             if (!_rangeFits(relro.Offset, relro.FileSize, _fileBuffer.size()))
-                throw RelinkerException("PT_SCE_RELRO file range exceeds the input file", relro.Offset);
+                throw RelinkerException("Segment offset out of bounds", relro.Offset);
             relro.Type = PT_LOAD;
             relro.Flags = PF_R | PF_W;
         }
@@ -267,12 +267,8 @@ std::vector<DynamicTag> ElfReader::ReadDynamicTags(const ProgramHeader& dynamicH
 FileByteOffset ElfReader::TranslateVirtualAddress(VirtualAddress address) const {
     for (const auto& segment : ReadProgramHeaders()) {
         if (segment.Type == PT_LOAD && address >= segment.MappedAddress &&
-            address - segment.MappedAddress < segment.FileSize) {
-            if (!_rangeFits(segment.Offset, segment.FileSize, _fileBuffer.size())) {
-                throw RelinkerException("PT_LOAD file mapping out of bounds", segment.Offset);
-            }
+            address - segment.MappedAddress < segment.FileSize)
             return segment.Offset + (address - segment.MappedAddress);
-        }
     }
 
     throw RelinkerException("Virtual address not mapped by any PT_LOAD segment", address);
