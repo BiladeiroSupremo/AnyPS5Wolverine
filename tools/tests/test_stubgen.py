@@ -30,6 +30,15 @@ class StubgenTests(unittest.TestCase):
         self.assertIn("APS5_VABI", code)
         self.assertIn("NotImplemented_nid_no_patch", code)
 
+    def test_prx_suffix_is_stripped_from_module_name(self):
+        nids = ["AAAAAAAAAAA", "BBBBBBBBBBB"]
+        expected = stubgen.generate("libSceAmpr", nids, {})
+        self.assertIn("sceAmprUnknown00", expected[0])
+        self.assertIn("core/libs/prx/libSceAmpr/", expected[1])
+        for spelling in ("libSceAmpr.prx", "libSceAmpr.PRX"):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(stubgen.generate(spelling, nids, {}), expected)
+
 
 class StubGeneratorTests(unittest.TestCase):
     def test_default_stdout_contains_only_cpp(self):

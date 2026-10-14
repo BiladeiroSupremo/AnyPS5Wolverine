@@ -115,6 +115,7 @@ def td_target(module, td_path, td_lib):
 
 
 def generate(module, nids, db, td_path=None, td_lib=None):
+    module = re.sub(r"\.prx$", "", module, flags=re.IGNORECASE)
     prefix = module_prefix(module)
     path, lib = td_target(module, td_path, td_lib)
     used = set()
