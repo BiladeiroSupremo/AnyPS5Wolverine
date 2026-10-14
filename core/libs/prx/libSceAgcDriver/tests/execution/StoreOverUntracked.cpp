@@ -53,6 +53,10 @@ alignas(256) constexpr std::array<std::uint32_t, 9> FillCode{
     0xd7460004, 0x04010c08, 0x7e000204, 0x7e020205, 0x7e040206, 0x7e060207, 0xe01c2000, 0x80000004, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 9> ReadCode{
+    0x7e020280, 0x7e04020c, 0xf0001108, 0x00010300, 0xbf8c3f70, 0x34080082, 0xe0701000, 0x80000304, 0xbf810000,
+};
+
 std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
 }
@@ -111,6 +115,20 @@ void Fill(const std::uint32_t* texels) {
         Filled,
     };
     Dispatch(FillCode, 64, (static_cast<std::uint32_t>(userData.size()) << 1u) | 0x80u, userData, static_cast<std::uint32_t>(SurfaceBytes / 1024u));
+}
+
+std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::size_t bytes) {
+    const auto address = AddressOf(data);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), static_cast<std::uint32_t>(bytes), 0x31016facu};
+}
+
+void ReadImage(const std::uint32_t* texels, std::uint32_t* output) {
+    std::array<std::uint32_t, 13> userData{};
+    const auto buffer = BufferDescriptor(output, SurfaceBytes);
+    const auto texture = TextureDescriptor(texels);
+    std::copy(buffer.begin(), buffer.end(), userData.begin());
+    std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+    Dispatch(ReadCode, 32, static_cast<std::uint32_t>(userData.size()) << 1u, userData, 1);
 }
 
 class Surface {
