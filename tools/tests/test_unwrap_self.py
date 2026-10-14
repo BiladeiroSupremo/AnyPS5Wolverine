@@ -186,6 +186,28 @@ class UnwrapTest(unittest.TestCase):
         self.assertIn("no inner ELF header", result.stderr)
         self.assertFalse(output.exists())
 
+    def test_incomplete_elf_metadata_is_refused_without_replacing_output(self):
+        truncated_header = bytearray(FIRST_REGION)
+        struct.pack_into("<I", truncated_header, 0, SELF_MAGIC)
+        truncated_header[-4:] = b"\x7fELF"
+        containers = [("header", truncated_header)]
+        for label, program_offset, count in (("table", 0xFFFFFFFFFFFFFFFF, 3),
+                                            ("table", PROGRAM_TABLE_OFFSET, 0xFFFF)):
+            container = bytearray(build_container(default_segments(), default_records(), default_payloads()))
+            struct.pack_into("<Q", container, ELF_HEADER_OFFSET + 0x20, program_offset)
+            struct.pack_into("<H", container, ELF_HEADER_OFFSET + 0x38, count)
+            containers.append((label, container))
+        output = Path(self.directory) / "output.elf"
+        for index, (label, container) in enumerate(containers):
+            with self.subTest(label=label, case=index):
+                output.write_bytes(b"previous output")
+                result, output = self.convert(container)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ELF", result.stderr)
+                self.assertIn(label, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(output.read_bytes(), b"previous output")
+
     def test_a_container_whose_load_segments_look_encrypted_is_refused(self):
         random_like = bytes(range(256)) * 4
         segments = [(PT_LOAD, 1, 0x1234, 0x0, 0x400, PAGE), (PT_LOAD, 4, 0x1500, 0x1000, 0x400, PAGE)]
