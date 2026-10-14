@@ -271,6 +271,8 @@ set(LIBUSB_ENABLE_UDEV OFF CACHE BOOL "" FORCE)
 add_subdirectory(3rdparty/libusb-cmake EXCLUDE_FROM_ALL)
 set_target_properties(usb-1.0 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+include(cmake/ZArchive.cmake)
+
 add_subdirectory(core/shader/recompiler)
 add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)
