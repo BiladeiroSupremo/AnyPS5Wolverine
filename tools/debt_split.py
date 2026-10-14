@@ -17,6 +17,7 @@ def parse(text):
     items = []
     section = None
     current = None
+    blanks = []
     for line in text.splitlines():
         heading = HEADING.match(line)
         if heading:
@@ -26,13 +27,15 @@ def parse(text):
         elif line.startswith("- "):
             current = ["entry", section, [line]]
             items.append(current)
+            blanks = []
         elif current and (line.startswith(" ") or line.startswith("\t")):
-            current[2].append(line)
+            current[2] += blanks + [line]
+            blanks = []
         elif line.strip():
             current = None
             items.append(["text", section, [line]])
         else:
-            current = None
+            blanks.append(line)
     return [(kind, section, "\n".join(lines)) for kind, section, lines in items]
 
 
