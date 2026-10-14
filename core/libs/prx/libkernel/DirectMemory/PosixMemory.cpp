@@ -257,13 +257,13 @@ int APS5_VABI mincore_nid_postfix(const void* address, std::size_t length, char*
         SetError(error);
         return -1;
     };
-    constexpr std::uintptr_t mask = PS5_PAGE_SIZE - 1;
-    const auto first = reinterpret_cast<std::uintptr_t>(address);
-    if ((first & mask) != 0) return failed(GuestInvalid);
     if (length == 0) return 0;
     if (vec == nullptr) return failed(GuestFault);
+    constexpr std::uintptr_t mask = PS5_PAGE_SIZE - 1;
+    auto first = reinterpret_cast<std::uintptr_t>(address);
     if (length > std::numeric_limits<std::uintptr_t>::max() - mask - first) return failed(GuestNoMemory);
     const auto end = (first + length + mask) & ~mask;
+    first &= ~mask;
     if (end <= first) return failed(GuestNoMemory);
     if (!GuestRangeMapped(first, end)) return failed(GuestNoMemory);
     const std::size_t pages = (end - first) / PS5_PAGE_SIZE;

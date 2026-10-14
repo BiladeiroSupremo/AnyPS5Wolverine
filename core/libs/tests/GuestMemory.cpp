@@ -2391,8 +2391,7 @@ int main() {
     char mincoreVec[4] = {};
     Require(mincore_nid_postfix(memory, page * 3, mincoreVec) == 0);
     Require(mincoreVec[0] == 1 && mincoreVec[1] == 1 && mincoreVec[2] == 1);
-    Require(mincore_nid_postfix(memory + 1, page, mincoreVec) == -1 && *__error_nid_postfix() == 22);
-    *__error_nid_postfix() = 0;
+    Require(mincore_nid_postfix(memory + 1, page, mincoreVec) == 0 && mincoreVec[0] == 1);
     Require(mincore_nid_postfix(memory, 0, nullptr) == 0);
     Require(mincore_nid_postfix(memory, page, nullptr) == -1 && *__error_nid_postfix() == 14);
     *__error_nid_postfix() = 0;
@@ -2414,7 +2413,6 @@ int main() {
     Require(munmap_nid_postfix(memory, page) == 0);
     Require(madvise_nid_postfix(memory, page, 4) == 0);
     Require(mincore_nid_postfix(memory, page, mincoreVec) == -1 && *__error_nid_postfix() == 12);
-    *__error_nid_postfix() = 0;
     *__error_nid_postfix() = 0;
     Require(mprotect_nid_postfix(memory, page, 1) == -1 && *__error_nid_postfix() == 22);
     *__error_nid_postfix() = 0;
