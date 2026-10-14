@@ -10,7 +10,7 @@
 extern "C" {
 
 int APS5_VABI sceAgcInit(std::uint32_t version) {
-    if (version >= 14) version = 13;
+    if (version >= 14) return 0;
     Agc::Command::GetRegisterDefaults(version, false, __func__);
     Agc::Command::GetRegisterDefaults(version, true, __func__);
     return 0;

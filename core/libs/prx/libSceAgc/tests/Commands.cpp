@@ -625,9 +625,9 @@ void testDefaults() {
     check(sceAgcInit_0090(&state, 14) == 0 && state == 0x12345678, "out-of-range AGC initialization version changed caller state");
     check(sceAgcInit(8) == 0, "AGC version initialization failed");
     check(sceAgcInit(13) == 0, "AGC version 13 initialization failed");
-    check(sceAgcInit(14) == 0, "out-of-range AGC version did not fall back");
-    check(sceAgcInit(0xffffffffu) == 0, "maximum AGC version did not fall back");
-    check(sceAgcInit(0xffffc278u) == 0, "pointer-valued AGC argument did not fall back");
+    check(sceAgcInit(14) == 0, "out-of-range AGC version did not return success");
+    check(sceAgcInit(0xffffffffu) == 0, "maximum AGC version did not return success");
+    check(sceAgcInit(0xffffc278u) == 0, "pointer-valued AGC argument did not return success");
     for (std::uint32_t version = 0; version < 14; ++version) {
         for (const bool internal : {false, true}) {
             auto* first = Agc::Command::GetRegisterDefaults(version, internal, __func__);
