@@ -16,6 +16,8 @@ int APS5_VABI scePlayGoInitialize(const PlayGoInitParams*);
 int APS5_VABI scePlayGoOpen(int*, const void*);
 int APS5_VABI scePlayGoClose(int);
 int APS5_VABI scePlayGoGetLanguageMask(int, std::uint64_t*);
+int APS5_VABI scePlayGoGetSupportedOptionalChunk(int, std::int32_t, PlayGoOptionalChunk*);
+int APS5_VABI scePlayGoGetOptionalChunk(int, std::int32_t, PlayGoOptionalChunk*);
 int APS5_VABI scePlayGoSetToDoList(int, const PlayGoToDo*, std::uint32_t);
 int APS5_VABI scePlayGoGetToDoList(int, PlayGoToDo*, std::uint32_t, std::uint32_t*);
 int APS5_VABI scePlayGoGetLocus(int, const std::uint16_t*, std::uint32_t, std::int8_t*);
@@ -91,6 +93,13 @@ static int CheckNoPlayGoFile(const char* root) {
     Require(scePlayGoGetLanguageMask(handle + 1, &mask) == badHandle);
     Require(scePlayGoGetLanguageMask(handle, nullptr) == badPointer);
     Require(scePlayGoGetLanguageMask(handle, &mask) == 0 && mask == ~0ull);
+
+    for (const auto getOptionalChunk : {scePlayGoGetSupportedOptionalChunk, scePlayGoGetOptionalChunk}) {
+        PlayGoOptionalChunk option{};
+        Require(getOptionalChunk(handle + 1, 0, &option) == badHandle);
+        Require(getOptionalChunk(handle, 0, nullptr) == badPointer);
+        Require(getOptionalChunk(handle, 0, &option) == 0 && option.bitmask == ~0ull);
+    }
 
     PlayGoToDo todo[2] = {{0, 3, 0}, {0, 0, 0}};
     Require(scePlayGoSetToDoList(handle + 1, todo, 2) == badHandle);
