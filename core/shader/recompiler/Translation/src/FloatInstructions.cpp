@@ -247,13 +247,25 @@ bool TranslationContext::float16Binary(const RdnaInstruction& inst, IrOpcode opc
 }
 
 bool TranslationContext::float16Ternary(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool mix) {
-    if (mix && floatMode.has_value() && (floatMode->floatMode & 0xc0u) != 0xc0u) {
-        throw std::runtime_error("v_fma_mixlo/mixhi_f16 at pc " + std::to_string(inst.programCounter) + " in FLOAT_MODE " + std::to_string(floatMode->floatMode) + " (f16 denormals not kept) is not implemented");
-    }
+    // v_fma_mixlo/mixhi_f16 with f16 denormals flushed (FLOAT_MODE bit 6 clear: inputs, bit 7 clear:
+    // the result), as float16Binary flushes them: the f16 sources and the f16 result below 2^-14
+    // become signed zeros. FPInterpolateF16 has already rounded the result to an f16 value.
+    const bool flushMixInputs = mix && floatMode.has_value() && (floatMode->floatMode & 0x40u) == 0u;
+    const bool flushMixResult = mix && floatMode.has_value() && (floatMode->floatMode & 0x80u) == 0u;
+    const auto flushF16 = [&](IrF32 value) {
+        const IrU32 bits(ir.BitCastU32(value.Value()));
+        const IrU1 tiny(ir.ULessThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0x38800000u)));
+        return IrF32(ir.BitCastF32(ir.Select(tiny.Value(), ir.BitwiseAnd(bits.Value(), ir.Constant(0x80000000u)), bits.Value())));
+    };
     std::array<IrValue*, 3> args{};
     for (std::uint32_t index = 0u; index < args.size(); ++index) {
         const RdnaOperand& operand = accumulator && index == 2u ? accumulatorOperand(inst) : sourceAt(inst, index);
-        args[index] = mix ? &readMixF32(operand).Value() : &readF16AsF32(operand).Value();
+        if (mix) {
+            const IrF32 value = readMixF32(operand);
+            args[index] = flushMixInputs && operand.opSelHi ? &flushF16(value).Value() : &value.Value();
+        } else {
+            args[index] = &readF16AsF32(operand).Value();
+        }
     }
     if (opcode == IrOpcode::FPFma32 && !mix) {
         writeF16(inst.destination, fmaF16RoundedToOdd(IrF32(*args[0]), IrF32(*args[1]), IrF32(*args[2])), {args[0], args[1], args[2]});
@@ -261,7 +273,8 @@ bool TranslationContext::float16Ternary(const RdnaInstruction& inst, IrOpcode op
     }
     if (mix) {
         const std::uint32_t rounding = floatMode.has_value() ? ((floatMode->floatMode >> 2u) & 3u) << InterpolationRound16Shift : 0u;
-        writeF16(inst.destination, IrF32(ir.Emit(IrOpcode::FPInterpolateF16, IrType::F32, {args[0], args[1], args[2], &ir.Constant(rounding)})), {args[0], args[1], args[2]});
+        const IrF32 result(ir.Emit(IrOpcode::FPInterpolateF16, IrType::F32, {args[0], args[1], args[2], &ir.Constant(rounding)}));
+        writeF16(inst.destination, flushMixResult ? flushF16(result) : result, {args[0], args[1], args[2]});
         return true;
     }
     writeF16(inst.destination, IrF32(ir.Emit(opcode, IrType::F32, {args[0], args[1], args[2]})), {args[0], args[1], args[2]});

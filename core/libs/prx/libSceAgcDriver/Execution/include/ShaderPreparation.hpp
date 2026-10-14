@@ -17,6 +17,9 @@ public:
     PreparedShaderState& Edit(const ShaderSnapshot& snapshot);
     const PreparedShaderState& Read(const ShaderSnapshot& snapshot) const;
     void Hold();
+    // After the caller caught and tolerates a preparation failure: a nested transaction the
+    // exception unwound through marked the root failed, which would make Commit abort.
+    void Tolerate();
     void Commit();
 
 private:

@@ -319,6 +319,11 @@ void ShaderPreparationTransaction::Hold() {
     root->Hold();
 }
 
+void ShaderPreparationTransaction::Tolerate() {
+    require(!committed, "shader preparation transaction is already committed");
+    root->failed = false;
+}
+
 void ShaderPreparationTransaction::Commit() {
     require(!committed && !root->failed, "shader preparation transaction was aborted");
     if (state != nullptr) {
@@ -1107,6 +1112,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
                 ResolvePreparedGraphics(*snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
             } catch (const std::exception& error) {
                 if (!TolerateFailedPreparation("graphics ABI", error)) throw;
+                transaction.Tolerate();
             }
         }
         transaction.Commit();
@@ -1120,6 +1126,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         prepared = PrepareGraphicsStages(decoded, localDevice->Target());
     } catch (const std::exception& error) {
         if (!TolerateFailedPreparation("graphics ABI", error)) throw;
+        transaction.Tolerate();
         transaction.Commit();
         return;
     }
@@ -1134,6 +1141,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             ResolvePreparedGraphics(*stage.snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
         } catch (const std::exception& error) {
             if (!TolerateFailedPreparation("graphics ABI", error)) throw;
+            transaction.Tolerate();
         }
     }
     if (decoded.state.stages.path == Graphics::ShaderPath::Vertex) {
@@ -1189,6 +1197,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
             return PrepareRegistered(*plan);
         } catch (const std::exception& error) {
             if (!TolerateFailedPreparation("static ABI", error)) throw;
+            transaction.Tolerate();
             return std::vector<PreparedShaders::Entry>{};
         }
     };
@@ -1253,6 +1262,7 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
         ResolvePreparedGraphics(*front, fragment, primitiveType, localDevice->Target());
     } catch (const std::exception& error) {
         if (!TolerateFailedPreparation("rectangle ABI", error)) throw;
+        transaction.Tolerate();
     }
     transaction.Commit();
 }

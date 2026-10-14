@@ -41,6 +41,15 @@
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 
+// The AMM submission queue's progress (defined with the queues below).
+struct AprAmmQueueState {
+    std::uint32_t submitted;
+    std::uint32_t completed;
+    std::uint32_t pending;
+    bool running;
+};
+AprAmmQueueState AprAmmQueueStatus();
+
 namespace {
 
 constexpr int GUEST_ENOENT = 2;
@@ -240,13 +249,58 @@ std::shared_ptr<const CompressedFile::Index> _compressed(std::uint32_t id, const
     return index;
 }
 
+// APS5_APR_TIMING=1: every 10 s, where the reads' time went (opening the guest write, reading and
+// decoding, closing the guest write).
+struct ReadTiming {
+    std::atomic<std::uint64_t> reads{0}, bytes{0}, openNs{0}, readNs{0}, closeNs{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+ReadTiming* _readTiming() {
+    static ReadTiming* const timing = std::getenv("APS5_APR_TIMING") != nullptr ? new ReadTiming() : nullptr;
+    return timing;
+}
+
+void _reportReadTiming(ReadTiming& timing) {
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = timing.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !timing.lastReport.compare_exchange_strong(last, now)) return;
+    const auto reads = timing.reads.exchange(0);
+    if (reads == 0) return;
+    const auto ms = [](std::atomic<std::uint64_t>& ns) { return static_cast<double>(ns.exchange(0)) / 1e6; };
+    const double bytes = static_cast<double>(timing.bytes.exchange(0)) / 1048576.0;
+    const double open = ms(timing.openNs), read = ms(timing.readNs), close = ms(timing.closeNs);
+    std::fprintf(stderr, "[apr-timing] %llu reads, %.1f MiB: open %.0f ms, read %.0f ms, close %.0f ms (%.2f ms per read)\n", static_cast<unsigned long long>(reads), bytes, open, read, close, (open + read + close) / static_cast<double>(reads));
+}
+
 void _readFile(const Apr::ReadFileCommand& command) {
     const auto file = _file(command.fileId);
     static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
     if (trace) std::fprintf(stderr, "[apr] read %s offset=0x%llx size=0x%llx -> 0x%llx at %.3f s\n", file.path.string().c_str(), static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination), std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto* timing = _readTiming();
+    const auto started = std::chrono::steady_clock::now();
+    auto readStarted = started;
+    struct CloseTimer {
+        ReadTiming* timing;
+        std::chrono::steady_clock::time_point* readStarted;
+        std::chrono::steady_clock::time_point readDone{};
+        ~CloseTimer() {
+            if (timing == nullptr || readDone == std::chrono::steady_clock::time_point{}) return;
+            const auto end = std::chrono::steady_clock::now();
+            timing->readNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(readDone - *readStarted).count());
+            timing->closeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - readDone).count());
+            timing->reads += 1;
+            _reportReadTiming(*timing);
+        }
+    } closeTimer{timing, &readStarted};
     const auto handle = _hostFile(command.fileId, file);
     const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
     if (!destination.Open()) throw std::runtime_error("APR: the read destination of " + file.path.string() + " is not writable guest memory");
+    if (timing != nullptr) {
+        readStarted = std::chrono::steady_clock::now();
+        timing->openNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(readStarted - started).count());
+        timing->bytes += command.size;
+    }
     std::uint64_t read = 0;
     if (const auto compressed = _compressed(command.fileId, file, handle)) {
         // The uncompressed bytes in the file, then the same short-read failure as an ordinary file.
@@ -256,6 +310,8 @@ void _readFile(const Apr::ReadFileCommand& command) {
     } else {
         read = _readAt(handle, command.offset, reinterpret_cast<std::uint8_t*>(command.destination), command.size);
     }
+    // The guest write closes after this (HostWrite's destructor runs before closeTimer's).
+    if (timing != nullptr) closeTimer.readDone = std::chrono::steady_clock::now();
     // Debug aid: APS5_APR_READ_DELAY_US=<us> slows every read down (load-order races).
     static const auto delay = [] { const char* text = std::getenv("APS5_APR_READ_DELAY_US"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul; }();
     if (delay != 0) PreciseSleepUs(delay);
@@ -645,6 +701,45 @@ struct ReadCursor {
     std::uint64_t nextOffset = 0;
 };
 
+bool _ammRangeMapped(AmmState& state, std::uint64_t address, std::uint64_t size) {
+    for (auto page = address & ~(std::uint64_t{PS5_PAGE_SIZE} - 1u); page < address + size; page += PS5_PAGE_SIZE) {
+        if (state.pages.find(page) == state.pages.end()) return false;
+    }
+    return true;
+}
+
+// A read into AMM pages that are not mapped yet: AMM buffers run on their own queue and can sit
+// behind a deferred wait, while a generic buffer runs at once on the submitting thread, so a read
+// could overtake the mapping it reads into (2026-10-14: 'Archive Asset IO' wrote to unmapped AMM
+// pages). Waits for the AMM queue to map them, for up to APS5_APR_AMM_WAIT_MS (2000).
+void _awaitAmmMapping(const Apr::ReadFileCommand& command) {
+    auto& state = _amm();
+    {
+        const std::lock_guard lock(state.lock);
+        if (state.base == 0 || command.destination < state.base || command.destination - state.base >= 2 * AmmRangeBytes) return;
+        if (_ammRangeMapped(state, command.destination, command.size)) return;
+    }
+    static const auto limitMs = [] { const char* text = std::getenv("APS5_APR_AMM_WAIT_MS"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 2000ul; }();
+    const auto before = AprAmmQueueStatus();
+    const auto started = std::chrono::steady_clock::now();
+    bool mapped = false;
+    while (std::chrono::steady_clock::now() - started < std::chrono::milliseconds(limitMs)) {
+        PreciseSleepUs(100);
+        const std::lock_guard lock(state.lock);
+        if (_ammRangeMapped(state, command.destination, command.size)) {
+            mapped = true;
+            break;
+        }
+    }
+    const auto after = AprAmmQueueStatus();
+    const auto waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    std::fprintf(stderr, "[apr] read into unmapped AMM pages 0x%llx+0x%llx: %s after %.1f ms; AMM queue before %u/%u submitted/completed, %u pending, %s; after %u/%u, %u pending\n", static_cast<unsigned long long>(command.destination), static_cast<unsigned long long>(command.size), mapped ? "mapped" : "STILL UNMAPPED", waitedMs, before.submitted, before.completed, before.pending, before.running ? "running" : "idle", after.submitted, after.completed, after.pending);
+}
+
+// The command buffer being executed, for the bad-destination report below.
+thread_local const Apr::CommandBufferObject* g_executing = nullptr;
+thread_local std::uint32_t g_executingCursor = 0;
+
 void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor& read) {
     if (opcode != Apr::Opcode::ReadFile) {
         if (!read.valid) throw std::runtime_error("APR: gather or scatter read without a preceding read");
@@ -652,6 +747,27 @@ void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor&
         if (opcode == Apr::Opcode::ReadFileGather) command.destination = read.nextDestination;
         if (opcode == Apr::Opcode::ReadFileScatter) command.offset = read.nextOffset;
     }
+    // A destination in the first 64 KiB is never guest memory: the title sometimes submits reads
+    // into 0x4000 or 0x8000 (2026-10-14, with a save loaded). Report the command and its buffer.
+    if (command.destination < 0x10000u) {
+        std::fprintf(stderr, "[apr] read into 0x%llx: opcode %u file %u (%s) size 0x%llx offset 0x%llx; cursor valid %d file %u next destination 0x%llx next offset 0x%llx\n", static_cast<unsigned long long>(command.destination), static_cast<unsigned>(opcode), command.fileId, _file(command.fileId).path.string().c_str(), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.offset), read.valid ? 1 : 0, read.fileId, static_cast<unsigned long long>(read.nextDestination), static_cast<unsigned long long>(read.nextOffset));
+        // APS5_APR_SKIP_BAD_DESTINATION=1: drop the read and go on (diagnostic).
+        static const bool skip = std::getenv("APS5_APR_SKIP_BAD_DESTINATION") != nullptr;
+        if (skip) {
+            read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
+            return;
+        }
+        if (g_executing != nullptr) {
+            const auto from = g_executingCursor > 256u ? g_executingCursor - 256u : 0u;
+            const auto to = std::min<std::uint32_t>(g_executing->offset, g_executingCursor + 128u);
+            std::fprintf(stderr, "[apr] buffer %p of 0x%x bytes, command at 0x%x; bytes 0x%x-0x%x:", static_cast<const void*>(g_executing->base), g_executing->offset, g_executingCursor, from, to);
+            for (auto at = from; at < to; ++at) std::fprintf(stderr, "%s%02x", (at - from) % 32u == 0u ? "\n[apr]   " : " ", g_executing->base[at]);
+            std::fprintf(stderr, "\n");
+        }
+        std::fflush(stderr);
+        throw std::runtime_error("APR: read destination 0x" + std::to_string(command.destination) + " is not guest memory");
+    }
+    _awaitAmmMapping(command);
     _readFile(command);
     read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
 }
@@ -663,7 +779,9 @@ struct Deferred {
 
 std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::uint32_t start = 0, ReadCursor read = {}, bool defer = false) {
     std::uint32_t cursor = start;
+    g_executing = &buffer;
     while (cursor < buffer.offset) {
+        g_executingCursor = cursor;
         if (cursor + sizeof(Apr::CommandHeader) > buffer.offset) throw std::runtime_error("APR: truncated command buffer");
         Apr::CommandHeader header;
         std::memcpy(&header, buffer.base + cursor, sizeof(header));
@@ -1047,4 +1165,10 @@ int APS5_VABI sceKernelWriteRemapIntoPrtCommand(std::uint32_t* dst, std::uint64_
     return 0;
 }
 
+}
+
+AprAmmQueueState AprAmmQueueStatus() {
+    auto& queue = _queue(true);
+    std::lock_guard lock(queue.mutex);
+    return {queue.submitted, queue.completed, static_cast<std::uint32_t>(queue.pending.size()), queue.running};
 }
