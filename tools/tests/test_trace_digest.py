@@ -59,6 +59,44 @@ class TraceDigestTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
+    def test_folded_only_threads_are_reported_in_json_and_markdown(self):
+        baseline = {thread["thread"]: thread for thread in self.result()["threads"]}
+        for name, total in (("shader compiler", 6.0), ("tid 3", 6.0), ("shader compiler", 0.0)):
+            with self.subTest(name=name, total=total):
+                events = EVENTS + [
+                    {"name": "thread_name", "ph": "M", "ts": 0, "pid": 7, "tid": 3, "args": {"name": name}},
+                    {"name": "thread_name", "ph": "M", "ts": 0, "pid": 7, "tid": 4, "args": {"name": "idle"}},
+                    {"name": f"{name} folded", "ph": "C", "ts": 0, "pid": 7, "tid": 3, "args": {"ms": total / 2}},
+                    {"name": f"{name} folded", "ph": "C", "ts": 20000, "pid": 7, "tid": 3, "args": {"ms": total / 2}},
+                ]
+                with gzip.open(self.trace, "wt", encoding="utf-8") as handle:
+                    json.dump({"traceEvents": events}, handle)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(trace_digest.main([str(self.trace), "--json"]), 0)
+                result = json.loads(output.getvalue())
+                threads = {thread["thread"]: thread for thread in result["threads"]}
+                self.assertEqual(set(threads), set(baseline) | {name})
+                self.assertEqual(threads[name]["folded_ms_per_frame"], total / 3)
+                self.assertEqual(threads[name]["busy_ms_per_frame"], 0)
+                self.assertEqual(threads[name]["wait_ms_per_frame"], 0)
+                self.assertEqual(threads[name]["top"], [])
+                for thread_name, thread in baseline.items():
+                    self.assertEqual(threads[thread_name], thread)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    trace_digest.main([str(self.trace)])
+                self.assertIn(f"| {name} | 0.0 (0 %) | 0.0 (0 %) |", output.getvalue())
+
+    def test_folded_only_thread_without_frame_boundaries(self):
+        trace = trace_digest.Trace({"traceEvents": [
+            {"name": "compiler folded", "ph": "C", "ts": 0, "tid": 3, "args": {"ms": 1.5}},
+        ]})
+        thread = trace_digest.digest(trace)["threads"][0]
+        self.assertEqual(thread["thread"], "tid 3")
+        self.assertEqual(thread["folded_ms_per_frame"], 1.5)
+        self.assertEqual(thread["untraced_ms_per_frame"], 0)
+
     def result(self):
         return trace_digest.digest(trace_digest.load_trace(self.trace), trace_digest.load_summary(None, self.trace),
                                    trace_digest.load_stacks(self.stacks), worst=2, top=3)

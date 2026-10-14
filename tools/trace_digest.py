@@ -119,7 +119,8 @@ def digest(trace, summary=None, stacks=None, worst=5, top=10):
     threads = []
     totals = collections.Counter()
     waits = []
-    for tid, slices in sorted(trace.slices.items()):
+    for tid in sorted(trace.slices.keys() | trace.folded.keys()):
+        slices = trace.slices.get(tid, [])
         traced = sum(dur for _, dur, _, depth, _ in slices if depth == 0)
         waited = sum(dur for _, dur, name, _, nested in slices if is_wait(name) and not nested)
         leaders = collections.Counter()
