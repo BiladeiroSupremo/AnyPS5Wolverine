@@ -45,6 +45,7 @@ static int NativeOpen(const std::filesystem::path& p, int nativeFlags, std::uint
     return descriptor;
 }
 static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
+    if (const auto compressed = CompressedFile::FindDescriptor(fd)) return CompressedFile::SeekDescriptor(*compressed, offset, whence);
     const auto result = File::SeekSharedMemory_nid_no_patch(fd, offset, whence);
     if (result != -2) return result;
     const auto position = ::_lseeki64(fd, offset, whence);
@@ -56,6 +57,7 @@ static int NativeRead(int fd, void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
     }
+    if (const auto compressed = CompressedFile::FindDescriptor(fd)) return static_cast<int>(CompressedFile::ReadDescriptor(*compressed, buf, n, -1));
     const int result = ::_read(fd, buf, static_cast<unsigned int>(n));
     if (result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
     return result;
@@ -110,10 +112,12 @@ static int NativeOpen(const std::filesystem::path& p, int nativeFlags, std::uint
     return ::open(p.c_str(), nativeFlags, static_cast<mode_t>(mode));
 }
 static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
+    if (const auto compressed = CompressedFile::FindDescriptor(fd)) return CompressedFile::SeekDescriptor(*compressed, offset, whence);
     const auto result = File::SeekSharedMemory_nid_no_patch(fd, offset, whence);
     return result == -2 ? ::lseek(fd, static_cast<off_t>(offset), whence) : result;
 }
 static std::int64_t NativeRead(int fd, void* buf, std::size_t n) {
+    if (const auto compressed = CompressedFile::FindDescriptor(fd)) return CompressedFile::ReadDescriptor(*compressed, buf, n, -1);
     return ::read(fd, buf, n);
 }
 static std::int64_t NativeWrite(int fd, const void* buf, std::size_t n) {
@@ -197,8 +201,13 @@ static int OpenNative(const std::filesystem::path& native, int flags, std::uint1
     }
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))
         RecordWrittenPath_nid_no_patch(native);
-    // Descriptor reads do not decode GDEF containers (CompressedFile.hpp; APR reads do).
-    if ((flags & SCE_KERNEL_O_DIRECTORY) == 0) CompressedFile::RequireOrdinary(native, "sceKernelOpen");
+    // A GDEF container (CompressedFile.hpp) read through the descriptor is the uncompressed file;
+    // written, it is refused.
+    if ((flags & SCE_KERNEL_O_DIRECTORY) == 0) {
+        const bool readOnly = (flags & SCE_KERNEL_O_ACCMODE) == SCE_KERNEL_O_RDONLY && (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)) == 0;
+        if (!readOnly) CompressedFile::RequireOrdinary(native, "sceKernelOpen for writing");
+        else CompressedFile::AttachDescriptor(fd, native);
+    }
     File::RememberDescriptor(fd, flags);
     return fd;
 }
@@ -233,6 +242,7 @@ int APS5_VABI sceKernelClose(int d) {
     EqueueDescriptorClosed(d);
     File::ForgetRandomDevice(d);
     File::ForgetDescriptor(d);
+    CompressedFile::DetachDescriptor(d);
     ForgetJitSharedMemory(d);
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);

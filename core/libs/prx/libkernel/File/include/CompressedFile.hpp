@@ -41,9 +41,25 @@ bool Enabled();
 // The uncompressed size of the host file at `path` when it is a GDEF container (reads its header).
 std::optional<std::uint64_t> UncompressedSize(const std::filesystem::path& path);
 
-// Throws when `path` is a GDEF container: for the access paths that do not decode them (only APR
-// reads do), so a title reading one another way fails loudly instead of seeing compressed bytes.
+// Throws when `path` is a GDEF container: for the access paths that do not decode them, so a title
+// reading one another way fails loudly instead of seeing compressed bytes.
 void RequireOrdinary(const std::filesystem::path& path, const char* access);
+
+// Descriptors (sceKernelOpen) of GDEF containers: the guest sees the uncompressed file through
+// them. Each keeps its own guest position; the host file is only read positionally.
+struct OpenFile;
+// After a read-only open of `path` as host descriptor `fd`: attaches the container's index when the
+// file is one (returns whether it is).
+bool AttachDescriptor(int fd, const std::filesystem::path& path);
+void DetachDescriptor(int fd);
+// The descriptor's open container, or null (cheap while no container is open).
+std::shared_ptr<OpenFile> FindDescriptor(int fd);
+// Reads at `offset` (positional) or at the descriptor's position, advancing it (`offset` < 0);
+// returns the bytes read, short at the end of the file.
+std::int64_t ReadDescriptor(OpenFile& file, void* destination, std::size_t bytes, std::int64_t offset);
+// lseek on the uncompressed file; -1 with errno EINVAL for a negative result.
+std::int64_t SeekDescriptor(OpenFile& file, std::int64_t offset, int whence);
+std::uint64_t DescriptorSize(const OpenFile& file);
 
 }
 
