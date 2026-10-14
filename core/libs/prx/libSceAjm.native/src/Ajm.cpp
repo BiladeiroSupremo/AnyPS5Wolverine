@@ -1349,6 +1349,10 @@ void ClearContext(Instance& instance) {
     ClearResampler(instance);
 }
 
+void CheckAacFlags(std::uint64_t flags) {
+    if ((flags >> 32u) & ~((M4AAC_ENABLE_SBR_DECODE | M4AAC_ENABLE_NONDELAY_OUTPUT | M4AAC_SURROUND_INTERLEAVE_ORDERS) >> 32u)) NotImplemented_nid_no_patch("sceAjmInstanceCreate (M4AAC codec flags other than ENABLE_SBR_DECODE, ENABLE_NONDELAY_OUTPUT and the surround interleave orders)");
+}
+
 std::size_t ControlInitializeSize(std::uint32_t codec) {
     switch (codec) {
     case CODEC_MP3: return 0;
@@ -1523,7 +1527,7 @@ int APS5_VABI sceAjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t fl
         OpenMp3(*created);
         created->initialized = true;
     }
-    if (codec == CODEC_M4AAC && (flags >> 32u) & ~((M4AAC_ENABLE_SBR_DECODE | M4AAC_ENABLE_NONDELAY_OUTPUT | M4AAC_SURROUND_INTERLEAVE_ORDERS) >> 32u)) NotImplemented_nid_no_patch("sceAjmInstanceCreate (M4AAC codec flags other than ENABLE_SBR_DECODE, ENABLE_NONDELAY_OUTPUT and the surround interleave orders)");
+    if (codec == CODEC_M4AAC) CheckAacFlags(flags);
     const std::uint32_t id = (codec << 14) | (g_nextInstance.fetch_add(1, std::memory_order_relaxed) & 0x3FFF);
     std::lock_guard lock(g_lock);
     g_instances[id] = std::move(created);
