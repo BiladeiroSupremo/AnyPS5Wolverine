@@ -4174,7 +4174,8 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
     std::cout << "unchanged CPU stamps: ok\n";
 }
 
-bool keptUnitSettleTests(const Device& device, Recorder& recorder) {
+void keptUnitSettleTests(const Device& device, Recorder& recorder) {
+    Require(AgcDriver::GuestMemory::WriteWatched(), "(k) kept-unit settle tests require host write watching");
     const auto& base = device.GetContext();
     constexpr std::uint32_t width = 1024;
     constexpr std::uint32_t height = 512;
@@ -4182,13 +4183,8 @@ bool keptUnitSettleTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t unitBytes = 65536;
     constexpr std::array<std::uint8_t, 4> red{255, 0, 0, 255};
     constexpr std::array<std::uint8_t, 4> blue{0, 0, 255, 255};
-    bool directTested = false;
     for (const bool direct : {false, true}) {
         const std::string what = direct ? "GPU-mapped direct memory" : "watched memory";
-        if (!AgcDriver::GuestMemory::WriteWatched()) {
-            std::cout << "no write watching: units stored next to a unit kept for the CPU in " << what << " not tested\n";
-            continue;
-        }
         if (direct && base.hostImportAlignment == 0) {
             std::cout << "host imports unavailable: units stored next to a unit kept for the CPU in " << what << " not tested\n";
             continue;
@@ -4304,9 +4300,7 @@ bool keptUnitSettleTests(const Device& device, Recorder& recorder) {
             Require(std::to_integer<std::uint8_t>(head[16]) == 0x77, "(k) " + what + ": the second write-back stored over unit 0, which the CPU wrote after that unit's generation");
         }
         std::cout << "units stored next to a unit kept for the CPU in " << what << ": ok\n";
-        if (direct) directTested = true;
     }
-    return directTested;
 }
 
 void settledBaselineTests(const Device& device, Recorder& recorder) {
@@ -6466,7 +6460,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--kept-unit-settle-only") {
-            return keptUnitSettleTests(device, recorder) ? 0 : 77;
+            keptUnitSettleTests(device, recorder);
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--integer-clear-only") {
             integerClearTests(device);
