@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,9 @@ def main():
             assert sorted(path.name for path in output.parent.rglob("*.guest.prx")) == ["bundled.prx.guest.prx"]
             if not windows:
                 assert "$ORIGIN/app0/sce_module/bundled.prx.guest.prx" in needed_libraries(secondary.read_bytes())
+                if os.name != "nt":
+                    for executable in (output, secondary):
+                        assert stat.S_IMODE(executable.stat().st_mode) & 0o111 == 0o111, (executable, oct(executable.stat().st_mode))
             if windows and os.name == "nt":
                 for executable in (output, secondary):
                     run = subprocess.run([str(executable)], capture_output=True, text=True, timeout=30)
