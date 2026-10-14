@@ -260,6 +260,16 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "C\\+\\+ exception St9bad_alloc raised on thread [0-9]+ cannot be delivered: 0x[0-9a-f]+ undeliverable_host_exception_tests\\.exe\\+0x[0-9a-f]+ has no unwind data")
     endif()
 
+    add_test_executable(guest_voice_port_attr_tests tests/GuestVoicePortAttr.cpp)
+    target_include_directories(guest_voice_port_attr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_voice_port_attr_tests PRIVATE libSceVoice libc)
+    configure_windows_unwind(guest_voice_port_attr_tests)
+    add_test(NAME guest_voice_port_attr COMMAND guest_voice_port_attr_tests)
+    if(WIN32)
+        set_tests_properties(guest_voice_port_attr PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceVoice>")
+    endif()
+
     add_test_executable(guest_offline_imports_tests tests/GuestOfflineImports.cpp)
     target_include_directories(guest_offline_imports_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_offline_imports_tests PRIVATE libSceHttp libSceNpEntitlementAccess libSceRudp libc)
