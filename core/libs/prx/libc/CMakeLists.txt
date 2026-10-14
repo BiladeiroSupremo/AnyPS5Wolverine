@@ -622,8 +622,9 @@ if(BUILD_TESTING)
     target_link_libraries(log_macros_tests PRIVATE libc)
     configure_windows_unwind(log_macros_tests)
     add_test(NAME log_macros COMMAND log_macros_tests)
+    add_test(NAME log_macros_timestamps COMMAND log_macros_tests timestamps)
     if(WIN32)
-        set_tests_properties(log_macros PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(log_macros log_macros_timestamps PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
