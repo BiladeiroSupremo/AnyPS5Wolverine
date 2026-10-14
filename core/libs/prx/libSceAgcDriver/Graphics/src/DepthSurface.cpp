@@ -12,6 +12,7 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -492,6 +493,9 @@ std::set<std::uint64_t>& clearedHtiles() {
 
 const DepthSurface* drawnDepth = nullptr;
 
+// Gives a new surface the remembered whole-plane fills that cover its planes (NoteDepthMetadataFill).
+void claimUnclaimedFills(DepthSurface& surface);
+
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -555,6 +559,8 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
     surfaces().back()->clearDepth = target.clearDepth;
     surfaces().back()->clearStencil = target.clearStencil;
+    claimUnclaimedFills(*surfaces().back());
+    surfaces().back()->ApplyPlaneFills();
     drawnDepth = surfaces().back().get();
     return surfaces().back()->view;
 }
@@ -721,32 +727,85 @@ bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t addre
     return address + bytes - htile >= HtileMetadataBytes(extent);
 }
 
+namespace {
+
+// A whole-plane fill no host surface took: a surface made later for that plane starts from the
+// filled value. The console UI fills its glyph cache's planes (depth 1.0, stencil 1) before the
+// first path is drawn, i.e. before the host surface exists; a fresh surface's stencil of 0 made the
+// first text run's cover pass (stencil != 1) cover whole boxes, the letters cut out (2026-10-14).
+struct UnclaimedFill {
+    std::uint64_t address;
+    std::size_t bytes;
+    std::uint32_t pattern;
+};
+
+std::deque<UnclaimedFill>& unclaimedFills() {
+    static auto* fills = new std::deque<UnclaimedFill>();
+    return *fills;
+}
+
+// Marks `surface` filled by a fill of [address, address + bytes) with `pattern` where the fill
+// covers a whole plane of it; returns whether it did.
+bool claimPlaneFill(DepthSurface& surface, std::uint64_t address, std::size_t bytes, std::uint32_t pattern, bool traceClears) {
+    const auto& target = surface.target;
+    // A fill of a whole plane is a clear of that aspect to the filled value: a depth plane of
+    // 32-bit floats (or 16-bit unorm), a stencil plane of one repeated byte.
+    const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+    const auto covers = [&](std::uint64_t plane, std::uint64_t planeBytes) { return plane != 0 && address <= plane && address + bytes >= plane + planeBytes; };
+    bool claimed = false;
+    if (covers(target.address, DepthSliceBytes(target.extent, d16 ? 2u : 4u)) && (!d16 || (pattern >> 16u) == (pattern & 0xffffu))) {
+        surface.pendingFill |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        surface.fillDepth = d16 ? static_cast<float>(pattern & 0xffffu) / 65535.0f : std::bit_cast<float>(pattern);
+        surface.pendingClear &= ~VK_IMAGE_ASPECT_DEPTH_BIT;
+        claimed = true;
+        if (traceClears) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x clears the depth plane of 0x%llx\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.address));
+    }
+    const auto byte = pattern & 0xffu;
+    if (covers(target.stencilAddress, DepthSliceBytes(target.extent, 1u)) && pattern == byte * 0x01010101u) {
+        surface.pendingFill |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        surface.fillStencil = static_cast<std::uint8_t>(byte);
+        surface.pendingClear &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
+        claimed = true;
+        if (traceClears) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x clears the stencil plane 0x%llx of 0x%llx\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.address));
+    }
+    return claimed;
+}
+
+void claimUnclaimedFills(DepthSurface& surface) {
+    static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+    auto& fills = unclaimedFills();
+    for (auto it = fills.begin(); it != fills.end();) {
+        if (claimPlaneFill(surface, it->address, it->bytes, it->pattern, traceClears)) {
+            if (traceClears) std::fprintf(stderr, "[depth-clear] remembered fill 0x%llx+0x%zx taken by the new surface 0x%llx\n", static_cast<unsigned long long>(it->address), it->bytes, static_cast<unsigned long long>(surface.target.address));
+            it = fills.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+}
+
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     std::lock_guard lock(surfacesMutex());
+    static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
+    bool anyClaimed = false;
     for (const auto& surface : surfaces()) {
         const auto& target = surface->target;
-        static const bool traceClears = std::getenv("APS5_TRACE_DEPTH_CLEAR") != nullptr;
         if (traceClears && target.htileAddress != 0 && target.htileAddress < address + bytes && address < target.htileAddress + HtileMetadataBytes(target.extent)) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x over htile 0x%llx of depth 0x%llx: %s\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.htileAddress), static_cast<unsigned long long>(target.address), HtileFillCovers(target.htileAddress, target.extent, address, bytes) ? "covers" : "partial, ignored");
-        // A fill of a whole plane is a clear of that aspect to the filled value: a depth plane of
-        // 32-bit floats (or 16-bit unorm), a stencil plane of one repeated byte.
-        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
-        const auto covers = [&](std::uint64_t plane, std::uint64_t planeBytes) { return plane != 0 && address <= plane && address + bytes >= plane + planeBytes; };
-        if (covers(target.address, DepthSliceBytes(target.extent, d16 ? 2u : 4u)) && (!d16 || (pattern >> 16u) == (pattern & 0xffffu))) {
-            surface->pendingFill |= VK_IMAGE_ASPECT_DEPTH_BIT;
-            surface->fillDepth = d16 ? static_cast<float>(pattern & 0xffffu) / 65535.0f : std::bit_cast<float>(pattern);
-            surface->pendingClear &= ~VK_IMAGE_ASPECT_DEPTH_BIT;
-            if (traceClears) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x clears the depth plane of 0x%llx\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.address));
-        }
-        const auto byte = pattern & 0xffu;
-        if (covers(target.stencilAddress, DepthSliceBytes(target.extent, 1u)) && pattern == byte * 0x01010101u) {
-            surface->pendingFill |= VK_IMAGE_ASPECT_STENCIL_BIT;
-            surface->fillStencil = static_cast<std::uint8_t>(byte);
-            surface->pendingClear &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
-            if (traceClears) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x clears the stencil plane 0x%llx of 0x%llx\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.address));
-        }        if (!HtileFillCovers(target.htileAddress, target.extent, address, bytes)) continue;
+        anyClaimed = claimPlaneFill(*surface, address, bytes, pattern, traceClears) || anyClaimed;
+        if (!HtileFillCovers(target.htileAddress, target.extent, address, bytes)) continue;
         const VkImageAspectFlags written = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         surface->pendingClear = (surface->pendingClear & ~written) | HtileFillClears(pattern, target.htileStencil);
     }
+    // Remembered for a surface not made yet (APS5_NO_UNCLAIMED_FILLS=1 forgets them).
+    static const bool remember = std::getenv("APS5_NO_UNCLAIMED_FILLS") == nullptr;
+    if (anyClaimed || !remember || bytes < 0x10000) return;
+    auto& fills = unclaimedFills();
+    std::erase_if(fills, [&](const UnclaimedFill& fill) { return fill.address == address; });
+    fills.push_back({address, bytes, pattern});
+    if (fills.size() > 64) fills.pop_front();
+    if (traceClears) std::fprintf(stderr, "[depth-clear] fill 0x%llx+0x%zx pattern 0x%x matches no surface yet: remembered\n", static_cast<unsigned long long>(address), bytes, pattern);
 }
 
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource) {
