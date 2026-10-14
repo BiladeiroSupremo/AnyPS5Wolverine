@@ -1114,14 +1114,25 @@ void TestResampleParametersEx(std::uint32_t context) {
     std::int64_t result[2] = {-1, -1};
     Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
     for (const float bad : {0.0f, -1.0f, std::nanf(""), INFINITY}) Require(sceAjmBatchJobSetResampleParametersEx(&info, extended, bad, 0.0f, 1, result) == static_cast<int>(0x80930005));
-    bool rampThrows = false;
-    try {
-        static_cast<void>(sceAjmBatchJobSetResampleParametersEx(&info, extended, 1.0f, 0.001f, 1, result));
-    } catch (const std::runtime_error&) {
-        rampThrows = true;
+    for (const float bad : {std::nanf(""), INFINITY, -INFINITY}) Require(sceAjmBatchJobSetResampleParametersEx(&info, extended, 1.0f, bad, 1, result) == static_cast<int>(0x80930005));
+
+    std::uint32_t ramped = 0;
+    Require(sceAjmInstanceCreate(context, 0, 0, &ramped) == 0);
+    std::vector<std::int16_t> rampedPcm(512);
+    {
+        std::vector<std::uint8_t> rampBatch(4096);
+        AjmBatchInfo rampInfo{};
+        std::int64_t setResult[2] = {-1, -1};
+        DecodeSideband sideband{};
+        Require(sceAjmBatchInitialize(rampBatch.data(), rampBatch.size(), &rampInfo) == 0);
+        Require(sceAjmBatchJobSetResampleParametersEx(&rampInfo, ramped, 1.0f, 0.001f, 1, setResult) == 0);
+        Require(sceAjmBatchJobDecode(&rampInfo, ramped, MP3_MONO, sizeof(MP3_MONO), rampedPcm.data(), rampedPcm.size() * sizeof(std::int16_t), &sideband) == 0);
+        Submit(context, rampInfo);
+        Require(setResult[0] == 0 && sideband.result == 0 && sideband.outputWritten == 512 * 2);
     }
-    Require(rampThrows && info.offset == 0);
-    Require(sceAjmInstanceDestroy(context, plain) == 0 && sceAjmInstanceDestroy(context, extended) == 0);
+    const auto resampleInfo = GetResampleInfo(context, ramped);
+    Require(std::abs(resampleInfo.ratio - 1.512f) < 0.001f && rampedPcm != plainPcm);
+    Require(sceAjmInstanceDestroy(context, plain) == 0 && sceAjmInstanceDestroy(context, extended) == 0 && sceAjmInstanceDestroy(context, ramped) == 0);
 }
 
 const std::uint8_t AT9_MONO_SILENT_SUPERFRAME[] = {
