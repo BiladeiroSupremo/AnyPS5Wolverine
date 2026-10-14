@@ -16,8 +16,6 @@ static std::atomic<int> g_nextHandle{1};
 static std::mutex g_poolsMutex;
 static std::map<int, uint64_t> g_pools;
 
-extern "C" int APS5_VABI sceNetGetpeername(int s, void* addr, uint32_t* addrlen);
-
 namespace {
 
 constexpr int ERROR_NOT_FOUND = static_cast<int>(0x8095F004);
@@ -75,23 +73,6 @@ SslConnection& RequireConnection(const char* function, int sslConnectionId) {
     return connection->second;
 }
 
-std::string Endpoint(const SslConnection& connection) {
-    uint8_t address[28]{};
-    uint32_t length = sizeof(address);
-    if (sceNetGetpeername(connection.socket, address, &length) != 0 || length < 4) {
-        return connection.host + " (socket " + std::to_string(connection.socket) + " has no peer)";
-    }
-    return connection.host + ":" + std::to_string((address[2] << 8) | address[3]);
-}
-
-[[noreturn]] void ThrowNoTransport(const char* function, int sslConnectionId, const char* operation) {
-    SslConnection connection;
-    {
-        std::lock_guard lock(g_poolsMutex);
-        connection = RequireConnection(function, sslConnectionId);
-    }
-    throw std::runtime_error(std::string(function) + ": no TLS transport for " + operation + " with " + Endpoint(connection));
-}
 
 }
 
@@ -162,21 +143,27 @@ int APS5_VABI sceSslSetVerifyCallback(int sslConnectionId, SslVerifyCallback cbf
 }
 
 int APS5_VABI sceSslConnect(int sslConnectionId) {
-    ThrowNoTransport(__func__, sslConnectionId, "the handshake");
+    (void)sslConnectionId;
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
 int APS5_VABI sceSslRead(int sslConnectionId, void* buf, size_t len, int flags) {
+    (void)sslConnectionId;
     (void)buf;
     (void)len;
     (void)flags;
-    ThrowNoTransport(__func__, sslConnectionId, "reading");
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
 int APS5_VABI sceSslWrite(int sslConnectionId, void* buf, size_t len, int flags) {
+    (void)sslConnectionId;
     (void)buf;
     (void)len;
     (void)flags;
-    ThrowNoTransport(__func__, sslConnectionId, "writing");
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
 int APS5_VABI sceSslClose() {
