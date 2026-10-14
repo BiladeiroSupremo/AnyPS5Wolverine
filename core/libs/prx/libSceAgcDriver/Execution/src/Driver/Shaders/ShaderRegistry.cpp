@@ -837,7 +837,6 @@ void BuildRegisteredAbiKey(const QueueState& state, const VulkanDevice& device, 
 
 struct RegisteredPreparation {
     std::size_t codeOffset = 0;
-    ShaderRecompiler::RdnaProgram decoded;
     ShaderRecompiler::SwappcInfo swappc{};
     std::vector<std::uint32_t> userData;
     std::array<ShaderRecompiler::MemoryRegion, 2> memory{};
@@ -882,8 +881,9 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     auto plan = std::make_unique<RegisteredPreparation>();
     plan->codeOffset = codeOffset;
+    ShaderRecompiler::RdnaProgram decoded;
     try {
-        plan->decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+        decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
     } catch (const ShaderRecompiler::UnsupportedInstructionError& error) {
         if (deferred == nullptr) throw;
         return defer(error.what());
@@ -933,7 +933,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     }
     plan->swappc = {vertex.has_value(), firstUser, userCount};
     if (deferred != nullptr) {
-        if (const auto counter = ShaderRecompiler::UnresolvableSwappcTarget(plan->decoded, &plan->swappc)) {
+        if (const auto counter = ShaderRecompiler::UnresolvableSwappcTarget(decoded, &plan->swappc)) {
             char reason[96];
             std::snprintf(reason, sizeof(reason), "its s_swappc_b64 at program counter 0x%x calls a computed target", *counter);
             return defer(reason);
