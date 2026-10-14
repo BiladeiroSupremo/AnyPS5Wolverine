@@ -1,4 +1,6 @@
 #include "SceTypes.hpp"
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
