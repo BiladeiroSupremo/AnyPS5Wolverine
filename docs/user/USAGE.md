@@ -109,9 +109,10 @@ On Linux, when the Vulkan driver imports dma-buf memory (not the NVIDIA propriet
 Linux:
 
 ```sh
-chmod +x app.elf
 ./app.elf
 ```
+
+The relinker writes `app.elf` and each `Executable file:` it lists with execute permission. A copy that lost its file mode, such as a browser download, needs `chmod +x` on each of them first; without it a title that starts another executable stops with `sceSystemServiceLoadExec: execv failed: Permission denied`.
 
 Windows PowerShell:
 
