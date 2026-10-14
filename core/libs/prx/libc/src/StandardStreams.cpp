@@ -21,8 +21,33 @@ int APS5_VABI fgetc_nid_postfix(FileStream* stream) {
     return result;
 }
 std::int32_t APS5_VABI fgetwc_nid_postfix(FileStream* stream) {
-    return fgetc_nid_postfix(stream);
+    if (stream == nullptr) {
+        errno = 22;
+        return -1;
+    }
+    const int first = fgetc_nid_postfix(stream);
+    if (first == -1) return -1;
+    const unsigned char lead = static_cast<unsigned char>(first);
+    if (lead < 0x80) return lead;
+    const std::size_t extra = lead >= 0xf0 ? 3 : lead >= 0xe0 ? 2 : lead >= 0xc0 ? 1 : 0;
+    if (extra == 0) {
+        errno = 86;
+        stream->SetError();
+        return -1;
+    }
+    std::uint32_t code = extra == 3 ? (lead & 0x07) : extra == 2 ? (lead & 0x0f) : (lead & 0x1f);
+    for (std::size_t index = 0; index < extra; ++index) {
+        const int next = fgetc_nid_postfix(stream);
+        if (next == -1 || (static_cast<unsigned char>(next) & 0xc0) != 0x80) {
+            errno = 86;
+            stream->SetError();
+            return -1;
+        }
+        code = (code << 6) | (static_cast<unsigned char>(next) & 0x3f);
+    }
+    return static_cast<std::int32_t>(code);
 }
+
 
 std::int32_t APS5_VABI ungetwc_nid_postfix(std::int32_t value, FileStream* stream) {
     if (value == -1) return -1;
@@ -48,6 +73,9 @@ int APS5_VABI getc_unlocked_nid_postfix(FileStream* stream) {
 }
 int APS5_VABI __srget_nid_postfix(FileStream* stream) { return fgetc_nid_postfix(stream); }
 int APS5_VABI getchar_nid_postfix() { return fgetc_nid_postfix(__stdinp_nid_postfix); }
+std::int32_t APS5_VABI getwc_nid_postfix(FileStream* stream) { return fgetwc_nid_postfix(stream); }
+std::int32_t APS5_VABI getwchar_nid_postfix() { return fgetwc_nid_postfix(__stdinp_nid_postfix); }
+int APS5_VABI getchar_unlocked_nid_postfix() { return getc_unlocked_nid_postfix(__stdinp_nid_postfix); }
 int APS5_VABI fputc_nid_postfix(int value, FileStream* stream) {
     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
     const int result = std::fputc(value, GetNativeStream(stream));
@@ -67,6 +95,7 @@ int APS5_VABI putc_unlocked_nid_postfix(int value, FileStream* stream) {
 }
 int APS5_VABI __swbuf_nid_postfix(int value, FileStream* stream) { return fputc_nid_postfix(value, stream); }
 int APS5_VABI putchar_nid_postfix(int value) { return fputc_nid_postfix(value, __stdoutp_nid_postfix); }
+int APS5_VABI putchar_unlocked_nid_postfix(int value) { return putc_unlocked_nid_postfix(value, __stdoutp_nid_postfix); }
 int APS5_VABI ungetc_nid_postfix(int value, FileStream* stream) {
     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
     const int result = std::ungetc(value, GetNativeStream(stream));
