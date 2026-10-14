@@ -227,7 +227,7 @@ jobs:
         with:
           ref: ${{ needs.eligibility.outputs.sha }}
           persist-credentials: false
-          submodules: true
+          submodules: recursive
       - name: Merge the pull request into main
         if: ${{ needs.eligibility.outputs.head != '' }}
         shell: bash
@@ -297,7 +297,7 @@ jobs:
         with:
           ref: ${{ needs.eligibility.outputs.sha }}
           persist-credentials: false
-          submodules: true
+          submodules: recursive
       - name: Merge the pull request into main
         if: ${{ needs.eligibility.outputs.head != '' }}
         shell: bash
