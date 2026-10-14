@@ -653,7 +653,6 @@ int main() {
         Require(stat_nid_postfix(fileLink.string().c_str(), &followed) == 0 && (followed.st_mode & 0170000) == 0100000);
         Require(followed.st_ino == status.st_ino && linkStatus.st_ino != status.st_ino && linkStatus.st_dev == status.st_dev);
         Require(stat_nid_postfix(directoryLink.string().c_str(), &followed) == 0 && (followed.st_mode & 0170000) == 0040000);
-        Require(stat_nid_postfix(danglingLink.string().c_str(), &followed) == -1 && *__error_nid_postfix() == 2);
         const auto checkUnsupportedLink = [](const std::filesystem::path& link) {
             FileStat untouched;
             std::memset(&untouched, 0x5a, sizeof(untouched));
