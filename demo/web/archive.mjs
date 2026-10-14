@@ -47,8 +47,6 @@ async function headerBytes(entry) {
   return header;
 }
 
-// the containers a package holds before they are unwrapped, from pkg-to-anyps5's SELF_MAGIC_PS4 and
-// SELF_MAGIC_PS5
 const SELF_MAGICS = [
   [0x4f, 0x15, 0x3d, 0x1d],
   [0x54, 0x14, 0xf5, 0xee]
