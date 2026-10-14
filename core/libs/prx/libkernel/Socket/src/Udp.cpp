@@ -563,6 +563,34 @@ int SocketSendFlags(Socket& socket, int flags) {
     std::lock_guard lock(socket.modeMutex);
     return NativeSendFlags(socket.options.noSignal ? flags | GuestNoSignal : flags);
 }
+int WaitForTransfer(Socket& socket, bool send, int flags) {
+    if ((flags & GuestDontWait) != 0) return 0;
+    std::int64_t timeout;
+    {
+        std::lock_guard lock(socket.modeMutex);
+        if (socket.options.nonblocking) return 0;
+        timeout = send ? socket.options.sendTimeout : socket.options.receiveTimeout;
+    }
+    if (timeout == 0) return 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout >> 32) +
+        std::chrono::nanoseconds((static_cast<std::int64_t>(static_cast<std::uint32_t>(timeout)) * 1000000000) >> 32);
+    for (;;) {
+        const auto left = deadline - std::chrono::steady_clock::now();
+        if (left <= std::chrono::steady_clock::duration::zero()) return 35;
+        const int milliseconds = static_cast<int>(std::min<std::int64_t>(std::chrono::ceil<std::chrono::milliseconds>(left).count(), INT_MAX));
+        NativePollDescriptor entry{};
+        entry.fd = socket.value;
+#ifdef _WIN32
+        entry.events = static_cast<short>(send ? POLLWRNORM : POLLRDNORM);
+        const int ready = WSAPoll(&entry, 1, milliseconds);
+        if (ready != 0) return 0;
+#else
+        entry.events = static_cast<short>(send ? POLLOUT : POLLIN);
+        const int ready = ::poll(&entry, 1, milliseconds);
+        if (ready > 0 || (ready < 0 && errno != EINTR)) return 0;
+#endif
+    }
+}
 #ifdef _WIN32
 bool LoopbackName(NativeSocket socket, sockaddr_in& name) {
     int size = sizeof(name);
@@ -959,6 +987,8 @@ int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* l
             std::lock_guard modeLock(listener->modeMutex);
             inheritNonblocking = listener->options.nonblocking;
             accepted->options.noSignal = listener->options.noSignal;
+            accepted->options.sendTimeout = listener->options.sendTimeout;
+            accepted->options.receiveTimeout = listener->options.receiveTimeout;
         }
         if (inheritNonblocking && SetNonBlocking(*accepted)) return -1;
         const int acceptedDescriptor = Install(std::move(accepted));
@@ -975,6 +1005,7 @@ std::int64_t APS5_VABI send_nid_postfix(int descriptor, const void* buffer, std:
     if ((flags & ~GuestSendFlags) != 0) return Fail(45);
     if (length > INT_MAX) return Fail(40);
     if (!buffer && length) return Fail(14);
+    if (const int waited = WaitForTransfer(*socket, true, flags)) return Fail(waited);
     const auto result = ::send(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), SocketSendFlags(*socket, flags));
     return result < 0 ? Fail(SendError(socket->type)) : result;
 }
@@ -986,6 +1017,7 @@ std::int64_t APS5_VABI recv_nid_postfix(int descriptor, void* buffer, std::uint6
     if (!buffer && length) return Fail(14);
     const GuestArena::HostWrite destination(length == 0 ? nullptr : buffer, static_cast<std::size_t>(length));
     if (!destination.Open()) return Fail(14);
+    if (const int waited = WaitForTransfer(*socket, false, flags)) return Fail(waited);
     const auto result = ::recv(socket->value, static_cast<char*>(buffer), static_cast<int>(length),
         NativeReceiveFlags(flags));
 #ifdef _WIN32
@@ -1072,6 +1104,7 @@ std::int64_t APS5_VABI sendto_nid_postfix(int descriptor, const void* buffer, st
     if ((flags & ~GuestSendFlags) != 0) return Fail(45);
     if (length > INT_MAX) return Fail(40);
     if (!buffer && length) return Fail(14);
+    if (const int waited = WaitForTransfer(*socket, true, flags)) return Fail(waited);
     int result;
     if (!address) {
         if (addressLength != 0) return Fail(22);
@@ -1097,6 +1130,7 @@ std::int64_t APS5_VABI recvfrom_nid_postfix(int descriptor, void* buffer, std::u
     if (!destination.Open()) return Fail(14);
     sockaddr_storage native{};
     socklen_t size = sizeof(native);
+    if (const int waited = WaitForTransfer(*socket, false, flags)) return Fail(waited);
     auto result = ::recvfrom(socket->value, static_cast<char*>(buffer), static_cast<int>(length),
         NativeReceiveFlags(flags), reinterpret_cast<sockaddr*>(&native), &size);
 #ifdef _WIN32
@@ -1172,6 +1206,7 @@ std::int64_t APS5_VABI recvmsg_nid_postfix(int descriptor, GuestMsghdr* message,
     }
     sockaddr_storage native{};
     socklen_t size = sizeof(native);
+    if (const int waited = WaitForTransfer(*socket, false, flags)) return Fail(waited);
     std::int64_t received = ::recvfrom(socket->value, buffer.data(), static_cast<int>(buffer.size()),
         NativeReceiveFlags(flags), reinterpret_cast<sockaddr*>(&native), &size);
     if (received < 0) {
