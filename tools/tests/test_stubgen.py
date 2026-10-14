@@ -115,6 +115,12 @@ class StubGeneratorTests(unittest.TestCase):
             path.write_text("# imports\nAAAAAAAAAAA#A#B\nAAAAAAAAAAA\nBBBBBBBBBBB\n", encoding="utf-8-sig")
             self.assertEqual(stubgen.parse_nids(path), ["AAAAAAAAAAA", "BBBBBBBBBBB"])
 
+    def test_named_stub_reports_its_function_name(self):
+        code = stubgen.generate("libSceAmpr", ["tNn5WBkta60", "AAAAAAAAAAA"], {"tNn5WBkta60": "sceAmprCommandBufferNop"})[0]
+        named = code.split("sceAmprCommandBufferNop(void) {\n", 1)[1].split("\n", 1)[0]
+        self.assertEqual(named, "    NotImplemented_nid_no_patch(__func__);")
+        self.assertIn('NotImplemented_nid_no_patch("AAAAAAAAAAA");', code)
+
     def test_valid_generation_keeps_the_code_and_debt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
