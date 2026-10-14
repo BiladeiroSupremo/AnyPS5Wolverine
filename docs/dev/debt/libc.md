@@ -30,6 +30,7 @@
 - [set_constraint_handler_s](../../../core/libs/prx/libc/src/WideConversion.cpp) (libc, re-exported by libSceAmpr) - the default handler is assumed to abort; each module keeps its own handler state, so a handler set through one library is not seen by the other. `ctime_s` and `asctime_s` follow the Dinkumware 26-byte format with `EINVAL` for a buffer under 26 bytes, a null pointer or an out-of-range weekday/month; `ctime_s` uses the guest time zone of `localtime_s`, and the console's exact checks are not verified
 - [__udivti3](../../../core/libs/prx/libc/src/RuntimeSupport.cpp) (libc, re-exported by libSceAmpr) - the hardware traps on a zero divisor; this throws instead
 - [__umodti3](../../../core/libs/prx/libc/src/RuntimeSupport.cpp) (libc) - the hardware traps on a zero divisor; this throws instead
+- [strndup and strdup](../../../core/libs/prx/libc/src/AllocatingStrings.cpp) (libc) return null with `errno` set to `EINVAL` (22) when `source` is null, preventing a host segfault on invalid guest input. POSIX.1-2008 and FreeBSD 11.4 libc leave `strndup(NULL)` and `strdup(NULL)` undefined (faulting); exact console behavior on hardware is unverified.
 
 ### Functional
 

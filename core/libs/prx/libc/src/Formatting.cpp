@@ -229,6 +229,10 @@ int APS5_VABI vasprintf_nid_postfix(char** destination, const char* format, VaLi
         const char* source = guestWide ? guestText.c_str() : text;
 #endif
         auto* output = static_cast<char*>(ApplicationHeapAllocate_nid_no_patch(static_cast<size_t>(count) + 1));
+        if (!output) {
+            errno = 12;
+            return -1;
+        }
         std::memcpy(output, source, static_cast<size_t>(count) + 1);
         *destination = output;
         return count;
