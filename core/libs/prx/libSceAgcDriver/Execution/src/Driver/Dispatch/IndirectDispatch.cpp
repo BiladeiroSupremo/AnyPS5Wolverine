@@ -43,9 +43,12 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
     int path = IndirectGpu;
     if (!gpuIndirect) path = IndirectDisabled;
     // Thread dimensions (bit 0x20): read on the CPU. APS5_GPU_THREAD_DIMENSIONS=1 (experimental)
-    // has the device convert the thread counts on the GPU instead; the title froze after its
-    // first-boot dialog with it (2026-10-14, cause not yet found).
-    else if ((initiator & 0x20u) != 0 && std::getenv("APS5_GPU_THREAD_DIMENSIONS") == nullptr) path = IndirectThreadDimensions;
+    // has the device convert the thread counts on the GPU instead, except with a partial last group
+    // (PARTIAL_TG_EN, bit 0x2), whose extra threads only the CPU path's direct dispatch limits
+    // (Pm4::PartialGroupThreads). Unsolved: with it the title froze after its first-boot dialog
+    // (run tg1) and, with partial groups excluded, lost the device within ~3 minutes (tg2,
+    // 2026-10-14); a debug readback comparing the kernel's groups to the CPU's is the next step.
+    else if ((initiator & 0x20u) != 0 && ((initiator & 0x2u) != 0 || std::getenv("APS5_GPU_THREAD_DIMENSIONS") == nullptr)) path = IndirectThreadDimensions;
     else if (arguments % 4 != 0) path = IndirectMisaligned;
     if (path != IndirectGpu) {
         if (!resolvingAhead()) {
