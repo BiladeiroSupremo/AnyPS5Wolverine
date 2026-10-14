@@ -11,9 +11,17 @@ layout(push_constant) uniform Parameters {
     uint dumpCount;
     uint firstSegment;
     uint lastSegment;
+    uint phase;
 } parameters;
 
 void main() {
+    if (parameters.phase == 2u) {
+        for (uint dump = parameters.firstDump; dump < parameters.firstDump + parameters.dumpCount; ++dump) {
+            Words target = Words(uvec2(parameters.dumps.words[dump * 4u], parameters.dumps.words[dump * 4u + 1u]));
+            for (uint db = 0u; db < 16u; ++db) target.words[db * 4u + 1u] |= 0x80000000u;
+        }
+        return;
+    }
     uint low = parameters.counter.words[0];
     uint high = parameters.counter.words[1];
     uint segment = parameters.firstSegment;
@@ -26,10 +34,11 @@ void main() {
         }
         Words target = Words(uvec2(parameters.dumps.words[dump * 4u], parameters.dumps.words[dump * 4u + 1u]));
         for (uint db = 0u; db < 16u; ++db) {
-            target.words[db * 4u] = db == 0u ? low : 0u;
-            target.words[db * 4u + 1u] = (db == 0u ? high : 0u) | 0x80000000u;
+            if (parameters.phase == 0u) target.words[db * 4u + 1u] = db == 0u ? (high & 0x7fffffffu) : 0u;
+            else target.words[db * 4u] = db == 0u ? low : 0u;
         }
     }
+    if (parameters.phase == 0u && parameters.dumpCount != 0u) return;
     for (; segment < parameters.lastSegment; ++segment) {
         uint carry;
         low = uaddCarry(low, parameters.counter.words[4u + 2u * segment], carry);
