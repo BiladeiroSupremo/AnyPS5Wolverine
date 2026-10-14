@@ -18,6 +18,12 @@ int main() {
     Require(::setenv(key, "host", 1) == 0);
 #endif
     Require(getenv_nid_postfix(key) == nullptr);
+#ifdef _WIN32
+    Require(_putenv_s("HOME", "C:\\Users\\host") == 0);
+#else
+    Require(::setenv("HOME", "/home/host", 1) == 0);
+#endif
+    for (const char* host : {"HOME", "PATH"}) Require(std::getenv(host) != nullptr && getenv_nid_postfix(host) == nullptr);
     Require(setenv_nid_postfix(key, "inherited", 0) == 0);
     Require(setenv_nid_postfix(key, "kept out", 0) == 0);
     Require(std::strcmp(getenv_nid_postfix(key), "inherited") == 0);
