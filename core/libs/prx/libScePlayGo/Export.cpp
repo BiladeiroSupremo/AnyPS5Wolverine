@@ -87,7 +87,9 @@ static const ChunkTable& Chunks() {
 
 static bool IsKnownChunk(uint16_t id) {
     const auto& chunks = Chunks();
-    return chunks.defined ? chunks.ids.contains(id) : chunks.scenario || id == 0;
+    if (chunks.defined) return chunks.ids.contains(id);
+    if (chunks.scenario || id == 0) return true;
+    throw std::runtime_error("scePlayGo: sce_sys/playgo-chunk.dat and sce_sys/playgo-scenario.json are missing, so chunk ID " + std::to_string(id) + " cannot be checked");
 }
 
 static int ValidateChunks(const uint16_t* chunk_ids, uint32_t number_of_entries) {
