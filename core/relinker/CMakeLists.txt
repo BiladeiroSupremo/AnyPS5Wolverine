@@ -218,6 +218,11 @@ if(BUILD_TESTING)
     add_test(NAME sdk_mman_syscall COMMAND sdk_mman_syscall_tests)
     set_tests_properties(sdk_mman_syscall PROPERTIES TIMEOUT 20)
 
+    add_test_executable(runtime_layout_tests ${CMAKE_CURRENT_SOURCE_DIR}/cli/tests/RuntimeLayoutTests.cpp)
+    target_include_directories(runtime_layout_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/include)
+    add_test(NAME runtime_layout COMMAND runtime_layout_tests)
+    set_tests_properties(runtime_layout PROPERTIES TIMEOUT 20)
+
     add_test_executable(autorun_exit_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/cli/tests/AutorunExitTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp
