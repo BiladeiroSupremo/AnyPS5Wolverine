@@ -976,7 +976,9 @@ static void CheckGuestModuleImageProtection() {
 
     rejected = false;
     try {
-        sceKernelMprotect(reinterpret_cast<const void*>(&sceKernelMprotect), page, 1);
+        const auto libkernel = GetModuleHandleA("libkernel.prx");
+        Require(libkernel != nullptr);
+        sceKernelMprotect(libkernel, page, 1);
     } catch (const std::invalid_argument&) {
         rejected = true;
     }
