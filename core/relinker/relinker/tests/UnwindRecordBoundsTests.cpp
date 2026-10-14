@@ -26,7 +26,7 @@ int main() {
         auto second = load; second.MappedAddress = 0x1048; second.Offset = 72; second.FileSize = 56;
         auto first = load; first.FileSize = 72;
         Require(Relinker::UnusedNidFilter::ReadExceptionFunctions(Fixture(), {first, second, eh}, {}, {}).size() == 1);
-        for (int kind = 0; kind < 7; ++kind) {
+        for (int kind = 0; kind < 10; ++kind) {
             auto bytes = Fixture(); auto segment = load;
             switch (kind) {
                 case 0: Io::WriteU32(bytes, 64, 0x1000); break;
@@ -36,12 +36,15 @@ int main() {
                 case 4: segment.Offset = std::numeric_limits<std::uint64_t>::max() - 4095; segment.MappedAddress = 0; segment.FileSize = 0x1100; break;
                 case 5: segment.FileSize = 119; break;
                 case 6: Io::WriteU32(bytes, 64, 8); break;
+                case 7: Io::WriteU32(bytes, 100, 0); break;
+                case 8: bytes[3] = 0x1B; Io::WriteU32(bytes, 16, 0xFFFFE000); break;
+                case 9: bytes[3] = 0x10; Io::WriteU64(bytes, 16, std::numeric_limits<std::uint64_t>::max() - 0x10); break;
             }
             bool rejected = false;
             try { Relinker::UnusedNidFilter::ReadExceptionFunctions(bytes, {segment, eh}, {}, {}); }
             catch (const std::exception&) { rejected = true; }
             Require(rejected);
         }
-        std::cout << "9 unwind record cases passed\n";
+        std::cout << "12 unwind record cases passed\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
