@@ -55,11 +55,13 @@ inline void PreciseSleepFromCounterWithTimer(
     LARGE_INTEGER counter,
     unsigned long long hundredNanos,
     HANDLE timerHandle,
-    bool useCustomTimer) {
+    bool useCustomTimer,
+    bool allowSpinTail = true) {
     if (hundredNanos == 0) {
         return;
     }
     constexpr unsigned long long kSpinTailHundredNanos = 2500;
+    constexpr unsigned long long kMinTimerSpinSleepHundredNanos = 10000;
     static std::atomic<std::uint64_t> cachedFreq{0};
     std::uint64_t freq = cachedFreq.load(std::memory_order_relaxed);
     std::uint64_t deltaTicks = hundredNanos;
@@ -77,9 +79,11 @@ inline void PreciseSleepFromCounterWithTimer(
         }
     }
     const std::uint64_t deadlineTicks = static_cast<std::uint64_t>(counter.QuadPart) + deltaTicks;
-    if (hundredNanos > kSpinTailHundredNanos) [[unlikely]] {
+    const bool useSpinTail = allowSpinTail || hundredNanos >= kMinTimerSpinSleepHundredNanos;
+    if (!useSpinTail || hundredNanos > kSpinTailHundredNanos) [[unlikely]] {
         const HANDLE handle = useCustomTimer ? timerHandle : PreciseWaitThreadTimer();
-        PreciseSleepWaitableTimerWithHandle(handle, hundredNanos - kSpinTailHundredNanos);
+        const unsigned long long timerHundredNanos = useSpinTail ? (hundredNanos - kSpinTailHundredNanos) : hundredNanos;
+        PreciseSleepWaitableTimerWithHandle(handle, timerHundredNanos);
     }
     for (;;) {
         QueryPerformanceCounter(&counter);
@@ -94,7 +98,7 @@ inline void PreciseSleepFromCounterWithTimer(
 }
 
 inline void PreciseSleepFromCounter(LARGE_INTEGER counter, unsigned long long hundredNanos) {
-    PreciseSleepFromCounterWithTimer(counter, hundredNanos, nullptr, false);
+    PreciseSleepFromCounterWithTimer(counter, hundredNanos, nullptr, false, true);
 }
 
 inline void PreciseSleepHundredNanos(unsigned long long hundredNanos) {
@@ -103,7 +107,7 @@ inline void PreciseSleepHundredNanos(unsigned long long hundredNanos) {
     }
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
-    PreciseSleepFromCounter(counter, hundredNanos);
+    PreciseSleepFromCounterWithTimer(counter, hundredNanos, nullptr, false, false);
 }
 #elif !defined(__EMSCRIPTEN__)
 #include <cerrno>
