@@ -24,7 +24,6 @@ int APS5_VABI sched_get_priority_max_nid_postfix(int policy);
 }
 
 static constexpr int GUEST_EINVAL = 22;
-static constexpr int GUEST_ENOTSUP = 45;
 static constexpr int PRIO_NONE = 0;
 static constexpr int PRIO_INHERIT = 1;
 static constexpr int PRIO_PROTECT = 2;
@@ -90,10 +89,11 @@ static void CheckProcessSharing() {
     Require(pthread_mutexattr_getpshared_nid_postfix(&attr, &sharing) == 0 && sharing == 0);
     Require(pthread_mutexattr_settype_nid_postfix(&attr, 2) == 0);
     Require(pthread_mutexattr_setpshared_nid_postfix(&attr, 0) == 0);
-    Require(pthread_mutexattr_setpshared_nid_postfix(&attr, 1) == GUEST_ENOTSUP);
+    Require(pthread_mutexattr_setpshared_nid_postfix(&attr, 1) == 0);
+    Require(pthread_mutexattr_getpshared_nid_postfix(&attr, &sharing) == 0 && sharing == 1);
     for (const int invalid : {-1, 2, 2147483647})
         Require(pthread_mutexattr_setpshared_nid_postfix(&attr, invalid) == GUEST_EINVAL);
-    Require(pthread_mutexattr_getpshared_nid_postfix(&attr, &sharing) == 0 && sharing == 0);
+    Require(pthread_mutexattr_getpshared_nid_postfix(&attr, &sharing) == 0 && sharing == 1);
     int type = -1;
     Require(pthread_mutexattr_gettype_nid_postfix(&attr, &type) == 0 && type == 2);
     Require(Throws([&] { pthread_mutexattr_getpshared_nid_postfix(&attr, nullptr); }));
@@ -104,6 +104,8 @@ static void CheckProcessSharing() {
     Require(pthread_mutex_unlock_nid_postfix(&mutex) == 0);
     Require(pthread_mutex_unlock_nid_postfix(&mutex) == 0);
     Require(pthread_mutex_destroy_nid_postfix(&mutex) == 0);
+    Require(pthread_mutexattr_setpshared_nid_postfix(&attr, 0) == 0);
+    Require(pthread_mutexattr_getpshared_nid_postfix(&attr, &sharing) == 0 && sharing == 0);
     Require(pthread_mutexattr_destroy_nid_postfix(&attr) == 0);
     sharing = -1;
     Require(pthread_mutexattr_getpshared_nid_postfix(&attr, &sharing) == GUEST_EINVAL && sharing == -1);
