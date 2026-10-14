@@ -1838,7 +1838,7 @@ void VulkanDevice::StoreIdleResults(bool reapFirst) {
     if (!Graphics::StorageTexture::AnyPending()) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    Graphics::StorageTexture::FlushAllPending("idle");
+    Graphics::StorageTexture::FlushIdlePending("idle");
     SubmitRecorded(reapFirst);
 }
 

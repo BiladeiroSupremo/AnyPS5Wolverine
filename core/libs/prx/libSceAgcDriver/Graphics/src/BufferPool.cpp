@@ -254,6 +254,43 @@ void BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted)
     ++tier.evictions;
 }
 
+namespace {
+
+std::int64_t steadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::int64_t idleMs() {
+    static const std::int64_t value = [] {
+        const char* text = std::getenv("APS5_BUFFER_POOL_IDLE_MS");
+        return text != nullptr ? static_cast<std::int64_t>(std::strtoll(text, nullptr, 10)) : std::int64_t{10000};
+    }();
+    return value;
+}
+
+}
+
+void BufferPool::evictIdle(std::vector<BufferAllocation>& evicted) {
+    const auto idle = idleMs();
+    if (idle <= 0) return;
+    const auto now = steadyMs();
+    if (now - lastIdleSweepMs < 1000) return;
+    lastIdleSweepMs = now;
+    for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
+        for (auto it = tier->free.begin(); it != tier->free.end();) {
+            auto& slots = it->second;
+            while (!slots.empty() && now - slots.front().returnedMs > idle) {
+                evicted.push_back(slots.front().allocation);
+                tier->retainedBytes -= slots.front().allocation.allocationBytes;
+                slots.pop_front();
+                --tier->slots;
+                ++tier->evictions;
+            }
+            it = slots.empty() ? tier->free.erase(it) : std::next(it);
+        }
+    }
+}
+
 std::size_t BufferPool::MaxSlots() {
     // APS5_BUFFER_POOL_SLOTS=<n> bounds the retained allocations; 64 is the capacity the pool had
     // before least-recently-used retention, for A/B runs.
@@ -313,9 +350,15 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
             evicted.push_back(allocation);
         } else {
             while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);
-            tier.free[{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock});
+            tier.free[{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock, steadyMs()});
             ++tier.slots;
             tier.retainedBytes += allocation.allocationBytes;
+        }
+        // The allocation is retained by now: a vector that cannot grow only ends the sweep early
+        // (each slot is pushed before it is popped).
+        try {
+            evictIdle(evicted);
+        } catch (...) {
         }
     } catch (...) {
         destroy(allocation);

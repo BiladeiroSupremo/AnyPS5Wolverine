@@ -14,7 +14,14 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-constexpr auto IdleResultsQuietPeriod = std::chrono::milliseconds(50);
+// How long every queue must stay quiet before pending storage image results are written back to
+// guest memory (APS5_IDLE_RESULTS_MS, default 1). PPSA03671 waits for such a write-back every frame
+// (a CPU read the driver cannot see), so the quiet period was frame latency: 50 ms ran its
+// cinematic at 3.2 FPS, 1 ms at 3.8, 2000 ms at 0.4 (2026-10-14).
+const std::chrono::milliseconds IdleResultsQuietPeriod = [] {
+    const char* value = std::getenv("APS5_IDLE_RESULTS_MS");
+    return std::chrono::milliseconds(value != nullptr ? std::strtoll(value, nullptr, 10) : 1);
+}();
 
 }
 

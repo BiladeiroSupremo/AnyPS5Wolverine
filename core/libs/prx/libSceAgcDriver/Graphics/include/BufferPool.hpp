@@ -88,6 +88,8 @@ private:
     struct Slot {
         BufferAllocation allocation;
         std::uint64_t lastUse;
+        // When the slot was returned (steady clock, ms): see evictIdle.
+        std::int64_t returnedMs = 0;
     };
     struct SlotKey {
         std::size_t bytes;
@@ -124,6 +126,12 @@ private:
     // caller destroys those after releasing the mutex, so builds taking buffers on other threads
     // do not wait behind the Vulkan destroy calls. Nothing changes when the vector cannot grow.
     void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
+    // Moves every slot retained longer than APS5_BUFFER_POOL_IDLE_MS (default 10000, 0 = never)
+    // to `evicted`, at most once a second. The budgets alone kept ~1.8 GiB of device memory and
+    // ~0.5 GiB of host memory idle in PPSA03671 (each device-local byte is also process commit on
+    // AMD's Windows driver), while the sizes in use are taken again within a few frames.
+    void evictIdle(std::vector<BufferAllocation>& evicted);
+    std::int64_t lastIdleSweepMs = 0;
     // The retained-slot bound of each tier (APS5_BUFFER_POOL_SLOTS, default `defaultSlots`), read once.
     static std::size_t MaxSlots();
     std::size_t maxSlots;

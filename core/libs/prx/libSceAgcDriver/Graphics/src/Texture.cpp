@@ -2961,8 +2961,16 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     return false;
 }
 
+namespace {
+
+// Images larger than this stay pending through an idle store (FlushIdlePending); 0 stores all.
+thread_local std::uint64_t idleSizeLimit = 0;
+
+}
+
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (published != nullptr) *published = false;
+    const auto sizeLimit = std::exchange(idleSizeLimit, 0);
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
     std::vector<std::shared_ptr<StorageTexture>> flush;
@@ -2973,6 +2981,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
             if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
+                if (sizeLimit != 0 && texture->guestBytes > sizeLimit) {
+                    ++it;
+                    continue;
+                }
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
@@ -3096,6 +3108,20 @@ void StorageTexture::FlushDumpSelected(const char* reason) {
 
 void StorageTexture::FlushAllPending(const char* reason) {
     static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
+}
+
+void StorageTexture::FlushIdlePending(const char* reason) {
+    // Experiment (APS5_IDLE_STORE_MAX_KB): the idle store is the safety net for CPU reads the
+    // driver cannot see; PPSA03671's per-frame one is presumably a small result (a readback), while
+    // its ~100 render targets a frame (~1.5 GB/s of GPU retiling) are only sampled on the GPU,
+    // which reads the images themselves. Larger images stay pending for the reads the driver sees.
+    static const std::uint64_t limit = [] {
+        const char* value = std::getenv("APS5_IDLE_STORE_MAX_KB");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) << 10u : 0ull;
+    }();
+    idleSizeLimit = limit;
+    static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
+    idleSizeLimit = 0;
 }
 
 bool StorageTexture::AnyPending() {

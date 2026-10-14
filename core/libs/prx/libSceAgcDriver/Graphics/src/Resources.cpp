@@ -356,8 +356,44 @@ void Buffer::Invalidate() {
     Check(context.Function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(context.device, 1, &range), "vkInvalidateMappedMemoryRanges");
 }
 
+namespace {
+
+// APS5_TRACE_VKMEM: device buffers made per caller (module offset) every 10 s, the pool's churn.
+void NoteDeviceBuffer(void* caller, std::size_t size) {
+    static const bool enabled = std::getenv("APS5_TRACE_VKMEM") != nullptr;
+    if (!enabled) return;
+    struct Site {
+        std::uint64_t made = 0;
+        std::uint64_t bytes = 0;
+        std::size_t largest = 0;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::uintptr_t, Site> sites;
+    static auto lastReport = std::chrono::steady_clock::now();
+    // The caller of the constructor (inside make_shared/make_unique when one wraps it).
+    const auto site = SiteOf(caller);
+    std::lock_guard lock(mutex);
+    auto& entry = sites[site];
+    ++entry.made;
+    entry.bytes += size;
+    entry.largest = std::max(entry.largest, size);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::vector<std::pair<std::uintptr_t, Site>> ranked(sites.begin(), sites.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+    for (std::size_t index = 0; index < ranked.size() && index < 8; ++index) {
+        const auto& [where, made] = ranked[index];
+        std::fprintf(stderr, "[devbuf] 10 s: site +0x%llx made %llu device buffers, %.1f MiB, largest %.1f MiB\n", static_cast<unsigned long long>(where), static_cast<unsigned long long>(made.made), made.bytes / 1048576.0, made.largest / 1048576.0);
+    }
+    sites.clear();
+}
+
+}
+
 DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
     Require(size != 0, "zero-sized device buffer");
+    NoteDeviceBuffer(__builtin_return_address(0), size);
     cache = GetBufferPool(context);
     if (const auto allocation = cache->Take(size, this->usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
         buffer = allocation->buffer;
