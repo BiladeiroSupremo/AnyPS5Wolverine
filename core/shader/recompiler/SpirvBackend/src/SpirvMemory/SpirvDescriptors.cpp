@@ -246,7 +246,10 @@ std::uint32_t LoadSampledImageDescriptor(SpirvEmitterState& state, std::uint32_t
         FailEmit("sampled image descriptor requested for a non-sampled image");
     }
     // The heap branch of a table root (EmitImage): the entry comes from the heap set.
-    if (state.bindlessHeapSlot != 0u && state.program.Info().images.at(resource).indirectRoot == resource) {
+    // Experiment: APS5_HEAP_ROOT_IMAGE=1 samples the table root's own binding (the representative
+    // entry) in the heap branch of graphics stages instead of the heap set.
+    static const bool rootImage = std::getenv("APS5_HEAP_ROOT_IMAGE") != nullptr;
+    if (state.bindlessHeapSlot != 0u && !(rootImage && state.program.Resources().stage != IrShaderStage::Compute) && state.program.Info().images.at(resource).indirectRoot == resource) {
         return LoadBindlessHeapImage(state, state.program.Info().images.at(resource), imageResource, state.bindlessHeapSlot);
     }
     const auto kind = DescriptorBindingForImage(imageResource);

@@ -24,6 +24,10 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+    // Diagnostic: APS5_DUMP_SHADERS also writes the requests of graphics stages prepared at a draw
+    // (once per address; agc_shader_replay reads them).
+    static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
+    if (dumpShaders) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
     const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];

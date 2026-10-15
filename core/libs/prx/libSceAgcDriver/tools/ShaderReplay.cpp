@@ -118,7 +118,14 @@ bool Replay(const char* path) {
     if (g_prepare) {
         try {
             const auto handle = ShaderRecompiler::PrepareShader(request.request);
-            std::printf("  prepared: %zu SPIR-V words\n", ShaderRecompiler::GetPreparedArtifact(*handle).spirv.Words().size());
+            const auto& words = ShaderRecompiler::GetPreparedArtifact(*handle).spirv.Words();
+            std::printf("  prepared: %zu SPIR-V words\n", words.size());
+            // --spv with --prepare writes the prepared (registration) module.
+            if (g_spirv) {
+                std::string name(path);
+                name = name.substr(name.find_last_of("/\\") + 1) + ".prepared.spv";
+                std::ofstream(name, std::ios::binary).write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * sizeof(words[0])));
+            }
             return true;
         } catch (const std::exception& error) {
             std::printf("  prepare failed: %s\n", FirstLine(error.what()).c_str());

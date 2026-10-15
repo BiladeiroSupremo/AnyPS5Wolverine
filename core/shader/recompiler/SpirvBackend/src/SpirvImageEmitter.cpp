@@ -1689,15 +1689,22 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     const auto entries = loadSrt(image.indirectMappingOffset + 2u);
     const auto inTable = Binary(state, spv::OpULessThan, boolean, key, entries);
     const auto entry = Binary(state, spv::OpIAdd, u32, region, Select(state, u32, inTable, key, ConstantU32(state, 0u)));
-    const auto wordPointer = state.module.AllocateId();
-    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), wordPointer, BindlessHeapBuffer(state, false), ConstantU32(state, 0), entry);
-    const auto word = state.module.AllocateId();
-    state.module.AddFunction(spv::OpLoad, u32, word, wordPointer);
+    // Experiment: APS5_HEAP_NO_BUFFERS=1 leaves out the translation read and the feedback write in
+    // graphics stages (every key reads as unusable, so the placeholder is sampled).
+    static const bool noBuffers = std::getenv("APS5_HEAP_NO_BUFFERS") != nullptr;
+    const bool skipBuffers = noBuffers && StageOf(state) != IrShaderStage::Compute;
+    std::uint32_t word = ConstantU32(state, BindlessHeaps::Unusable);
+    if (!skipBuffers) {
+        const auto wordPointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), wordPointer, BindlessHeapBuffer(state, false), ConstantU32(state, 0), entry);
+        word = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, word, wordPointer);
+    }
     const auto request = Binary(state, spv::OpLogicalAnd, boolean, inTable, Binary(state, spv::OpIEqual, boolean, word, ConstantU32(state, BindlessHeaps::Pending)));
     // The request is written once: an invocation that finds the word already set (another one
     // asked first, the driver has not consumed it yet) writes nothing. Pixel shaders otherwise
     // wrote it from every pixel of every frame until the entry was published.
-    EmitIfCondition(state, request, [&]() {
+    if (!skipBuffers) EmitIfCondition(state, request, [&]() {
         const auto feedback = state.module.AllocateId();
         state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), feedback, BindlessHeapBuffer(state, true), ConstantU32(state, 0), entry);
         const auto asked = state.module.AllocateId();
