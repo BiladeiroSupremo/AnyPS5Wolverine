@@ -156,6 +156,8 @@ std::atomic<std::uint32_t> g_nextInstance{1};
 std::atomic<std::uint32_t> g_nextBatch{1};
 std::mutex& g_batchLock = *new std::mutex();
 std::set<std::uint32_t>& g_batches = *new std::set<std::uint32_t>();
+// How far each batch buffer has been run by sceAjmBatchStart since its sceAjmBatchInitialize.
+std::map<const void*, std::size_t>& g_batchStarted = *new std::map<const void*, std::size_t>();
 
 enum class JobKind : std::uint32_t {
     Initialize = 1,
@@ -1336,6 +1338,10 @@ int APS5_VABI sceAjmBatchInitialize(void* buffer, size_t size, AjmBatchInfo* inf
     info->p_buffer = buffer;
     info->offset = 0;
     info->size = size;
+    {
+        std::lock_guard lock(g_batchLock);
+        g_batchStarted.erase(buffer);
+    }
     return 0;
 }
 
@@ -1444,6 +1450,22 @@ int APS5_VABI sceAjmBatchStart(uint32_t context, const AjmBatchInfo* info, int p
     AJM_TRACE("[ajm] batch start: context %u, priority %d, %llu of %llu buffer bytes used\n", context, priority, static_cast<unsigned long long>(info->offset), static_cast<unsigned long long>(info->size));
     const auto* cursor = static_cast<const std::uint8_t*>(info->p_buffer);
     const auto* end = cursor + info->offset;
+    // A batch started again without sceAjmBatchInitialize runs only the jobs appended since its last
+    // start: running the earlier ones again decoded into their output buffers a second time, which
+    // the title may have freed and reused (PPSA03671's Wwise AudioOut2 port table was overwritten
+    // with the same decoded PCM in every crash). A start whose offset went back (the title reset
+    // it itself) runs from the beginning. APS5_AJM_RERUN_BATCHES=1 always runs the whole buffer.
+    static const bool rerun = std::getenv("APS5_AJM_RERUN_BATCHES") != nullptr;
+    {
+        std::lock_guard lock(g_batchLock);
+        auto& started = g_batchStarted[info->p_buffer];
+        if (!rerun && started != 0 && started <= info->offset) {
+            static std::atomic<int> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[ajm] batch buffer %p started again without initialize: skipping %zu bytes of jobs already run, running %zu\n", info->p_buffer, started, static_cast<std::size_t>(info->offset) - started);
+            cursor += started;
+        }
+        started = info->offset;
+    }
     std::vector<AjmBuffer> buffers;
     while (cursor < end) {
         PackedJob record;
