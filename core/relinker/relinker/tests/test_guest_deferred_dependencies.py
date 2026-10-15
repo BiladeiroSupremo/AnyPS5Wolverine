@@ -61,6 +61,7 @@ def main():
                 libraries = case / "libs"
                 libraries.mkdir()
                 shutil.copyfile(host, libraries / "libc.prx")
+                shutil.copyfile(host, libraries / "libkernel.prx")
                 events = case / "startup-events.txt"
                 output.chmod(0o755)
                 run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30,
