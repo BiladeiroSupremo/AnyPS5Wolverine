@@ -141,7 +141,11 @@ public:
                 memory.sampler = patch.sampler;
             }
         }
-        for (const auto& plan : m_indirectImages) {
+        for (auto& plan : m_indirectImages) {
+            if (plan.keyMask != ~0u) {
+                const std::array<IrValue*, 2> arguments {plan.key, &m_builder.Constant(plan.keyMask)};
+                plan.key = EmitBefore(*plan.handle, IrOpcode::BitwiseAnd32, IrType::U32, arguments);
+            }
             plan.handle->ReplaceArgument(0, plan.key);
             for (std::uint32_t dword = 0; dword < 4u; dword++) {
                 plan.handle->ReplaceArgument(dword + 1u, plan.roots[dword]);
@@ -182,6 +186,8 @@ private:
         IrValue* handle = nullptr;
         std::uint32_t source = 0;
         IrValue* key = nullptr;
+        // A masked entry offset's key mask (MatchTableOffset), applied to the key when the plan is.
+        std::uint32_t keyMask = ~0u;
         std::array<IrValue*, 8> roots {};
         std::array<std::uint32_t, 8> memory {};
         std::array<const IrValue*, 8> reads {};
@@ -454,10 +460,19 @@ private:
         return stride != 0u && selector->Opcode() == IrOpcode::ReadFirstLane;
     }
 
-    // The table entry offset `key * 32` (a shift or a multiply), optionally plus an immediate.
-    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset) {
+    // APS5_NO_MASKED_TABLE_OFFSETS=1 rejects masked entry offsets again (their draws are skipped).
+    static bool maskedTableOffsetsEnabled() {
+        static const bool enabled = std::getenv("APS5_NO_MASKED_TABLE_OFFSETS") == nullptr;
+        return enabled;
+    }
+
+    // The table entry offset `key * 32` (a shift or a multiply), optionally plus an immediate. The
+    // product may be masked, `(key << 5) & mask` (PPSA03671's layered material pixel shaders use
+    // 0x01ffffe0): that is `(key & (mask >> 5)) * 32`, and `keyMask` returns `mask >> 5`.
+    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset, std::uint32_t& keyMask) {
         value = value->Resolve();
         entryOffset = 0;
+        keyMask = ~0u;
         if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
             std::uint32_t immediate = 0;
             if (immediateU32(value->Argument(0), immediate)) {
@@ -468,6 +483,17 @@ private:
                 return false;
             }
             entryOffset = immediate;
+        }
+        if (value->Opcode() == IrOpcode::BitwiseAnd32 && value->ArgumentCount() == 2u && maskedTableOffsetsEnabled()) {
+            std::uint32_t mask = 0;
+            if (immediateU32(value->Argument(1), mask)) {
+                value = value->Argument(0)->Resolve();
+            } else if (immediateU32(value->Argument(0), mask)) {
+                value = value->Argument(1)->Resolve();
+            } else {
+                return false;
+            }
+            keyMask = mask >> 5;
         }
         if (value->ArgumentCount() != 2u) {
             return false;
@@ -579,7 +605,8 @@ private:
 
         IrValue* key = nullptr;
         std::uint32_t entryOffset = 0;
-        if (!MatchTableOffset(heapOffset, key, entryOffset) || key->Type() != IrType::U32) {
+        std::uint32_t keyMask = ~0u;
+        if (!MatchTableOffset(heapOffset, key, entryOffset, keyMask) || key->Type() != IrType::U32) {
             { m_tableRejection = "table check 6"; return false; }
         }
         entryOffset += immediateOffset;
@@ -630,7 +657,8 @@ private:
         table.entryOffset = entryOffset;
         DescriptorSource materialSource = heapSource;
         std::uint32_t materialMemoryIndex = 0;
-        const MemoryInfo* materialMemory = ScalarReadMemory(*key, materialMemoryIndex);
+        // A masked key is not the material record's value, so its keys are not enumerated from them.
+        const MemoryInfo* materialMemory = keyMask == ~0u ? ScalarReadMemory(*key, materialMemoryIndex) : nullptr;
         if (materialMemory != nullptr && MemoryIndexBelongsTo(materialMemoryIndex, *key)) {
             IrValue* selector = nullptr;
             std::uint32_t selectorStride = 0;
@@ -655,6 +683,7 @@ private:
         plan.handle = &handle;
         plan.source = InternSource(imageSource);
         plan.key = key;
+        plan.keyMask = keyMask;
         plan.roots = imageSource.dwords;
         return true;
     }
