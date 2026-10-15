@@ -406,7 +406,15 @@ TCommand _read(const Apr::CommandBufferObject& buffer, std::uint32_t cursor) {
     return command;
 }
 
-constexpr std::uint64_t AmmRangeBytes = 32ull << 30;
+// The AMM virtual address range the title manages itself (sceKernelAmmGetVirtualAddressRanges):
+// APS5_AMM_RANGE_GB (default 32) for the main range, then 32 GiB for multimaps. KytyPS5 hands
+// PPSA03671 512 GiB (and no multimap range).
+std::uint64_t AmmMainBytes() {
+    static const std::uint64_t bytes = [] { const char* text = std::getenv("APS5_AMM_RANGE_GB"); return (text != nullptr ? std::strtoull(text, nullptr, 10) : 32ull) << 30; }();
+    return bytes;
+}
+constexpr std::uint64_t AmmMultimapBytes = 32ull << 30;
+std::uint64_t AmmTotalBytes() { return AmmMainBytes() + AmmMultimapBytes; }
 constexpr std::uint64_t AmmRangeAlignment = 2ull << 20;
 constexpr int GuestMapFixed = 0x10;
 constexpr int GuestMapNoOverwrite = 0x80;
@@ -438,11 +446,11 @@ std::uintptr_t _ammBase(AmmState& state) {
         std::uintptr_t arenaBase = 0;
         std::size_t arenaBytes = 0;
         GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
-        if (arenaBase == 0 || arenaBytes < 2 * AmmRangeBytes) throw std::runtime_error("AMM: the guest address space arena cannot hold the virtual address range");
-        const auto top = GuestArena::GuestArenaHighestFree_nid_no_patch(2 * AmmRangeBytes, AmmRangeAlignment);
+        if (arenaBase == 0 || arenaBytes < AmmTotalBytes()) throw std::runtime_error("AMM: the guest address space arena cannot hold the virtual address range");
+        const auto top = GuestArena::GuestArenaHighestFree_nid_no_patch(AmmTotalBytes(), AmmRangeAlignment);
         if (top == 0) throw std::runtime_error("AMM: the guest address space arena has no free virtual address range");
         void* address = reinterpret_cast<void*>(top);
-        if (DoReserveVirtual(&address, 2 * AmmRangeBytes, GuestMapFixed | GuestMapNoOverwrite, 0) != 0) throw std::runtime_error("AMM: cannot reserve the virtual address range");
+        if (DoReserveVirtual(&address, AmmTotalBytes(), GuestMapFixed | GuestMapNoOverwrite, 0) != 0) throw std::runtime_error("AMM: cannot reserve the virtual address range");
         state.base = reinterpret_cast<std::uintptr_t>(address);
     }
     return state.base;
@@ -450,7 +458,7 @@ std::uintptr_t _ammBase(AmmState& state) {
 
 void _ammCheckRange(AmmState& state, std::uint64_t address, std::uint64_t size) {
     const auto base = _ammBase(state);
-    if (address < base || size > 2 * AmmRangeBytes || address - base > 2 * AmmRangeBytes - size) throw std::runtime_error("AMM: range outside the AMM virtual address range");
+    if (address < base || size > AmmTotalBytes() || address - base > AmmTotalBytes() - size) throw std::runtime_error("AMM: range outside the AMM virtual address range");
 }
 
 int _ammHostProtection(std::int32_t protection) {
@@ -740,7 +748,7 @@ void _awaitAmmMapping(const Apr::ReadFileCommand& command) {
     auto& state = _amm();
     {
         const std::lock_guard lock(state.lock);
-        if (state.base == 0 || command.destination < state.base || command.destination - state.base >= 2 * AmmRangeBytes) return;
+        if (state.base == 0 || command.destination < state.base || command.destination - state.base >= AmmTotalBytes()) return;
         if (_ammRangeMapped(state, command.destination, command.size)) return;
     }
     static const auto limitMs = [] { const char* text = std::getenv("APS5_APR_AMM_WAIT_MS"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 2000ul; }();
@@ -760,6 +768,22 @@ void _awaitAmmMapping(const Apr::ReadFileCommand& command) {
     std::fprintf(stderr, "[apr] read into unmapped AMM pages 0x%llx+0x%llx: %s after %.1f ms; AMM queue before %u/%u submitted/completed, %u pending, %s; after %u/%u, %u pending\n", static_cast<unsigned long long>(command.destination), static_cast<unsigned long long>(command.size), mapped ? "mapped" : "STILL UNMAPPED", waitedMs, before.submitted, before.completed, before.pending, before.running ? "running" : "idle", after.submitted, after.completed, after.pending);
 }
 
+// Whether [address, address + bytes) is committed memory (its protection may still be read-only
+// for write tracking; the read opens the guest write itself).
+bool _committed(std::uint64_t address, std::uint64_t bytes) {
+#ifdef _WIN32
+    for (auto cursor = address; cursor < address + bytes;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT) return false;
+        cursor = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
+    }
+#else
+    (void)address;
+    (void)bytes;
+#endif
+    return true;
+}
+
 // The command buffer being executed, for the bad-destination report below.
 thread_local const Apr::CommandBufferObject* g_executing = nullptr;
 thread_local std::uint32_t g_executingCursor = 0;
@@ -771,9 +795,23 @@ void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor&
         if (opcode == Apr::Opcode::ReadFileGather) command.destination = read.nextDestination;
         if (opcode == Apr::Opcode::ReadFileScatter) command.offset = read.nextOffset;
     }
-    // A destination in the first 64 KiB is never guest memory: the title sometimes submits reads
-    // into 0x4000 or 0x8000 (2026-10-14, with a save loaded). Report the command and its buffer.
-    if (command.destination < 0x10000u) {
+    // A destination that is not committed memory: the title sometimes submits reads into base-0
+    // texture addresses (0x4000, 0x8000, 0x1560000..., 2026-10-14, with a save loaded). A read
+    // into AMM pages first waits for their mapping. Report the command and its buffer.
+    bool bad = command.destination < 0x10000u;
+    if (!bad) {
+        _awaitAmmMapping(command);
+        bad = !_committed(command.destination, command.size);
+    }
+    static std::atomic<std::uint32_t> badReads{0};
+    if (bad && badReads.fetch_add(1) >= 64u) {
+        static const bool skipQuietly = std::getenv("APS5_APR_SKIP_BAD_DESTINATION") != nullptr;
+        if (skipQuietly) {
+            read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
+            return;
+        }
+    }
+    if (bad) {
         std::fprintf(stderr, "[apr] read into 0x%llx: opcode %u file %u (%s) size 0x%llx offset 0x%llx; cursor valid %d file %u next destination 0x%llx next offset 0x%llx\n", static_cast<unsigned long long>(command.destination), static_cast<unsigned>(opcode), command.fileId, _file(command.fileId).path.string().c_str(), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.offset), read.valid ? 1 : 0, read.fileId, static_cast<unsigned long long>(read.nextDestination), static_cast<unsigned long long>(read.nextOffset));
         {
             // How full the AMM is: pooled physical memory still free, pages mapped.
@@ -804,7 +842,6 @@ void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor&
         std::fflush(stderr);
         throw std::runtime_error("APR: read destination 0x" + std::to_string(command.destination) + " is not guest memory");
     }
-    _awaitAmmMapping(command);
     _readFile(command);
     read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
 }
@@ -978,9 +1015,9 @@ void AmmVirtualAddressRanges_nid_no_patch(std::uint64_t* start, std::uint64_t* e
     const std::lock_guard lock(state.lock);
     const auto base = _ammBase(state);
     if (start) *start = base;
-    if (end) *end = base + AmmRangeBytes;
-    if (multimapStart) *multimapStart = base + AmmRangeBytes;
-    if (multimapEnd) *multimapEnd = base + 2 * AmmRangeBytes;
+    if (end) *end = base + AmmMainBytes();
+    if (multimapStart) *multimapStart = base + AmmMainBytes();
+    if (multimapEnd) *multimapEnd = base + AmmTotalBytes();
 }
 
 struct AprQueue {
