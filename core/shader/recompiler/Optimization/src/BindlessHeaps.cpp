@@ -41,10 +41,12 @@ void SetEnabled(bool enabled) {
 
 namespace {
 
-// APS5_GRAPHICS_HEAPS: the graphics stages that take the heap, "pixel" by default; "0" for none,
-// "1" or "all" for every graphics stage, or a comma list (vertex, pixel, mesh, local, hull, domain).
+// APS5_GRAPHICS_HEAPS: the graphics stages that take the heap, every one by default ("all"; was
+// "pixel" until the load freezes it caused were traced to revalidation, 715b27741; 25 min clean
+// run hall3 2026-10-15); "0" for none, "1" or "all" for every graphics stage, or a comma list
+// (vertex, pixel, mesh, local, hull, domain).
 bool graphicsStageHeaps(IrShaderStage stage) {
-    static const std::string list = [] { const char* text = std::getenv("APS5_GRAPHICS_HEAPS"); return std::string(text != nullptr ? text : "pixel"); }();
+    static const std::string list = [] { const char* text = std::getenv("APS5_GRAPHICS_HEAPS"); return std::string(text != nullptr ? text : "all"); }();
     if (list.empty() || list == "0") return false;
     if (list == "1" || list == "all") return true;
     const char* name = stage == IrShaderStage::Vertex ? "vertex" : stage == IrShaderStage::Pixel ? "pixel" : stage == IrShaderStage::Mesh ? "mesh" : stage == IrShaderStage::Local ? "local" : stage == IrShaderStage::TessellationControl ? "hull" : stage == IrShaderStage::TessellationEvaluation ? "domain" : "other";
@@ -62,11 +64,10 @@ bool graphicsStageHeaps(IrShaderStage stage) {
 bool HeapEligible(IrShaderStage stage, std::uint32_t dimension, bool sampled, bool depthCompare, bool r128) {
     const bool compute = stage == IrShaderStage::Compute;
     const auto shape = static_cast<RdnaImageDimension>(dimension);
-    // Dim1D has a heap kind (ImageBinding1D) but stays ineligible: with it, PPSA03671 ends ~2-4 min
-    // in with an uncaught C++ exception (0x20474343) right after shader 0x11d1e2b900's registration
-    // module emits a 1D heap path; offline preparation of that request succeeds. Unresolved.
-    // APS5_HEAP_1D=1 makes Dim1D eligible (experiment).
-    static const bool heap1D = std::getenv("APS5_HEAP_1D") != nullptr;
+    // Dim1D is eligible: the uncaught exception (0x20474343) PPSA03671 ended with once its 1D heap
+    // path was emitted was a name-table overrun, fixed in b1d1b84b1 (run hall3 clean).
+    // APS5_NO_HEAP_1D=1 makes it ineligible again.
+    static const bool heap1D = std::getenv("APS5_NO_HEAP_1D") == nullptr;
     const bool kind = shape == RdnaImageDimension::Dim2D || shape == RdnaImageDimension::Dim2DArray || shape == RdnaImageDimension::Dim3D || (heap1D && shape == RdnaImageDimension::Dim1D);
     // Graphics stages take the heap per APS5_GRAPHICS_HEAPS (every graphics pipeline layout carries
     // the set either way; tables wider than the static limit are rejected in the others, and their
