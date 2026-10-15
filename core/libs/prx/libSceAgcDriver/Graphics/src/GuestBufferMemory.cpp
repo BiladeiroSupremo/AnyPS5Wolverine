@@ -1970,11 +1970,11 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         allocate.commandBufferCount = 2;
         if ((probe.result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, commands)) != VK_SUCCESS) return "vkAllocateCommandBuffers";
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if ((probe.result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands[0], &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer";
         const VkBufferCopy region{0, 0, bytes};
         context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands[0], import.buffer, destination, 1, &region);
         if ((probe.result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands[0])) != VK_SUCCESS) return "vkEndCommandBuffer";
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if ((probe.result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands[1], &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer";
         context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands[1], import.buffer, 0, bytes, 0x02020202u);
         if ((probe.result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands[1])) != VK_SUCCESS) return "vkEndCommandBuffer";
