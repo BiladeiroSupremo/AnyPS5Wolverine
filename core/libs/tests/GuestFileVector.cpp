@@ -145,6 +145,7 @@ static void ConcurrentRecords(const std::filesystem::path& path) {
     }
     for (const auto count : seen) Require(count == 1);
     Require(sceKernelLseek(descriptors[0], 0, SEEK_CUR) == static_cast<std::int64_t>(bytes.size()));
+#ifdef _WIN32
     std::array<std::thread, Workers> positioned;
     for (std::size_t worker = 0; worker < Workers; ++worker) {
         positioned[worker] = std::thread([&, worker] {
@@ -169,6 +170,7 @@ static void ConcurrentRecords(const std::filesystem::path& path) {
     }
     for (auto& transfer : positioned) transfer.join();
     Require(sceKernelLseek(descriptors[0], 0, SEEK_CUR) == static_cast<std::int64_t>(bytes.size()));
+#endif
     for (const auto descriptor : descriptors) Require(sceKernelClose(descriptor) == 0);
 }
 
