@@ -616,7 +616,7 @@ void spaceReadsAcrossImportsMergedTests(const Context& context, const BdaTestAcc
     SetHostImportWindow(window);
     const auto change = [&](std::uint8_t* range, bool add) {
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, range == guest + 3 * piece, true);
         else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     };
@@ -628,6 +628,7 @@ void spaceReadsAcrossImportsMergedTests(const Context& context, const BdaTestAcc
     const std::uint64_t upper = second + 128;
     const std::uint64_t upperBytes = third + 256 - upper;
     for (int build = 0; build < 3; ++build) {
+        const auto before = AddressSpaceCounters();
         GuestBufferMemory leased(importing);
         leased.AcquireRegistered();
         leased.AddReadable(lower, lowerBytes);
@@ -645,6 +646,8 @@ void spaceReadsAcrossImportsMergedTests(const Context& context, const BdaTestAcc
             Require(at + bytes <= mapped.size() && mapped[at] == expected(address) && mapped[at + bytes - 1] == expected(address + bytes - 1), "a read-only V# over imports, merged with another one, maps other bytes than its own");
         }
         leased.WriteBack();
+        const auto after = AddressSpaceCounters();
+        if (after.enabled && build > 0) Require(after.hits == before.hits + 1 && after.dissolvedOverlap == before.dissolvedOverlap && after.dissolvedImports == before.dissolvedImports + (build == 2 ? 1u : 0u), "read-only V#s over imports, merged with each other, left the cached address space other than by the import change");
     }
     for (std::size_t index = 0; index < pieces; ++index) change(guest + index * piece, false);
     SetHostImportWindow(0);
