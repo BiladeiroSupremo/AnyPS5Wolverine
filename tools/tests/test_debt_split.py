@@ -186,6 +186,7 @@ class DebtSplitTests(unittest.TestCase):
                          "\n".join(entry.replace("../../", "../../../") for entry in (first, second, A_STUB)) +
                          "\n\n### Functional\n\n" + A_FUNCTIONAL.replace("../../", "../../../") + "\n")
         self.assertEqual(self.read(INDEX), self.git("show", "main:" + INDEX).stdout)
+
     def test_indented_continuation_after_a_blank_line_moves_with_its_entry(self):
         note = "  - sub note about sceAOne"
         self.write(INDEX, "# Project technical debt\n\n### Silent stubs\n\n" + A_STUB + "\n\n" + note + "\n")
