@@ -207,7 +207,7 @@ std::uint32_t LoadBindlessHeapImage(SpirvEmitterState& state, const ImageResourc
     auto& variable = state.bindlessHeapImageVariables[{kind, imageType}];
     if (variable == 0u) {
         RequireBindlessHeapCapabilities(state);
-        static constexpr const char* names[] = {"bindless_heap_2d", "bindless_heap_2d_array", "bindless_heap_3d"};
+        static constexpr const char* names[BindlessHeaps::KindCount] = {"bindless_heap_2d", "bindless_heap_2d_array", "bindless_heap_3d", "bindless_heap_1d"};
         variable = DefineBindlessHeapVariable(state, state.module.Type(spv::OpTypeRuntimeArray, imageType), spv::StorageClassUniformConstant, kind, names[kind]);
     }
     const auto pointer = state.module.AllocateId();

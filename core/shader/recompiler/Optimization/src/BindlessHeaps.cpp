@@ -65,7 +65,9 @@ bool HeapEligible(IrShaderStage stage, std::uint32_t dimension, bool sampled, bo
     // Dim1D has a heap kind (ImageBinding1D) but stays ineligible: with it, PPSA03671 ends ~2-4 min
     // in with an uncaught C++ exception (0x20474343) right after shader 0x11d1e2b900's registration
     // module emits a 1D heap path; offline preparation of that request succeeds. Unresolved.
-    const bool kind = shape == RdnaImageDimension::Dim2D || shape == RdnaImageDimension::Dim2DArray || shape == RdnaImageDimension::Dim3D;
+    // APS5_HEAP_1D=1 makes Dim1D eligible (experiment).
+    static const bool heap1D = std::getenv("APS5_HEAP_1D") != nullptr;
+    const bool kind = shape == RdnaImageDimension::Dim2D || shape == RdnaImageDimension::Dim2DArray || shape == RdnaImageDimension::Dim3D || (heap1D && shape == RdnaImageDimension::Dim1D);
     // Graphics stages take the heap per APS5_GRAPHICS_HEAPS (every graphics pipeline layout carries
     // the set either way; tables wider than the static limit are rejected in the others, and their
     // draws skipped). PPSA03671's terrain and rock materials need it in pixel shaders. Those draws
