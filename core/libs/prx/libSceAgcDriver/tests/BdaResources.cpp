@@ -651,6 +651,55 @@ void spaceReadsAcrossImportsMergedTests(const Context& context, const BdaTestAcc
     ::operator delete(block, std::align_val_t{window});
 }
 
+void spaceReadOverWritableImportTableTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = 2 * piece;
+    void* block = ::operator new(3 * piece, std::align_val_t{window});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const auto boundary = first + window;
+    std::memset(guest, 0x5a, 3 * piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(window);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, range != guest + 2 * piece, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    for (std::size_t index = 0; index < 3; ++index) change(guest + index * piece, true);
+    const auto lookup = [](const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::uint64_t address) {
+        const auto found = std::upper_bound(ranges.begin(), ranges.end(), address, [](std::uint64_t value, const auto& range) { return value < range.begin; });
+        return found == ranges.begin() ? ranges.end() : std::prev(found);
+    };
+    for (int build = 0; build < 3; ++build) {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddReadable(boundary - 256, 512);
+        leased.UploadPrepare(true);
+        if (build == 2) ClearHostImports(importing.device);
+        leased.UploadFinish(true);
+        std::uint32_t adjustment = 0;
+        const auto view = leased.Descriptor(boundary - 256, 512, adjustment);
+        Require(view.buffer != VK_NULL_HANDLE && view.range == 512 + adjustment, "a read-only V# across a writable and a read-only import has no descriptor");
+        const auto ranges = leased.AddressRanges();
+        Require(std::adjacent_find(ranges.begin(), ranges.end(), [](const auto& left, const auto& right) { return right.begin < left.end; }) == ranges.end(), "the BDA table of a build with a read-only V# across imports has overlapping ranges");
+        for (const auto address : {first + 16, boundary - 256, boundary - 128, boundary - 16}) {
+            const auto found = lookup(ranges, address);
+            Require(found != ranges.end() && address + 16 <= found->end && (found->permissions & ShaderRecompiler::BdaAbi::Write) != 0u, "a BDA store into a writable import resolves to the read-only copy of a V# across it");
+        }
+        for (const auto address : {boundary, boundary + 64, boundary + piece - 32}) {
+            const auto found = lookup(ranges, address);
+            Require(found != ranges.end() && address + 16 <= found->end && (found->permissions & ShaderRecompiler::BdaAbi::Read) != 0u, "a BDA read past a read-only V# across imports finds no range");
+        }
+        leased.WriteBack();
+    }
+    for (std::size_t index = 0; index < 3; ++index) change(guest + index * piece, false);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{window});
+}
+
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
@@ -1652,6 +1701,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     spaceReadAcrossImportsTests(context, access);
     spaceReadAcrossImportsWrittenTests(context);
     spaceReadsAcrossImportsMergedTests(context, access);
+    spaceReadOverWritableImportTableTests(context);
     importJoinTests(context);
     importWholeRangeOverWindowTests(context);
     importRefusedWholeRangeTests(context);
