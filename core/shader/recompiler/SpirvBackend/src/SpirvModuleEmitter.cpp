@@ -624,7 +624,7 @@ void DefineTessellationInterfaces(SpirvEmitterState& state) {
 
 void DefineTessellationExecutionModes(SpirvEmitterState& state) {
     const auto& tess = state.inputInfo.vertex->tess;
-    if ((tess.domain != 1u && tess.domain != 2u) || (tess.partitioning != 0u && tess.partitioning != 2u) || (tess.outputTopology != 2u && tess.outputTopology != 3u)) {
+    if ((tess.domain != 1u && tess.domain != 2u) || tess.partitioning > 3u || (tess.outputTopology != 2u && tess.outputTopology != 3u)) {
         throw std::runtime_error("unsupported tessellation domain, partitioning, or output topology");
     }
     state.module.EmitCapability(spv::CapabilityTessellation);
@@ -632,7 +632,9 @@ void DefineTessellationExecutionModes(SpirvEmitterState& state) {
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeOutputVertices, tess.outputControlPoints);
     } else {
         state.module.AddExecutionMode(state.mainFunc, tess.domain == 2u ? spv::ExecutionModeQuads : spv::ExecutionModeTriangles);
-        state.module.AddExecutionMode(state.mainFunc, tess.partitioning == 0u ? spv::ExecutionModeSpacingEqual : spv::ExecutionModeSpacingFractionalOdd);
+        // VGT_TF_PARAM.PARTITIONING: 0 integer, 1 power of two (integer spacing, without the rounding
+        // of each factor up to a power of two), 2 fractional odd, 3 fractional even.
+        state.module.AddExecutionMode(state.mainFunc, tess.partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd : tess.partitioning == 3u ? spv::ExecutionModeSpacingFractionalEven : spv::ExecutionModeSpacingEqual);
         state.module.AddExecutionMode(state.mainFunc, tess.outputTopology == 3u ? spv::ExecutionModeVertexOrderCcw : spv::ExecutionModeVertexOrderCw);
     }
 }
@@ -1262,7 +1264,7 @@ void EmitSetTessellationAttribute(SpirvValueEmitContext& ctx, const IrValue& ins
             const auto raised = state.module.AllocateId();
             state.module.AddFunction(spv::OpExtInst, TypeF32(state), raised, GlslStd450(state), GLSLstd450FMax, floating, lowest);
             const auto clamped = state.module.AllocateId();
-            state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FMin, raised, TessellationLevelBound(state, TessellationLevel(state, 1u), GLSLstd450FMin, state.inputInfo.vertex->tess.partitioning == 0u ? 64.0f : 63.0f));
+            state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FMin, raised, TessellationLevelBound(state, TessellationLevel(state, 1u), GLSLstd450FMin, state.inputInfo.vertex->tess.partitioning == 2u ? 63.0f : 64.0f));
             value = state.module.AllocateId();
             state.module.AddFunction(spv::OpSelect, TypeF32(state), value, inside, clamped, outer ? floating : lowest);
         }

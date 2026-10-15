@@ -645,7 +645,11 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         validate(tess.inputControlPoints != 0 && tess.inputControlPoints <= 32 && tess.outputControlPoints != 0 && tess.outputControlPoints <= 32, "invalid tessellation control-point counts");
         validate(tess.patchesPerGroup != 0, "VGT_LS_HS_CONFIG.NUM_PATCHES is zero");
         if ((parameters & ~0x000600ffu) != 0) Require(false, zeroMessage(0x2db, parameters, "VGT_TF_PARAM donut, factor detection, memory type or reserved state"));
-        validate((tess.domain == 1 || tess.domain == 2) && (tess.partitioning == 0 || tess.partitioning == 2) && (tess.outputTopology == 2 || tess.outputTopology == 3), "only triangle and quad domains with integer or fractional-odd partitioning and triangle output are supported by the reference path");
+        if (!((tess.domain == 1 || tess.domain == 2) && tess.partitioning <= 3u && (tess.outputTopology == 2 || tess.outputTopology == 3))) {
+            std::ostringstream reason;
+            reason << "only triangle and quad domains with integer, power-of-two, fractional-even or fractional-odd partitioning and triangle output are supported by the reference path (VGT_TF_PARAM=0x" << std::hex << parameters << ")";
+            validate(false, reason.str().c_str());
+        }
         result.minTessellationLevel = readFloat(queue.context, 0x287);
         result.maxTessellationLevel = readFloat(queue.context, 0x286);
         Require(result.minTessellationLevel >= 0.0f && result.minTessellationLevel <= 63.0f && result.minTessellationLevel <= result.maxTessellationLevel && result.maxTessellationLevel >= 1.0f, "tessellation level clamps need 0 <= VGT_HOS_MIN_TESS_LEVEL <= 63, VGT_HOS_MAX_TESS_LEVEL >= 1 and the minimum at most the maximum");

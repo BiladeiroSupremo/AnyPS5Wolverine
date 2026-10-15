@@ -600,10 +600,14 @@ void ShaderStageTests() {
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Tessellation && stages.tessellation, "tessellation routing changed");
     const auto& tessellation = *stages.tessellation;
     Require(tessellation.inputControlPoints == 3 && tessellation.outputControlPoints == 3 && tessellation.domain == 1 && tessellation.partitioning == 2 && tessellation.outputTopology == 2 && stages.minTessellationLevel == 1.0f && stages.maxTessellationLevel == 64.0f && tessellation.patchesPerGroup == 85, "the passthrough triangle-patch configuration decoded differently");
-    for (const auto [parameters, reason] : {std::pair{0x44049u, "VGT_TF_PARAM"}, std::pair{0x140049u, "VGT_TF_PARAM"}, std::pair{0x2040049u, "VGT_TF_PARAM"}, std::pair{0x40059u, "fractional-odd partitioning"}, std::pair{0x4004du, "fractional-odd partitioning"}, std::pair{0x40045u, "fractional-odd partitioning"}, std::pair{0x40048u, "fractional-odd partitioning"}, std::pair{0x40029u, "fractional-odd partitioning"}, std::pair{0x4004bu, "fractional-odd partitioning"}}) {
+    for (const auto [parameters, reason] : {std::pair{0x44049u, "VGT_TF_PARAM"}, std::pair{0x140049u, "VGT_TF_PARAM"}, std::pair{0x2040049u, "VGT_TF_PARAM"}, std::pair{0x40059u, "fractional-odd partitioning"}, std::pair{0x40048u, "fractional-odd partitioning"}, std::pair{0x40029u, "fractional-odd partitioning"}, std::pair{0x4004bu, "fractional-odd partitioning"}}) {
         queue.context[0x2db] = parameters;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
     }
+    queue.context[0x2db] = 0x4004d;
+    Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation->partitioning == 3, "fractional-even triangle patches decoded differently");
+    queue.context[0x2db] = 0x40045;
+    Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation->partitioning == 1, "power-of-two triangle patches decoded differently");
     queue.context[0x2db] = 0x40041;
     Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation->partitioning == 0, "integer-partitioned triangle patches decoded differently");
     queue.context[0x2d6] = 0x1043f;

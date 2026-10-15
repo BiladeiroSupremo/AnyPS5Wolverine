@@ -447,7 +447,8 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         const bool quads = state.rectList || state.stages.tessellation->domain == 2u;
         const bool counterClockwise = !state.rectList && state.stages.tessellation->outputTopology == 3u;
         mode(quads ? spv::ExecutionModeQuads : spv::ExecutionModeTriangles, {});
-        mode(state.rectList || state.stages.tessellation->partitioning == 0u ? spv::ExecutionModeSpacingEqual : spv::ExecutionModeSpacingFractionalOdd, {});
+        const auto partitioning = state.rectList ? 0u : state.stages.tessellation->partitioning;
+        mode(partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd : partitioning == 3u ? spv::ExecutionModeSpacingFractionalEven : spv::ExecutionModeSpacingEqual, {});
         mode(counterClockwise ? spv::ExecutionModeVertexOrderCcw : spv::ExecutionModeVertexOrderCw, {});
         Require(module.modes.size() == 3, "unsupported tessellation-evaluation execution mode");
     } else if (geometry) {
