@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -36,6 +37,15 @@ struct OptimizedPipeline {
 };
 
 VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized = nullptr, bool partsOnly = false, std::span<VkShaderModule> modules = {});
+
+// Thrown by LinkPipelineFromLibraries, while the calling thread defers missing shader parts, in
+// place of compiling a pre-rasterization or fragment shader part for a draw (the driver takes
+// minutes for the largest modules); the caller builds the parts elsewhere and skips the draw.
+struct ShaderPartNotReady : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+// Whether LinkPipelineFromLibraries on this thread defers missing shader parts (thread-local).
+void DeferMissingShaderParts(bool defer);
 
 void WaitForOptimizedPipelines(VkDevice device);
 

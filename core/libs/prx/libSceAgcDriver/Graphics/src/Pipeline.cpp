@@ -10,12 +10,17 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -898,6 +903,97 @@ void reportPipelines(PipelineStore& store) {
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 
+// Background shader parts: a draw whose pre-rasterization or fragment library part is missing is
+// skipped while a worker builds the parts from the draw's own state (Pipeline::Prebuild). On the
+// draw thread amdvlk took ~3 min per 1M-word module and the game froze meanwhile (PPSA03671, first
+// encounter of a material). A key built once compiles in place if a draw still misses it, so a
+// draw is never skipped for good. APS5_SYNC_PIPELINE_PARTS=1 compiles every part on the draw thread;
+// APS5_PIPELINE_PART_THREADS sets the workers (default 2).
+struct PartJob {
+    Context context;
+    State state;
+    VertexInputLayout vertexInput;
+    VkDescriptorSetLayout main = VK_NULL_HANDLE;
+    VkDescriptorSetLayout fragment = VK_NULL_HANDLE;
+    bool split = false;
+    std::vector<std::uint32_t> mainKey;
+    std::vector<std::uint32_t> fragmentKey;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> programs;
+    std::vector<CompiledShader> shaders;
+    std::uint64_t hash = 0;
+};
+
+struct PartBuilds {
+    std::mutex mutex;
+    std::condition_variable work;
+    std::deque<std::unique_ptr<PartJob>> jobs;
+    // Queued or building.
+    std::unordered_set<std::uint64_t> pending;
+    // Built once (or failed): a draw that misses again compiles in place.
+    std::unordered_set<std::uint64_t> attempted;
+    std::uint64_t built = 0;
+    std::size_t threads = 0;
+};
+
+PartBuilds& partBuilds() {
+    static auto* builds = new PartBuilds();
+    return *builds;
+}
+
+void runPartJobs(PartBuilds& builds) {
+    std::unique_lock lock(builds.mutex);
+    for (;;) {
+        builds.work.wait(lock, [&] { return !builds.jobs.empty(); });
+        auto job = std::move(builds.jobs.front());
+        builds.jobs.pop_front();
+        lock.unlock();
+        const auto started = std::chrono::steady_clock::now();
+        const PipelineSetLayouts layouts{job->main, job->fragment, job->split, job->mainKey, job->fragmentKey};
+        bool failed = false;
+        try {
+            static_cast<void>(Pipeline::Prebuild(job->context, job->state, job->vertexInput, layouts, job->shaders));
+        } catch (const std::exception& error) {
+            failed = true;
+            std::fprintf(stderr, "[pipeline] background shader part build failed (the draw compiles in place): %s\n", error.what());
+        }
+        const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        lock.lock();
+        builds.pending.erase(job->hash);
+        builds.attempted.insert(job->hash);
+        ++builds.built;
+        if (!failed && seconds >= 1.0) std::fprintf(stderr, "[pipeline] background shader parts built in %.1f s (%llu built, %zu queued)\n", seconds, static_cast<unsigned long long>(builds.built), builds.jobs.size());
+    }
+}
+
+// Whether this draw's parts may be built in the background: false once a build was attempted.
+// Throws ShaderPartNotReady while one is pending.
+bool deferParts(std::uint64_t hash) {
+    static const bool enabled = std::getenv("APS5_SYNC_PIPELINE_PARTS") == nullptr;
+    if (!enabled) return false;
+    auto& builds = partBuilds();
+    std::lock_guard lock(builds.mutex);
+    if (builds.pending.contains(hash)) throw ShaderPartNotReady("graphics pipeline shader part is compiling in the background");
+    return !builds.attempted.contains(hash);
+}
+
+void queueParts(std::uint64_t hash, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
+    auto job = std::make_unique<PartJob>(PartJob{context, state, vertexInput, resources.main, resources.fragment, resources.split, {resources.mainKey.begin(), resources.mainKey.end()}, {resources.fragmentKey.begin(), resources.fragmentKey.end()}, {}, {}, hash});
+    for (const auto& shader : shaders) {
+        job->programs.push_back(std::make_shared<const ShaderRecompiler::RecompileResult>(*shader.program));
+        job->shaders.push_back({shader.stage, job->programs.back().get(), shader.pushConstantOffset});
+    }
+    auto& builds = partBuilds();
+    std::lock_guard lock(builds.mutex);
+    if (!builds.pending.insert(hash).second) return;
+    if (builds.threads == 0) {
+        const char* text = std::getenv("APS5_PIPELINE_PART_THREADS");
+        builds.threads = text != nullptr ? static_cast<std::size_t>(std::max(1, std::atoi(text))) : std::size_t{2};
+        for (std::size_t thread = 0; thread < builds.threads; ++thread) std::thread(runPartJobs, std::ref(builds)).detach();
+    }
+    builds.jobs.push_back(std::move(job));
+    builds.work.notify_one();
+}
+
 }
 
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
@@ -940,7 +1036,22 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
-    auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    std::shared_ptr<Pipeline> pipeline;
+    if (deferParts(hash)) {
+        struct Deferring {
+            Deferring() { DeferMissingShaderParts(true); }
+            ~Deferring() { DeferMissingShaderParts(false); }
+        };
+        try {
+            Deferring deferring;
+            pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+        } catch (const ShaderPartNotReady&) {
+            queueParts(hash, context, state, vertexInput, resources, shaders);
+            throw;
+        }
+    } else {
+        pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    }
     store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
     store.index[hash] = std::prev(store.entries.end());
     constexpr std::size_t bound = 1024;

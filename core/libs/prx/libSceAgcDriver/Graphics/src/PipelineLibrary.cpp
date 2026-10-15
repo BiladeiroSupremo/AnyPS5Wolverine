@@ -83,6 +83,8 @@ void enqueue(LibraryStore& store, VkDevice device, std::function<void()> job) {
     store.work.notify_one();
 }
 
+thread_local bool deferShaderParts = false;
+
 Key Combined(const Key& part, const Key& context) {
     Key key;
     const auto append = [&](const Key& value) {
@@ -96,6 +98,10 @@ Key Combined(const Key& part, const Key& context) {
     return key;
 }
 
+}
+
+void DeferMissingShaderParts(bool defer) {
+    deferShaderParts = defer;
 }
 
 std::span<const VkDynamicState> PipelineLibraryDynamicStates() {
@@ -171,6 +177,8 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             libraries.push_back(found->second);
             continue;
         }
+        const bool shaderPart = flags[part] == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT || flags[part] == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
+        if (deferShaderParts && !partsOnly && shaderPart) throw ShaderPartNotReady("graphics pipeline shader part is compiling in the background");
         PerformanceTimer timing("Vulkan.GraphicsPipelineLibrary");
         VkGraphicsPipelineLibraryCreateInfoEXT library{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, flags[part] == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT ? &rendering : &shaderRendering};
         library.flags = flags[part];
