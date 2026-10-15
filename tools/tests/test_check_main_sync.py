@@ -38,7 +38,12 @@ class Repo:
 
 
 def run_tool(path, *args):
-    return subprocess.run([sys.executable, str(TOOL), "--repo", str(path), "--base", "main", *args], capture_output=True, text=True)
+    return subprocess.run(
+        [sys.executable, str(TOOL), "--repo", str(path), "--base", "main", *args],
+        capture_output=True,
+        encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+    )
 
 
 class CheckMainSyncTests(unittest.TestCase):
