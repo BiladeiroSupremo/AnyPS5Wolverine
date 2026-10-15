@@ -609,6 +609,7 @@ int APS5_VABI sigsuspend_nid_postfix(const GuestSignalSet* set) {
     {
         std::lock_guard lock(registration);
         previous.bits[0] = blockedMask.exchange(set->bits[0]);
+        for (int word = 1; word < 4; ++word) previous.bits[word] = blockedMaskExtra[word - 1].exchange(set->bits[word]);
     }
     WaitForDeliverableSignal();
     _sigprocmask_nid_postfix(GuestSigsetmask, &previous, nullptr);
