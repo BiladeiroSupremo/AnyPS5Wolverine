@@ -234,6 +234,7 @@ struct Case {
 enum class Outcome { Kept, Lost, Missed };
 
 Outcome Run(const Case& test) {
+    std::optional<Surface> output;
     std::optional<Surface> source;
     if (test.kind == Kind::Copied) source.emplace();
     Surface surface(test.kind == Kind::LeftWatch);
