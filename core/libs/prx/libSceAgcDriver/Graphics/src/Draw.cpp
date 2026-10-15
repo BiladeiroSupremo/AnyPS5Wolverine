@@ -1789,7 +1789,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         std::fprintf(stderr, "[draw-io] depth-only draw depth 0x%llx %ux%u vk%d, %u indices x%u, test %d write %d op %d htile 0x%llx%s:%s\n", static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format), draw.indexCount, draw.instanceCount, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth->htileAddress), DescribeStencil(state).c_str(), resources.Describe().c_str());
     }    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
-    if (Breadcrumbs::Requested() && !shaders.empty()) Breadcrumbs::SetProgram(shaders.front().program->PipelineVariantId());
+    if (Breadcrumbs::Requested() && !shaders.empty()) Breadcrumbs::SetProgram(shaders.back().program->PipelineVariantId());
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state);
@@ -2391,7 +2391,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     }
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
-    if (Breadcrumbs::Requested() && !shaders.empty()) Breadcrumbs::SetProgram(shaders.front().program->PipelineVariantId());
+    if (Breadcrumbs::Requested() && !shaders.empty()) Breadcrumbs::SetProgram(shaders.back().program->PipelineVariantId());
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
     if (pipeline->SplitsFaces()) {
         pipeline->ContinueBackFaces(commands, state);
