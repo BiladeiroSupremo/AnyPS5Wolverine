@@ -518,10 +518,10 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     // A ceiling on the memory-budget-derived figure: device-local memory is process commit on Windows
     // drivers that back it (AMD), and freed VRAM stays with the driver, so the peak counts. 2 GiB of
     // sampled textures cost the title's cinematic no frame rate and saved ~1.2 GB of commit (it
-    // floated at 3.2-5.4 GiB). APS5_TEXTURE_CACHE_CEILING_MIB=0 removes the ceiling.
+    // floated at 3.2-5.4 GiB). Off by default since 2026-10-15: with pixel-shader heaps the title samples far more textures, and at 2 GiB every heap revalidation got a new uncached texture (~5000 republished entries per 10 s, a load that never ended). APS5_TEXTURE_CACHE_CEILING_MIB=<MiB> sets one.
     static const std::uint64_t ceiling = [] {
         const char* text = std::getenv("APS5_TEXTURE_CACHE_CEILING_MIB");
-        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 2048ull) << 20u;
+        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull) << 20u;
     }();
     auto budget = SampledTextureBudget(context.memory, &reported, sampled + storage);
     if (ceiling != 0) budget = std::min(budget, ceiling);

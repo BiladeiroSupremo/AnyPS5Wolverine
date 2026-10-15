@@ -41,10 +41,10 @@ void SetEnabled(bool enabled) {
 
 namespace {
 
-// APS5_GRAPHICS_HEAPS: "1" or "all" for every graphics stage, or a comma list of stages
-// (vertex, pixel, mesh, local, hull, domain) to find which stage's heap path hangs the GPU.
+// APS5_GRAPHICS_HEAPS: the graphics stages that take the heap, "pixel" by default; "0" for none,
+// "1" or "all" for every graphics stage, or a comma list (vertex, pixel, mesh, local, hull, domain).
 bool graphicsStageHeaps(IrShaderStage stage) {
-    static const std::string list = [] { const char* text = std::getenv("APS5_GRAPHICS_HEAPS"); return std::string(text != nullptr ? text : ""); }();
+    static const std::string list = [] { const char* text = std::getenv("APS5_GRAPHICS_HEAPS"); return std::string(text != nullptr ? text : "pixel"); }();
     if (list.empty() || list == "0") return false;
     if (list == "1" || list == "all") return true;
     const char* name = stage == IrShaderStage::Vertex ? "vertex" : stage == IrShaderStage::Pixel ? "pixel" : stage == IrShaderStage::Mesh ? "mesh" : stage == IrShaderStage::Local ? "local" : stage == IrShaderStage::TessellationControl ? "hull" : stage == IrShaderStage::TessellationEvaluation ? "domain" : "other";
@@ -66,13 +66,12 @@ bool HeapEligible(IrShaderStage stage, std::uint32_t dimension, bool sampled, bo
     // in with an uncaught C++ exception (0x20474343) right after shader 0x11d1e2b900's registration
     // module emits a 1D heap path; offline preparation of that request succeeds. Unresolved.
     const bool kind = shape == RdnaImageDimension::Dim2D || shape == RdnaImageDimension::Dim2DArray || shape == RdnaImageDimension::Dim3D;
-    // Graphics stages take the heap only with APS5_GRAPHICS_HEAPS=1 (every graphics pipeline layout
-    // carries the set either way; graphics tables wider than the static limit are rejected without
-    // it). With graphics heaps PPSA03671 hangs the GPU in its terrain mesh draws (mesh shader
-    // 0x11d0134500, slot-1 gameplay and the slot-4 title; one hang took the AMD driver and the
-    // whole display down); without them 0 hangs in two 7-minute runs (2026-10-15). Cause not found
-    // yet. The materializer decides at each draw, so a shader prepared with the heap path is safe
-    // either way.
+    // Graphics stages take the heap per APS5_GRAPHICS_HEAPS (every graphics pipeline layout carries
+    // the set either way; tables wider than the static limit are rejected in the others, and their
+    // draws skipped). PPSA03671's terrain and rock materials need it in pixel shaders. Those draws
+    // hung the GPU until 2026-10-15: their pixel shaders loop on a row scan read with v_readlane
+    // (EmitRowReduction); the draws only ran once the heap let their tables bind. The materializer
+    // decides at each draw, so a shader prepared with the heap path is safe either way.
     return Enabled() && (compute || graphicsStageHeaps(stage)) && kind && sampled && !depthCompare && !r128;
 }
 
