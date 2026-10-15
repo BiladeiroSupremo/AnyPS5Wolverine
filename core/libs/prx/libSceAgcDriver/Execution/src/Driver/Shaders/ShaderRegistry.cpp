@@ -58,7 +58,7 @@ void RejectSkippedShader(const ShaderSnapshot& snapshot) {
         static std::mutex listedMutex;
         static std::set<std::uint64_t> listed;
         std::lock_guard lock(listedMutex);
-        if (listed.insert(snapshot.codeAddress).second) std::fprintf(stderr, "[shader-list] 0x%llx hash 0x%016" PRIx64 "\n", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash);
+        if (listed.insert(snapshot.codeAddress).second) std::fprintf(stderr, "[shader-list] 0x%llx hash 0x%016" PRIx64 " type %u\n", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash, static_cast<unsigned>(snapshot.type));
     }
     // An entry may also be a code address (as the GPU breadcrumbs and APS5_TRACE_VARIANTS name a
     // shader); the content hash is then reported once, for a stable list.
