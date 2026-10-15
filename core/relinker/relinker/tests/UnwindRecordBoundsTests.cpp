@@ -45,11 +45,22 @@ int main() {
                 case 5: segment.FileSize = 119; break;
                 case 6: Io::WriteU32(bytes, 64, 8); break;
                 case 7: Io::WriteU32(bytes, 100, 0); break;
-                case 8: bytes[3] = 0x1B; Io::WriteU32(bytes, 16, 0xFFFFE000); break;
+                case 8: {
+                    bytes[3] = 0x1B;
+                    Io::WriteU32(bytes, 16, 0xFFFFE000);
+                    Io::WriteU32(bytes, 20, 0x1060 - 0x1014);
+                    Io::WriteU64(bytes, 104, 0xFFFFFFFFFFFFF010ULL);
+                    break;
+                }
                 case 9: bytes[3] = 0x1C; Io::WriteU64(bytes, 16, 0x8000000000000000ULL); break;
             }
             bool rejected = false;
-            try { Relinker::UnusedNidFilter::ReadExceptionFunctions(bytes, {segment, eh}, {}, {}); }
+            std::vector<Domain::ProgramHeader> headers = {segment, eh};
+            if (kind == 8) {
+                Domain::ProgramHeader high{}; high.Type = 1; high.MappedAddress = 0xFFFFFFFFFFFFF000ULL; high.FileSize = 0x100;
+                headers.push_back(high);
+            }
+            try { Relinker::UnusedNidFilter::ReadExceptionFunctions(bytes, headers, {}, {}); }
             catch (const std::exception&) { rejected = true; }
             Require(rejected);
         }
