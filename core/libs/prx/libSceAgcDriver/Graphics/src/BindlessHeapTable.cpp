@@ -437,9 +437,14 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
     // APS5_NO_HEAP_REVALIDATE=1 keeps every entry as first resolved.
     static const bool revalidate = std::getenv("APS5_NO_HEAP_REVALIDATE") == nullptr;
     auto& entries = table->Entries();
+    // A pass also stops after APS5_HEAP_REVALIDATE_US (2000 by default): a revalidation reads and
+    // hashes the whole texture, and passes slower than the interval ran on every dispatch and
+    // stalled the queue for minutes (PPSA03671 load freezes, 2026-10-15).
+    static const auto passTime = std::chrono::microseconds([] { const char* text = std::getenv("APS5_HEAP_REVALIDATE_US"); return text ? std::atoi(text) : 2000; }());
     if (revalidate && !entries.empty() && table->RevalidateDue()) {
         auto& cursor = table->RevalidateCursor();
-        for (std::size_t visited = 0; visited < std::min(RevalidateBudget, entries.size()); ++visited) {
+        const auto passStart = std::chrono::steady_clock::now();
+        for (std::size_t visited = 0; visited < std::min(RevalidateBudget, entries.size()) && std::chrono::steady_clock::now() - passStart < passTime; ++visited) {
             if (cursor >= entries.size()) cursor = 0;
             auto& entry = entries[cursor++];
             try {
@@ -450,6 +455,7 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             } catch (const std::exception&) {
             }
         }
+        table->RevalidateDone();
     }
     reportHeaps();
     if (published.empty()) return;

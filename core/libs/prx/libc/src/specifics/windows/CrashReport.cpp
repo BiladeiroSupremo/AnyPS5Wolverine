@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -127,7 +128,11 @@ bool HandleHardwareWatch(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// Each thread is suspended once, when first seen: suspending every thread each second froze
+// PPSA03671's load.
 void ArmHardwareWatch(std::uintptr_t address) {
+    static DWORD armed[4096];
+    static std::size_t armedCount = 0;
     const auto self = GetCurrentThreadId();
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) return;
@@ -135,6 +140,8 @@ void ArmHardwareWatch(std::uintptr_t address) {
     entry.dwSize = sizeof(entry);
     for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
         if (entry.th32OwnerProcessID != GetCurrentProcessId() || entry.th32ThreadID == self) continue;
+        if (std::find(armed, armed + armedCount, entry.th32ThreadID) != armed + armedCount) continue;
+        if (armedCount < std::size(armed)) armed[armedCount++] = entry.th32ThreadID;
         HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, entry.th32ThreadID);
         if (thread == nullptr) continue;
         if (SuspendThread(thread) != static_cast<DWORD>(-1)) {

@@ -60,8 +60,10 @@ public:
     };
     std::vector<Entry>& Entries() { return entries; }
     std::size_t& RevalidateCursor() { return revalidateCursor; }
-    // Whether a revalidation pass is due (at most one per interval).
+    // Whether a revalidation pass is due (at most one per interval, counted from the end of the
+    // last pass); RevalidateDone marks that end.
     bool RevalidateDue();
+    void RevalidateDone() { lastRevalidate = std::chrono::steady_clock::now(); }
 
 private:
     void createPlaceholders();
