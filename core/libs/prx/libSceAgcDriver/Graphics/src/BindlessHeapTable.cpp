@@ -81,7 +81,14 @@ BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) 
             return std::make_unique<Buffer>(context, bytes, usage);
         };
         translation = makeBuffer(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        feedback = makeBuffer(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        // The feedback is read by the CPU at every scan (a copy per region every few milliseconds)
+        // and written by the GPU once per request: cached host memory, where uncached reads through
+        // the BAR would cost about a millisecond per region.
+        try {
+            feedback = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        } catch (const std::exception&) {
+            feedback = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        }
         std::fill(Translation().begin(), Translation().end(), Heaps::Pending);
         std::fill(Feedback().begin(), Feedback().end(), 0u);
         const std::array<VkDescriptorBufferInfo, 2> infos{{{translation->Handle(), 0, VK_WHOLE_SIZE}, {feedback->Handle(), 0, VK_WHOLE_SIZE}}};
