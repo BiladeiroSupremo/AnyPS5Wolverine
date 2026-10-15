@@ -95,7 +95,67 @@ void ProtectWatchPage(DWORD protection) {
     VirtualProtect(reinterpret_cast<void*>(g_watchPage), 0x1000, protection, &old);
 }
 
+// Debug aid: APS5_HW_WATCH=<absolute hex address> reports writes to those 8 bytes with a hardware
+// data breakpoint (DR0) armed in every thread (re-armed each second for new threads); unlike the
+// page watch it does not slow writes to the rest of the page. Each hit prints the writer and the
+// new value; the first hits and any that look like a pair of floats print the stack too.
+std::uintptr_t g_hwWatchAddress = 0;
+std::atomic<unsigned> g_hwWatchHits{0};
+
+bool FloatLike(std::uint32_t word) {
+    const auto exponent = (word >> 23) & 0xffu;
+    return exponent >= 0x60u && exponent < 0x88u;
+}
+
+bool HandleHardwareWatch(EXCEPTION_POINTERS* info) {
+    auto* context = info->ContextRecord;
+    if (g_hwWatchAddress == 0 || info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || (context->Dr6 & 1u) == 0) return false;
+    context->Dr6 = 0;
+    const auto hit = g_hwWatchHits.fetch_add(1, std::memory_order_relaxed);
+    if (hit >= 5000) return true;
+    const auto value = *reinterpret_cast<const unsigned long long*>(g_hwWatchAddress);
+    char line[MAX_PATH + 64];
+    DescribeAddress(context->Rip, line, sizeof(line));
+    Report("[hwwatch] #%u thread %lu wrote 0x%016llx, after %s rsp=%llx rdi=%llx rsi=%llx rcx=%llx rdx=%llx r8=%llx\n", hit, GetCurrentThreadId(), value, line, context->Rsp, context->Rdi, context->Rsi, context->Rcx, context->Rdx, context->R8);
+    if (hit >= 40 && !(FloatLike(static_cast<std::uint32_t>(value)) && FloatLike(static_cast<std::uint32_t>(value >> 32)))) return true;
+    for (std::uint64_t slot = context->Rsp; slot < context->Rsp + 0x100 && IsReadable(slot); slot += 8) {
+        const auto candidate = *reinterpret_cast<const std::uint64_t*>(slot);
+        if (!IsExecutable(candidate)) continue;
+        DescribeAddress(candidate, line, sizeof(line));
+        Report("[hwwatch]     [rsp+0x%llx] %s\n", static_cast<unsigned long long>(slot - context->Rsp), line);
+    }
+    return true;
+}
+
+void ArmHardwareWatch(std::uintptr_t address) {
+    const auto self = GetCurrentThreadId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != GetCurrentProcessId() || entry.th32ThreadID == self) continue;
+        HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, entry.th32ThreadID);
+        if (thread == nullptr) continue;
+        if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            // L0, RW0 = write (01), LEN0 = 8 bytes (10).
+            constexpr DWORD64 control = 1ull | (1ull << 16u) | (2ull << 18u);
+            if (GetThreadContext(thread, &context) && (context.Dr0 != address || (context.Dr7 & 0x000f0003ull) != control)) {
+                context.Dr0 = address;
+                context.Dr7 = (context.Dr7 & ~0x000f0003ull) | control;
+                SetThreadContext(thread, &context);
+            }
+            ResumeThread(thread);
+        }
+        CloseHandle(thread);
+    }
+    CloseHandle(snapshot);
+}
+
 bool HandleWatch(EXCEPTION_POINTERS* info) {
+    if (HandleHardwareWatch(info)) return true;
     if (g_watchPage == 0) return false;
     const auto* record = info->ExceptionRecord;
     auto* context = info->ContextRecord;
@@ -147,6 +207,16 @@ bool HandleWatch(EXCEPTION_POINTERS* info) {
 }
 
 void InstallWatch() {
+    if (const char* hardware = std::getenv("APS5_HW_WATCH")) {
+        g_hwWatchAddress = std::strtoull(hardware, nullptr, 16) & ~static_cast<std::uintptr_t>(7);
+        Report("[hwwatch] watching 0x%llx with DR0 in every thread\n", static_cast<unsigned long long>(g_hwWatchAddress));
+        CreateThread(nullptr, 0, [](void*) -> DWORD {
+            for (;;) {
+                ArmHardwareWatch(g_hwWatchAddress);
+                Sleep(1000);
+            }
+        }, nullptr, 0, nullptr);
+    }
     // APS5_WATCH_ADDR=<absolute hex address> watches guest data that is mapped later: the page is
     // protected once it has been committed.
     if (const char* absolute = std::getenv("APS5_WATCH_ADDR")) {
