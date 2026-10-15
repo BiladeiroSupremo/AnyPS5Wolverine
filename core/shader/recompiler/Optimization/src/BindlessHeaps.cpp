@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 
@@ -45,9 +46,13 @@ bool HeapEligible(bool compute, std::uint32_t dimension, bool sampled, bool dept
     // module emits a 1D heap path; offline preparation of that request succeeds. Unresolved.
     const bool kind = shape == RdnaImageDimension::Dim2D || shape == RdnaImageDimension::Dim2DArray || shape == RdnaImageDimension::Dim3D;
     // Graphics stages take the heap too (every graphics pipeline layout carries the set); the
-    // driver resolves their requests before the next draw or dispatch.
-    (void)compute;
-    return Enabled() && kind && sampled && !depthCompare && !r128;
+    // driver resolves their requests before the next draw or dispatch. Experiment:
+    // APS5_NO_GRAPHICS_HEAPS=1 keeps the heap to compute (graphics tables wider than the static
+    // limit are rejected again). With no heap at all, PPSA03671's slot-1 gameplay ran 2 minutes
+    // without the device loss it otherwise hits in mesh draws (2026-10-15, one run). The
+    // materializer decides at each draw, so a shader prepared with the heap path is safe either way.
+    static const bool graphics = std::getenv("APS5_NO_GRAPHICS_HEAPS") == nullptr;
+    return Enabled() && (compute || graphics) && kind && sampled && !depthCompare && !r128;
 }
 
 std::uint32_t RegionBase(std::uint64_t heapBase, std::uint32_t entryOffset, std::uint32_t entries) {
