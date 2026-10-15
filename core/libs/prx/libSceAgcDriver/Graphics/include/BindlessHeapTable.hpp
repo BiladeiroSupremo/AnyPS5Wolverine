@@ -45,6 +45,8 @@ public:
     // Marks a translation entry handled (its word published or about to be); false when it already
     // was. The GPU writes the word later, so the CPU copy can still read Pending meanwhile.
     bool Claim(std::uint32_t index);
+    // Makes a demoted entry requestable again (its word is back to Pending).
+    void Unclaim(std::uint32_t index) { if (index < claimed.size()) claimed[index] = 0u; }
     std::mutex& Mutex() { return mutex; }
 
     // A published entry, revalidated over time (ResolveBindlessHeapRequests): a guest texture the
@@ -57,6 +59,9 @@ public:
         std::array<std::uint32_t, 8> words{};
         std::shared_ptr<Texture> texture;
         std::uint32_t word = 0;
+        // The texture was in the sampled texture cache when published: once the cache evicts it,
+        // the entry goes back to Pending (the heap must not keep evicted textures alive).
+        bool cached = false;
     };
     std::vector<Entry>& Entries() { return entries; }
     std::size_t& RevalidateCursor() { return revalidateCursor; }

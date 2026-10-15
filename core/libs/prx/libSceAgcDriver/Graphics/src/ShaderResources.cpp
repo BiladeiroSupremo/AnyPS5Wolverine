@@ -193,6 +193,7 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.bytes -= it->accounted;
+    if (it->texture != nullptr) it->texture->SetInSampledCache(false);
     if (it->source != nullptr) {
         for (auto [view, last] = cache.views.equal_range(it->source.get()); view != last; ++view) {
             if (view->second == it) {
@@ -742,6 +743,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     cache.bytes += entry.accounted;
     entry.present = Recorder::Presents();
+    entry.texture->SetInSampledCache(true);
     ++cache.counts.inserted;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
     cache.entries.push_front(std::move(entry));

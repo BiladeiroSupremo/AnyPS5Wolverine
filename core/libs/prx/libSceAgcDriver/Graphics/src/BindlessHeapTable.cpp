@@ -345,8 +345,9 @@ std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table,
             existing->words = words;
             existing->texture = texture;
             existing->word = word;
+            existing->cached = texture->InSampledCache();
         } else {
-            table.Entries().push_back({index, address, words, texture, word});
+            table.Entries().push_back({index, address, words, texture, word, texture->InSampledCache()});
         }
     }
     if (traceEntries) {
@@ -361,6 +362,7 @@ struct HeapCounters {
     std::atomic<std::uint64_t> usable{0};
     std::atomic<std::uint64_t> failed{0};
     std::atomic<std::uint64_t> republished{0};
+    std::atomic<std::uint64_t> demoted{0};
     std::atomic<long long> lastReport{0};
 };
 
@@ -377,8 +379,9 @@ void reportHeaps() {
     if (now - last < 10 || !counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     const auto requests = counters.requests.exchange(0, std::memory_order_relaxed);
     const auto republished = counters.republished.exchange(0, std::memory_order_relaxed);
-    if (requests == 0 && republished == 0) return;
-    std::fprintf(stderr, "[bindless] heap (10 s): %llu requests, %llu published, %llu unusable, %llu republished\n", static_cast<unsigned long long>(requests), static_cast<unsigned long long>(counters.usable.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.failed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(republished));
+    const auto demoted = counters.demoted.exchange(0, std::memory_order_relaxed);
+    if (requests == 0 && republished == 0 && demoted == 0) return;
+    std::fprintf(stderr, "[bindless] heap (10 s): %llu requests, %llu published, %llu unusable, %llu republished, %llu demoted (evicted textures)\n", static_cast<unsigned long long>(requests), static_cast<unsigned long long>(counters.usable.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.failed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(republished), static_cast<unsigned long long>(demoted));
 }
 
 }
@@ -443,8 +446,28 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
     static const auto passTime = std::chrono::microseconds([] { const char* text = std::getenv("APS5_HEAP_REVALIDATE_US"); return text ? std::atoi(text) : 2000; }());
     if (revalidate && !entries.empty() && table->RevalidateDue()) {
         auto& cursor = table->RevalidateCursor();
+        // Entries whose texture the sampled texture cache evicted go back to Pending: kept alive by
+        // the heap they escaped the cache budget, and PPSA03671's jungle filled the 16 GB of VRAM,
+        // spilled into system memory and ran the PC out of RAM (soak1, 2026-10-15). A shader that
+        // still samples one requests it again through the feedback buffer.
+        // APS5_HEAP_KEEP_EVICTED=1 keeps them.
+        static const bool demote = std::getenv("APS5_HEAP_KEEP_EVICTED") == nullptr;
+        for (std::size_t index = 0; demote && index < entries.size();) {
+            auto& entry = entries[index];
+            if (!entry.cached || entry.texture == nullptr || entry.texture->InSampledCache()) {
+                ++index;
+                continue;
+            }
+            table->Retire(entry.word, recorder);
+            published.emplace_back(entry.index, Heaps::Pending);
+            table->Unclaim(entry.index);
+            counters.demoted.fetch_add(1, std::memory_order_relaxed);
+            entry = std::move(entries.back());
+            entries.pop_back();
+        }
+        if (cursor >= entries.size()) cursor = 0;
         const auto passStart = std::chrono::steady_clock::now();
-        for (std::size_t visited = 0; visited < std::min(RevalidateBudget, entries.size()) && std::chrono::steady_clock::now() - passStart < passTime; ++visited) {
+        for (std::size_t visited = 0; !entries.empty() && visited < std::min(RevalidateBudget, entries.size()) && std::chrono::steady_clock::now() - passStart < passTime; ++visited) {
             if (cursor >= entries.size()) cursor = 0;
             auto& entry = entries[cursor++];
             try {

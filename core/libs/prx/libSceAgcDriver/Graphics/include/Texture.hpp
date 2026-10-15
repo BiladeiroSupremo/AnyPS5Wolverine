@@ -91,6 +91,10 @@ public:
     VkImageLayout Layout() const { return layout; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
     VkFormat ViewFormat() const { return viewFormat; }
+    // Whether the sampled texture cache still accounts this texture: holders that keep it beyond
+    // the cache (the bindless heap) let it go once evicted, so it does not escape the budget.
+    bool InSampledCache() const { return inSampledCache.load(std::memory_order_acquire); }
+    void SetInSampledCache(bool value) { inSampledCache.store(value, std::memory_order_release); }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
@@ -130,6 +134,7 @@ private:
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
     PerUseCopy perUseCopy = PerUseCopy::None;
+    std::atomic<bool> inSampledCache{false};
     bool copiedOnce = false;
     std::uint64_t copiedVersion = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
