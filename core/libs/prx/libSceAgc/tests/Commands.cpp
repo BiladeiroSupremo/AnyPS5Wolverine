@@ -638,8 +638,9 @@ void testDefaults() {
     auto* internalDefaults = sceAgcGetRegisterDefaultsInternal();
     check(internalDefaults != nullptr && internalDefaults == Agc::Command::GetRegisterDefaults(0, true, __func__) && internalDefaults == sceAgcGetRegisterDefaults2Internal(0), "internal register defaults are not the baseline internal table");
     check(internalDefaults != sceAgcGetRegisterDefaults(), "internal register defaults returned the public table");
+    constexpr int kInvalidArgument = static_cast<int>(0x80890001u);
     std::array<std::uint32_t, 512> flatCxBuffer{};
-    check(sceAgcGetDefaultCxStateFlat(nullptr, sizeof(flatCxBuffer)) == SCE_AGC_ERROR_INVALID_ARGUMENT, "null destination was accepted");
+    check(sceAgcGetDefaultCxStateFlat(nullptr, sizeof(flatCxBuffer)) == kInvalidArgument, "null destination was accepted");
     check(sceAgcGetDefaultCxStateFlat(flatCxBuffer.data(), 0) == 0, "zero size copy failed");
     check(sceAgcGetDefaultCxStateFlat(flatCxBuffer.data(), sizeof(flatCxBuffer)) == 0, "flat CX state default retrieval failed");
     check(flatCxBuffer[0x001] == 0x11000100u, "flat CX state register 0x001 mismatch");
@@ -650,8 +651,10 @@ void testDefaults() {
     overBuffer[512] = 0x12345678u;
     check(sceAgcGetDefaultCxStateFlat(overBuffer.data(), sizeof(overBuffer)) == 0, "oversized copy failed");
     check(overBuffer[512] == 0x12345678u, "oversized copy overflowed buffer");
-    check(Agc::Command::GetDefaultCxStateFlat(nullptr, sizeof(flatCxBuffer)) == SCE_AGC_ERROR_INVALID_ARGUMENT, "null command destination was accepted");
+    check(Agc::Command::GetDefaultCxStateFlat(nullptr, sizeof(flatCxBuffer)) == kInvalidArgument, "null command destination was accepted");
     check(Agc::Command::GetDefaultCxStateFlat(flatCxBuffer.data(), sizeof(flatCxBuffer)) == 0, "command flat CX state retrieval failed");
+    expectFailure([] { Agc::Command::GetRegisterDefaults(14, false, __func__); });
+    expectFailure([] { Agc::Command::GetRegisterDefaults(0xffffffffu, true, __func__); });
 }
 
 void testEventWrite() {
