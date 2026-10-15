@@ -4,14 +4,14 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 class KeepAll : public Elfpatcher::ISegmentFilter {
 public:
     bool ShouldSkip(const Domain::ProgramHeader&) const override { return false; }
 };
 
-static int gLine=0;
-static void Require(bool ok) { if (!ok) throw std::runtime_error("Program layout range validation failed at line " + std::to_string(gLine)); }
+static void Require(bool ok, const char* what) { if (!ok) throw std::runtime_error(std::string("program layout: ") + what); }
 
 static Domain::ProgramHeader Load(std::uint64_t vaddr, std::uint64_t memorySize, std::uint64_t fileSize, std::uint32_t flags) {
     Domain::ProgramHeader load{};
@@ -39,29 +39,27 @@ static std::vector<Domain::ProgramHeader> MappedLoads(const std::vector<std::uin
 }
 
 static void RequireExtraBlockStartsOnItsOwnPage(std::vector<Domain::ProgramHeader> loads, std::uint64_t extraFileOffset) {
-    gLine = 3000;
     std::sort(loads.begin(), loads.end(), [](const Domain::ProgramHeader& left, const Domain::ProgramHeader& right) {
         return left.MappedAddress < right.MappedAddress;
     });
     std::size_t extraIndex = loads.size();
     for (std::size_t index = 0; index < loads.size(); ++index) {
-        if (loads[index].FileSize > loads[index].MemorySize) std::cerr << "case3005 off=" << std::hex << loads[index].Offset << " vaddr=" << loads[index].MappedAddress << " fsz=" << loads[index].FileSize << " msz=" << loads[index].MemorySize << "\n";
-        gLine = 3005; Require(loads[index].FileSize <= loads[index].MemorySize);
-        gLine = 3006; Require(loads[index].MappedAddress % loads[index].Alignment == loads[index].Offset % loads[index].Alignment);
+        Require(loads[index].FileSize <= loads[index].MemorySize, "load file size above its memory size");
+        Require(loads[index].MappedAddress % loads[index].Alignment == loads[index].Offset % loads[index].Alignment, "load vaddr and offset differ modulo alignment");
         if (loads[index].Offset == extraFileOffset)
             extraIndex = index;
     }
-    gLine = 3001; Require(extraIndex < loads.size());
+    Require(extraIndex < loads.size(), "no load at the extra block offset");
     const auto& extraBlock = loads[extraIndex];
-    gLine = 3002; Require(extraBlock.MemorySize >= extraBlock.FileSize);
+    Require(extraBlock.MemorySize >= extraBlock.FileSize, "extra block memory size below its file size");
     for (std::size_t index = 0; index < loads.size(); ++index) {
         if (index == extraIndex)
             continue;
         const auto& other = loads[index];
         if (other.MappedAddress < extraBlock.MappedAddress) {
-            gLine = 3003; Require((other.MappedAddress + other.FileSize - 1) / 0x1000 < extraBlock.MappedAddress / 0x1000);
+            Require((other.MappedAddress + other.FileSize - 1) / 0x1000 < extraBlock.MappedAddress / 0x1000, "load below the extra block ends on its page");
         } else {
-            gLine = 3004; Require(other.MappedAddress >= extraBlock.MappedAddress + extraBlock.FileSize);
+            Require(other.MappedAddress >= extraBlock.MappedAddress + extraBlock.FileSize, "load above the extra block overlaps it");
         }
     }
 }
@@ -75,17 +73,17 @@ int main() {
         load.Type = 1; load.MappedAddress = maximum - 3; load.MemorySize = 8;
         bool rejected = false;
         try { builder.ComputeExtraBlockVaddr({load}, 0x1000); } catch (const std::exception&) { rejected = true; }
-        gLine=__LINE__; Require(rejected);
+        Require(rejected, "overflowing load end accepted");
         load.MappedAddress = 0x1000; load.MemorySize = 0x1000;
-        gLine=__LINE__; Require(builder.ComputeExtraBlockVaddr({load}, 0x1003) == 0x2003);
+        Require(builder.ComputeExtraBlockVaddr({load}, 0x1003) == 0x2003, "vaddr for aligned end 0x2000, offset 0x1003");
         load.MemorySize = 0x1800;
-        gLine=__LINE__; Require(builder.ComputeExtraBlockVaddr({load}, 0x8A00) == 0x3A00);
-        gLine=__LINE__; Require(builder.ComputeExtraBlockVaddr({load}, 0x8800) == 0x3800);
+        Require(builder.ComputeExtraBlockVaddr({load}, 0x8A00) == 0x3A00, "vaddr for end 0x2800, offset 0x8A00");
+        Require(builder.ComputeExtraBlockVaddr({load}, 0x8800) == 0x3800, "vaddr for end 0x2800, offset 0x8800");
         load.MappedAddress = 0x1000; load.MemorySize = 0x1000;
-        gLine=__LINE__; Require(builder.ComputeExtraBlockVaddr({load}, 0x1000) == 0x2000);
+        Require(builder.ComputeExtraBlockVaddr({load}, 0x1000) == 0x2000, "vaddr for aligned end 0x2000, offset 0x1000");
         Elfpatcher::ProgramHeaderLayoutRequest valid{64, 56, 6, {load}, 0x1000, 0x2000, 0x100, 0x1000, 16, 0x1010, 8};
         std::vector<std::uint8_t> output(0x1100, 0xA5);
-        gLine=__LINE__; Require(builder.WriteLayout(output, valid) == 6);
+        Require(builder.WriteLayout(output, valid) == 6, "header count for a valid request");
         for (int kind = 0; kind < 11; ++kind) {
             auto request = valid;
             switch (kind) {
@@ -105,7 +103,7 @@ int main() {
             const auto before = bytes;
             rejected = false;
             try { builder.WriteLayout(bytes, request); } catch (const std::exception&) { rejected = true; }
-            gLine=__LINE__; Require(rejected && bytes == before);
+            Require(rejected && bytes == before, "invalid request accepted or output changed");
         }
         const std::uint16_t tableCount = 2 + 5;
         const auto writeLayout = [&builder, tableCount](const std::vector<Domain::ProgramHeader>& headers, std::uint64_t extraFileOffset, std::uint64_t extraFileSize) {
@@ -115,7 +113,7 @@ int main() {
                 builder.ComputeExtraBlockVaddr(headers, extraFileOffset), tableSize + extraFileSize,
                 extraFileOffset, 0x20, extraFileOffset + 0x20, 8};
             const std::uint16_t written = builder.WriteLayout(bytes, request);
-            gLine=__LINE__; Require(written == tableCount);
+            Require(written == tableCount, "written header count");
             RequireExtraBlockStartsOnItsOwnPage(MappedLoads(bytes, extraFileOffset, written), extraFileOffset);
         };
         writeLayout({Load(0x1000, 0x1800, 0x1800, 6), Load(0x3000, 0x1000, 0x1000, 4)}, 0x8A00, 0x400);
