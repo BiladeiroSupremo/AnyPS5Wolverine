@@ -51,6 +51,15 @@ void RejectSkippedShader(const ShaderSnapshot& snapshot) {
         for (const auto hash : hashes) std::fprintf(stderr, "[gpu] skipping the draws and dispatches of shader hash 0x%016" PRIx64 " (APS5_SKIP_SHADERS)\n", hash);
         return hashes;
     }();
+    // Diagnostic: APS5_LIST_SHADERS=1 prints every shader once, at its first draw or dispatch
+    // (bisecting a bad draw with APS5_SKIP_SHADERS by code address).
+    static const bool list = std::getenv("APS5_LIST_SHADERS") != nullptr;
+    if (list) {
+        static std::mutex listedMutex;
+        static std::set<std::uint64_t> listed;
+        std::lock_guard lock(listedMutex);
+        if (listed.insert(snapshot.codeAddress).second) std::fprintf(stderr, "[shader-list] 0x%llx hash 0x%016" PRIx64 "\n", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash);
+    }
     // An entry may also be a code address (as the GPU breadcrumbs and APS5_TRACE_VARIANTS name a
     // shader); the content hash is then reported once, for a stable list.
     const bool byHash = snapshot.contentHash != 0 && std::find(skipped.begin(), skipped.end(), snapshot.contentHash) != skipped.end();

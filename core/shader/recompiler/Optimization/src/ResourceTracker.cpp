@@ -243,6 +243,30 @@ private:
                 return false;
             }
             if (!walker.ValidateRuntimeValue(m_program.Resources(), descriptor.dwords[i])) {
+                // Diagnostic: APS5_TRACE_RUNTIME_VALIDATE=1 names the deepest failing value of the chain.
+                static const bool trace = std::getenv("APS5_TRACE_RUNTIME_VALIDATE") != nullptr;
+                if (trace) {
+                    std::vector<IrValue*> pending{descriptor.dwords[i]->Resolve()};
+                    std::unordered_set<IrValue*> seen;
+                    while (!pending.empty()) {
+                        IrValue* value = pending.back();
+                        pending.pop_back();
+                        if (!seen.insert(value).second) continue;
+                        bool childFails = false;
+                        for (std::size_t a = 0; a < value->ArgumentCount(); ++a) {
+                            IrValue* child = value->Argument(a)->Resolve();
+                            if (!child->HasImmediate() && child->Opcode() != IrOpcode::Void && !walker.ValidateRuntimeValue(m_program.Resources(), child)) {
+                                childFails = true;
+                                pending.push_back(child);
+                            }
+                        }
+                        if (!childFails) {
+                            const auto index = value->Flags<MemoryFlags>().index;
+                            const auto kind = (value->Opcode() == IrOpcode::ReadConstBuffer || value->Opcode() == IrOpcode::LoadAddressU32) && index < m_program.Resources().memoryInfo.size() ? static_cast<int>(m_program.Resources().memoryInfo[index].kind) : -1;
+                            std::fprintf(stderr, "[runtime-validate] dword %u: %s fails with valid arguments (memory kind %d)\n", i, IrOpcodeName(value->Opcode()).data(), kind);
+                        }
+                    }
+                }
                 return false;
             }
         }
@@ -517,6 +541,12 @@ private:
             return false;
         }
         return scale == 32u;
+    }
+
+    // APS5_NO_UNIFORM_STORAGE_TABLES=1 rejects storage images read from a table at a uniform key.
+    static bool uniformStorageTables() {
+        static const bool enabled = std::getenv("APS5_NO_UNIFORM_STORAGE_TABLES") == nullptr;
+        return enabled;
     }
 
     // A waterfall loop's descriptor (PPSA03671's 0x11d1418800, ~300 skipped draws a run without it):
@@ -1244,6 +1274,21 @@ private:
                 if (planned == nullptr && !TryMakeTableImage(*handle, plan)) {
                     continue;
                 }
+                // Diagnostic: APS5_TRACE_TABLE_PLANS=1 prints each table image's heap descriptor.
+                static const bool tracePlans = std::getenv("APS5_TRACE_TABLE_PLANS") != nullptr;
+                if (tracePlans) {
+                    const auto& source = planned != nullptr ? m_sources[planned->source] : m_sources[plan.source];
+                    const auto& table = *source.indirectImage;
+                    std::fprintf(stderr, "[table-plan] %s image op %s: entry offset 0x%x, material %d; heap V#: %s; key: %s\n", imageInfo.resourceClass == ImageResourceClass::Storage ? "storage" : "sampled", IrOpcodeName(inst->Opcode()).data(), table.entryOffset, table.hasMaterial ? 1 : 0, describeValueChain(source.dwords[0], 4u).c_str(), describeValueChain(planned != nullptr ? planned->key : plan.key, 7u).c_str());
+                }
+                // A store through a table whose key is one runtime value for the whole dispatch (an SRT
+                // constant: PPSA03671's lighting compute 0x11d0395500 writes heap[srt word]) is not a
+                // table: its T# words stay reads of the heap at that key, evaluated per dispatch, and
+                // the image binds as any storage image. APS5_NO_UNIFORM_STORAGE_TABLES=1 rejects it.
+                if (imageInfo.resourceClass == ImageResourceClass::Storage && planned == nullptr && uniformStorageTables()) {
+                    constexpr SrtWalker walker;
+                    if (walker.ValidateRuntimeValue(m_program.Resources(), plan.key)) continue;
+                }
                 // A store through a table would mark every bound slot pending write-back.
                 if (imageInfo.resourceClass == ImageResourceClass::Storage) {
                     ResourceMaterializer::CountBindlessRejection(BindlessRejection::Storage);
@@ -1269,6 +1314,10 @@ private:
         if (expected == IrOpcode::GetImageResource) {
             for (; badDword < descriptor.dwordCount; badDword++) {
                 const IrValue* value2 = descriptor.dwords[badDword]->Resolve();
+                // A read the host can evaluate at dispatch time (the heap entry of a uniform storage
+                // table, its offset an SRT constant) is a valid descriptor word.
+                constexpr SrtWalker walker;
+                if (value2->Opcode() == IrOpcode::ReadConstBuffer && uniformStorageTables() && walker.ValidateRuntimeValue(m_program.Resources(), descriptor.dwords[badDword])) continue;
                 if (value2->Opcode() == IrOpcode::ReadConstBuffer) {
                     IndirectImagePlan probe;
                     m_tableRejection = TryMakeTableImage(*handle, probe) ? "matched late" : m_tableRejection;
