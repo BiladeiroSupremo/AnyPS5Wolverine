@@ -11,9 +11,16 @@ int APS5_VABI sceSystemServiceLoadExec(const char*, const char* const*);
 int APS5_VABI dup2_nid_postfix(int, int);
 }
 
-static void Require(bool value) { if (!value) std::abort(); }
+namespace {
 
-static std::string Drain(int descriptor) {
+constexpr const char* Marker = "APS5_LOAD_EXEC_STANDARD_ERROR";
+constexpr const char* AfterLoadExec = "--after-load-exec";
+
+void Require(bool value) {
+    if (!value) std::abort();
+}
+
+std::string Drain(int descriptor) {
     std::string text;
     char buffer[4096];
     for (ssize_t count; (count = ::read(descriptor, buffer, sizeof(buffer))) > 0;) text.append(buffer, static_cast<std::size_t>(count));
@@ -21,12 +28,7 @@ static std::string Drain(int descriptor) {
     return text;
 }
 
-int main(int argc, char** argv) {
-    if (argc == 2 && std::strcmp(argv[1], "--after-load-exec") == 0) {
-        std::fputs("started\n", stderr);
-        return 0;
-    }
-    Require(argc == 1);
+void Run(const char* mode, const char* const* arguments) {
     int host[2] = {-1, -1};
     int guest[2] = {-1, -1};
     Require(::pipe(host) == 0);
@@ -40,9 +42,9 @@ int main(int argc, char** argv) {
         ::close(host[1]);
         if (dup2_nid_postfix(guest[1], 2) != 2) ::_exit(71);
         ::close(guest[1]);
-        const char* const arguments[] = {"--after-load-exec", nullptr};
+        if (::setenv(Marker, mode, 1) != 0) ::_exit(72);
         sceSystemServiceLoadExec("/app0/eboot.bin", arguments);
-        ::_exit(72);
+        ::_exit(73);
     }
     ::close(host[1]);
     ::close(guest[1]);
@@ -51,7 +53,22 @@ int main(int argc, char** argv) {
     int status = 0;
     Require(::waitpid(child, &status, 0) == child);
     Require(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    Require(hostText == "started\n");
+    Require(hostText == std::string("started ") + mode + "\n");
     Require(guestText.empty());
+}
+
+}
+
+int main(int argc, char** argv) {
+    if (const char* mode = std::getenv(Marker); mode != nullptr) {
+        if (std::strcmp(mode, "list") == 0) Require(argc == 1 && std::strcmp(argv[0], AfterLoadExec) == 0);
+        else Require(std::strcmp(mode, "none") == 0 && argc == 1);
+        std::fprintf(stderr, "started %s\n", mode);
+        return 0;
+    }
+    const char* const arguments[] = {AfterLoadExec, nullptr};
+    Run("list", arguments);
+    Run("none", nullptr);
+    std::puts("LoadExec standard error tests passed");
     return 0;
 }
