@@ -188,6 +188,10 @@ def spans(conflicts, blob):
                                                for s, e in ranges) for path, ranges in sorted((conflicts or {}).items()))
 
 
+def pull(blob, number):
+    return f'[PR {number}]({blob.split("/blob/", 1)[0].replace("https://github.com/", "https://www.github.com/", 1)}/pull/{number})'
+
+
 def report(rows, blob):
     if not rows:
         return ""
@@ -204,7 +208,7 @@ def report(rows, blob):
             "|---|---|---|---|",
         ])
         for number, found in sorted(confirmed.items()):
-            lines.append(f'| #{number} | {spans(found.get("conflicts"), blob)} | {cell(found.get("exports"))} | {cell(found["added"])} |')
+            lines.append(f'| {pull(blob, number)} | {spans(found.get("conflicts"), blob)} | {cell(found.get("exports"))} | {cell(found["added"])} |')
     if uncompared:
         if confirmed:
             lines.append("")
@@ -216,7 +220,7 @@ def report(rows, blob):
             "|---|---|",
         ])
         for number, files in sorted(uncompared.items()):
-            lines.append(f"| #{number} | {cell(files)} |")
+            lines.append(f"| {pull(blob, number)} | {cell(files)} |")
     return "\n".join(lines) + "\n"
 
 

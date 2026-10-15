@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -216,6 +217,14 @@ class ConflictTests(unittest.TestCase):
         self.assertIn("could not be completed", report)
         self.assertIn("`shared.cpp`", report)
         self.assertTrue(report.startswith(pr_overlap.MARKER))
+
+    def test_report_links_pull_requests_without_cross_references(self):
+        rows = {2: {"added": set(), "conflicts": {"other.cpp": [(1, 1)]}},
+                3: {"added": set(), "uncompared": {"shared.cpp"}}}
+        report = pr_overlap.report(rows, "https://github.com/owner/project/blob/base")
+        self.assertIsNone(re.search(r"#\d|https://github\.com/owner/project/(pull|issues)/", report))
+        self.assertIn("[PR 2](https://www.github.com/owner/project/pull/2)", report)
+        self.assertIn("[PR 3](https://www.github.com/owner/project/pull/3)", report)
 
 
 class UnicodePathTests(unittest.TestCase):
