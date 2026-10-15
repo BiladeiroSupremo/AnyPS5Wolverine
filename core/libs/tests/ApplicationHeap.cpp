@@ -373,7 +373,7 @@ int main(int argc, char** argv) {
     require(directory == reinterpret_cast<char*>(storage.data()) && directory[0] == '/' && lastSize == std::strlen(directory) + 1);
     ApplicationHeapFree_nid_no_patch(directory);
     directory = getcwd_nid_postfix(nullptr, 200);
-    require(directory == reinterpret_cast<char*>(storage.data()) && lastSize == 200);
+    require(directory == reinterpret_cast<char*>(storage.data()) && lastSize == std::strlen(directory) + 1);
     ApplicationHeapFree_nid_no_patch(directory);
     fail = true;
     *__error_nid_postfix() = 0;
