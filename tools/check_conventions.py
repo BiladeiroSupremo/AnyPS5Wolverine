@@ -194,7 +194,7 @@ class Check:
     def shaders(self):
         if any(is_debt(path) for path in self.status):
             return
-        for path, lines in self.files(lambda p: p.suffix in (".comp", ".frag", ".vert")):
+        for path, lines in self.files(lambda p: p.suffix in (".comp", ".frag", ".vert", ".glsl")):
             masked = cpp_text(self.show(path), preserve_comments=True).split("\n")
             for number, _ in lines:
                 bare = masked[number - 1]

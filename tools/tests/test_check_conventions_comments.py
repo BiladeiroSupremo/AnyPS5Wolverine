@@ -396,7 +396,7 @@ class TestFixtureExportTests(unittest.TestCase):
         self.assertIn("sceKernelGetProcessTime is also in libkernel", result.stdout)
 
     def test_comment_in_a_shader_is_reported(self):
-        for path in ("core/libs/prx/libSceAgcDriver/Graphics/shaders/Fill.comp", "core/libs/prx/libSceAgcDriver/tests/shaders/Fill.frag"):
+        for path in ("core/libs/prx/libSceAgcDriver/Graphics/shaders/Fill.comp", "core/libs/prx/libSceAgcDriver/tests/shaders/Fill.frag", "core/libs/prx/libSceAgcDriver/Graphics/shaders/Fill.glsl"):
             for line in ("    // fill the target", "    /* fill the target */"):
                 with self.subTest(path=path, line=line):
                     result = self.check(path, f"#version 450\nvoid main() {{\n{line}\n}}\n")
