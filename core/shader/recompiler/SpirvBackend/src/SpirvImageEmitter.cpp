@@ -1645,7 +1645,7 @@ bool HeapBranched(const SpirvEmitterState& state, const MemoryInfo& memory, cons
     if (image.indirectRoot != memory.resource || state.flattenedSrtVariable == 0u) return false;
     const auto& sources = state.program.Resources().descriptorSources;
     if (image.source >= sources.size() || !sources[image.source].indirectImage.has_value()) return false;
-    return BindlessHeaps::HeapEligible(StageOf(state) == IrShaderStage::Compute, static_cast<std::uint32_t>(image.dimension), image.resourceClass == ImageResourceClass::Sampled, image.depthCompare, image.r128);
+    return BindlessHeaps::HeapEligible(StageOf(state), static_cast<std::uint32_t>(image.dimension), image.resourceClass == ImageResourceClass::Sampled, image.depthCompare, image.r128);
 }
 
 void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst);

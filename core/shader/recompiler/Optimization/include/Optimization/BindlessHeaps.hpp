@@ -1,6 +1,7 @@
 #ifndef CORE_SHADER_RECOMPILIER_OPTIMIZATION_INCLUDE_OPTIMIZATION_BINDLESSHEAPS_HPP
 #define CORE_SHADER_RECOMPILIER_OPTIMIZATION_INCLUDE_OPTIMIZATION_BINDLESSHEAPS_HPP
 
+#include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include <cstdint>
 #include <vector>
 
@@ -58,7 +59,7 @@ void SetEnabled(bool enabled);
 
 // Whether a table root of this stage, dimension and access is emitted with the heap path (the
 // SPIR-V and the materializer must agree). `dimension` is an RdnaImageDimension value.
-[[nodiscard]] bool HeapEligible(bool compute, std::uint32_t dimension, bool sampled, bool depthCompare, bool r128);
+[[nodiscard]] bool HeapEligible(IrShaderStage stage, std::uint32_t dimension, bool sampled, bool depthCompare, bool r128);
 
 // The region of the heap, allocated (with headroom) on first use or when the table outgrew it.
 // Throws BindlessTableRejected when the translation buffer is full.

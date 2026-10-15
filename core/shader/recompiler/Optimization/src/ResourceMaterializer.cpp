@@ -353,7 +353,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     };
 
     auto& counters = bindlessCounters();
-    const bool heapEligible = BindlessHeaps::HeapEligible(plan.stage == IrShaderStage::Compute, static_cast<std::uint32_t>(image.dimension), image.resourceClass == ImageResourceClass::Sampled, image.depthCompare, image.r128);
+    const bool heapEligible = BindlessHeaps::HeapEligible(plan.stage, static_cast<std::uint32_t>(image.dimension), image.resourceClass == ImageResourceClass::Sampled, image.depthCompare, image.r128);
     std::vector<std::uint32_t> keys;
     bool materialMode = false;
     std::uint32_t materialEntries = 0;

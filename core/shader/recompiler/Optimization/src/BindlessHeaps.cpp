@@ -39,7 +39,28 @@ void SetEnabled(bool enabled) {
     registry().enabled.store(enabled, std::memory_order_release);
 }
 
-bool HeapEligible(bool compute, std::uint32_t dimension, bool sampled, bool depthCompare, bool r128) {
+namespace {
+
+// APS5_GRAPHICS_HEAPS: "1" or "all" for every graphics stage, or a comma list of stages
+// (vertex, pixel, mesh, local, hull, domain) to find which stage's heap path hangs the GPU.
+bool graphicsStageHeaps(IrShaderStage stage) {
+    static const std::string list = [] { const char* text = std::getenv("APS5_GRAPHICS_HEAPS"); return std::string(text != nullptr ? text : ""); }();
+    if (list.empty() || list == "0") return false;
+    if (list == "1" || list == "all") return true;
+    const char* name = stage == IrShaderStage::Vertex ? "vertex" : stage == IrShaderStage::Pixel ? "pixel" : stage == IrShaderStage::Mesh ? "mesh" : stage == IrShaderStage::Local ? "local" : stage == IrShaderStage::TessellationControl ? "hull" : stage == IrShaderStage::TessellationEvaluation ? "domain" : "other";
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        const auto end = std::min(list.find(',', start), list.size());
+        if (list.compare(start, end - start, name) == 0) return true;
+        start = end + 1;
+    }
+    return false;
+}
+
+}
+
+bool HeapEligible(IrShaderStage stage, std::uint32_t dimension, bool sampled, bool depthCompare, bool r128) {
+    const bool compute = stage == IrShaderStage::Compute;
     const auto shape = static_cast<RdnaImageDimension>(dimension);
     // Dim1D has a heap kind (ImageBinding1D) but stays ineligible: with it, PPSA03671 ends ~2-4 min
     // in with an uncaught C++ exception (0x20474343) right after shader 0x11d1e2b900's registration
@@ -52,8 +73,7 @@ bool HeapEligible(bool compute, std::uint32_t dimension, bool sampled, bool dept
     // whole display down); without them 0 hangs in two 7-minute runs (2026-10-15). Cause not found
     // yet. The materializer decides at each draw, so a shader prepared with the heap path is safe
     // either way.
-    static const bool graphics = [] { const char* text = std::getenv("APS5_GRAPHICS_HEAPS"); return text != nullptr && text[0] == '1'; }();
-    return Enabled() && (compute || graphics) && kind && sampled && !depthCompare && !r128;
+    return Enabled() && (compute || graphicsStageHeaps(stage)) && kind && sampled && !depthCompare && !r128;
 }
 
 std::uint32_t RegionBase(std::uint64_t heapBase, std::uint32_t entryOffset, std::uint32_t entries) {
