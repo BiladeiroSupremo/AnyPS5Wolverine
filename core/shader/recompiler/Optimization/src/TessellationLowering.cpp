@@ -622,12 +622,45 @@ private:
         return address && address->dynamic && address->relative == static_cast<std::int64_t>(tessellation.inputControlPoints) * localStride;
     }
 
+    // The bits of `user`'s result that can carry bits `bits` of its operand `value`, for the
+    // operations that keep or narrow them (a hull reads its patch and control point ids out of one
+    // VGPR, relative patch index in bits 0-7: a field above them does not depend on it).
+    static std::uint32_t taintedBits(IrValue* user, IrValue* value, std::uint32_t bits) {
+        const auto immediate = [](IrValue* raw, std::uint32_t& out) {
+            const IrValue* resolved = raw->Resolve();
+            if (!resolved->HasImmediate() || resolved->Type() != IrType::U32) return false;
+            out = resolved->ImmediateU32();
+            return true;
+        };
+        std::uint32_t first = 0, second = 0;
+        switch (user->Opcode()) {
+        case IrOpcode::BitFieldUExtract:
+            if (user->Argument(0)->Resolve() != value || !immediate(user->Argument(1), first) || !immediate(user->Argument(2), second) || first >= 32u) return ~0u;
+            return (bits >> first) & (second >= 32u ? ~0u : (1u << second) - 1u);
+        case IrOpcode::ShiftRightLogical32:
+            if (user->Argument(0)->Resolve() != value || !immediate(user->Argument(1), first) || first >= 32u) return ~0u;
+            return bits >> first;
+        case IrOpcode::BitwiseAnd32:
+            if (immediate(user->Argument(0), first) || immediate(user->Argument(1), first)) return bits & first;
+            return bits;
+        case IrOpcode::BitwiseOr32:
+        case IrOpcode::Identity:
+        case IrOpcode::Phi:
+        case IrOpcode::SelectU32:
+            return bits;
+        default:
+            return ~0u;
+        }
+    }
+
     void requireRelativeIndependence(const std::vector<IrValue*>& bases) {
         std::vector<IrValue*> pending(bases.begin(), bases.end());
-        std::unordered_set<IrValue*> visited(bases.begin(), bases.end());
+        std::unordered_map<IrValue*, std::uint32_t> taint;
+        for (IrValue* base : bases) taint[base] = 0xffu;
         while (!pending.empty()) {
             IrValue* value = pending.back();
             pending.pop_back();
+            const auto bits = taint[value];
             for (IrValue* user : value->Uses()) {
                 switch (user->Opcode()) {
                 case IrOpcode::Identity:
@@ -641,11 +674,38 @@ private:
                 case IrOpcode::BitFieldUExtract:
                 case IrOpcode::SelectU32:
                 case IrOpcode::Phi:
-                    if (visited.insert(user).second) pending.push_back(user);
+                case IrOpcode::CompositeConstructU32x2:
+                case IrOpcode::CompositeConstructU32x3:
+                case IrOpcode::CompositeConstructU32x4:
+                case IrOpcode::CompositeExtractU32x2:
+                case IrOpcode::CompositeExtractU32x3:
+                case IrOpcode::CompositeExtractU32x4: {
+                    // A Select's condition is not data: the whole result depends on it.
+                    const bool condition = user->Opcode() == IrOpcode::SelectU32 && user->Argument(0)->Resolve() == value;
+                    const auto out = condition ? ~0u : taintedBits(user, value, bits);
+                    if (out == 0u) continue;
+                    auto& merged = taint[user];
+                    if ((merged | out) != merged || merged == 0u) {
+                        merged |= out;
+                        pending.push_back(user);
+                    }
                     continue;
+                }
                 default:
                     break;
                 }
+                // Stored as ring data (PPSA03671's hull 0x11d0141300 saves its packed patch/control
+                // point VGPR): the relative index lowers to 0 in every tessellation stage, so the
+                // stage reading it back sees the same value. As an address it must still lower.
+                if (user->Opcode() == IrOpcode::SetTessellationAttribute && user->Argument(2)->Resolve() == value && user->Argument(1)->Resolve() != value) continue;
+                // Conditions and data outside memory addresses: each TCS invocation group runs one
+                // patch, the relative index is 0 there, which is what the replacement below gives
+                // them (0x11d0141300 compares a VGPR that held the packed ids in lanes outside the
+                // predicate that reads it). Addresses must still lower. APS5_TESS_STRICT_RELATIVE=1
+                // rejects every use outside an address again.
+                static const bool strict = std::getenv("APS5_TESS_STRICT_RELATIVE") != nullptr;
+                const bool memory = SharedAccessOf(user->Opcode()) != SharedAccess::None || BufferAccessOf(user->Opcode()) != BufferAccess::None || user->Opcode() == IrOpcode::GetTessellationAttribute || user->Opcode() == IrOpcode::SetTessellationAttribute;
+                if (!strict && !memory) continue;
                 if (dynamicInputAddress(user, value)) continue;
                 const auto address = evaluator.Evaluate(value, nullptr);
                 if (!address || address->relative != 0) {
