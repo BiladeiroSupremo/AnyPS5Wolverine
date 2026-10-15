@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: Pull request numbers to build together, separated by spaces or commas (up to 8)
+        description: Pull request numbers to build together, separated by spaces or commas (up to 40)
         required: true
         type: string
       linux:
@@ -127,8 +127,8 @@ jobs:
                   throw new Error('Only collaborators with write access can start or rerun builds');
                 }
               }
-              if (!/^[1-9][0-9]*([ ,]+[1-9][0-9]*){0,7}$/.test(process.env.PR_NUMBER.trim())) {
-                throw new Error('Enter up to 8 positive pull request numbers separated by spaces or commas');
+              if (!/^[1-9][0-9]*([ ,]+[1-9][0-9]*){0,39}$/.test(process.env.PR_NUMBER.trim())) {
+                throw new Error('Enter up to 40 positive pull request numbers separated by spaces or commas');
               }
             }
             const numbers = manual
