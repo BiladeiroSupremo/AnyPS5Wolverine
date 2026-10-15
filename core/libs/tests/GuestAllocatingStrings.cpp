@@ -23,7 +23,9 @@ void Require(bool value) {
     if (!value) std::abort();
 }
 
-void* APS5_VABI Allocate(std::size_t size) { return std::malloc(size); }
+bool failAllocation = false;
+
+void* APS5_VABI Allocate(std::size_t size) { return failAllocation ? nullptr : std::malloc(size); }
 void APS5_VABI Free(void* ptr) { std::free(ptr); }
 void* APS5_VABI Reallocate(void* ptr, std::size_t size) { return std::realloc(ptr, size); }
 void* APS5_VABI Calloc(std::size_t count, std::size_t size) { return std::calloc(count, size); }
@@ -123,6 +125,14 @@ int main() {
     Require(allocated != nullptr);
     Require(std::strcmp(allocated, "value=42 ok") == 0);
     free_nid_postfix(allocated);
+
+    failAllocation = true;
+    allocated = nullptr;
+    *__error_nid_postfix() = 0;
+    Require(asprintf_nid_postfix(&allocated, "value=%d", 1) == -1);
+    Require(*__error_nid_postfix() == 12);
+    Require(allocated == nullptr);
+    failAllocation = false;
 
     return 0;
 }
