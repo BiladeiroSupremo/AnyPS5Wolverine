@@ -222,7 +222,7 @@ jobs:
           read -ra numbers <<< "$PR_NUMBER"
           read -ra heads <<< "$PR_HEAD"
           refspecs=()
-          for number in "${numbers[@]}"; do refspecs+=("refs/pull/$number/head:refs/remotes/pull/$number"); done
+          for number in "${numbers[@]}"; do refspecs+=("+refs/pull/$number/head:refs/remotes/pull/$number"); done
           git fetch --no-tags --unshallow origin "${refspecs[@]}"
           for i in "${!numbers[@]}"; do
             if [ "$(git rev-parse "refs/remotes/pull/${numbers[i]}")" != "${heads[i]}" ]; then echo "::error::Pull request #${numbers[i]} has newer commits; start a new build"; exit 1; fi
@@ -304,7 +304,7 @@ jobs:
           read -ra numbers <<< "$PR_NUMBER"
           read -ra heads <<< "$PR_HEAD"
           refspecs=()
-          for number in "${numbers[@]}"; do refspecs+=("refs/pull/$number/head:refs/remotes/pull/$number"); done
+          for number in "${numbers[@]}"; do refspecs+=("+refs/pull/$number/head:refs/remotes/pull/$number"); done
           fetch_options=()
           if [ "$(git rev-parse --is-shallow-repository)" = true ]; then fetch_options+=(--unshallow); fi
           git fetch --no-tags "${fetch_options[@]}" origin "${refspecs[@]}"
@@ -370,7 +370,7 @@ jobs:
           read -ra numbers <<< "$PR_NUMBER"
           read -ra heads <<< "$PR_HEAD"
           refspecs=()
-          for number in "${numbers[@]}"; do refspecs+=("refs/pull/$number/head:refs/remotes/pull/$number"); done
+          for number in "${numbers[@]}"; do refspecs+=("+refs/pull/$number/head:refs/remotes/pull/$number"); done
           git fetch --no-tags --unshallow origin "${refspecs[@]}"
           for i in "${!numbers[@]}"; do
             if [ "$(git rev-parse "refs/remotes/pull/${numbers[i]}")" != "${heads[i]}" ]; then echo "::error::Pull request #${numbers[i]} has newer commits; start a new build"; exit 1; fi
