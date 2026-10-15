@@ -65,8 +65,23 @@ BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) 
         Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), "vkAllocateDescriptorSets bindless heaps");
 
         const auto bytes = static_cast<std::size_t>(Heaps::TranslationEntries) * sizeof(std::uint32_t);
-        translation = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        feedback = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        // Device-local and host-visible (resizable BAR) where the device has such memory: graphics
+        // stages write feedback per pixel, and in host memory those writes crossed the bus slowly
+        // enough for a draw to exceed the GPU timeout (PPSA03671's terrain draws, 2026-10-15).
+        // APS5_HEAP_HOST_BUFFERS=1 keeps them in host memory.
+        static const bool hostBuffers = std::getenv("APS5_HEAP_HOST_BUFFERS") != nullptr;
+        const auto makeBuffer = [&](VkBufferUsageFlags usage) {
+            if (!hostBuffers) {
+                try {
+                    return std::make_unique<Buffer>(context, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[bindless] no device-local host-visible memory for the heap buffers (%s); host memory\n", error.what());
+                }
+            }
+            return std::make_unique<Buffer>(context, bytes, usage);
+        };
+        translation = makeBuffer(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        feedback = makeBuffer(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         std::fill(Translation().begin(), Translation().end(), Heaps::Pending);
         std::fill(Feedback().begin(), Feedback().end(), 0u);
         const std::array<VkDescriptorBufferInfo, 2> infos{{{translation->Handle(), 0, VK_WHOLE_SIZE}, {feedback->Handle(), 0, VK_WHOLE_SIZE}}};
@@ -388,11 +403,16 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
         std::fprintf(stderr, "[bindless] probe: last out-of-table key 0x%x\n", feedback[Heaps::TranslationEntries - 1u]);
     }
     std::vector<std::pair<std::uint32_t, std::uint32_t>> published;
+    // The feedback words are read in one copy per region: in device-local host-visible memory a
+    // word-by-word scan costs a bus round trip per word.
+    thread_local std::vector<std::uint32_t> requested;
     for (const auto& region : regions) {
         const auto count = std::min(region.entries, region.capacity);
+        requested.resize(count);
+        if (count != 0) std::memcpy(requested.data(), feedback.data() + region.base, count * sizeof(std::uint32_t));
         for (std::uint32_t key = 0; key < count && published.size() < ScanBudget; key++) {
             const auto index = region.base + key;
-            if (feedback[index] == 0u) continue;
+            if (requested[key] == 0u) continue;
             feedback[index] = 0u;
             if (!table->Claim(index)) continue;
             std::uint32_t word = Heaps::Unusable;

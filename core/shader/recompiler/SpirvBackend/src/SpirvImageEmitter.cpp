@@ -1694,21 +1694,35 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     const auto word = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, u32, word, wordPointer);
     const auto request = Binary(state, spv::OpLogicalAnd, boolean, inTable, Binary(state, spv::OpIEqual, boolean, word, ConstantU32(state, BindlessHeaps::Pending)));
+    // The request is written once: an invocation that finds the word already set (another one
+    // asked first, the driver has not consumed it yet) writes nothing. Pixel shaders otherwise
+    // wrote it from every pixel of every frame until the entry was published.
     EmitIfCondition(state, request, [&]() {
         const auto feedback = state.module.AllocateId();
         state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), feedback, BindlessHeapBuffer(state, true), ConstantU32(state, 0), entry);
-        state.module.AddFunction(spv::OpStore, feedback, ConstantU32(state, 1u));
+        const auto asked = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, asked, feedback);
+        EmitIfCondition(state, Binary(state, spv::OpIEqual, boolean, asked, ConstantU32(state, 0u)), [&]() {
+            state.module.AddFunction(spv::OpStore, feedback, ConstantU32(state, 1u));
+        });
     });
-    // Diagnostic word: the last key that fell outside its table, in the feedback buffer's last
-    // word (the driver reports it, BindlessHeapTable).
-    EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, inTable), [&]() {
-        const auto outside = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), outside, BindlessHeapBuffer(state, true), ConstantU32(state, 0), ConstantU32(state, BindlessHeaps::TranslationEntries - 1u));
-        state.module.AddFunction(spv::OpStore, outside, key);
-    });
+    // Diagnostic (APS5_HEAP_OUTSIDE_PROBE=1): the last key that fell outside its table, in the
+    // feedback buffer's last word (the driver reports it, BindlessHeapTable). Every such invocation
+    // writes the same word, so it stays off by default.
+    static const bool outsideProbe = std::getenv("APS5_HEAP_OUTSIDE_PROBE") != nullptr;
+    if (outsideProbe) {
+        EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, inTable), [&]() {
+            const auto outside = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), outside, BindlessHeapBuffer(state, true), ConstantU32(state, 0), ConstantU32(state, BindlessHeaps::TranslationEntries - 1u));
+            state.module.AddFunction(spv::OpStore, outside, key);
+        });
+    }
     const auto kind = Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::KindShift));
     const auto mapped = Binary(state, spv::OpLogicalAnd, boolean, inTable, Binary(state, spv::OpIEqual, boolean, kind, ConstantU32(state, BindlessHeapKind(image))));
-    const auto slot = Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, BindlessHeaps::IndexMask)), ConstantU32(state, 0u));
+    // Experiment: APS5_HEAP_PLACEHOLDER_ONLY=1 samples the placeholder (slot 0) in graphics stages
+    // while the rest of the heap path (translation, feedback, publishing) runs as usual.
+    static const bool placeholderOnly = std::getenv("APS5_HEAP_PLACEHOLDER_ONLY") != nullptr;
+    const auto slot = placeholderOnly && StageOf(state) != IrShaderStage::Compute ? ConstantU32(state, 0u) : Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, BindlessHeaps::IndexMask)), ConstantU32(state, 0u));
     std::uint32_t heapValue = 0u;
     // Graphics stages sample the heap with a subgroup-uniform slot, one distinct slot per pass of
     // a loop of our own: each pass takes the first active invocation's slot (which that invocation
