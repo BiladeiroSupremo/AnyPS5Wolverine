@@ -1725,7 +1725,15 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
         });
     }
     const auto kind = Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::KindShift));
-    const auto mapped = Binary(state, spv::OpLogicalAnd, boolean, inTable, Binary(state, spv::OpIEqual, boolean, kind, ConstantU32(state, BindlessHeapKind(image))));
+    // 2D and 2D array entries share their slots (BindlessHeapTable::Publish binds each in both), so
+    // either kind serves both: the hardware samples a 2D T# with an array instruction and the
+    // reverse. APS5_HEAP_SPLIT_FLAT_KINDS=1 (driver and recompiler) keeps them apart.
+    static const bool splitFlatKinds = std::getenv("APS5_HEAP_SPLIT_FLAT_KINDS") != nullptr;
+    const auto expectedKind = BindlessHeapKind(image);
+    const bool flatKind = !splitFlatKinds && (expectedKind == BindlessHeaps::ImageBinding2D || expectedKind == BindlessHeaps::ImageBinding2DArray);
+    static_assert(BindlessHeaps::ImageBinding2D == 0u && BindlessHeaps::ImageBinding2DArray == 1u, "the flat kinds are the first two");
+    const auto kindMatches = flatKind ? Binary(state, spv::OpULessThan, boolean, kind, ConstantU32(state, 2u)) : Binary(state, spv::OpIEqual, boolean, kind, ConstantU32(state, expectedKind));
+    const auto mapped = Binary(state, spv::OpLogicalAnd, boolean, inTable, kindMatches);
     // Experiment: APS5_HEAP_PLACEHOLDER_ONLY=1 samples the placeholder (slot 0) in graphics stages
     // while the rest of the heap path (translation, feedback, publishing) runs as usual.
     static const bool placeholderOnly = std::getenv("APS5_HEAP_PLACEHOLDER_ONLY") != nullptr;

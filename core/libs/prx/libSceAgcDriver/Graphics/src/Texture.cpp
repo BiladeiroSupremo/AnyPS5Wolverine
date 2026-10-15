@@ -389,10 +389,16 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             }
             context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
             std::unique_ptr<Buffer> dump;
+            std::vector<VkDeviceSize> dumpOffsets;
             if (dumpWanted) {
-                dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(mips[0].linearSize), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                VkDeviceSize dumpBytes = 0;
+                for (const auto& mip : mips) {
+                    dumpOffsets.push_back(dumpBytes);
+                    dumpBytes += mip.linearSize;
+                }
+                dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(dumpBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-                CopyBuffer(context, commands, linear->Handle(), mips[0].linearOffset, dump->Handle(), 0, mips[0].linearSize);
+                for (std::size_t level = 0; level < mips.size(); ++level) CopyBuffer(context, commands, linear->Handle(), mips[level].linearOffset, dump->Handle(), dumpOffsets[level], mips[level].linearSize);
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
             }
 
@@ -416,15 +422,20 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 std::lock_guard lock(dumpMutex);
                 auto& count = dumped[descriptor.baseAddress];
                 if (count < 8) {
-                    char name[64];
-                    std::snprintf(name, sizeof(name), "texture_%llx_%d.raw", static_cast<unsigned long long>(descriptor.baseAddress), count++);
-                    if (std::FILE* file = std::fopen(name, "wb")) {
-                        const std::uint32_t header[3] = {mips[0].pitchBytes / static_cast<std::uint32_t>(elementBytes), mips[0].height, static_cast<std::uint32_t>(vkFormat)};
-                        std::fwrite(header, sizeof(header), 1, file);
-                        std::fwrite(dump->Bytes().data(), 1, dump->Bytes().size(), file);
-                        std::fclose(file);
-                        std::fprintf(stderr, "[texture] dumped %s (%ux%u VkFormat %d, tile %d)\n", name, header[0], header[1], static_cast<int>(vkFormat), static_cast<int>(descriptor.tileMode));
+                    // Mip 0 keeps its old name; mip n > 0 goes to texture_<address>_<count>_m<n>.raw.
+                    for (std::size_t level = 0; level < mips.size(); ++level) {
+                        char name[80];
+                        if (level == 0) std::snprintf(name, sizeof(name), "texture_%llx_%d.raw", static_cast<unsigned long long>(descriptor.baseAddress), count);
+                        else std::snprintf(name, sizeof(name), "texture_%llx_%d_m%zu.raw", static_cast<unsigned long long>(descriptor.baseAddress), count, level);
+                        if (std::FILE* file = std::fopen(name, "wb")) {
+                            const std::uint32_t header[3] = {mips[level].pitchBytes / static_cast<std::uint32_t>(elementBytes), mips[level].height, static_cast<std::uint32_t>(vkFormat)};
+                            std::fwrite(header, sizeof(header), 1, file);
+                            std::fwrite(dump->Bytes().data() + dumpOffsets[level], 1, static_cast<std::size_t>(mips[level].linearSize), file);
+                            std::fclose(file);
+                            std::fprintf(stderr, "[texture] dumped %s (%ux%u VkFormat %d, tile %d, tiled offset 0x%llx)\n", name, header[0], header[1], static_cast<int>(vkFormat), static_cast<int>(descriptor.tileMode), static_cast<unsigned long long>(mips[level].tiledOffset));
+                        }
                     }
+                    ++count;
                 }
             }
         }
@@ -447,6 +458,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView");
         viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
+        recordMainView(viewInfo);
         createFirstLayerView(descriptor, viewInfo);
         prepareBaseLevelView(descriptor, viewInfo);
         if (profile) {
@@ -528,6 +540,10 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth copy");
+        // Unset, the range read as a 1D view (type 0) and the bindless heap published the 2D view
+        // in its 1D binding.
+        viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
+        recordMainView(viewInfo);
         createFirstLayerView(descriptor, viewInfo);
         static_cast<void>(components);
         depthCopyTextures.fetch_add(1, std::memory_order_relaxed);
@@ -649,6 +665,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView storage view");
         viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
+        recordMainView(viewInfo);
         createFirstLayerView(descriptor, viewInfo);
         prepareBaseLevelView(descriptor, viewInfo);
         if (profile) {
@@ -674,6 +691,7 @@ Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthForma
     viewInfo.subresourceRange = {aspect, 0, 1, 0, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : VK_REMAINING_ARRAY_LAYERS};
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
+    recordMainView(viewInfo);
     if (viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.subresourceRange.layerCount = 1;
@@ -703,6 +721,27 @@ void Texture::prepareBaseLevelView(const GuestTextureResource& descriptor, VkIma
     baseLevelInfo = viewInfo;
 }
 
+void Texture::recordMainView(VkImageViewCreateInfo viewInfo) {
+    viewInfo.pNext = nullptr;
+    mainViewInfo = viewInfo;
+}
+
+VkImageView Texture::CompanionView(VkImageViewType type) const {
+    if (viewRange.type == type) return view;
+    const auto flat = [](VkImageViewType candidate) { return candidate == VK_IMAGE_VIEW_TYPE_2D || candidate == VK_IMAGE_VIEW_TYPE_2D_ARRAY; };
+    if (!mainViewInfo.has_value() || !flat(type) || !flat(viewRange.type)) return VK_NULL_HANDLE;
+    if (type == VK_IMAGE_VIEW_TYPE_2D && firstLayerView && firstLayerRange.type == VK_IMAGE_VIEW_TYPE_2D) return firstLayerView;
+    std::lock_guard lock(companionMutex);
+    auto& companion = type == VK_IMAGE_VIEW_TYPE_2D ? companion2D : companion2DArray;
+    if (!companion) {
+        auto info = *mainViewInfo;
+        info.viewType = type;
+        info.subresourceRange.layerCount = 1;
+        if (context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &companion) != VK_SUCCESS) companion = VK_NULL_HANDLE;
+    }
+    return companion;
+}
+
 VkImageView Texture::BaseLevelView() const {
     Require(baseLevelInfo.has_value(), "a base-level view needs a mipmapped 1D, 2D or 2D array texture");
     std::lock_guard lock(baseLevelMutex);
@@ -718,6 +757,10 @@ void Texture::release() noexcept {
     firstLayerView = VK_NULL_HANDLE;
     if (baseLevelView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, baseLevelView, nullptr);
     baseLevelView = VK_NULL_HANDLE;
+    if (companion2D) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, companion2D, nullptr);
+    companion2D = VK_NULL_HANDLE;
+    if (companion2DArray) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, companion2DArray, nullptr);
+    companion2DArray = VK_NULL_HANDLE;
     // The image and its memory go with the last holder: this texture, or the batch still uploading it.
     owned.reset();
     image = VK_NULL_HANDLE;

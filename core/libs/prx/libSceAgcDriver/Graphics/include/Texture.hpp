@@ -87,6 +87,11 @@ public:
         std::uint32_t layers;
     };
     ViewRange SampledViewRange(bool firstLayer) const { return firstLayer ? firstLayerRange : viewRange; }
+    // A view of the same image as `type`, 2D or 2D array: the main view when it already is one,
+    // otherwise (made once) its first layer as a 2D view, or a 2D image as a one-layer array. The
+    // bindless heap binds both, as the hardware samples a 2D T# with an array instruction and an
+    // array T# with a 2D one. Null when the main view is neither.
+    VkImageView CompanionView(VkImageViewType type) const;
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
@@ -112,6 +117,7 @@ private:
     void release() noexcept;
     void createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
     void prepareBaseLevelView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
+    void recordMainView(VkImageViewCreateInfo viewInfo);
 
     // Held by value: cached textures outlive the Context of the draw that created them.
     Context context;
@@ -125,6 +131,11 @@ private:
     ViewRange firstLayerRange{};
     std::optional<VkImageViewCreateInfo> baseLevelInfo;
     mutable std::mutex baseLevelMutex;
+    // The main view's create info (no pNext chain), for CompanionView.
+    std::optional<VkImageViewCreateInfo> mainViewInfo;
+    mutable std::mutex companionMutex;
+    mutable VkImageView companion2D = VK_NULL_HANDLE;
+    mutable VkImageView companion2DArray = VK_NULL_HANDLE;
     mutable VkImageView baseLevelView = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkDeviceSize allocationBytes = 0;

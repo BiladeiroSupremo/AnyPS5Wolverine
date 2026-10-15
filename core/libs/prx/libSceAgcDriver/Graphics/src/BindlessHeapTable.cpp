@@ -212,38 +212,75 @@ std::span<std::uint32_t> BindlessHeapTable::Feedback() {
     return {reinterpret_cast<std::uint32_t*>(bytes.data()), Heaps::TranslationEntries};
 }
 
+namespace {
+
+// 2D and 2D array entries share one slot range, each slot holding the texture in both bindings:
+// the hardware samples a 2D T# with an array instruction (layer 0) and an array T# with a 2D one,
+// and a shader expecting the other kind otherwise read the placeholder (PPSA03671's menu windows
+// glowed magenta). APS5_HEAP_SPLIT_FLAT_KINDS=1 restores separate ranges.
+bool sharedFlatKinds() {
+    static const bool shared = std::getenv("APS5_HEAP_SPLIT_FLAT_KINDS") == nullptr;
+    return shared;
+}
+
+std::uint32_t slotPool(std::uint32_t kind) {
+    return sharedFlatKinds() && kind == Heaps::ImageBinding2DArray ? Heaps::ImageBinding2D : kind;
+}
+
+}
+
 std::uint32_t BindlessHeapTable::Publish(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout imageLayout) {
     if (kind >= Heaps::KindCount) return Heaps::Unusable;
+    const auto pool = slotPool(kind);
     std::uint32_t slot = 0;
     {
         std::lock_guard lock(*freeMutex);
-        auto& free = (*freeSlots)[kind];
+        auto& free = (*freeSlots)[pool];
         if (!free.empty()) {
             slot = free.back();
             free.pop_back();
         }
     }
     if (slot == 0) {
-        if (nextSlot[kind] >= Heaps::SlotsPerKind) return Heaps::Unusable;
-        slot = nextSlot[kind]++;
+        if (nextSlot[pool] >= Heaps::SlotsPerKind) return Heaps::Unusable;
+        slot = nextSlot[pool]++;
     }
-    const VkDescriptorImageInfo info{VK_NULL_HANDLE, view, imageLayout};
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = set;
-    write.dstBinding = kind;
-    write.dstArrayElement = slot;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    write.pImageInfo = &info;
-    context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &write, 0, nullptr);
-    auto& textures = slotTextures[kind];
+    const bool flat = sharedFlatKinds() && (kind == Heaps::ImageBinding2D || kind == Heaps::ImageBinding2DArray);
+    std::array<VkDescriptorImageInfo, 2> infos{};
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    std::uint32_t count = 0;
+    const auto add = [&](std::uint32_t binding, VkImageView bound, VkImageLayout boundLayout) {
+        infos[count] = {VK_NULL_HANDLE, bound, boundLayout};
+        auto& write = writes[count];
+        write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = set;
+        write.dstBinding = binding;
+        write.dstArrayElement = slot;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        write.pImageInfo = &infos[count];
+        count++;
+    };
+    if (flat) {
+        // The other binding gets the matching view of the same image, or the placeholder (a slot
+        // reused from a texture that had one must not keep its view).
+        const auto other = kind == Heaps::ImageBinding2D ? Heaps::ImageBinding2DArray : Heaps::ImageBinding2D;
+        auto companion = texture->CompanionView(other == Heaps::ImageBinding2D ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+        add(kind, view, imageLayout);
+        if (companion) add(other, companion, imageLayout);
+        else add(other, placeholders[other].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    } else {
+        add(kind, view, imageLayout);
+    }
+    context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, count, writes.data(), 0, nullptr);
+    auto& textures = slotTextures[pool];
     if (textures.size() <= slot) textures.resize(slot + 1u);
     textures[slot] = texture;
     return (kind << Heaps::KindShift) | slot;
 }
 
 void BindlessHeapTable::Retire(std::uint32_t word, Recorder& recorder) {
-    const auto kind = word >> Heaps::KindShift;
+    const auto kind = slotPool(word >> Heaps::KindShift);
     const auto slot = word & Heaps::IndexMask;
     if (kind >= Heaps::KindCount || slot == 0 || slot >= slotTextures[kind].size()) return;
     // Holds the texture until the batch completes, then returns the slot.
