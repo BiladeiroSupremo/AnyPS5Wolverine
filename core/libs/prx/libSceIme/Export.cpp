@@ -15,7 +15,6 @@
 namespace {
 
 constexpr int ErrorBusy = static_cast<int>(0x80bc0001u);
-constexpr int ErrorAlreadyOpened = static_cast<int>(0x80bc0001u);
 constexpr int ErrorNotOpened = static_cast<int>(0x80bc0002u);
 constexpr int ErrorConnectionFailed = static_cast<int>(0x80bc0004u);
 constexpr int ErrorInvalidText = static_cast<int>(0x80bc0006u);
@@ -370,7 +369,7 @@ int APS5_VABI sceImeKeyboardGetResourceId(int32_t user_id, KeyboardResourceIdArr
 int APS5_VABI sceImeKeyboardOpen(int32_t user_id, const KeyboardParam* param) {
  if (!param) APS5_INVALID_ARG_EX;
  std::lock_guard lock(g_keyboardMutex);
- if (!g_openKeyboards.insert(user_id).second) return ErrorAlreadyOpened;
+ if (!g_openKeyboards.insert(user_id).second) return ErrorBusy;
  return 0;
 }
 
