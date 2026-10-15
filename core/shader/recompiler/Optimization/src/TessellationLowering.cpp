@@ -86,20 +86,39 @@ IrValue* HostLaneWord(IrValue* raw, std::uint32_t word) {
     return value;
 }
 
-IrValue* SavedLaneBit(IrValue* value) {
-    if (value->Opcode() != IrOpcode::INotEqual32) return nullptr;
+// The ballot sources whose AND a mask word is: an AND tree of ballot words (Ballot(true), the active
+// lanes, adds no term).
+bool BallotTerms(IrValue* raw, std::uint32_t word, std::vector<IrValue*>& terms) {
+    IrValue* value = raw->Resolve();
+    if (value->Opcode() == IrOpcode::BitwiseAnd32) return BallotTerms(value->Argument(0), word, terms) && BallotTerms(value->Argument(1), word, terms);
+    IrValue* source = BallotSource(value, word);
+    if (source == nullptr) return false;
+    if (!IsTrue(source)) terms.push_back(source);
+    return true;
+}
+
+// The invocation's own bit of a saved exec mask, `(mask >> (lane & 31)) & 1 != 0` with the mask a
+// ballot word (or the AND of several, PPSA03671's hull shaders nest saveexec scopes): the AND of
+// the ballot sources at this lane.
+std::optional<std::vector<IrValue*>> SavedLaneBitTerms(IrValue* value) {
+    if (value->Opcode() != IrOpcode::INotEqual32) return std::nullopt;
     IrValue* masked = VariableOperand(value, 0u);
-    if (masked == nullptr || masked->Opcode() != IrOpcode::BitwiseAnd32) return nullptr;
+    if (masked == nullptr || masked->Opcode() != IrOpcode::BitwiseAnd32) return std::nullopt;
     IrValue* shifted = VariableOperand(masked, 1u);
-    if (shifted == nullptr || shifted->Opcode() != IrOpcode::ShiftRightLogical32) return nullptr;
+    if (shifted == nullptr || shifted->Opcode() != IrOpcode::ShiftRightLogical32) return std::nullopt;
     IrValue* bit = shifted->Argument(1)->Resolve();
-    if (bit->Opcode() != IrOpcode::BitwiseAnd32 || !IsLaneId(VariableOperand(bit, 31u))) return nullptr;
+    if (bit->Opcode() != IrOpcode::BitwiseAnd32 || !IsLaneId(VariableOperand(bit, 31u))) return std::nullopt;
     IrValue* word = shifted->Argument(0)->Resolve();
-    if (word->Opcode() != IrOpcode::SelectU32) return BallotSource(HostLaneWord(word, 0u), 0u);
-    IrValue* low = word->Argument(0)->Resolve();
-    if (low->Opcode() != IrOpcode::ULessThan32 || !IsLaneId(low->Argument(0)) || !IsImmediate(low->Argument(1), 32u)) return nullptr;
-    IrValue* source = BallotSource(HostLaneWord(word->Argument(1), 0u), 0u);
-    return source != nullptr && BallotSource(HostLaneWord(word->Argument(2), 1u), 1u) == source ? source : nullptr;
+    std::vector<IrValue*> low;
+    if (word->Opcode() != IrOpcode::SelectU32) {
+        if (!BallotTerms(word, 0u, low)) return std::nullopt;
+        return low;
+    }
+    IrValue* half = word->Argument(0)->Resolve();
+    if (half->Opcode() != IrOpcode::ULessThan32 || !IsLaneId(half->Argument(0)) || !IsImmediate(half->Argument(1), 32u)) return std::nullopt;
+    std::vector<IrValue*> high;
+    if (!BallotTerms(word->Argument(1), 0u, low) || !BallotTerms(word->Argument(2), 1u, high) || low != high) return std::nullopt;
+    return low;
 }
 
 bool Implies(IrValue* rawPredicate, IrValue* rawCondition) {
@@ -420,10 +439,23 @@ public:
         : program(program), tessellation(tessellation), stage(program.Resources().stage), evaluator(stage == IrShaderStage::TessellationControl ? tessellation.outputControlPoints : 0u, stage == IrShaderStage::Local ? LocalVertexIndexCount : static_cast<std::int64_t>(tessellation.patchesPerGroup)) {}
 
     void Run() {
+        // Collected first: a lane bit of several ballots inserts their LogicalAnd before it.
+        std::vector<std::pair<IrValue*, std::vector<IrValue*>>> laneBits;
         for (IrBlock* block : program.BlockOrder()) {
             for (IrValue* inst : block->Instructions()) {
-                if (IrValue* source = SavedLaneBit(inst)) inst->ReplaceAllUsesWith(source);
+                if (auto terms = SavedLaneBitTerms(inst); terms && !terms->empty()) laneBits.emplace_back(inst, std::move(*terms));
             }
+        }
+        for (auto& [inst, terms] : laneBits) {
+            IrValue* source = terms.front();
+            for (std::size_t index = 1; index < terms.size(); ++index) {
+                IrValue& both = program.CreateValue(IrOpcode::LogicalAnd, IrType::Bool);
+                both.AddArgument(source);
+                both.AddArgument(terms[index]);
+                inst->Parent()->InsertInstructionBefore(inst, &both);
+                source = &both;
+            }
+            inst->ReplaceAllUsesWith(source);
         }
         collect();
         derive();
@@ -616,7 +648,10 @@ private:
                 }
                 if (dynamicInputAddress(user, value)) continue;
                 const auto address = evaluator.Evaluate(value, nullptr);
-                if (!address || address->relative != 0) Fail("the relative patch or vertex index is used outside a tessellation ring or LDS address", 0u);
+                if (!address || address->relative != 0) {
+                    const std::string reason = std::string("the relative patch or vertex index is used outside a tessellation ring or LDS address (by ") + std::string(IrOpcodeName(user->Opcode())) + ")";
+                    Fail(reason.c_str(), 0u);
+                }
             }
         }
     }
