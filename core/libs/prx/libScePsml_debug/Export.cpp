@@ -70,9 +70,13 @@ void RequireBlocks(const MfsrBlock* blocks, std::uint64_t blockCount, const char
  }
 }
 
-void* CreateMfsrObject(MfsrObjectKind kind, void* sharedResources) {
- auto* object = new MfsrObject{kind, sharedResources};
+void* CreateMfsrObject(MfsrObjectKind kind, void* sharedResources, const char* function) {
  std::lock_guard lock(g_mfsrMutex);
+ if (kind == MfsrObjectKind::Context) {
+  const auto found = g_mfsrObjects.find(sharedResources);
+  RequireMfsr(found != g_mfsrObjects.end() && found->second->kind == MfsrObjectKind::SharedResources, function, "shared resources handle was not created by this library");
+ }
+ auto* object = new MfsrObject{kind, sharedResources};
  g_mfsrObjects.emplace(object, object);
  return object;
 }
@@ -134,7 +138,7 @@ std::int32_t APS5_VABI scePsmlMfsrCreateSharedResources(void** sharedResources, 
  RequireMfsr(sharedResources != nullptr && param != nullptr, __func__, "null handle or parameter");
  RequireMfsr(param->type == 0, __func__, ("shared resources type " + std::to_string(param->type) + " is not supported").c_str());
  RequireBlocks(param->blocks, param->blockCount, __func__);
- *sharedResources = CreateMfsrObject(MfsrObjectKind::SharedResources, nullptr);
+ *sharedResources = CreateMfsrObject(MfsrObjectKind::SharedResources, nullptr, __func__);
  return 0;
 }
 
@@ -155,12 +159,7 @@ std::int32_t APS5_VABI scePsmlMfsrCreateContext800M3_2(void** context, const Mfs
  if (!g_mfsrInitialized) return SCE_PSML_ERROR_NOT_INITIALIZED;
  RequireMfsr(context != nullptr && param != nullptr, __func__, "null handle or parameter");
  RequireBlocks(param->blocks, param->blockCount, __func__);
- {
-  std::lock_guard lock(g_mfsrMutex);
-  const auto found = g_mfsrObjects.find(param->sharedResources);
-  RequireMfsr(found != g_mfsrObjects.end() && found->second->kind == MfsrObjectKind::SharedResources, __func__, "shared resources handle was not created by this library");
- }
- *context = CreateMfsrObject(MfsrObjectKind::Context, param->sharedResources);
+ *context = CreateMfsrObject(MfsrObjectKind::Context, param->sharedResources, __func__);
  return 0;
 }
 
