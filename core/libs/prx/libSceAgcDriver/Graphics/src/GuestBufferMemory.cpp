@@ -2474,8 +2474,6 @@ void GuestBufferMemory::dissolveSpace(bool resolve) {
     std::vector<Region> merged;
     merged.reserve(space->base.size() + regions.size());
     if (prepared) {
-        // Both sorted and disjoint (UploadPrepare merged this build's regions; the space's are
-        // registered ranges), so the merge keeps the order Descriptor searches.
         std::merge(space->base.begin(), space->base.end(), std::make_move_iterator(regions.begin()), std::make_move_iterator(regions.end()), std::back_inserter(merged), [](const Region& left, const Region& right) { return left.begin < right.begin; });
         std::uint64_t reached = 0;
         for (const auto& region : merged) {
@@ -3579,16 +3577,73 @@ std::uint64_t GuestBufferMemory::servedEnd(const Region& region) {
     return region.bufferEnd != 0 ? region.bufferEnd : region.end;
 }
 
+namespace {
+
+using AddressRange = ShaderRecompiler::BdaAbi::Range;
+
+void AppendFrom(const AddressRange& range, std::uint64_t begin, std::uint64_t end, std::vector<AddressRange>& result) {
+    if (begin >= end) return;
+    auto part = range;
+    part.begin = begin;
+    part.end = end;
+    part.deviceAddress += begin - range.begin;
+    result.push_back(part);
+}
+
+void AppendDisjoint(const std::vector<AddressRange>& ranges, std::vector<AddressRange>& result) {
+    std::uint64_t reached = 0;
+    for (const auto& range : ranges) {
+        AppendFrom(range, std::max(range.begin, reached), range.end, result);
+        reached = std::max(reached, range.end);
+    }
+}
+
+void AppendUncovered(const std::vector<AddressRange>& ranges, const std::vector<AddressRange>& covering, std::vector<AddressRange>& result) {
+    for (const auto& range : ranges) {
+        auto cursor = range.begin;
+        auto cover = std::partition_point(covering.begin(), covering.end(), [&](const AddressRange& candidate) { return candidate.end <= range.begin; });
+        for (; cover != covering.end() && cover->begin < range.end && cursor < range.end; ++cover) {
+            AppendFrom(range, cursor, std::min(cover->begin, range.end), result);
+            cursor = std::max(cursor, cover->end);
+        }
+        AppendFrom(range, cursor, range.end, result);
+    }
+}
+
+std::vector<AddressRange> MergeByBegin(const std::vector<AddressRange>& left, const std::vector<AddressRange>& right) {
+    std::vector<AddressRange> merged;
+    merged.reserve(left.size() + right.size());
+    std::merge(left.begin(), left.end(), right.begin(), right.end(), std::back_inserter(merged), [](const AddressRange& first, const AddressRange& second) { return first.begin < second.begin; });
+    return merged;
+}
+
+}
+
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() const {
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
-    result.reserve(regions.size() + (space != nullptr ? space->ranges.size() : 0));
-    for (const auto& region : regions) result.push_back(addressRange(region));
     if (space != nullptr) {
-        std::vector<ShaderRecompiler::BdaAbi::Range> combined;
-        combined.reserve(result.size() + space->ranges.size());
-        std::merge(space->ranges.begin(), space->ranges.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
-        result = std::move(combined);
+        std::vector<ShaderRecompiler::BdaAbi::Range> own;
+        own.reserve(regions.size());
+        for (const auto& region : regions) own.push_back(addressRange(region));
+        std::vector<ShaderRecompiler::BdaAbi::Range> uncovered;
+        uncovered.reserve(own.size());
+        AppendUncovered(own, space->ranges, uncovered);
+        result = MergeByBegin(space->ranges, uncovered);
+    } else if (regionsOverlap) {
+        std::vector<ShaderRecompiler::BdaAbi::Range> live;
+        std::vector<ShaderRecompiler::BdaAbi::Range> copies;
+        for (const auto& region : regions) (region.direct != nullptr || region.mirror != nullptr ? live : copies).push_back(addressRange(region));
+        std::vector<ShaderRecompiler::BdaAbi::Range> liveParts;
+        AppendDisjoint(live, liveParts);
+        std::vector<ShaderRecompiler::BdaAbi::Range> copyParts;
+        AppendDisjoint(copies, copyParts);
+        std::vector<ShaderRecompiler::BdaAbi::Range> uncovered;
+        AppendUncovered(copyParts, liveParts, uncovered);
+        result = MergeByBegin(liveParts, uncovered);
+    } else {
+        result.reserve(regions.size());
+        for (const auto& region : regions) result.push_back(addressRange(region));
     }
     if (writes.empty()) return result;
     auto sortedWrites = writes;
