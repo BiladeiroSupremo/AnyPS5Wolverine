@@ -1709,14 +1709,75 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     const auto kind = Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::KindShift));
     const auto mapped = Binary(state, spv::OpLogicalAnd, boolean, inTable, Binary(state, spv::OpIEqual, boolean, kind, ConstantU32(state, BindlessHeapKind(image))));
     const auto slot = Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, BindlessHeaps::IndexMask)), ConstantU32(state, 0u));
-    state.module.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
-    state.bindlessHeapSlot = slot;
-    state.bindlessHeapMapped = mapped;
-    EmitImage(ctx, inst);
-    state.bindlessHeapSlot = 0u;
-    state.bindlessHeapMapped = 0u;
-    const auto heapValue = returnsValue ? ctx.Def(&inst) : 0u;
-    ctx.definitions.erase(&inst);
+    std::uint32_t heapValue = 0u;
+    // Graphics stages sample the heap with a subgroup-uniform slot, one distinct slot per pass of
+    // a loop of our own: each pass takes the first active invocation's slot (which that invocation
+    // matches, so the loop ends), and the image load needs no NonUniform decoration. With a
+    // per-invocation slot the GPU hung in PPSA03671's pixel shaders (2026-10-15; compute was fine).
+    // APS5_HEAP_NONUNIFORM=1 restores the decorated per-invocation index.
+    static const bool nonUniform = std::getenv("APS5_HEAP_NONUNIFORM") != nullptr;
+    if (StageOf(state) != IrShaderStage::Compute && !nonUniform) {
+        state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+        state.module.EmitCapability(spv::CapabilityGroupNonUniformBallot);
+        const auto resultType = returnsValue ? TypeId(state, inst.Type()) : 0u;
+        std::uint32_t undefined = 0u;
+        if (returnsValue) {
+            undefined = state.module.AllocateId();
+            state.module.AddFunction(spv::OpUndef, resultType, undefined);
+        }
+        const auto entryLabel = state.currentLabel;
+        const auto header = state.module.AllocateId();
+        const auto body = state.module.AllocateId();
+        const auto sample = state.module.AllocateId();
+        const auto joined = state.module.AllocateId();
+        const auto continued = state.module.AllocateId();
+        const auto exit = state.module.AllocateId();
+        const auto done = state.module.AllocateId();
+        const auto carried = state.module.AllocateId();
+        const auto doneNext = state.module.AllocateId();
+        const auto carriedNext = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, header);
+        state.module.AddFunction(spv::OpPhi, boolean, done, ConstantBool(state, false), entryLabel, doneNext, continued);
+        if (returnsValue) state.module.AddFunction(spv::OpPhi, resultType, carried, undefined, entryLabel, carriedNext, continued);
+        state.module.AddFunction(spv::OpLoopMerge, exit, continued, spv::LoopControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, done, exit, body);
+        EmitLabel(state, body);
+        const auto first = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformBroadcastFirst, u32, first, ConstantU32(state, spv::ScopeSubgroup), slot);
+        const auto matches = Binary(state, spv::OpIEqual, boolean, slot, first);
+        state.module.AddFunction(spv::OpSelectionMerge, joined, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, matches, sample, joined);
+        EmitLabel(state, sample);
+        state.bindlessHeapSlot = first;
+        state.bindlessHeapMapped = mapped;
+        state.bindlessHeapUniformSlot = true;
+        EmitImage(ctx, inst);
+        state.bindlessHeapUniformSlot = false;
+        state.bindlessHeapSlot = 0u;
+        state.bindlessHeapMapped = 0u;
+        const auto sampled = returnsValue ? ctx.Def(&inst) : 0u;
+        ctx.definitions.erase(&inst);
+        const auto sampleEnd = state.currentLabel;
+        state.module.AddFunction(spv::OpBranch, joined);
+        EmitLabel(state, joined);
+        state.module.AddFunction(spv::OpPhi, boolean, doneNext, ConstantBool(state, true), sampleEnd, done, body);
+        if (returnsValue) state.module.AddFunction(spv::OpPhi, resultType, carriedNext, sampled, sampleEnd, carried, body);
+        state.module.AddFunction(spv::OpBranch, continued);
+        EmitLabel(state, continued);
+        state.module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, exit);
+        heapValue = returnsValue ? carried : 0u;
+    } else {
+        state.module.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
+        state.bindlessHeapSlot = slot;
+        state.bindlessHeapMapped = mapped;
+        EmitImage(ctx, inst);
+        state.bindlessHeapSlot = 0u;
+        state.bindlessHeapMapped = 0u;
+        heapValue = returnsValue ? ctx.Def(&inst) : 0u;
+        ctx.definitions.erase(&inst);
+    }
     const auto heapEnd = state.currentLabel;
     state.module.AddFunction(spv::OpBranch, merge);
 

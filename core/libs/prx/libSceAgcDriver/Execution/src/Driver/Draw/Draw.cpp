@@ -4,7 +4,12 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -96,6 +101,23 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<DrawProgram> programs = decode->programs;
     // Debug aid: draws of APS5_TRACE_DRAW_PROGRAMS print their resources ([draw-io]) and skip recipes.
     const bool tracedPrograms = std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return Graphics::TraceDrawProgram(program.binary.codeAddress); });
+    if (tracedPrograms) {
+        // Each distinct program combination of a traced draw once: every stage's code address.
+        static std::mutex seenMutex;
+        static std::set<std::vector<std::uint64_t>> seen;
+        std::vector<std::uint64_t> addresses;
+        for (const auto& program : programs) addresses.push_back(program.binary.codeAddress);
+        std::lock_guard seenLock(seenMutex);
+        if (seen.insert(addresses).second && seen.size() <= 64) {
+            std::string text;
+            for (const auto& program : programs) {
+                char item[64];
+                std::snprintf(item, sizeof(item), " stage %u 0x%llx", static_cast<unsigned>(program.binary.stage), static_cast<unsigned long long>(program.binary.codeAddress));
+                text += item;
+            }
+            std::fprintf(stderr, "[draw-programs]%s\n", text.c_str());
+        }
+    }
     struct TracedDrawMark {
         bool on;
         const std::string& rejected;

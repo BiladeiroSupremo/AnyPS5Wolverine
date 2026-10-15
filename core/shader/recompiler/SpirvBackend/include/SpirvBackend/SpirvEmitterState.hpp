@@ -164,6 +164,9 @@ struct SpirvEmitterState {
     // from, and the selection TableSlot returns for the root instead of searching its mapping.
     std::uint32_t bindlessHeapSlot = 0;
     std::uint32_t bindlessHeapMapped = 0;
+    // The slot is subgroup-uniform (the heap branch's own loop over distinct slots): its image
+    // load carries no NonUniform decoration.
+    bool bindlessHeapUniformSlot = false;
     // While EmitImage emits either branch of a table root, so the branches do not branch again.
     bool bindlessHeapBranch = false;
     std::uint32_t mainFunc = 0;

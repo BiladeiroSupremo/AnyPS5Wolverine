@@ -212,10 +212,10 @@ std::uint32_t LoadBindlessHeapImage(SpirvEmitterState& state, const ImageResourc
     }
     const auto pointer = state.module.AllocateId();
     state.module.AddFunction(spv::OpAccessChain, state.module.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, imageType), pointer, variable, slot);
-    state.module.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+    if (!state.bindlessHeapUniformSlot) state.module.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
     const auto loaded = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, imageType, loaded, pointer);
-    state.module.AddAnnotation(spv::OpDecorate, loaded, spv::DecorationNonUniform);
+    if (!state.bindlessHeapUniformSlot) state.module.AddAnnotation(spv::OpDecorate, loaded, spv::DecorationNonUniform);
     return loaded;
 }
 
@@ -290,7 +290,7 @@ std::uint32_t MakeSampledImage(SpirvEmitterState& state, std::uint32_t resource,
     const auto sampledType = state.module.Type(spv::OpTypeSampledImage, ImageType(state, imageResource));
     state.module.AddFunction(spv::OpSampledImage, sampledType, sampledImage, image, samplerId);
     DecorateTableNonUniform(state, slotId, sampledImage);
-    if (state.bindlessHeapSlot != 0u && state.program.Info().images.at(resource).indirectRoot == resource) state.module.AddAnnotation(spv::OpDecorate, sampledImage, spv::DecorationNonUniform);
+    if (state.bindlessHeapSlot != 0u && !state.bindlessHeapUniformSlot && state.program.Info().images.at(resource).indirectRoot == resource) state.module.AddAnnotation(spv::OpDecorate, sampledImage, spv::DecorationNonUniform);
     return sampledImage;
 }
 

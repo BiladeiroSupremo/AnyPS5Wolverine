@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -231,6 +232,12 @@ void BindlessHeapTable::Retire(std::uint32_t word, Recorder& recorder) {
         std::uint32_t kind = 0;
         std::uint32_t slot = 0;
         ~Retired() {
+            // A retired slot is not written again unless APS5_HEAP_REUSE_SLOTS=1: work recorded by
+            // another thread may still read the old translation word after this batch completes,
+            // and rewriting a descriptor the GPU is reading is undefined (suspected in PPSA03671's
+            // GPU hangs, 2026-10-15). The texture is released either way.
+            static const bool reuse = std::getenv("APS5_HEAP_REUSE_SLOTS") != nullptr;
+            if (!reuse) return;
             std::lock_guard lock(*mutex);
             (*free)[kind].push_back(slot);
         }
