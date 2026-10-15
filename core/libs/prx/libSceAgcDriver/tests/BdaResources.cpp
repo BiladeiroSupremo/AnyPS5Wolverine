@@ -654,6 +654,51 @@ void spaceReadsAcrossImportsMergedTests(const Context& context, const BdaTestAcc
     ::operator delete(block, std::align_val_t{window});
 }
 
+void spaceWriteMergedPastImportTests(const Context& context, const BdaTestAccess& access) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = 2 * piece;
+    constexpr std::size_t pieces = 5;
+    void* block = ::operator new(pieces * piece, std::align_val_t{window});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const auto second = first + window;
+    const auto outside = first + 2 * window;
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(window);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, range == guest + 3 * piece, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    for (std::size_t index = 0; index + 1 < pieces; ++index) change(guest + index * piece, true);
+    const std::uint64_t written = outside + 512;
+    for (int build = 0; build < 2; ++build) {
+        std::memset(guest, 0x21, pieces * piece);
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddReadable(second - 256, window + 512);
+        leased.AddReadable(outside + 128, 640);
+        leased.AddWritable(written, 256);
+        leased.Upload(true);
+        std::uint32_t adjustment = 0;
+        const auto view = leased.Descriptor(written, 256, adjustment);
+        Require(view.buffer != VK_NULL_HANDLE && view.range == 256 + adjustment, "a written V# merged with a read-only V# past an import has no descriptor");
+        auto mapped = access.bytes(view.buffer);
+        const auto at = static_cast<std::size_t>(view.offset + adjustment);
+        Require(at + 256 <= mapped.size() && mapped[at] == std::byte{0x21} && mapped[at + 255] == std::byte{0x21}, "a written V# merged with a read-only V# past an import maps other bytes than its own");
+        std::memset(mapped.data() + at, 0x7c, 256);
+        Require(leased.HasCopiedWrites(), "a written V# merged with a read-only V# past an import is not stored back");
+        leased.WriteBack();
+        const auto offset = static_cast<std::size_t>(written - first);
+        Require(guest[offset] == 0x7c && guest[offset + 255] == 0x7c && guest[offset - 1] == 0x21 && guest[offset + 256] == 0x21, "a write through a V# merged with a read-only V# past an import did not land on its own bytes");
+    }
+    for (std::size_t index = 0; index + 1 < pieces; ++index) change(guest + index * piece, false);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{window});
+}
+
 void spaceReadOverWritableImportTableTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     constexpr std::size_t window = 2 * piece;
@@ -1704,6 +1749,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     spaceReadAcrossImportsTests(context, access);
     spaceReadAcrossImportsWrittenTests(context);
     spaceReadsAcrossImportsMergedTests(context, access);
+    spaceWriteMergedPastImportTests(context, access);
     spaceReadOverWritableImportTableTests(context);
     importJoinTests(context);
     importWholeRangeOverWindowTests(context);
