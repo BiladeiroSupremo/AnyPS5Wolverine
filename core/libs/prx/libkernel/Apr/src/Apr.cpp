@@ -407,10 +407,12 @@ TCommand _read(const Apr::CommandBufferObject& buffer, std::uint32_t cursor) {
 }
 
 // The AMM virtual address range the title manages itself (sceKernelAmmGetVirtualAddressRanges):
-// APS5_AMM_RANGE_GB (default 32) for the main range, then 32 GiB for multimaps. KytyPS5 hands
-// PPSA03671 512 GiB (and no multimap range).
+// APS5_AMM_RANGE_GB (default 256) for the main range, then 32 GiB for multimaps. KytyPS5 hands
+// PPSA03671 512 GiB (and no multimap range). At 32 GiB the title's texture VA allocation failed
+// and it streamed mips to base-0 destinations (crashed 7 of 7 runs at its slot-4 title); at 256
+// none did in 3 runs (2026-10-14/15).
 std::uint64_t AmmMainBytes() {
-    static const std::uint64_t bytes = [] { const char* text = std::getenv("APS5_AMM_RANGE_GB"); return (text != nullptr ? std::strtoull(text, nullptr, 10) : 32ull) << 30; }();
+    static const std::uint64_t bytes = [] { const char* text = std::getenv("APS5_AMM_RANGE_GB"); return (text != nullptr ? std::strtoull(text, nullptr, 10) : 256ull) << 30; }();
     return bytes;
 }
 constexpr std::uint64_t AmmMultimapBytes = 32ull << 30;
