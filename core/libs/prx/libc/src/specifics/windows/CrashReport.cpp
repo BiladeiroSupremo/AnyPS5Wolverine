@@ -96,11 +96,13 @@ void ProtectWatchPage(DWORD protection) {
     VirtualProtect(reinterpret_cast<void*>(g_watchPage), 0x1000, protection, &old);
 }
 
-// Debug aid: APS5_HW_WATCH=<absolute hex address> reports writes to those 8 bytes with a hardware
-// data breakpoint (DR0) armed in every thread (re-armed each second for new threads); unlike the
-// page watch it does not slow writes to the rest of the page. Each hit prints the writer and the
-// new value; the first hits and any that look like a pair of floats print the stack too.
-std::uintptr_t g_hwWatchAddress = 0;
+// Debug aid: APS5_HW_WATCH=<hex address>[,<hex address>...] (up to four) reports writes to those
+// 8-byte locations with hardware data breakpoints (DR0-DR3) armed in every thread (new threads are
+// armed within a second); unlike the page watch it does not slow writes to the rest of the page.
+// Each hit prints the writer and the new value; the first hits and any that look like a pair of
+// floats print stack return candidates too.
+std::uintptr_t g_hwWatchAddresses[4] = {};
+std::size_t g_hwWatchCount = 0;
 std::atomic<unsigned> g_hwWatchHits{0};
 
 bool FloatLike(std::uint32_t word) {
@@ -110,15 +112,20 @@ bool FloatLike(std::uint32_t word) {
 
 bool HandleHardwareWatch(EXCEPTION_POINTERS* info) {
     auto* context = info->ContextRecord;
-    if (g_hwWatchAddress == 0 || info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || (context->Dr6 & 1u) == 0) return false;
+    if (g_hwWatchCount == 0 || info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || (context->Dr6 & 0xfu) == 0) return false;
+    const auto which = static_cast<std::size_t>(__builtin_ctzll(context->Dr6 & 0xfu));
     context->Dr6 = 0;
     const auto hit = g_hwWatchHits.fetch_add(1, std::memory_order_relaxed);
-    if (hit >= 5000) return true;
-    const auto value = *reinterpret_cast<const unsigned long long*>(g_hwWatchAddress);
+    if (hit >= 20000 || which >= g_hwWatchCount) return true;
+    const auto address = g_hwWatchAddresses[which];
+    const auto value = *reinterpret_cast<const unsigned long long*>(address);
+    const bool floats = FloatLike(static_cast<std::uint32_t>(value)) && FloatLike(static_cast<std::uint32_t>(value >> 32));
+    // Past the first hits only float-looking values are reported (the corruption being hunted).
+    if (hit >= 400 && !floats) return true;
     char line[MAX_PATH + 64];
     DescribeAddress(context->Rip, line, sizeof(line));
-    Report("[hwwatch] #%u thread %lu wrote 0x%016llx, after %s rsp=%llx rdi=%llx rsi=%llx rcx=%llx rdx=%llx r8=%llx\n", hit, GetCurrentThreadId(), value, line, context->Rsp, context->Rdi, context->Rsi, context->Rcx, context->Rdx, context->R8);
-    if (hit >= 40 && !(FloatLike(static_cast<std::uint32_t>(value)) && FloatLike(static_cast<std::uint32_t>(value >> 32)))) return true;
+    Report("[hwwatch] #%u thread %lu wrote 0x%016llx to 0x%llx, after %s rsp=%llx rdi=%llx rsi=%llx rcx=%llx rdx=%llx r8=%llx\n", hit, GetCurrentThreadId(), value, static_cast<unsigned long long>(address), line, context->Rsp, context->Rdi, context->Rsi, context->Rcx, context->Rdx, context->R8);
+    if (hit >= 40 && !floats) return true;
     for (std::uint64_t slot = context->Rsp; slot < context->Rsp + 0x100 && IsReadable(slot); slot += 8) {
         const auto candidate = *reinterpret_cast<const std::uint64_t*>(slot);
         if (!IsExecutable(candidate)) continue;
@@ -130,7 +137,7 @@ bool HandleHardwareWatch(EXCEPTION_POINTERS* info) {
 
 // Each thread is suspended once, when first seen: suspending every thread each second froze
 // PPSA03671's load.
-void ArmHardwareWatch(std::uintptr_t address) {
+void ArmHardwareWatch() {
     static DWORD armed[4096];
     static std::size_t armedCount = 0;
     const auto self = GetCurrentThreadId();
@@ -147,11 +154,14 @@ void ArmHardwareWatch(std::uintptr_t address) {
         if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
             CONTEXT context{};
             context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            // L0, RW0 = write (01), LEN0 = 8 bytes (10).
-            constexpr DWORD64 control = 1ull | (1ull << 16u) | (2ull << 18u);
-            if (GetThreadContext(thread, &context) && (context.Dr0 != address || (context.Dr7 & 0x000f0003ull) != control)) {
-                context.Dr0 = address;
-                context.Dr7 = (context.Dr7 & ~0x000f0003ull) | control;
+            if (GetThreadContext(thread, &context)) {
+                DWORD64* slots[4] = {&context.Dr0, &context.Dr1, &context.Dr2, &context.Dr3};
+                for (std::size_t index = 0; index < g_hwWatchCount; ++index) {
+                    *slots[index] = g_hwWatchAddresses[index];
+                    // Ln, RWn = write (01), LENn = 8 bytes (10).
+                    const auto shift = 16u + 4u * static_cast<unsigned>(index);
+                    context.Dr7 = (context.Dr7 & ~((3ull << (2u * index)) | (0xfull << shift))) | (1ull << (2u * index)) | (1ull << shift) | (2ull << (shift + 2u));
+                }
                 SetThreadContext(thread, &context);
             }
             ResumeThread(thread);
@@ -215,11 +225,17 @@ bool HandleWatch(EXCEPTION_POINTERS* info) {
 
 void InstallWatch() {
     if (const char* hardware = std::getenv("APS5_HW_WATCH")) {
-        g_hwWatchAddress = std::strtoull(hardware, nullptr, 16) & ~static_cast<std::uintptr_t>(7);
-        Report("[hwwatch] watching 0x%llx with DR0 in every thread\n", static_cast<unsigned long long>(g_hwWatchAddress));
+        for (const char* cursor = hardware; *cursor != '\0' && g_hwWatchCount < std::size(g_hwWatchAddresses);) {
+            char* end = nullptr;
+            const auto address = std::strtoull(cursor, &end, 16) & ~static_cast<std::uintptr_t>(7);
+            if (end == cursor) break;
+            g_hwWatchAddresses[g_hwWatchCount++] = address;
+            Report("[hwwatch] watching 0x%llx with DR%zu in every thread\n", static_cast<unsigned long long>(address), g_hwWatchCount - 1);
+            cursor = *end == ',' ? end + 1 : end;
+        }
         CreateThread(nullptr, 0, [](void*) -> DWORD {
             for (;;) {
-                ArmHardwareWatch(g_hwWatchAddress);
+                ArmHardwareWatch();
                 Sleep(1000);
             }
         }, nullptr, 0, nullptr);
