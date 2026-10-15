@@ -247,11 +247,10 @@ void BindlessHeapTable::Retire(std::uint32_t word, Recorder& recorder) {
         std::uint32_t kind = 0;
         std::uint32_t slot = 0;
         ~Retired() {
-            // A retired slot is not written again unless APS5_HEAP_REUSE_SLOTS=1: work recorded by
-            // another thread may still read the old translation word after this batch completes,
-            // and rewriting a descriptor the GPU is reading is undefined (suspected in PPSA03671's
-            // GPU hangs, 2026-10-15). The texture is released either way.
-            static const bool reuse = std::getenv("APS5_HEAP_REUSE_SLOTS") != nullptr;
+            // APS5_HEAP_NO_SLOT_REUSE=1 never writes a retired slot again (an experiment for the GPU
+            // hangs of 2026-10-15, which turned out to be a shader loop; without reuse republished
+            // entries ran the heap out of slots within a minute). The texture is released either way.
+            static const bool reuse = std::getenv("APS5_HEAP_NO_SLOT_REUSE") == nullptr;
             if (!reuse) return;
             std::lock_guard lock(*mutex);
             (*free)[kind].push_back(slot);
