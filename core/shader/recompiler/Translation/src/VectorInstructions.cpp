@@ -94,7 +94,8 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
         break;
     case RdnaOpcode::VMadLegacyF32:
     case RdnaOpcode::VMacLegacyF32:
-        return 3u;
+        // With a native flush the mode is 0 (nativeF32Flush is only set then), which flushes too.
+        return nativeF32Flush ? 0u : 3u;
     default:
         return 0u;
     }
@@ -102,6 +103,8 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     if (denormals == 1u || denormals == 2u) {
         throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " is not implemented");
     }
+    // The module's DenormFlushToZero execution mode makes the host flush exactly where this would.
+    if (nativeF32Flush) return 0u;
     return denormals == 0u ? flush : 0u;
 }
 

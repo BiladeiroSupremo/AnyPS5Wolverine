@@ -34,6 +34,9 @@ struct TranslateOptions {
     std::uint64_t shaderHash = 0;
     bool fragmentShaderBarycentricEnabled = false;
     bool nativeFloat16 = false;
+    // The module runs with DenormFlushToZero for f32 (the host flushes as the guest's FP_DENORM mode
+    // 0 does), so no flush is emulated.
+    bool nativeF32Flush = false;
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;

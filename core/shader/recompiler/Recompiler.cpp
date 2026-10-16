@@ -79,6 +79,21 @@ ShaderStageKind toShaderStageKind(ShaderStage stage) {
     throw std::runtime_error("ShaderRecompiler::Recompile: unsupported shader stage");
 }
 
+// Whether the module flushes f32 denormals natively (DenormFlushToZero) instead of emulating the
+// guest's FP_DENORM mode 0 around every operand and result: ~10 extra instructions per float
+// operation, a large part of the 100-200 SPIR-V words per guest instruction PPSA03671's material
+// shaders compiled to. The host (an AMD RDNA GPU) applies the mode as the guest's GPU does. Only
+// for mode 0 (flush in and out), on a device with f32 DenormFlushToZero. 2026-10-16 slot-4 cabin:
+// 5.3 -> 6.2-6.4 FPS over 20 min, same picture. APS5_NO_NATIVE_F32_DENORMALS=1 emulates as before.
+bool NativeF32Flush(const RecompileRequest& request) {
+    static const bool enabled = std::getenv("APS5_NO_NATIVE_F32_DENORMALS") == nullptr;
+    if (!enabled) return false;
+    const auto& capabilities = request.target.supportedCapabilities;
+    if (std::ranges::find(capabilities, static_cast<std::uint32_t>(spv::CapabilityDenormFlushToZero)) == capabilities.end()) return false;
+    const std::uint32_t denormals = request.context.floatMode.has_value() ? (request.context.floatMode->floatMode >> 4u) & 3u : 0u;
+    return denormals == 0u;
+}
+
 }
 
 namespace {
@@ -180,6 +195,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled;
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
+    translateOptions.nativeF32Flush = NativeF32Flush(request);
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.inputInfo = inputInfo;
 
@@ -474,6 +490,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
+    targetOptions.f32FlushToZero = NativeF32Flush(request);
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;

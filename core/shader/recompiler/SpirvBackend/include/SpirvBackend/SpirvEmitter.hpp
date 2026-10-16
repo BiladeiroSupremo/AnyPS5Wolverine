@@ -24,6 +24,8 @@ struct SpirvTargetOptions {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    // DenormFlushToZero for f32 (the translation emulated no flush; see NativeF32Flush).
+    bool f32FlushToZero = false;
 };
 
 class SpirvEmitter {

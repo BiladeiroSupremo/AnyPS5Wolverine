@@ -18,6 +18,7 @@ public:
     void SetPixelInput(const ShaderPixelInputInfo* info, bool barycentricEnabled) { pixelInput = info; fragmentShaderBarycentricEnabled = barycentricEnabled; }
     void SetFloatMode(const std::optional<ShaderFloatMode>& mode) { floatMode = mode; ieeeMode = mode.has_value() && mode->ieeeMode; }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
+    void SetNativeF32Flush(bool enabled) { nativeF32Flush = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
 
@@ -354,6 +355,7 @@ private:
     std::optional<ShaderFloatMode> floatMode;
     bool ieeeMode = false;
     bool nativeFloat16 = false;
+    bool nativeF32Flush = false;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;
