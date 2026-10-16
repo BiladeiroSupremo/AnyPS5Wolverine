@@ -468,6 +468,20 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         }
         countedBytes = allocationBytes;
         SampledMemoryCounter().fetch_add(countedBytes, std::memory_order_relaxed);
+        if (profile) {
+            // How much of the sampled textures lies in levels below the T#'s minimum LOD (a streamed
+            // texture whose finer levels are not loaded yet): a 2D chain's levels under f hold about
+            // 1 - 4^-f of it.
+            static std::atomic<std::uint64_t> created{0}, total{0}, clamped{0}, unloaded{0};
+            const auto floorLevel = static_cast<std::uint32_t>(EffectiveMinLod(descriptor));
+            total.fetch_add(allocationBytes, std::memory_order_relaxed);
+            if (floorLevel != 0) {
+                clamped.fetch_add(allocationBytes, std::memory_order_relaxed);
+                const double share = 1.0 - std::pow(0.25, static_cast<double>(floorLevel));
+                unloaded.fetch_add(static_cast<std::uint64_t>(static_cast<double>(allocationBytes) * share), std::memory_order_relaxed);
+            }
+            if (created.fetch_add(1, std::memory_order_relaxed) % 500 == 499) std::fprintf(stderr, "[texture] sampled bytes created: %.0f MiB, %.0f MiB of them with a minimum LOD, ~%.0f MiB in the levels below it\n", static_cast<double>(total.load()) / 1048576.0, static_cast<double>(clamped.load()) / 1048576.0, static_cast<double>(unloaded.load()) / 1048576.0);
+        }
     } catch (...) {
         release();
         throw;

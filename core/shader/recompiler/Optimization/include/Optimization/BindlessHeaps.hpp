@@ -36,7 +36,14 @@ inline constexpr std::uint32_t FeedbackBinding = 5u;
 inline constexpr std::uint32_t SlotsPerKind = 16384u;
 inline constexpr std::uint32_t TranslationEntries = 1u << 20u;
 inline constexpr std::uint32_t KindShift = 24u;
-inline constexpr std::uint32_t IndexMask = (1u << KindShift) - 1u;
+inline constexpr std::uint32_t IndexMask = (1u << 16u) - 1u;
+static_assert(SlotsPerKind <= IndexMask + 1u, "a slot index fits the word's index bits");
+// Bits 16-19 of a slot word: levels the slot's texture leaves out at the top of its chain (a
+// streamed texture held from its first loaded level, after KytyPS5's image heap). The shader
+// subtracts them from explicit levels and adds them back to level and size queries; an implicit
+// level follows from the smaller image by itself.
+inline constexpr std::uint32_t LevelShift = 16u;
+inline constexpr std::uint32_t LevelMask = 0xfu;
 inline constexpr std::uint32_t Pending = 0xffffffffu;
 inline constexpr std::uint32_t Unusable = 0xfffffffeu;
 // First word of a table root's mapping block when its table went through the heap.

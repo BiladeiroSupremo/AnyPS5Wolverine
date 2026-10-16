@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -351,13 +353,63 @@ bool readHeapWords(std::uint64_t address, std::array<std::uint32_t, 8>& words) {
     return !(words[0] == 0u && (words[1] & 0xffu) == 0u);
 }
 
+// The levels a heap entry's texture can leave out (after KytyPS5's image heap, 08ee7463): a
+// streamed texture's T# clamps its minimum LOD to the first level the title has loaded, so the
+// levels above it hold nothing the title reads. A plain 2D texture (swizzled, base level 0, last
+// level at the surface's last) stores its chain smallest first, so the T# of the same surface from
+// level f on (width and height >> f, f levels fewer, minimum LOD lowered by f) names the start of
+// the same memory. 2026-10-16 slot-4 cabin: ~87% of the sampled bytes created lay in such levels,
+// nearly all of them heap textures. The shader takes the count from the slot word
+// (BindlessHeaps::LevelShift). APS5_NO_HEAP_LEVEL_DROP=1 keeps every level.
+std::uint32_t droppableLevels(const std::array<std::uint32_t, 8>& words) {
+    static const bool enabled = std::getenv("APS5_NO_HEAP_LEVEL_DROP") == nullptr;
+    if (!enabled) return 0u;
+    const auto minLod = (words[1] >> 8u) & 0xfffu;
+    const auto baseLevel = (words[3] >> 12u) & 0xfu;
+    const auto lastLevel = (words[3] >> 16u) & 0xfu;
+    const auto tileMode = (words[3] >> 20u) & 0x1fu;
+    const auto type = (words[3] >> 28u) & 0xfu;
+    const auto maxMip = (words[5] >> 4u) & 0xfu;
+    constexpr std::uint32_t Type2D = 9u;
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profiled && minLod >= 256u) {
+        // Why a texture with a minimum LOD keeps every level (counted per reason, 10 s lines).
+        static std::atomic<std::uint64_t> reasons[6]{};
+        static std::atomic<long long> lastReport{0};
+        const int reason = type != Type2D ? (type == 13u ? 1 : 2) : tileMode == 0u ? 3 : baseLevel != 0u ? 4 : lastLevel != maxMip ? 5 : 0;
+        reasons[reason].fetch_add(1, std::memory_order_relaxed);
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReport.load(std::memory_order_relaxed);
+        if (now - last >= 10 && lastReport.compare_exchange_strong(last, now)) std::fprintf(stderr, "[bindless] level drop: %llu dropped; kept: 2D array %llu, other type %llu, linear %llu, base level %llu, last level below the surface's %llu\n", static_cast<unsigned long long>(reasons[0].load()), static_cast<unsigned long long>(reasons[1].load()), static_cast<unsigned long long>(reasons[2].load()), static_cast<unsigned long long>(reasons[3].load()), static_cast<unsigned long long>(reasons[4].load()), static_cast<unsigned long long>(reasons[5].load()));
+    }
+    if (type != Type2D || tileMode == 0u || baseLevel != 0u || lastLevel != maxMip || lastLevel == 0u) return 0u;
+    return std::min(minLod >> 8u, std::min(lastLevel, Heaps::LevelMask));
+}
+
+std::array<std::uint32_t, 8> dropLevels(std::array<std::uint32_t, 8> words, std::uint32_t levels) {
+    if (levels == 0u) return words;
+    const auto width = (((words[1] >> 30u) & 0x3u) | ((words[2] & 0xfffu) << 2u)) + 1u;
+    const auto height = ((words[2] >> 14u) & 0x3fffu) + 1u;
+    const auto newWidth = std::max(width >> levels, 1u) - 1u;
+    const auto newHeight = std::max(height >> levels, 1u) - 1u;
+    const auto minLod = ((words[1] >> 8u) & 0xfffu) - (levels << 8u);
+    words[1] = (words[1] & ~(0xfffu << 8u) & ~(0x3u << 30u)) | (minLod << 8u) | ((newWidth & 0x3u) << 30u);
+    words[2] = (words[2] & ~0xfffu & ~(0x3fffu << 14u)) | ((newWidth >> 2u) & 0xfffu) | ((newHeight & 0x3fffu) << 14u);
+    const auto lastLevel = ((words[3] >> 16u) & 0xfu) - levels;
+    words[3] = (words[3] & ~(0xfu << 16u)) | (lastLevel << 16u);
+    const auto maxMip = ((words[5] >> 4u) & 0xfu) - levels;
+    words[5] = (words[5] & ~(0xfu << 4u)) | (maxMip << 4u);
+    return words;
+}
+
 // The translation word of one heap entry: the entry's texture in a slot of the kind its view has,
 // or Unusable (null, unreadable, integer or of a kind the heap set lacks). A usable entry is
 // recorded for revalidation (`existing`: the entry being revalidated, updated in place).
 std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table, Recorder& recorder, std::uint32_t index, std::uint64_t address, BindlessHeapTable::Entry* existing = nullptr) {
     std::array<std::uint32_t, 8> words{};
     if (!readHeapWords(address, words)) return Heaps::Unusable;
-    const auto texture = CachedSampledTexture(context, words);
+    const auto dropped = droppableLevels(words);
+    const auto texture = CachedSampledTexture(context, dropLevels(words, dropped));
     // Revalidation: the same T# served by the same texture needs nothing (the lookup refreshed an
     // image-backed view in place).
     if (existing != nullptr && existing->words == words && existing->texture == texture) return Heaps::Pending;
@@ -374,7 +426,22 @@ std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table,
         if (traceEntries) std::fprintf(stderr, "[bindless] entry 0x%llx: %ux%u guest format %u, view type %d unusable\n", static_cast<unsigned long long>(address), DecodeTextureResource(words).width, DecodeTextureResource(words).height, DecodeTextureResource(words).format, static_cast<int>(range.type));
         return Heaps::Unusable;
     }
-    const auto word = table.Publish(kind, texture, texture->View(), texture->Layout());
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profiled) {
+        // Heap textures with a minimum LOD: their bytes and those of the levels below the clamp
+        // (about 1 - 4^-f of a 2D chain), against the sampled totals of the [texture] line.
+        static std::atomic<std::uint64_t> published{0}, total{0}, clamped{0}, unloaded{0};
+        const auto resource = DecodeTextureResource(words);
+        const auto floorLevel = static_cast<std::uint32_t>(EffectiveMinLod(resource));
+        total.fetch_add(texture->AllocationBytes(), std::memory_order_relaxed);
+        if (floorLevel != 0) {
+            clamped.fetch_add(texture->AllocationBytes(), std::memory_order_relaxed);
+            unloaded.fetch_add(static_cast<std::uint64_t>(static_cast<double>(texture->AllocationBytes()) * (1.0 - std::pow(0.25, static_cast<double>(floorLevel)))), std::memory_order_relaxed);
+        }
+        if (published.fetch_add(1, std::memory_order_relaxed) % 500 == 499) std::fprintf(stderr, "[bindless] heap textures published: %.0f MiB, %.0f MiB with a minimum LOD, ~%.0f MiB below it\n", static_cast<double>(total.load()) / 1048576.0, static_cast<double>(clamped.load()) / 1048576.0, static_cast<double>(unloaded.load()) / 1048576.0);
+    }
+    auto word = table.Publish(kind, texture, texture->View(), texture->Layout());
+    if (word != Heaps::Unusable) word |= dropped << Heaps::LevelShift;
     if (word != Heaps::Unusable) {
         if (existing != nullptr) {
             // The replaced slot (and its texture) is released once the work that may read it ends.

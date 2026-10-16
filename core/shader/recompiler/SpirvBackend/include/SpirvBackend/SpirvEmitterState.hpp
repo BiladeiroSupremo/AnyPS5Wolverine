@@ -165,6 +165,10 @@ struct SpirvEmitterState {
     // from, and the selection TableSlot returns for the root instead of searching its mapping.
     std::uint32_t bindlessHeapSlot = 0;
     std::uint32_t bindlessHeapMapped = 0;
+    // The u32 id of the levels the slot's texture leaves out at the top of its chain
+    // (BindlessHeaps::LevelShift), 0 outside the heap branch: explicit levels and level/size
+    // queries are moved by it.
+    std::uint32_t bindlessHeapLevels = 0;
     // The slot is subgroup-uniform (the heap branch's own loop over distinct slots): its image
     // load carries no NonUniform decoration.
     bool bindlessHeapUniformSlot = false;

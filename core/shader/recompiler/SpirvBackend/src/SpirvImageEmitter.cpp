@@ -239,6 +239,19 @@ std::uint32_t CoordU32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access
     return result;
 }
 
+// A guest level as a level of the bound view: inside the heap branch, the slot's texture may start
+// `bindlessHeapLevels` levels into the guest's chain (its finer levels not loaded), and a guest
+// level above them reads the view's first.
+std::uint32_t HostLevelU32(SpirvEmitterState& state, std::uint32_t level) {
+    if (state.bindlessHeapLevels == 0u) return level;
+    const auto above = Binary(state, spv::OpUGreaterThan, TypeBool(state), level, state.bindlessHeapLevels);
+    return Select(state, TypeU32(state), above, Binary(state, spv::OpISub, TypeU32(state), level, state.bindlessHeapLevels), ConstantU32(state, 0u));
+}
+
+std::uint32_t HostLevelsF32(SpirvEmitterState& state) {
+    return Unary(state, spv::OpConvertUToF, TypeF32(state), state.bindlessHeapLevels);
+}
+
 std::uint32_t LodU32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     if (!access.mem.imageHasMip) {
         return ConstantU32(ctx.state, 0);
@@ -247,7 +260,7 @@ std::uint32_t LodU32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) 
     if (access.mem.imageAddressComponents <= component) {
         ctx.Fail(access.inst, "has an image address without the mip level component");
     }
-    return AddressU32(ctx, access, component);
+    return HostLevelU32(ctx.state, AddressU32(ctx, access, component));
 }
 
 std::uint32_t DrefValueF32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const ImageSampleLayout& layout) {
@@ -424,10 +437,11 @@ std::uint32_t QueryDimensions(SpirvValueEmitContext& ctx, const ImageEmitAccess&
     const auto& info = RdnaImageDimensionInfoFor(dimension);
     const auto image = LoadSampledImageDescriptor(state, access.mem.resource, access.slot);
     const auto size = state.module.AllocateId();
+    const auto guestLevel = info.multisampled != 0u ? 0u : AddressU32(ctx, access, 0);
     if (info.multisampled != 0u) {
         state.module.AddFunction(spv::OpImageQuerySize, ImageViewSizeType(state, dimension), size, image);
     } else {
-        state.module.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, dimension), size, image, AddressU32(ctx, access, 0));
+        state.module.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, dimension), size, image, HostLevelU32(state, guestLevel));
     }
     const auto components = info.coordinateComponents;
     std::uint32_t result[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0)};
@@ -439,12 +453,20 @@ std::uint32_t QueryDimensions(SpirvValueEmitContext& ctx, const ImageEmitAccess&
             state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), result[index], size, index);
         }
     }
+    if (state.bindlessHeapLevels != 0u && info.multisampled == 0u) {
+        // A guest level the texture left out is as large as the view's first shifted up by the
+        // levels between them (the heap trims 2D textures only: width and height).
+        const auto below = Binary(state, spv::OpULessThan, TypeBool(state), guestLevel, state.bindlessHeapLevels);
+        const auto shift = Select(state, TypeU32(state), below, Binary(state, spv::OpISub, TypeU32(state), state.bindlessHeapLevels, guestLevel), ConstantU32(state, 0u));
+        for (std::uint32_t index = 0; index < std::min(components, 2u); index++) result[index] = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), result[index], shift);
+    }
     if (access.mem.imageDimension == RdnaImageDimension::Dim3D && dimension == RdnaImageDimension::Dim2D) {
         result[2] = ConstantU32(state, 1);
     }
     if (info.multisampled == 0u) {
         result[3] = state.module.AllocateId();
         state.module.AddFunction(spv::OpImageQueryLevels, TypeU32(state), result[3], image);
+        if (state.bindlessHeapLevels != 0u) result[3] = Binary(state, spv::OpIAdd, TypeU32(state), result[3], state.bindlessHeapLevels);
     }
     const auto vector = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), vector, result[0], result[1], result[2], result[3]);
@@ -879,8 +901,10 @@ void EmitQueryLodOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     state.module.AddFunction(spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled, coord);
     std::uint32_t values[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0)};
     for (std::uint32_t index = 0; index < 2u; index++) {
-        const auto component = state.module.AllocateId();
+        auto component = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, lod, index);
+        // Levels of the view are guest levels past the ones the heap texture left out.
+        if (state.bindlessHeapLevels != 0u) component = Binary(state, spv::OpFAdd, TypeF32(state), component, HostLevelsF32(state));
         values[index] = F32BitsToU32(ctx, component);
     }
     const auto result = state.module.AllocateId();
@@ -1427,7 +1451,11 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         operands.push_back(CoordF32(ctx, access, setup.layout.gradY, setup.dimensionInfo.spatialComponents, AddressDimension(access).spatialComponents, true));
     } else if (explicitLod) {
         operandMask |= spv::ImageOperandsLodMask;
-        operands.push_back(HasFlag(mem, RdnaImageSampleFlagLod) ? AddressF32(ctx, access, setup.layout.lod) : ZeroF32(state));
+        auto lod = HasFlag(mem, RdnaImageSampleFlagLod) ? AddressF32(ctx, access, setup.layout.lod) : ZeroF32(state);
+        // A heap texture without its finest levels: the guest level as a level of the view (below
+        // zero, the view's own minimum LOD keeps it at the first loaded level, as the T# did).
+        if (state.bindlessHeapLevels != 0u) lod = Binary(state, spv::OpFSub, TypeF32(state), lod, HostLevelsF32(state));
+        operands.push_back(lod);
     } else if (setup.layout.bias != NoImageComponent) {
         operandMask |= spv::ImageOperandsBiasMask;
         operands.push_back(AddressF32(ctx, access, setup.layout.bias));
@@ -1435,7 +1463,8 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     if (setup.layout.clamp != NoImageComponent) {
         const auto& capabilities = state.supportedCapabilities;
         if (std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityMinLod)) == capabilities.end()) ctx.Fail(access.inst, "clamps its LOD, which needs the device's shaderResourceMinLod");
-        const auto clamp = AddressF32(ctx, access, setup.layout.clamp);
+        auto clamp = AddressF32(ctx, access, setup.layout.clamp);
+        if (state.bindlessHeapLevels != 0u) clamp = Binary(state, spv::OpFSub, TypeF32(state), clamp, HostLevelsF32(state));
         if ((operandMask & spv::ImageOperandsLodMask) != 0u) {
             const auto clamped = state.module.AllocateId();
             state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FMax, operands.back(), clamp);
@@ -1738,6 +1767,8 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     // while the rest of the heap path (translation, feedback, publishing) runs as usual.
     static const bool placeholderOnly = std::getenv("APS5_HEAP_PLACEHOLDER_ONLY") != nullptr;
     const auto slot = placeholderOnly && StageOf(state) != IrShaderStage::Compute ? ConstantU32(state, 0u) : Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, BindlessHeaps::IndexMask)), ConstantU32(state, 0u));
+    // The levels the slot's texture leaves out at the top of its chain (0 for the placeholder).
+    const auto levels = Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::LevelShift)), ConstantU32(state, BindlessHeaps::LevelMask)), ConstantU32(state, 0u));
     std::uint32_t heapValue = 0u;
     // Graphics stages sample the heap with a subgroup-uniform slot, one distinct slot per pass of
     // a loop of our own: each pass takes the first active invocation's slot (which that invocation
@@ -1780,11 +1811,13 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
         EmitLabel(state, sample);
         state.bindlessHeapSlot = first;
         state.bindlessHeapMapped = mapped;
+        state.bindlessHeapLevels = levels;
         state.bindlessHeapUniformSlot = true;
         EmitImage(ctx, inst);
         state.bindlessHeapUniformSlot = false;
         state.bindlessHeapSlot = 0u;
         state.bindlessHeapMapped = 0u;
+        state.bindlessHeapLevels = 0u;
         const auto sampled = returnsValue ? ctx.Def(&inst) : 0u;
         ctx.definitions.erase(&inst);
         const auto sampleEnd = state.currentLabel;
@@ -1801,9 +1834,11 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
         state.module.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
         state.bindlessHeapSlot = slot;
         state.bindlessHeapMapped = mapped;
+        state.bindlessHeapLevels = levels;
         EmitImage(ctx, inst);
         state.bindlessHeapSlot = 0u;
         state.bindlessHeapMapped = 0u;
+        state.bindlessHeapLevels = 0u;
         heapValue = returnsValue ? ctx.Def(&inst) : 0u;
         ctx.definitions.erase(&inst);
     }
