@@ -242,7 +242,7 @@ if(BUILD_TESTING)
         add_dependencies(guest_dynamic_loader_fixed_base_tests guest_module_fixture)
         set_target_properties(guest_dynamic_loader_fixed_base_tests PROPERTIES ENABLE_EXPORTS ON POSITION_INDEPENDENT_CODE OFF)
         target_compile_options(guest_dynamic_loader_fixed_base_tests PRIVATE -fno-pie)
-        target_link_options(guest_dynamic_loader_fixed_base_tests PRIVATE -no-pie)
+        target_link_options(guest_dynamic_loader_fixed_base_tests PRIVATE -no-pie -fuse-ld=bfd)
         add_test(NAME guest_dynamic_loader_fixed_base COMMAND guest_dynamic_loader_fixed_base_tests $<TARGET_FILE_NAME:guest_module_fixture>)
         set_tests_properties(guest_dynamic_loader_fixed_base PROPERTIES
             WORKING_DIRECTORY "$<TARGET_FILE_DIR:guest_module_fixture>")
