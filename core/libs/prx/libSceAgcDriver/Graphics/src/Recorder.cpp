@@ -28,6 +28,9 @@
 #include <map>
 #include <mutex>
 #include <string>
+#ifdef _WIN32
+extern "C" char __ImageBase;
+#endif
 #include <thread>
 #include <tuple>
 
@@ -1369,6 +1372,7 @@ std::uint64_t Recorder::ReapsWithWork() {
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
+    if (open->renderPass.open) CountPassCloser(__builtin_return_address(0));
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1387,13 +1391,19 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        if (!pass.open) CountPassStart(PassStart::NotOpen);
+        else if (!forced) CountPassStart(PassStart::Segment);
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         return {commands, false, true};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
-    if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (hazard == PassHazard::None && pass.key == key) {
+        CountPassStart(PassStart::Continued);
+        return {open->commands, true, false};
+    }
+    CountPassStart(pass.key == key ? PassStart::Hazard : PassStart::OtherKey);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(!merge);
@@ -1401,6 +1411,10 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
     return {commands, false, !elide};
+}
+
+bool Recorder::RenderPassOpen() const {
+    return open != nullptr && open->renderPass.open;
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
@@ -1763,6 +1777,14 @@ constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dis
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};
 std::atomic<std::uint64_t> classMerged[CommandClasses]{};
+constexpr std::size_t PassStartReasons = static_cast<std::size_t>(Recorder::PassStart::Count);
+constexpr const char* PassStartNames[PassStartReasons] = {"continued", "not-open", "forced-capture", "forced-reads-target", "forced-gpu-indirect", "forced-mesh-indirect", "segment", "hazard", "other-key"};
+std::atomic<std::uint64_t> passStarts[PassStartReasons]{};
+// Who ends an open draw pass through Commands() (the [passes] line's closers: return addresses
+// relative to this module, for addr2line/nm).
+std::mutex passCloserMutex;
+std::map<const void*, std::uint64_t> passClosers;
+
 // The hazard tracker's counts (APS5_BARRIER_VALIDATE=1): simulated barriers by class and by
 // hazard kind, leading barriers it would have skipped by class, batch-end barriers, and the
 // APS5_TRACE_BARRIERS budget left.
@@ -1809,6 +1831,33 @@ void reportBarriers() {
         mergedLine += text;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
+    std::string passLine;
+    for (std::size_t i = 0; i < PassStartReasons; ++i) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " %s %llu", PassStartNames[i], static_cast<unsigned long long>(passStarts[i].exchange(0, std::memory_order_relaxed)));
+        passLine += text;
+    }
+    {
+        std::vector<std::pair<std::uint64_t, const void*>> closers;
+        {
+            std::lock_guard lock(passCloserMutex);
+            for (const auto& [caller, count] : passClosers) closers.emplace_back(count, caller);
+            passClosers.clear();
+        }
+        std::sort(closers.rbegin(), closers.rend());
+#ifdef _WIN32
+        const auto base = reinterpret_cast<std::uintptr_t>(&__ImageBase);
+#else
+        const std::uintptr_t base = 0;
+#endif
+        passLine += "; closed by (module offset x count):";
+        for (std::size_t i = 0; i < closers.size() && i < 12; ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " +0x%llx x%llu", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(closers[i].second) - base), static_cast<unsigned long long>(closers[i].first));
+            passLine += text;
+        }
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[passes] draws by render pass outcome (10 s):%s", passLine.c_str());
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -1842,6 +1891,17 @@ bool Recorder::GpuTimingEnabled() {
 
 bool Recorder::BatchStampsEnabled() {
     return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured();
+}
+
+void Recorder::CountPassCloser(const void* caller) {
+    if (!DrawOrGpuProfiled()) return;
+    std::lock_guard lock(passCloserMutex);
+    ++passClosers[caller];
+}
+
+void Recorder::CountPassStart(PassStart why) {
+    if (!DrawOrGpuProfiled()) return;
+    passStarts[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {

@@ -1729,6 +1729,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    if (recorder->RenderPassOpen()) {
+        if (capture) Recorder::CountPassStart(Recorder::PassStart::ForcedCapture);
+        else if (readsTarget) Recorder::CountPassStart(Recorder::PassStart::ForcedReadsTarget);
+        else if (meshIndirect) Recorder::CountPassStart(Recorder::PassStart::ForcedMeshIndirect);
+        else if (gpuIndirect) Recorder::CountPassStart(Recorder::PassStart::ForcedGpuIndirect);
+    }
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;

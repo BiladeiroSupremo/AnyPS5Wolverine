@@ -66,6 +66,8 @@ public:
         bool barrier = true;
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    // Whether a draw's render pass is open in the open batch (the [passes] counters).
+    bool RenderPassOpen() const;
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -461,6 +463,13 @@ public:
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
+    // Why a draw's render pass began instead of continuing the open one, on the [passes] line
+    // (APS5_PROFILE_DRAW / APS5_PROFILE_GPU): no pass was open (other work ended it), the draw
+    // forced a new one (CaptureInputs, reads its target, GPU-side indirect, mesh indirect), a
+    // sample segment, a hazard against the open pass, or other attachments.
+    enum class PassStart : std::uint8_t { Continued = 0, NotOpen, ForcedCapture, ForcedReadsTarget, ForcedGpuIndirect, ForcedMeshIndirect, Segment, Hazard, OtherKey, Count };
+    static void CountPassStart(PassStart why);
+    static void CountPassCloser(const void* caller);
     // A leading barrier a command left out because the previous trailing barrier covered its
     // accesses (see Commands), on the [barriers] line as 'merged'. Debug aid: APS5_FULL_BARRIERS=1
     // (or APS5_NO_BARRIER_ELISION=1) records every leading barrier, as before.
