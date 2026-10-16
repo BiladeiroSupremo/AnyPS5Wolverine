@@ -26,6 +26,8 @@ struct SpirvTargetOptions {
     bool float16DenormPreserve = false;
     // DenormFlushToZero for f32 (the translation emulated no flush; see NativeF32Flush).
     bool f32FlushToZero = false;
+    // FPInterpolateF32/F16 (v_interp, v_fma_mix) as a host f32 fma instead of the exact f64 emulation.
+    bool nativeInterpolation = false;
 };
 
 class SpirvEmitter {

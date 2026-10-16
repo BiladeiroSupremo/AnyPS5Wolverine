@@ -498,6 +498,12 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
     targetOptions.f32FlushToZero = NativeF32Flush(request);
+    // v_interp / v_fma_mix results from a host f32 fma (f16 results rounded once more, to nearest
+    // even) instead of the exact f64 emulation (~1,600 f64 operations in the largest modules; f64
+    // runs at a small fraction of the f32 rate on consumer GPUs). Directed f16 rounding modes stay
+    // exact. APS5_NO_NATIVE_INTERPOLATE=1 emulates every one as before.
+    static const bool nativeInterpolation = std::getenv("APS5_NO_NATIVE_INTERPOLATE") == nullptr;
+    targetOptions.nativeInterpolation = nativeInterpolation;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;

@@ -280,6 +280,13 @@ std::uint32_t Interpolate(SpirvEmitterState& state, std::uint32_t delta, std::ui
     delta = FlushDenormal32(state, delta, flush16, 0x38800000u);
     coordinate = FlushDenormal32(state, coordinate, flush32, 0x00800000u);
     base = halfResult ? FlushDenormal32(state, base, flush32, 0x00800000u) : FlushDenormal32(state, base, flush16, 0x38800000u);
+    if (state.nativeInterpolation && (!halfResult || ((mode >> InterpolationRound16Shift) & 3u) == 0u)) {
+        // The host's fused f32 multiply-add (an f16 result quantized once more, to nearest even, f16
+        // denormals to zero) and its NaNs, instead of the exact emulation below.
+        auto result = Glsl(state, TypeF32(state), GLSLstd450Fma, delta, coordinate, base);
+        if (halfResult) result = Unary(state, spv::OpQuantizeToF16, TypeF32(state), result);
+        return halfResult ? FlushDenormal32(state, result, flush16, 0x38800000u) : FlushDenormal32(state, result, flush32, 0x00800000u);
+    }
     const auto product = Exact(state, spv::OpFMul, FromF32Exact(state, delta), FromF32Exact(state, coordinate));
     const auto sum = AddRoundToOdd(state, product, FromF32Exact(state, base));
     const std::uint32_t rounding16 = halfResult ? (mode >> InterpolationRound16Shift) & 3u : 0u;
