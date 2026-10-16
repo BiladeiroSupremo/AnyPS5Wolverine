@@ -470,20 +470,20 @@ jobs:
       - id: submodule-cache
         uses: actions/cache/restore@v6
         with:
-          path: ${{ runner.temp }}/submodules.tar
-          key: submodules-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
       - name: Check out the submodules
         run: |
-          if [ -f "$RUNNER_TEMP/submodules.tar" ]; then tar --force-local -xf "$RUNNER_TEMP/submodules.tar"; fi
+          if [ -f "$RUNNER_TEMP/submodule-gitdirs.tar" ]; then tar --force-local -xf "$RUNNER_TEMP/submodule-gitdirs.tar"; fi
           git submodule update --init --recursive --depth 1 --jobs 8
       - if: steps.submodule-cache.outputs.cache-hit != 'true'
-        run: tar --force-local -cf "$RUNNER_TEMP/submodules.tar" .git/modules 3rdparty
+        run: tar --force-local -cf "$RUNNER_TEMP/submodule-gitdirs.tar" .git/modules
       - if: steps.submodule-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         continue-on-error: true
         with:
-          path: ${{ runner.temp }}/submodules.tar
-          key: submodules-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
       - name: Point the WinLibs CMake at the CA bundle of Git for Windows
         run: |
           for prefix in ucrt64 mingw64; do
