@@ -300,8 +300,6 @@ jobs:
       CCACHE_COMPILERCHECK: content
       MESA_SHADER_CACHE_DIR: /var/cache/anyps5/mesa
       MESA_SHADER_CACHE_MAX_SIZE: 4G
-      CMAKE_BUILD_PARALLEL_LEVEL: 1
-      CTEST_PARALLEL_LEVEL: 1
     steps:
       - uses: actions/checkout@v7
         with:
@@ -335,11 +333,23 @@ jobs:
           ccache --show-config
           dpkg-query -W mesa-vulkan-drivers
           grep -m1 '^model name' /proc/cpuinfo
+      - name: Size parallelism to what the shared host has free
+        run: |
+          cpus=$(nproc)
+          busy=$(awk '{ printf "%d", $1 + 0.5 }' /proc/loadavg)
+          mem_gb=$(awk '/^MemAvailable:/ { print int($2 / 1048576) }' /proc/meminfo)
+          jobs=$(( cpus - busy ))
+          jobs=$(( jobs < mem_gb / 3 ? jobs : mem_gb / 3 ))
+          jobs=$(( jobs > 8 ? 8 : jobs ))
+          jobs=$(( jobs < 1 ? 1 : jobs ))
+          echo "cpus=$cpus load=$busy mem_available_gb=$mem_gb -> build jobs $jobs"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
+          echo "CTEST_PARALLEL_LEVEL=$(( jobs > 4 ? 4 : jobs ))" >> "$GITHUB_ENV"
       - run: cmake -S . -B build $CONFIGURE -DANYPS5_ENABLE_SPIRV_TOOLS=ON
       - name: Check that every test executable is registered with ctest
         run: python3 tools/check_test_registration.py build
-      - run: cmake --build build
-      - run: cmake --build build --target libs
+      - run: cmake --build build -- -l "$(nproc)"
+      - run: cmake --build build --target libs -- -l "$(nproc)"
       - run: ctest --test-dir build --output-on-failure --timeout 120 --output-log ctest.log --output-junit ctest.xml
         env:
           ANYPS5_REQUIRE_VULKAN: 1
