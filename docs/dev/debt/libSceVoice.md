@@ -2,7 +2,7 @@
 
 ### Silent stubs
 
-- [sceVoiceGetPortAttr](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - attribute 1001 writes one zero byte and returns 0 for an existing port; the backend processes no voice audio. PPSA34501 requests size 1 and reads one byte on success, and this fallback avoids its startup exception. The name follows attribute 1001 (`CELLVOICE_ATTR_VAD`) (Voice Activity Detection) in [RPCS3](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellVoice.h), not confirmed for the PS5. The correct result, eligible port types and behaviour are unknown;
+- [sceVoiceGetPortAttr](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - attribute 1001 writes one zero byte and returns 0 for an existing port; the backend processes no voice audio. PPSA34501 requests size 1 and reads one byte on success, and this fallback avoids its startup exception. The name follows attribute 1001 (`CELLVOICE_ATTR_VAD`) (Voice Activity Detection) in [RPCS3](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellVoice.h), not confirmed for the PS5. The correct result, eligible port types and behaviour are unknown.
 
 ### Unknown function info
 
