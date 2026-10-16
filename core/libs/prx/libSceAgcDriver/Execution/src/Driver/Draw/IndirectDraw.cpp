@@ -30,7 +30,14 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     const auto fail = [&](Path reason) { if (!indirectCpu) indirectCpu = reason; };
     constexpr std::uint32_t NoLocation = 0x280u;
     const bool meshPath = graphics.stages.mesh.has_value() && !graphics.stages.tessellation && !graphics.rectList;
-    const bool meshGpuSide = meshPath && drawParameters.indexed && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
+    // Auto (non-indexed) mesh draws go GPU-side too when GE_INDX_OFFSET is 0: the record's count,
+    // instances and first sit in the same words as an indexed one's, and the CPU path draws them
+    // with no index buffer and that offset alone. PPSA03671 issues ~600 such DRAW_INDIRECTs per
+    // second; read on the CPU, each waited for the GPU work that wrote its record (~26 ms of every
+    // frame). APS5_NO_AUTO_MESH_GPU_INDIRECT=1 keeps them on the CPU.
+    static const bool autoMeshGpu = std::getenv("APS5_NO_AUTO_MESH_GPU_INDIRECT") == nullptr;
+    const bool meshCountsKnown = drawParameters.indexed || (autoMeshGpu && indirect.indxOffset == 0);
+    const bool meshGpuSide = meshPath && meshCountsKnown && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
     if ((graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList) && !meshGpuSide) fail(Path::NonVertexPath);
     if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) fail(Path::DrawIndex);
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);
