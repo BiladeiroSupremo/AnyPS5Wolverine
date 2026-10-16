@@ -333,33 +333,6 @@ jobs:
           ccache --show-config
           dpkg-query -W mesa-vulkan-drivers
           grep -m1 '^model name' /proc/cpuinfo
-      - name: Install the wild linker
-        shell: bash
-        env:
-          WILD_VERSION: 0.10.0
-          WILD_SHA256: 641265506a7c06cfb03181b8916ab663ec8407855db6d4db7f8450667d105283
-        run: |
-          tools=/var/cache/anyps5/tools
-          dir=$tools/wild-$WILD_VERSION
-          tmp=
-          probe=$(mktemp -d)
-          trap 'rm -rf "$tmp" "$probe"' EXIT
-          if [ ! -x "$dir/bin/ld" ]; then
-            mkdir -p "$tools"
-            tmp=$(mktemp -d "$tools/.wild.XXXXXX")
-            name=wild-linker-$WILD_VERSION-x86_64-unknown-linux-gnu
-            curl -fsSL --retry 3 -o "$tmp/$name.tar.gz" "https://github.com/davidlattimore/wild/releases/download/$WILD_VERSION/$name.tar.gz"
-            echo "$WILD_SHA256  $tmp/$name.tar.gz" | sha256sum -c -
-            tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
-            mkdir -p "$tmp/out/bin"
-            mv "$tmp/$name/wild" "$tmp/out/bin/wild"
-            ln -s wild "$tmp/out/bin/ld"
-            mv -T "$tmp/out" "$dir" 2>/dev/null || test -x "$dir/bin/ld"
-          fi
-          echo 'int main(void) { return 0; }' > "$probe/main.c"
-          gcc "-B$dir/bin" "$probe/main.c" -o "$probe/main"
-          readelf -p .comment "$probe/main" | grep -F "Linker: Wild $WILD_VERSION"
-          echo "LINKER_FLAGS=-B$dir/bin" >> "$GITHUB_ENV"
       - name: Size parallelism to what the shared host has free
         run: |
           cpus=$(nproc)
@@ -372,7 +345,7 @@ jobs:
           echo "cpus=$cpus load=$busy mem_available_gb=$mem_gb -> build jobs $jobs"
           echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
           echo "CTEST_PARALLEL_LEVEL=$(( jobs > 4 ? 4 : jobs ))" >> "$GITHUB_ENV"
-      - run: cmake -S . -B build $CONFIGURE -DANYPS5_ENABLE_SPIRV_TOOLS=ON "-DCMAKE_EXE_LINKER_FLAGS=$LINKER_FLAGS" "-DCMAKE_SHARED_LINKER_FLAGS=$LINKER_FLAGS" "-DCMAKE_MODULE_LINKER_FLAGS=$LINKER_FLAGS"
+      - run: cmake -S . -B build $CONFIGURE -DANYPS5_ENABLE_SPIRV_TOOLS=ON
       - name: Check that every test executable is registered with ctest
         run: python3 tools/check_test_registration.py build
       - run: cmake --build build -- -l "$(nproc)"
