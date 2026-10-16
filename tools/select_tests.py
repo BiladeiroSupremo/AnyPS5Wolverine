@@ -15,12 +15,12 @@ BATCH = 20000
 
 class Build:
     def __init__(self, path):
-        self.path = os.path.realpath(path)
         cache = {}
-        for line in (Path(self.path) / "CMakeCache.txt").read_text(encoding="utf-8").splitlines():
+        for line in (Path(path) / "CMakeCache.txt").read_text(encoding="utf-8").splitlines():
             name, _, value = line.partition("=")
             cache[name.partition(":")[0]] = value
-        self.source = os.path.realpath(cache["CMAKE_HOME_DIRECTORY"])
+        self.path = os.path.normpath(cache["CMAKE_CACHEFILE_DIR"])
+        self.source = os.path.normpath(cache["CMAKE_HOME_DIRECTORY"])
         self.program = cache.get("CMAKE_MAKE_PROGRAM") or "ninja"
         self.encoding = "utf-8"
         if sys.platform == "win32":

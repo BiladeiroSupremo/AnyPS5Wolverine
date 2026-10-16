@@ -33,7 +33,9 @@ class SelectTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
-        root = Path(cls.directory.name)
+        (Path(cls.directory.name) / "real").mkdir()
+        (Path(cls.directory.name) / "link").symlink_to("real", target_is_directory=True)
+        root = Path(cls.directory.name) / "link"
         cls.source, cls.build, cls.graph = root / "source", root / "build", root / "graph.json"
         for name, content in PROJECT.items():
             (cls.source / name).parent.mkdir(parents=True, exist_ok=True)
