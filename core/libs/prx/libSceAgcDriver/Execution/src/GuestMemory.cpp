@@ -21,6 +21,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -1610,7 +1611,22 @@ void GpuMutexType::acquired() {
     if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+// The graphics queue's worker (tag 0) records the draws the title's render thread waits on, so it
+// has the GpuMutex first when it waits: another thread taking the mutex fresh (not recursively)
+// holds off while it waits, up to a bound, and its try_lock fails. The async compute worker
+// otherwise re-took the mutex ahead of it again and again (2026-10-16 cabin: q0x0 waited ~26 us
+// per draw behind q0x20 dispatches). APS5_NO_GPU_LOCK_PRIORITY=1 restores first come.
+bool GpuLockPriority() {
+    static const bool enabled = std::getenv("APS5_NO_GPU_LOCK_PRIORITY") == nullptr;
+    return enabled;
+}
+std::atomic<std::uint32_t> priorityWaiting{0};
+constexpr auto PriorityDeferLimit = std::chrono::microseconds(300);
+}
+
 bool GpuMutexType::try_lock() {
+    if (GpuLockPriority() && priorityWaiting.load(std::memory_order_acquire) != 0 && LockStats().tag != 0 && !HeldByThisThread()) return false;
     if (!GpuLockProfiled()) {
         if (!mutex.try_lock()) return false;
         acquired();
@@ -1674,6 +1690,21 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    struct PriorityWait {
+        bool counted = false;
+        ~PriorityWait() {
+            if (counted) priorityWaiting.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    } priorityWait;
+    if (GpuLockPriority() && !HeldByThisThread()) {
+        if (LockStats().tag == 0) {
+            priorityWaiting.fetch_add(1, std::memory_order_acq_rel);
+            priorityWait.counted = true;
+        } else if (priorityWaiting.load(std::memory_order_acquire) != 0) {
+            const auto deadline = std::chrono::steady_clock::now() + PriorityDeferLimit;
+            while (priorityWaiting.load(std::memory_order_acquire) != 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        }
+    }
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
