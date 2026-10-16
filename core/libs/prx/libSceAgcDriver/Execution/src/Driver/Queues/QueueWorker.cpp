@@ -9,6 +9,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -22,6 +28,36 @@ const std::chrono::milliseconds IdleResultsQuietPeriod = [] {
     const char* value = std::getenv("APS5_IDLE_RESULTS_MS");
     return std::chrono::milliseconds(value != nullptr ? std::strtoll(value, nullptr, 10) : 1);
 }();
+
+// Debug aid: APS5_TRACE_IDLE=<hex guest address> prints queue 0's idle-path events (completions
+// cleared, idle store begun and done) with a millisecond clock and the guest qword at that address
+// (a title's frame label), to place the idle store against the title's frame.
+void TraceIdle(const char* event) {
+    static const std::uint64_t peek = [] {
+        const char* text = std::getenv("APS5_TRACE_IDLE");
+        return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+    }();
+    if (peek == 0) return;
+    // A repeat of the previous event (the loop going round) is counted, not printed.
+    static const char* previous = nullptr;
+    static std::uint64_t repeats = 0;
+    if (event == previous) {
+        ++repeats;
+        return;
+    }
+    if (repeats != 0) std::fprintf(stderr, "[idle]   (x%llu)\n", static_cast<unsigned long long>(repeats));
+    previous = event;
+    repeats = 0;
+    static const auto start = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    // The guest address is read only once it is committed (it is unmapped early in the boot).
+    std::uint64_t value = 0;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(reinterpret_cast<const void*>(peek), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT && (memory.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) value = *reinterpret_cast<const volatile std::uint64_t*>(peek);
+#endif
+    std::fprintf(stderr, "[idle] %.2f ms %s label 0x%llx\n", ms, event, static_cast<unsigned long long>(value));
+}
 
 }
 
@@ -141,10 +177,14 @@ void Driver::run(std::uint32_t id) noexcept {
 #endif
                 };
 
+                bool polled = false;
                 while (!ready()) {
                     if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
+                        if (id == 0 && polled) TraceIdle("completions clear");
+                        polled = false;
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
                         const bool storeIdleResults = idleResultsPending();
+                        if (id == 0) TraceIdle(storeIdleResults ? "idle store due" : Graphics::StorageTexture::AnyPending() ? (allQueuesIdle() ? "no store: completions" : "no store: queues busy") : "no store: nothing pending");
                         if (storeIdleResults) {
                             queue0Dormant.store(true, std::memory_order_relaxed);
                             const auto quietUntil = std::chrono::steady_clock::now() + IdleResultsQuietPeriod;
@@ -161,7 +201,9 @@ void Driver::run(std::uint32_t id) noexcept {
                         }
                         lock.unlock();
                         if (storeIdleResults) {
+                            TraceIdle("idle store begin");
                             if (const auto localDevice = device.Load()) localDevice->StoreIdleResults();
+                            TraceIdle("idle store submitted");
                         }
                         lock.lock();
                         if (ready()) break;
@@ -169,11 +211,15 @@ void Driver::run(std::uint32_t id) noexcept {
                             && (!storeIdleResults || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
+                        if (id == 0) TraceIdle("dormant");
                         changed.wait(lock, [&] { return ready() || (id == 0 && idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait); });
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
+                        if (id == 0) TraceIdle(ready() ? "woken: work" : "woken: idle epoch");
                         if (id == 0 && !ready() && idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait) continue;
                         break;
                     }
+                    if (id == 0 && !polled) TraceIdle("polling completions");
+                    polled = true;
                     if (poll(ready)) break;
                     lock.unlock();
                     reapCompletionLabels();

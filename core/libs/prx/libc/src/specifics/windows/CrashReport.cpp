@@ -226,8 +226,14 @@ bool HandleWatch(EXCEPTION_POINTERS* info) {
 void InstallWatch() {
     if (const char* hardware = std::getenv("APS5_HW_WATCH")) {
         for (const char* cursor = hardware; *cursor != '\0' && g_hwWatchCount < std::size(g_hwWatchAddresses);) {
+            // image+<hex offset>: an address inside the main executable, whose base moves each run.
+            std::uintptr_t base = 0;
+            if (std::strncmp(cursor, "image+", 6) == 0) {
+                base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+                cursor += 6;
+            }
             char* end = nullptr;
-            const auto address = std::strtoull(cursor, &end, 16) & ~static_cast<std::uintptr_t>(7);
+            const auto address = (base + std::strtoull(cursor, &end, 16)) & ~static_cast<std::uintptr_t>(7);
             if (end == cursor) break;
             g_hwWatchAddresses[g_hwWatchCount++] = address;
             Report("[hwwatch] watching 0x%llx with DR%zu in every thread\n", static_cast<unsigned long long>(address), g_hwWatchCount - 1);
