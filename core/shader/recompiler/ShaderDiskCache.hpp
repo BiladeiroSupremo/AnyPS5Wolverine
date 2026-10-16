@@ -48,6 +48,9 @@ void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out);
 
 [[nodiscard]] bool Load(std::span<const std::byte> key, CompiledVariant& variant);
 void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant);
+// Makes a freshly compiled variant's SPIR-V evictable like a loaded one, pinned until Store has
+// written its entry (the words are reloaded from that entry once evicted).
+void MakeStoredEvictable(std::span<const std::byte> key, CompiledVariant& variant);
 void Flush();
 [[nodiscard]] Counters Totals();
 

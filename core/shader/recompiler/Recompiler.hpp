@@ -448,7 +448,9 @@ public:
         return *this;
     }
     // Words that `loader(context)` can produce again; `context` is owned (freed with `release`).
-    static SharedSpirv MakeEvictable(std::vector<std::uint32_t> words, Loader loader, const void* context, void (*release)(const void*));
+    // `pinned`: kept resident until Unpin (a module whose reload source is not written yet).
+    static SharedSpirv MakeEvictable(std::vector<std::uint32_t> words, Loader loader, const void* context, void (*release)(const void*), bool pinned = false);
+    void Unpin() const;
 
     [[nodiscard]] const std::vector<std::uint32_t>& Words() const {
         if (evictable) return EvictableWords(*evictable);

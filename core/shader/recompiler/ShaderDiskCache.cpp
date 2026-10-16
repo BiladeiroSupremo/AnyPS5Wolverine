@@ -780,7 +780,14 @@ public:
 
     // The loaded SPIR-V can be read again from its entry, so it may be dropped while unused
     // (SharedSpirv::MakeEvictable). APS5_NO_SPIRV_EVICTION=1 keeps every module's words.
-    static void makeEvictable(const std::filesystem::path& path, std::span<const std::byte> key, CompiledVariant& variant) {
+    // A variant compiled in this session: evictable once its entry is written (write unpins it).
+    // Freshly compiled SPIR-V otherwise stayed resident for good, so a boot after a recompiler change
+    // (every shader compiled) needed several GiB more than one from the cache.
+    void MakeStoredEvictable(std::span<const std::byte> key, CompiledVariant& variant) {
+        makeEvictable(directory / EntryName(key), key, variant, true);
+    }
+
+    static void makeEvictable(const std::filesystem::path& path, std::span<const std::byte> key, CompiledVariant& variant, bool pinned = false) {
         static const bool disabled = std::getenv("APS5_NO_SPIRV_EVICTION") != nullptr;
         if (disabled || variant.artifact.spirv.empty()) return;
         struct Source {
@@ -797,7 +804,7 @@ public:
                 throw std::runtime_error("shader disk cache: cannot reload the SPIR-V of " + source.path.string());
             }
             return std::vector<std::uint32_t>(reloaded.artifact.spirv.Words());
-        }, source, [](const void* context) { delete static_cast<const Source*>(context); });
+        }, source, [](const void* context) { delete static_cast<const Source*>(context); }, pinned);
     }
 
     void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant) {
@@ -857,6 +864,7 @@ private:
     void write(const Job& job) {
         const auto file = EncodeEntry(job.key, *job.variant);
         if (WriteFileAtomically(directory / EntryName(job.key), file)) {
+            job.variant->artifact.spirv.Unpin();
             writes.fetch_add(1, std::memory_order_relaxed);
             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
         } else {
@@ -1048,6 +1056,11 @@ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> va
     if (instance.Enabled()) instance.Store(std::move(key), std::move(variant));
 }
 
+void MakeStoredEvictable(std::span<const std::byte> key, CompiledVariant& variant) {
+    auto& instance = store();
+    if (instance.Enabled()) instance.MakeStoredEvictable(key, variant);
+}
+
 void Flush() {
     auto& instance = store();
     if (instance.Enabled()) instance.Flush();
@@ -1066,6 +1079,8 @@ struct SharedSpirv::Evictable {
     std::shared_ptr<std::vector<std::uint32_t>> words;
     std::size_t count = 0;
     std::atomic<std::int64_t> lastUse{0};
+    // Not evicted while set: a compiled module whose disk entry is not written yet.
+    std::atomic<bool> pinned{false};
     Loader loader = nullptr;
     const void* context = nullptr;
     void (*release)(const void*) = nullptr;
@@ -1125,7 +1140,7 @@ void sweepEvictable() {
             std::shared_ptr<std::vector<std::uint32_t>> dropped;
             {
                 std::lock_guard lock(module->mutex);
-                if (module->words == nullptr || now - module->lastUse.load(std::memory_order_relaxed) < idleSeconds()) continue;
+                if (module->words == nullptr || module->pinned.load(std::memory_order_acquire) || now - module->lastUse.load(std::memory_order_relaxed) < idleSeconds()) continue;
                 dropped = std::move(module->words);
             }
             state.residentBytes.fetch_sub(dropped->size() * sizeof(std::uint32_t), std::memory_order_relaxed);
@@ -1140,9 +1155,14 @@ void sweepEvictable() {
 
 }
 
-SharedSpirv SharedSpirv::MakeEvictable(std::vector<std::uint32_t> words, Loader loader, const void* context, void (*release)(const void*)) {
+void SharedSpirv::Unpin() const {
+    if (evictable != nullptr) evictable->pinned.store(false, std::memory_order_release);
+}
+
+SharedSpirv SharedSpirv::MakeEvictable(std::vector<std::uint32_t> words, Loader loader, const void* context, void (*release)(const void*), bool pinned) {
     SharedSpirv result;
     auto module = std::make_shared<Evictable>();
+    module->pinned.store(pinned, std::memory_order_relaxed);
     module->count = words.size();
     module->words = std::make_shared<std::vector<std::uint32_t>>(std::move(words));
     module->lastUse.store(nowSeconds(), std::memory_order_relaxed);
