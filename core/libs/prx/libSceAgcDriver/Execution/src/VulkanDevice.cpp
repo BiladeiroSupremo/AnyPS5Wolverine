@@ -3512,6 +3512,24 @@ bool TraceDispatchIo(std::uint64_t programAddress) {
 // APS5_FLUSH_AFTER_DISPATCH_AFTER=<s> delays it, APS5_FLUSH_AFTER_DISPATCH_TIMES=<n> (default 1)
 // repeats it. Raise APS5_DUMP_STORAGE_MAX for more than 8 dumps.
 void FlushAfterDispatch(std::uint64_t programAddress, const Graphics::ShaderResources& resources, Graphics::Recorder& recorder) {
+    // Debug aid: APS5_TRACE_STORAGE_USERS=<hex>[,...] names every dispatch that binds a storage image
+    // based at one of those addresses (cheap enough from boot, unlike APS5_TRACE_DISPATCH_IO).
+    static const std::vector<std::uint64_t> watchedImages = [] {
+        std::vector<std::uint64_t> parsed;
+        for (const char* text = std::getenv("APS5_TRACE_STORAGE_USERS"); text != nullptr && *text != '\0';) {
+            char* end = nullptr;
+            parsed.push_back(std::strtoull(text, &end, 16));
+            text = *end == ',' ? end + 1 : nullptr;
+        }
+        return parsed;
+    }();
+    if (!watchedImages.empty()) {
+        for (const auto& image : resources.DebugStorageImages()) {
+            const auto& descriptor = image->Descriptor();
+            if (std::find(watchedImages.begin(), watchedImages.end(), descriptor.baseAddress) == watchedImages.end()) continue;
+            std::fprintf(stderr, "[storage-user] shader 0x%llx binds storage 0x%llx %ux%u layers %u dim %d tile %d format %u at %.3f s\n", static_cast<unsigned long long>(programAddress), static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.depthOrLastArray, static_cast<int>(descriptor.dimension), static_cast<int>(descriptor.tileMode), descriptor.format, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
+    }
     static const std::vector<std::uint64_t> programs = [] {
         std::vector<std::uint64_t> parsed;
         for (const char* text = std::getenv("APS5_FLUSH_AFTER_DISPATCH"); text != nullptr && *text != '\0';) {

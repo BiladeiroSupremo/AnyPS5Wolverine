@@ -3216,15 +3216,20 @@ bool StorageTexture::DumpImage(const char* tag) const {
     default: return false;
     }
     const auto width = descriptor.width;
-    const auto height = descriptor.height;
+    // A 3D image dumps every depth slice and an array every layer, stacked below each other (the
+    // header's height covers them).
+    const bool volume = descriptor.dimension == TextureDimension::k3D;
+    const bool layered = descriptor.dimension == TextureDimension::k2DArray;
+    const auto slices = volume || layered ? descriptor.depthOrLastArray + 1u : 1u;
+    const auto height = descriptor.height * slices;
     const auto bytes = static_cast<std::size_t>(width) * height * texel;
     Buffer host(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     CommandBatch batch(context);
     const auto commands = batch.Handle();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {width, height, 1};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layered ? slices : 1u};
+    copy.imageExtent = {width, descriptor.height, volume ? slices : 1u};
     context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_GENERAL, host.Handle(), 1, &copy);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     batch.SubmitAndWait();
