@@ -130,6 +130,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (!rejected.empty() && printed.fetch_add(1, std::memory_order_relaxed) < 200) std::fprintf(stderr, "[draw-io] traced draw (program 0x%llx) rejected: %s\n", static_cast<unsigned long long>(program), rejected.c_str());
         }
     } tracedMark(tracedPrograms, rejected, programs.empty() ? 0 : programs.front().binary.codeAddress);
+    Graphics::SetDrawTimingProgram(programs.empty() ? 0 : programs.back().binary.codeAddress);
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
         auto& words = programs.front().userData;

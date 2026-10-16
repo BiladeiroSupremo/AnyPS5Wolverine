@@ -88,6 +88,8 @@ bool DrawRecipes();
 // APS5_TRACE_DRAW_IO (the driver marks the calling thread's current draw).
 bool TraceDrawProgram(std::uint64_t address);
 void MarkTracedDraw(bool traced);
+// The calling thread's current draw's last program, for APS5_GPU_TIME_DRAW_PROGRAMS timing.
+void SetDrawTimingProgram(std::uint64_t address);
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,

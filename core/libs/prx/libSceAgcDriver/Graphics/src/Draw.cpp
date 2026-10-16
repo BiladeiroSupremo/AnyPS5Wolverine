@@ -1674,6 +1674,16 @@ bool TraceDrawIoTarget(std::uint64_t address, VkFormat format);bool TraceDrawIoB
 namespace {
 // The calling thread's current draw is one of APS5_TRACE_DRAW_PROGRAMS (MarkTracedDraw).
 thread_local bool tracedDraw = false;
+// The code address of the calling thread's current draw's last program (SetDrawTimingProgram).
+thread_local std::uint64_t drawTimingProgram = 0;
+
+// Profiling: APS5_GPU_TIME_DRAW_PROGRAMS=1 (with APS5_PROFILE_GPU=1) times each render pass under
+// the code address of its first draw's pixel (last) program instead of the draw class, so the
+// [gputime] program list names the draws that take the GPU's time.
+bool DrawProgramTiming() {
+    static const bool enabled = std::getenv("APS5_GPU_TIME_DRAW_PROGRAMS") != nullptr;
+    return enabled;
+}
 }
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
@@ -1728,7 +1738,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
-    const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    const auto drawTiming = !continued ? (DrawProgramTiming() && drawTimingProgram != 0 ? recorder->BeginGpuTiming(drawTimingProgram) : recorder->BeginGpuTiming(CommandClass::Draw)) : Recorder::NoTiming;
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -2732,6 +2742,10 @@ bool TraceDrawProgram(std::uint64_t address) {
 
 void MarkTracedDraw(bool traced) {
     tracedDraw = traced;
+}
+
+void SetDrawTimingProgram(std::uint64_t address) {
+    drawTimingProgram = address;
 }
 
 }
