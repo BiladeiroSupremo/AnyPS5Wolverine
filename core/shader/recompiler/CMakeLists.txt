@@ -267,6 +267,7 @@ function(add_shader_recompiler target runtimeTarget)
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::HeapCapacity
             RuntimeAbi::RequireVersion
+            RuntimeImageMismatch
             SetDebugProbeActive
             ShaderCacheDirectory
             SrgbDecodeBit

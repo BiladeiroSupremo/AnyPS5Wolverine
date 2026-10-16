@@ -318,6 +318,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (dump.empty()) std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
             else std::snprintf(where, sizeof(where), "compute shader 0x%llx (%s): ", static_cast<unsigned long long>(address), dump.c_str());
             if (dynamic_cast<const ShaderRecompiler::BindlessTableRejected*>(&error) != nullptr) throw ShaderRecompiler::BindlessTableRejected(where + reason);
+            if (dynamic_cast<const ShaderRecompiler::RuntimeImageMismatch*>(&error) != nullptr) throw ShaderRecompiler::RuntimeImageMismatch(where + reason);
             if (dynamic_cast<const DispatchShaderRejected*>(&error) != nullptr) throw DispatchShaderRejected(where + reason);
             throw std::runtime_error(where + reason);
         }
@@ -423,6 +424,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         char where[64];
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
         if (dynamic_cast<const ShaderRecompiler::BindlessTableRejected*>(&error) != nullptr) throw ShaderRecompiler::BindlessTableRejected(where + std::string(error.what()));
+        if (dynamic_cast<const ShaderRecompiler::RuntimeImageMismatch*>(&error) != nullptr) throw ShaderRecompiler::RuntimeImageMismatch(where + std::string(error.what()));
         throw std::runtime_error(where + std::string(error.what()));
     };
     phaseTiming.Phase(PhaseSnapshots);

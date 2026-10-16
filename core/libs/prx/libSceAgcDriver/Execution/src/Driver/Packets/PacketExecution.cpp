@@ -257,6 +257,10 @@ void Driver::execute(const Submission& submission) {
                     else dispatchIndirect(queue, packet, submission);
                 } catch (const ShaderRecompiler::BindlessTableRejected& error) {
                     reportSkip("dispatch", error.what());
+                } catch (const ShaderRecompiler::RuntimeImageMismatch& error) {
+                    // PPSA03671 ended (std::terminate through the failed flip) when its frame
+                    // composite 0x11d03ebc00 was handed a 3D T# for a 2D interface once.
+                    reportSkip("dispatch", error.what());
                 } catch (const DispatchShaderRejected& error) {
                     reportSkip("dispatch", error.what());
                 } catch (const std::runtime_error& error) {

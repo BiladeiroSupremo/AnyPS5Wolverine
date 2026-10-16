@@ -19,6 +19,12 @@ struct BindlessTableRejected : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// An image descriptor the compiled interface cannot read (a dimension, class or format the shader
+// was not compiled for): that work cannot run, which a driver may report and skip as above.
+struct RuntimeImageMismatch : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 class ResourceMaterializer {
 public:
     static std::uint32_t EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index);
