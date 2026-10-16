@@ -43,7 +43,7 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t re
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | ((Stride * 4u) << 16u), records, 0x11016facu};
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint64_t exec) {
+void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint64_t exec, bool spanned) {
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
     userData[0] = static_cast<std::uint32_t>(exec);
@@ -59,13 +59,15 @@ void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, s
         device.Target(),
         {0, 0, 0, 128}
     };
+    request.target.spannedWaves = spanned;
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
+    Require(result.fullSubgroups == spanned, spanned ? "the program did not span two host subgroups" : "the program spans host subgroups without APS5_SPANNED_WAVE");
     device.Dispatch(result, 1, 1, 1, {}, address);
     device.WaitIdle();
 }
 
-void Check(std::uint64_t exec) {
+void Check(std::uint64_t exec, bool spanned) {
     std::array<std::uint64_t, Lanes> slots{};
     for (std::uint32_t lane = 0; lane < Lanes; ++lane) slots[(lane * 5u) & (Slots - 1u)] |= std::uint64_t{1} << lane;
     std::uint32_t iterations = 0;
@@ -77,7 +79,7 @@ void Check(std::uint64_t exec) {
         }
     }
     char name[64];
-    std::snprintf(name, sizeof(name), "exec 0x%016llx", static_cast<unsigned long long>(exec));
+    std::snprintf(name, sizeof(name), "%s, exec 0x%016llx", spanned ? "spanned" : "two-lane", static_cast<unsigned long long>(exec));
     for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
         const bool active = ((exec >> lane) & 1u) != 0;
         const std::array<std::uint32_t, Stride> expected{active ? iterations : 0u, active ? indexSum : 0u, iterations, static_cast<std::uint32_t>(slots[lane])};
@@ -90,13 +92,13 @@ void Check(std::uint64_t exec) {
     }
 }
 
-void CheckMaskedOr(std::uint64_t exec) {
+void CheckMaskedOr(std::uint64_t exec, bool spanned) {
     std::array<std::uint64_t, Lanes> slots{};
     for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
         if (((exec >> lane) & 1u) != 0) slots[lane & (Slots - 1u)] |= std::uint64_t{1} << lane;
     }
     char name[64];
-    std::snprintf(name, sizeof(name), "masked ds_or_b64, exec 0x%016llx", static_cast<unsigned long long>(exec));
+    std::snprintf(name, sizeof(name), "%s masked ds_or_b64, exec 0x%016llx", spanned ? "spanned" : "two-lane", static_cast<unsigned long long>(exec));
     for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
         const std::array<std::uint32_t, 2> expected{static_cast<std::uint32_t>(slots[lane]), static_cast<std::uint32_t>(slots[lane] >> 32u)};
         for (std::uint32_t word = 0; word < expected.size(); ++word) {
@@ -116,15 +118,20 @@ int main() {
             std::printf("skipped, subgroup size %u cannot hold a wave32\n", device->Target().subgroupSize);
             return VulkanTestSkipped;
         }
-        for (const std::uint64_t exec : {~std::uint64_t{0}, std::uint64_t{0xaaaaaaaaaaaaaaaa}, std::uint64_t{0xffff000000000000}, std::uint64_t{0x000000000000ffff}, std::uint64_t{1} << 63u, std::uint64_t{1}, std::uint64_t{0x0000000100000000}}) {
-            Run(*device, WaterfallCode, exec);
-            Check(exec);
+        const bool spannable = device->Target().subgroupSize == 32u && device->ComputeFullSubgroups();
+        if (!spannable) std::puts("spanned mode skipped: the device has no full 32-lane compute subgroups");
+        for (const bool spanned : {false, true}) {
+            if (spanned && !spannable) continue;
+            for (const std::uint64_t exec : {~std::uint64_t{0}, std::uint64_t{0xaaaaaaaaaaaaaaaa}, std::uint64_t{0xffff000000000000}, std::uint64_t{0x000000000000ffff}, std::uint64_t{1} << 63u, std::uint64_t{1}, std::uint64_t{0x0000000100000000}}) {
+                Run(*device, WaterfallCode, exec, spanned);
+                Check(exec, spanned);
+            }
+            for (const std::uint64_t exec : {~std::uint64_t{0}, std::uint64_t{0x00000000ffffffff}, std::uint64_t{0xffffffff00000000}, std::uint64_t{1} << 40u, std::uint64_t{0x8000000000000001}}) {
+                Run(*device, MaskedOrCode, exec, spanned);
+                CheckMaskedOr(exec, spanned);
+            }
         }
-        for (const std::uint64_t exec : {~std::uint64_t{0}, std::uint64_t{0x00000000ffffffff}, std::uint64_t{0xffffffff00000000}, std::uint64_t{1} << 40u, std::uint64_t{0x8000000000000001}}) {
-            Run(*device, MaskedOrCode, exec);
-            CheckMaskedOr(exec);
-        }
-        std::puts("LDS mask waterfall tests passed");
+        std::printf("LDS mask waterfall tests passed (two-lane%s)\n", spannable ? " and spanned" : "");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
