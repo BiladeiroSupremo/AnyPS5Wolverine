@@ -267,6 +267,9 @@ public:
                 }
             }
         } else if (clear && !collectable(address, end)) return false;
+        // The walk moves forward page by page: views are found from a hint (the next node, else a
+        // fresh lower_bound after a jump) instead of a tree search per 16 KiB page.
+        auto hint = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
             if (nextClean != cleanRanges.begin()) {
@@ -277,7 +280,7 @@ public:
                 }
             }
             const auto base = cursor & ~(pageBytes - 1);
-            const auto found = views.find(base);
+            const auto found = seekView(hint, base);
             if (found != views.end()) {
                 auto& view = found->second;
                 auto stop = std::min(std::min(end, base + pageBytes), nextClean == cleanRanges.end() ? end : nextClean->first);
@@ -377,9 +380,10 @@ public:
 
 private:
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
+        auto hint = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
-            if (const auto found = views.find(base); found != views.end()) {
+            if (const auto found = seekView(hint, base); found != views.end()) {
                 if (found->second.protection == PAGE_NOACCESS) return false;
                 cursor = std::min(end, base + pageBytes);
                 continue;
@@ -610,6 +614,18 @@ private:
     Ranges cleanRanges;
     Ranges freshRanges;
     std::map<std::uintptr_t, View> views;
+
+    // The view at `base` or views.end(), from a hint that only moves forward: `hint` is left at the
+    // first view at or after `base`.
+    std::map<std::uintptr_t, View>::iterator seekView(std::map<std::uintptr_t, View>::iterator& hint, std::uintptr_t base) {
+        if (hint != views.end() && hint->first < base) {
+            const auto next = std::next(hint);
+            hint = next == views.end() || next->first >= base ? next : views.lower_bound(base);
+        } else if (hint != views.begin() && std::prev(hint)->first >= base) {
+            hint = views.lower_bound(base);
+        }
+        return hint != views.end() && hint->first == base ? hint : views.end();
+    }
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
     std::mutex mutex;
