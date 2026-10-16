@@ -446,7 +446,6 @@ jobs:
         with:
           ref: ${{ needs.eligibility.outputs.sha }}
           persist-credentials: false
-          submodules: recursive
       - name: Merge the pull request into main
         if: ${{ needs.eligibility.outputs.head != '' }}
         shell: bash
@@ -463,7 +462,28 @@ jobs:
             if [ "$(git rev-parse "refs/remotes/pull/${numbers[i]}")" != "${heads[i]}" ]; then echo "::error::Pull request #${numbers[i]} has newer commits; start a new build"; exit 1; fi
             if ! git -c user.name=ci -c user.email=ci@localhost merge --no-ff --no-edit "refs/remotes/pull/${numbers[i]}"; then echo "::error::Pull request #${numbers[i]} does not merge cleanly into main and the pull requests before it; rebase it first"; exit 1; fi
           done
-          git submodule update --init --recursive
+      - id: submodules
+        name: Key the submodules on their commits
+        run: |
+          echo "key=$(git ls-files -s | awk '$1 == "160000" { print $2, $4 }' | cat - .gitmodules | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg=$(git rev-parse HEAD:3rdparty/ffmpeg-core)" >> "$GITHUB_OUTPUT"
+      - id: submodule-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/submodules.tar
+          key: submodules-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Check out the submodules
+        run: |
+          if [ -f "$RUNNER_TEMP/submodules.tar" ]; then tar --force-local -xf "$RUNNER_TEMP/submodules.tar"; fi
+          git submodule update --init --recursive --depth 1 --jobs 8
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        run: tar --force-local -cf "$RUNNER_TEMP/submodules.tar" .git/modules 3rdparty
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/submodules.tar
+          key: submodules-${{ runner.os }}-${{ steps.submodules.outputs.key }}
       - name: Point the WinLibs CMake at the CA bundle of Git for Windows
         run: |
           for prefix in ucrt64 mingw64; do
@@ -486,8 +506,33 @@ jobs:
           key: windows
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           evict-old-files: job
+      - id: ffmpeg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/externals
+          key: ffmpeg-${{ runner.os }}-${{ steps.submodules.outputs.ffmpeg }}
+      - id: seed-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: configure-seed.cmake
+          key: configure-seed-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.key }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'core/libs/CMakeLists.txt', '.github/workflows/build.yml') }}
       - shell: cmd
-        run: cmake -S . -B build %CONFIGURE% "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown"
+        run: if exist configure-seed.cmake (cmake -C configure-seed.cmake -S . -B build %CONFIGURE% "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown") else (cmake -S . -B build %CONFIGURE% "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown")
+      - if: steps.seed-cache.outputs.cache-hit != 'true'
+        shell: cmd
+        run: python tools/configure_seed.py build/CMakeCache.txt configure-seed.cmake
+      - if: steps.seed-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: configure-seed.cmake
+          key: ${{ steps.seed-cache.outputs.cache-primary-key }}
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: build/externals
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
       - name: Check that every test executable is registered with ctest
         shell: cmd
         run: python tools/check_test_registration.py build
