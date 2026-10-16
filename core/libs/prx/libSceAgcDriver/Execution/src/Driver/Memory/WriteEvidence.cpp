@@ -3,6 +3,11 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 #include <cstring>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -207,7 +212,38 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;
     pending.Load();
-    return Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    const auto policy = Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    // Profiling (APS5_PROFILE_DRAW): the capture reads' policies, the syncs by reason, on the
+    // [capsync] line every 10 s.
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile && policy != ShaderMemory::PendingWrite::None) {
+        static constexpr std::array<std::uint64_t ValidateCounters::*, 10> reasons{&ValidateCounters::syncedShadow, &ValidateCounters::syncedOff, &ValidateCounters::syncedNoWriter, &ValidateCounters::syncedForeign, &ValidateCounters::syncedLargeRange, &ValidateCounters::syncedLabel, &ValidateCounters::syncedEvidence, &ValidateCounters::syncedWriterChanged, &ValidateCounters::syncedSample, &ValidateCounters::syncedImage};
+        static constexpr std::array<const char*, 12> names{"shadow", "off", "no-writer", "foreign", "large-range", "label", "evidence-short", "writer-changed", "sampled", "image", "known-value", "raw"};
+        static std::array<std::atomic<std::uint64_t>, 12> counts{};
+        static std::atomic<std::int64_t> lastReport{0};
+        std::size_t index = names.size();
+        if (policy == ShaderMemory::PendingWrite::KnownValue || policy == ShaderMemory::PendingWrite::VerifyKnownValue) index = 10;
+        else if (policy == ShaderMemory::PendingWrite::Raw || policy == ShaderMemory::PendingWrite::VerifyRaw) index = 11;
+        else {
+            for (std::size_t i = 0; i < reasons.size(); ++i) {
+                if (reason == reasons[i]) index = i;
+            }
+        }
+        if (index < counts.size()) counts[index].fetch_add(1, std::memory_order_relaxed);
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReport.load(std::memory_order_relaxed);
+        if (last == 0) lastReport.compare_exchange_strong(last, now);
+        else if (now - last >= 10000 && lastReport.compare_exchange_strong(last, now)) {
+            std::string line;
+            for (std::size_t i = 0; i < counts.size(); ++i) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " %s %llu", names[i], static_cast<unsigned long long>(counts[i].exchange(0, std::memory_order_relaxed)));
+                line += text;
+            }
+            std::fprintf(stderr, "[capsync] capture reads over pending GPU writes (10 s) by policy:%s\n", line.c_str());
+        }
+    }
+    return policy;
 }
 
 }
