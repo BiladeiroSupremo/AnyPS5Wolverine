@@ -220,8 +220,10 @@ VkImageViewType ViewTypeFor(TextureDimension dimension, [[maybe_unused]] std::ui
 
 namespace {
 
-void ChainMinLod(const Context& context, const GuestTextureResource& descriptor, VkImageViewCreateInfo& viewInfo, VkImageViewMinLodCreateInfoEXT& minLod) {
-    const auto clamp = EffectiveMinLod(descriptor);
+// `skippedLevels`: guest levels the image leaves out at the top of its chain (its level 0 is the
+// guest's level `skippedLevels`), which the clamp is lowered by.
+void ChainMinLod(const Context& context, const GuestTextureResource& descriptor, VkImageViewCreateInfo& viewInfo, VkImageViewMinLodCreateInfoEXT& minLod, std::uint32_t skippedLevels = 0) {
+    const auto clamp = std::max(EffectiveMinLod(descriptor) - static_cast<float>(skippedLevels), 0.0f);
     if (clamp == 0.0f) return;
     Require(context.imageViewMinLod, "guest texture descriptor uses a minimum LOD clamp, which needs VK_EXT_image_view_min_lod");
     minLod.minLod = clamp;
@@ -240,11 +242,20 @@ std::uint64_t SampledTextureMemory() {
     return SampledMemoryCounter().load(std::memory_order_relaxed);
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, std::uint32_t skipLevels) : context(context) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     try {
+        // The image may leave out the top `skipLevels` levels of the guest chain (a streamed texture
+        // held from its first loaded level, see BindlessHeapTable): its level k is guest level
+        // skip + k, at the guest's size >> skip. The guest surface is read and detiled as it is
+        // (its geometry, slice pitch included, stays the guest's); only levels from `skip` on are
+        // detiled and copied. 2D and 2D array color textures viewed from level 0 only.
+        const bool flat = descriptor.dimension == TextureDimension::k2D || descriptor.dimension == TextureDimension::k2DArray;
+        const auto lastViewLevel = std::min(descriptor.lastLevel, descriptor.mipCount - 1u);
+        const std::uint32_t skip = !depthCompare && flat && descriptor.baseLevel == 0u ? std::min(skipLevels, lastViewLevel) : 0u;
+        skippedLevels = skip;
         const auto colorFormat = SampledTextureFormat(context, descriptor.format);
         Require(!depthCompare || colorFormat == VK_FORMAT_R32_SFLOAT || colorFormat == VK_FORMAT_R16_UNORM, "comparison sampling requires an R32 float or R16 unorm depth texture");
         Require(!depthCompare || descriptor.dimension != TextureDimension::k3D, "comparison sampling does not support 3D depth textures");
@@ -273,8 +284,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         imageInfo.flags = descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
         imageInfo.imageType = ImageTypeFor(descriptor.dimension);
         imageInfo.format = vkFormat;
-        imageInfo.extent = {descriptor.width, descriptor.height, geometry.imageDepth};
-        imageInfo.mipLevels = descriptor.mipCount;
+        imageInfo.extent = {std::max(descriptor.width >> skip, 1u), std::max(descriptor.height >> skip, 1u), geometry.imageDepth};
+        imageInfo.mipLevels = descriptor.mipCount - skip;
         imageInfo.arrayLayers = geometry.imageLayers;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -343,7 +354,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto guestLayerOffset = geometry.GuestLayerOffset(layer);
                 const auto linearLayerOffset = geometry.LinearLayerOffset(layer);
-                for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                for (std::uint32_t level = skip; level < mips.size(); ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
                     detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled->Handle(), guestLayerOffset + mip.tiledOffset, linear->Handle(), linearLayerOffset + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
@@ -367,21 +378,21 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             toTransferDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toTransferDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toTransferDst.image = image;
-            toTransferDst.subresourceRange = {aspect, 0, descriptor.mipCount, 0, geometry.imageLayers};
+            toTransferDst.subresourceRange = {aspect, 0, descriptor.mipCount - skip, 0, geometry.imageLayers};
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearReadBarrier, 1, &toTransferDst);
 
             std::vector<VkBufferImageCopy> regions;
             regions.reserve(static_cast<std::size_t>(arrayLayers) * mips.size());
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto linearLayerOffset = static_cast<std::uint64_t>(layer) * sliceLinearBytes;
-                for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+                for (std::uint32_t level = skip; level < descriptor.mipCount; ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
                     VkBufferImageCopy region{};
                     region.bufferOffset = linearLayerOffset + mip.linearOffset;
                     region.bufferRowLength = mip.pitchBytes / BytesPerElement(descriptor.format) * BlockWidth(descriptor.format);
                     region.bufferImageHeight = 0;
-                    region.imageSubresource = {aspect, level, geometry.CopyLayer(layer), 1};
+                    region.imageSubresource = {aspect, level - skip, geometry.CopyLayer(layer), 1};
                     region.imageOffset = {0, 0, geometry.CopyDepth(layer)};
                     region.imageExtent = {std::max(descriptor.width >> level, 1u), std::max(descriptor.height >> level, 1u), 1u};
                     regions.push_back(region);
@@ -440,7 +451,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             }
         }
 
-        const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
+        // A skipped chain (base level 0) is viewed from its own level 0, the guest's level `skip`.
+        const auto viewLevelCount = lastViewLevel - descriptor.baseLevel + 1u - skip;
         const auto viewLayerCount = geometry.imageLayers - descriptor.baseArray;
         if (descriptor.dimension == TextureDimension::kCube) {
             Require(viewLayerCount % 6u == 0, "guest cube texture view does not contain a multiple of 6 array slices");
@@ -454,7 +466,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         viewInfo.components = depthCompare ? VkComponentMapping{} : components;
         viewInfo.subresourceRange = {aspect, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
-        ChainMinLod(context, descriptor, viewInfo, minLod);
+        ChainMinLod(context, descriptor, viewInfo, minLod, skip);
 
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView");
         viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
@@ -473,7 +485,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             // texture whose finer levels are not loaded yet): a 2D chain's levels under f hold about
             // 1 - 4^-f of it.
             static std::atomic<std::uint64_t> created{0}, total{0}, clamped{0}, unloaded{0};
-            const auto floorLevel = static_cast<std::uint32_t>(EffectiveMinLod(descriptor));
+            const auto floorLevel = static_cast<std::uint32_t>(EffectiveMinLod(descriptor)) - std::min(skippedLevels, static_cast<std::uint32_t>(EffectiveMinLod(descriptor)));
             total.fetch_add(allocationBytes, std::memory_order_relaxed);
             if (floorLevel != 0) {
                 clamped.fetch_add(allocationBytes, std::memory_order_relaxed);
@@ -736,6 +748,12 @@ void Texture::prepareBaseLevelView(const GuestTextureResource& descriptor, VkIma
 }
 
 void Texture::recordMainView(VkImageViewCreateInfo viewInfo) {
+    // The minimum LOD clamp is kept apart (the pNext chain points into the caller's frame), for the
+    // companion views: without it a companion samples the levels below the clamp, which a streamed
+    // texture has not loaded.
+    for (const auto* next = static_cast<const VkBaseInStructure*>(viewInfo.pNext); next != nullptr; next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT) mainMinLod = reinterpret_cast<const VkImageViewMinLodCreateInfoEXT*>(next)->minLod;
+    }
     viewInfo.pNext = nullptr;
     mainViewInfo = viewInfo;
 }
@@ -751,6 +769,12 @@ VkImageView Texture::CompanionView(VkImageViewType type) const {
         auto info = *mainViewInfo;
         info.viewType = type;
         info.subresourceRange.layerCount = 1;
+        VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
+        static const bool clampCompanions = std::getenv("APS5_NO_COMPANION_MIN_LOD") == nullptr;
+        if (clampCompanions && mainMinLod > 0.0f) {
+            minLod.minLod = mainMinLod;
+            info.pNext = &minLod;
+        }
         if (context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &companion) != VK_SUCCESS) companion = VK_NULL_HANDLE;
     }
     return companion;

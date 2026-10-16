@@ -73,6 +73,8 @@ struct TextureKey {
     std::array<std::uint32_t, 8> words;
     std::array<std::uint32_t, 4> components;
     bool depthCompare = false;
+    // Guest levels a heap texture may leave out at the top of its chain (CachedSampledTexture).
+    std::uint32_t skipLevels = 0;
     bool operator==(const TextureKey&) const = default;
 };
 
@@ -84,14 +86,15 @@ std::uint64_t hashWords(std::uint64_t hash, const std::uint32_t* words, std::siz
 struct TextureKeyHash {
     std::size_t operator()(const TextureKey& key) const noexcept {
         auto hash = 14695981039346656037ull ^ reinterpret_cast<std::uintptr_t>(key.device);
-        hash = hashWords(hash, key.words.data(), key.words.size()) ^ static_cast<std::uint64_t>(key.depthCompare);
+        hash = hashWords(hash, key.words.data(), key.words.size()) ^ static_cast<std::uint64_t>(key.depthCompare) ^ (static_cast<std::uint64_t>(key.skipLevels) << 8u);
         return static_cast<std::size_t>(hashWords(hash, key.components.data(), key.components.size()));
     }
 };
 
-TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words, VkComponentMapping components, bool depthCompare = false) {
+TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words, VkComponentMapping components, bool depthCompare = false, std::uint32_t skipLevels = 0) {
     TextureKey key{device, {}, {static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a)}};
     key.depthCompare = depthCompare;
+    key.skipLevels = skipLevels;
     std::copy(words.begin(), words.end(), key.words.begin());
     key.words[5] &= ~((0xfffu << 8u) | (1u << 25u));
     key.words[6] &= ~0xffu;
@@ -541,7 +544,7 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
+std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, std::uint32_t skipLevels = 0) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     RequireNoMultisampleTarget(resource.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a texture read");
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
@@ -559,7 +562,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (depthBitsWidth == 16u && resource.format != unorm16) {
         auto normalized = resource;
         normalized.format = unorm16;
-        return cachedTexture(context, words, normalized, components, guestBytes, depthCompare);
+        return cachedTexture(context, words, normalized, components, guestBytes, depthCompare, skipLevels);
     }
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     const bool profile = LookupOutcomes::Profiled();
@@ -657,7 +660,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
     }
     auto& cache = Textures();
-    const auto key = MakeTextureKey(context.device, words, components, depthCompare);
+    const auto key = MakeTextureKey(context.device, words, components, depthCompare, skipLevels);
     std::lock_guard lock(cache.mutex);
     dropUncachedViews(cache);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
@@ -728,7 +731,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         entry.snapshotBytes = snapshot.size();
         entry.snapshotHash = XXH3_64bits(snapshot.data(), snapshot.size());
-        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
+        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare, skipLevels);
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
@@ -975,9 +978,9 @@ std::uint64_t SampledTextureCacheBudget(const Context& context) {
     return sampledBudget(context, cache);
 }
 
-std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
+std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, std::uint32_t skipLevels) {
     const auto resource = DecodeTextureResource(words);
-    return cachedTexture(context, words, resource, ViewComponents(resource));
+    return cachedTexture(context, words, resource, ViewComponents(resource), 0, false, skipLevels);
 }
 
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second) {

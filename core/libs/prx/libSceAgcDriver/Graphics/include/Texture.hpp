@@ -55,7 +55,9 @@ struct OwnedImage {
 
 class Texture {
 public:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false);
+    // `skipLevels`: guest levels the image may leave out at the top of its chain (see the
+    // constructor); SkippedLevels() says how many it did.
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, std::uint32_t skipLevels = 0);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -95,6 +97,8 @@ public:
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
+    // Guest levels the image leaves out at the top of its chain (its level 0 is guest level N).
+    std::uint32_t SkippedLevels() const { return skippedLevels; }
     VkFormat ViewFormat() const { return viewFormat; }
     // Whether the sampled texture cache still accounts this texture: holders that keep it beyond
     // the cache (the bindless heap) let it go once evicted, so it does not escape the budget.
@@ -133,6 +137,8 @@ private:
     mutable std::mutex baseLevelMutex;
     // The main view's create info (no pNext chain), for CompanionView.
     std::optional<VkImageViewCreateInfo> mainViewInfo;
+    // The main view's minimum LOD clamp (0 for none), which its companions take as well.
+    float mainMinLod = 0.0f;
     mutable std::mutex companionMutex;
     mutable VkImageView companion2D = VK_NULL_HANDLE;
     mutable VkImageView companion2DArray = VK_NULL_HANDLE;
@@ -140,6 +146,7 @@ private:
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkDeviceSize allocationBytes = 0;
     VkDeviceSize countedBytes = 0;
+    std::uint32_t skippedLevels = 0;
     VkFormat viewFormat = VK_FORMAT_UNDEFINED;
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
