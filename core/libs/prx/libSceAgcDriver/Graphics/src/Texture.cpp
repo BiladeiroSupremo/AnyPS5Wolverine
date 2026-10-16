@@ -2916,12 +2916,15 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         }
     }
     static const bool eagerAll = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    // Experiment (APS5_EAGER_WRITEBACK_MAX_KB, 0 = off): images this small are stored right behind
-    // their writer, in the same batch, instead of at the next idle store. PPSA03671 waits for a
-    // small result every frame, and the idle store only runs once every queue drained.
+    // Images this small (APS5_EAGER_WRITEBACK_MAX_KB, default 400, 0 = off) are stored right behind
+    // their writer, in the same batch, instead of at the next idle store. PPSA03671's main thread
+    // waits every frame for a 384x216 R32F readback (324 KiB) that the idle store delivered 13-25 ms
+    // after the GPU finished the frame (the store begins once every queue drained, then spends ~9 ms
+    // on every pending image). 2026-10-16 slot-4 cabin: 77-78 -> 87-88 presents per 10 s, same
+    // picture, private memory unchanged.
     static const std::uint64_t eagerLimit = [] {
         const char* text = std::getenv("APS5_EAGER_WRITEBACK_MAX_KB");
-        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull) << 10u;
+        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 400ull) << 10u;
     }();
     const bool eager = eagerAll || (eagerLimit != 0 && guestBytes <= eagerLimit);
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;

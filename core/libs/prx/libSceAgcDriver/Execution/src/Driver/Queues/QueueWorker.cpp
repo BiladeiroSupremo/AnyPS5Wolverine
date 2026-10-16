@@ -7,7 +7,10 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdio>
+#include <string>
 #include <cstdlib>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -29,34 +32,55 @@ const std::chrono::milliseconds IdleResultsQuietPeriod = [] {
     return std::chrono::milliseconds(value != nullptr ? std::strtoll(value, nullptr, 10) : 1);
 }();
 
-// Debug aid: APS5_TRACE_IDLE=<hex guest address> prints queue 0's idle-path events (completions
-// cleared, idle store begun and done) with a millisecond clock and the guest qword at that address
-// (a title's frame label), to place the idle store against the title's frame.
+// Debug aid: APS5_TRACE_IDLE=<hex guest address>[,<hex guest address>] prints queue 0's idle-path
+// events (completions cleared, idle store begun and done) with a millisecond clock and the guest
+// qwords at those addresses (a title's frame label, a readback it waits for), to place the idle
+// store against the title's frame. The lines are buffered and written 64 KiB at a time: a write to
+// a redirected stderr took ~4 ms each and slowed the title down to a crawl.
+std::uint64_t PeekGuest(std::uint64_t address) {
+    if (address == 0) return 0;
+    // The guest address is read only once it is committed (it is unmapped early in the boot).
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT && (memory.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) return *reinterpret_cast<const volatile std::uint64_t*>(address);
+#endif
+    return 0;
+}
+
 void TraceIdle(const char* event) {
-    static const std::uint64_t peek = [] {
+    static const std::array<std::uint64_t, 2> peek = [] {
+        std::array<std::uint64_t, 2> addresses{};
         const char* text = std::getenv("APS5_TRACE_IDLE");
-        return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+        if (text == nullptr) return addresses;
+        char* end = nullptr;
+        addresses[0] = std::strtoull(text, &end, 16);
+        if (*end == ',') addresses[1] = std::strtoull(end + 1, nullptr, 16);
+        return addresses;
     }();
-    if (peek == 0) return;
+    if (peek[0] == 0) return;
     // A repeat of the previous event (the loop going round) is counted, not printed.
     static const char* previous = nullptr;
     static std::uint64_t repeats = 0;
+    static std::string lines;
     if (event == previous) {
         ++repeats;
         return;
     }
-    if (repeats != 0) std::fprintf(stderr, "[idle]   (x%llu)\n", static_cast<unsigned long long>(repeats));
+    char line[160];
+    if (repeats != 0) {
+        std::snprintf(line, sizeof(line), "[idle]   (x%llu)\n", static_cast<unsigned long long>(repeats));
+        lines += line;
+    }
     previous = event;
     repeats = 0;
     static const auto start = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    // The guest address is read only once it is committed (it is unmapped early in the boot).
-    std::uint64_t value = 0;
-#ifdef _WIN32
-    MEMORY_BASIC_INFORMATION memory{};
-    if (VirtualQuery(reinterpret_cast<const void*>(peek), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT && (memory.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) value = *reinterpret_cast<const volatile std::uint64_t*>(peek);
-#endif
-    std::fprintf(stderr, "[idle] %.2f ms %s label 0x%llx\n", ms, event, static_cast<unsigned long long>(value));
+    std::snprintf(line, sizeof(line), "[idle] %.3f ms %s label 0x%llx peek 0x%llx\n", ms, event, static_cast<unsigned long long>(PeekGuest(peek[0])), static_cast<unsigned long long>(PeekGuest(peek[1])));
+    lines += line;
+    if (lines.size() >= 65536) {
+        std::fwrite(lines.data(), 1, lines.size(), stderr);
+        lines.clear();
+    }
 }
 
 }

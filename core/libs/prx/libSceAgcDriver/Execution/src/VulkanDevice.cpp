@@ -4276,7 +4276,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
-    if (const char* program = std::getenv("APS5_TRACE_PROGRAM"); program != nullptr) {
+    // Both trace switches are read once: a getenv per dispatch takes the CRT environment lock.
+    static const char* const traceProgram = std::getenv("APS5_TRACE_PROGRAM");
+    static const char* const traceWriter = std::getenv("APS5_TRACE_WRITER");
+    if (const char* program = traceProgram; program != nullptr) {
         // Diagnostic: the storage images (bit 0 written, bit 1 sampled view) and in-place reads of one program.
         static const std::uint64_t watched = std::strtoull(program, nullptr, 16);
         static std::atomic<std::uint32_t> logged{0};
@@ -4287,7 +4290,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             for (const auto& [begin, end] : resources.InPlaceReads()) std::fprintf(stderr, "[trace-program]   reads 0x%llx-0x%llx\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
         }
     }
-    if (const char* writer = std::getenv("APS5_TRACE_WRITER"); writer != nullptr) {
+    if (const char* writer = traceWriter; writer != nullptr) {
         // Diagnostic: the dispatches whose writes cover a guest address (hex), e.g. indirect arguments.
         static const std::uint64_t watched = std::strtoull(writer, nullptr, 16);
         static std::atomic<std::uint32_t> logged{0};
