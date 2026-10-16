@@ -32,22 +32,27 @@ alignas(256) constexpr std::array<std::uint32_t, 58> WaterfallCode{
     0x80010600, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 23> MaskedOrCode{
+    0x34240083, 0x7e040280, 0x7e060280, 0xd9340000, 0x00000212, 0xbf8cc07f, 0x3608008f, 0x34080883,
+    0xd6ff0002, 0x00010300, 0xbefe0400, 0xd9280000, 0x00000204, 0xbf8cc07f, 0xbefe04c1, 0xd9d80000,
+    0x06000012, 0xbf8cc07f, 0xe0702000, 0x80010600, 0xe0702004, 0x80010700, 0xbf810000,
+};
+
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t records) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | ((Stride * 4u) << 16u), records, 0x11016facu};
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::uint64_t exec) {
+void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint64_t exec) {
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
     userData[0] = static_cast<std::uint32_t>(exec);
     userData[1] = static_cast<std::uint32_t>(exec >> 32u);
     const auto output = BufferDescriptor(Output.data(), Lanes);
     std::copy(output.begin(), output.end(), userData.begin() + 4);
-    const std::span<const std::uint32_t> code(WaterfallCode);
     const auto address = reinterpret_cast<std::uintptr_t>(code.data());
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{address, std::as_bytes(code)}}};
-    const ShaderRecompiler::ShaderComputeStageInfo compute{{Lanes, 1, 1}, Lanes * 2u,{false, false, false}, false, 1};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Lanes, 1, 1}, Lanes * 2u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, address, code, 0, {}},
         {Lanes, 0, userData, compute, std::nullopt, std::nullopt, memory},
@@ -85,6 +90,22 @@ void Check(std::uint64_t exec) {
     }
 }
 
+void CheckMaskedOr(std::uint64_t exec) {
+    std::array<std::uint64_t, Lanes> slots{};
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+        if (((exec >> lane) & 1u) != 0) slots[lane & (Slots - 1u)] |= std::uint64_t{1} << lane;
+    }
+    char name[64];
+    std::snprintf(name, sizeof(name), "masked ds_or_b64, exec 0x%016llx", static_cast<unsigned long long>(exec));
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+        const std::array<std::uint32_t, 2> expected{static_cast<std::uint32_t>(slots[lane]), static_cast<std::uint32_t>(slots[lane] >> 32u)};
+        for (std::uint32_t word = 0; word < expected.size(); ++word) {
+            const auto actual = Output[lane * Stride + word];
+            Require(actual == expected[word], std::string(name) + ": lane " + std::to_string(lane) + " slot word " + std::to_string(word) + " is " + std::to_string(actual) + ", expected " + std::to_string(expected[word]));
+        }
+    }
+}
+
 }
 
 int main() {
@@ -96,8 +117,12 @@ int main() {
             return VulkanTestSkipped;
         }
         for (const std::uint64_t exec : {~std::uint64_t{0}, std::uint64_t{0xaaaaaaaaaaaaaaaa}, std::uint64_t{0xffff000000000000}, std::uint64_t{0x000000000000ffff}, std::uint64_t{1} << 63u, std::uint64_t{1}, std::uint64_t{0x0000000100000000}}) {
-            Run(*device, exec);
+            Run(*device, WaterfallCode, exec);
             Check(exec);
+        }
+        for (const std::uint64_t exec : {~std::uint64_t{0}, std::uint64_t{0x00000000ffffffff}, std::uint64_t{0xffffffff00000000}, std::uint64_t{1} << 40u, std::uint64_t{0x8000000000000001}}) {
+            Run(*device, MaskedOrCode, exec);
+            CheckMaskedOr(exec);
         }
         std::puts("LDS mask waterfall tests passed");
         return 0;
