@@ -706,6 +706,8 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_DOM_INTERSECTION",
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_RESULT_MEMO",
+    "APS5_NO_SPIRV_EVICTION",
+    "APS5_SPIRV_IDLE_SECONDS",
 };
 
 const std::vector<std::byte>& switchKey() {
@@ -1095,7 +1097,10 @@ EvictionState& evictionState() {
 std::int64_t idleSeconds() {
     static const std::int64_t seconds = [] {
         const char* text = std::getenv("APS5_SPIRV_IDLE_SECONDS");
-        return text != nullptr ? std::max<std::int64_t>(5, std::strtoll(text, nullptr, 10)) : std::int64_t{60};
+        // 15 s (was 60): PPSA03671 loads ~2,200 modules (~2.4 GiB) while it boots and reloaded none
+        // of the 1,076 evicted in the first 100 s; held a minute plus a minute in the graveyard they
+        // ran a 32 GB PC out of memory before the title.
+        return text != nullptr ? std::max<std::int64_t>(5, std::strtoll(text, nullptr, 10)) : std::int64_t{15};
     }();
     return seconds;
 }

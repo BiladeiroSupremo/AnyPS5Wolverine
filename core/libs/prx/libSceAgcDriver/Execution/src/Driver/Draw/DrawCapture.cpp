@@ -28,7 +28,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     // (once per address; agc_shader_replay reads them).
     static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
     if (dumpShaders) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
-    const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
+    const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request, true);
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();

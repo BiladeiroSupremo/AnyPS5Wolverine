@@ -12,6 +12,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstddef>
@@ -584,7 +585,107 @@ std::vector<std::uint32_t> LinkUserDataCallees(const ShaderRecompiler::Recompile
 
 }
 
-ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+namespace {
+
+// Preparation at use in the background (draw stages): a variant that registration did not prepare
+// was compiled on the render thread, and PPSA03671's largest material shaders froze the game for
+// minutes on first sight (PlanBuilder::Collect and MaskedSelectEliminator on the render thread). Now
+// the request is copied, compiled on the preparation pool and published into the snapshot's
+// entries, and the draw is skipped until then. A variant attempted once (built or failed) is
+// prepared in place on a later miss, so no draw is skipped for good. APS5_SYNC_PREPARE_AT_USE=1
+// prepares every variant on the calling thread as before.
+struct OwnedRequest {
+    ShaderRecompiler::RecompileRequest request;
+    std::vector<std::uint32_t> code;
+    std::vector<std::byte> header;
+    std::vector<std::uint32_t> userData;
+    std::vector<std::vector<std::byte>> memoryBytes;
+    std::vector<ShaderRecompiler::MemoryRegion> memory;
+    std::vector<std::vector<std::uint32_t>> linkedCode;
+    std::vector<std::vector<std::byte>> linkedHeaders;
+    std::vector<std::vector<std::uint32_t>> linkedUserData;
+    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    std::vector<std::uint32_t> capabilities;
+    std::vector<std::string> extensionText;
+    std::vector<std::string_view> extensions;
+};
+
+// A copy of `source` whose spans point into storage of its own.
+std::shared_ptr<OwnedRequest> ownRequest(const ShaderRecompiler::RecompileRequest& source) {
+    auto owned = std::make_shared<OwnedRequest>();
+    auto& copy = *owned;
+    copy.request = source;
+    copy.code.assign(source.shader.code.begin(), source.shader.code.end());
+    copy.request.shader.code = copy.code;
+    copy.header.assign(source.shader.header.begin(), source.shader.header.end());
+    copy.request.shader.header = copy.header;
+    copy.userData.assign(source.context.userData.begin(), source.context.userData.end());
+    copy.request.context.userData = copy.userData;
+    copy.memoryBytes.reserve(source.context.memory.size());
+    copy.memory.reserve(source.context.memory.size());
+    for (const auto& region : source.context.memory) {
+        copy.memoryBytes.emplace_back(region.bytes.begin(), region.bytes.end());
+        copy.memory.push_back({region.guestAddress, copy.memoryBytes.back()});
+    }
+    copy.request.context.memory = copy.memory;
+    if (source.graphics.has_value()) {
+        const auto programs = source.graphics->linkedPrograms;
+        copy.linkedCode.reserve(programs.size());
+        copy.linkedHeaders.reserve(programs.size());
+        copy.linkedUserData.reserve(programs.size());
+        copy.linked.reserve(programs.size());
+        for (const auto& program : programs) {
+            auto linked = program;
+            copy.linkedCode.emplace_back(program.binary.code.begin(), program.binary.code.end());
+            linked.binary.code = copy.linkedCode.back();
+            copy.linkedHeaders.emplace_back(program.binary.header.begin(), program.binary.header.end());
+            linked.binary.header = copy.linkedHeaders.back();
+            copy.linkedUserData.emplace_back(program.userData.begin(), program.userData.end());
+            linked.userData = copy.linkedUserData.back();
+            copy.linked.push_back(linked);
+        }
+        copy.request.graphics->linkedPrograms = copy.linked;
+    }
+    copy.capabilities.assign(source.target.supportedCapabilities.begin(), source.target.supportedCapabilities.end());
+    copy.request.target.supportedCapabilities = copy.capabilities;
+    copy.extensionText.reserve(source.target.supportedExtensions.size());
+    for (const auto extension : source.target.supportedExtensions) copy.extensionText.emplace_back(extension);
+    for (const auto& extension : copy.extensionText) copy.extensions.emplace_back(extension);
+    copy.request.target.supportedExtensions = copy.extensions;
+    return owned;
+}
+
+struct AtUsePreparations {
+    std::mutex mutex;
+    // Queued or compiling; attempted once (built or failed).
+    std::set<std::uint64_t> pending;
+    std::set<std::uint64_t> attempted;
+    std::uint64_t built = 0;
+};
+
+AtUsePreparations& atUsePreparations() {
+    static auto* state = new AtUsePreparations();
+    return *state;
+}
+
+// Identity of one variant prepared at use: the shader's preparation state, the code offset, the
+// prepared-shader key and the (possibly linked) code.
+std::uint64_t atUseIdentity(const PreparedShaders* prepared, std::size_t codeOffset, std::span<const std::uint64_t> key, std::span<const std::uint32_t> code) {
+    std::uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&](std::uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
+    mix(reinterpret_cast<std::uintptr_t>(prepared));
+    mix(codeOffset);
+    for (const auto word : key) mix(word);
+    mix(code.size());
+    for (const auto word : code) mix(word);
+    return hash;
+}
+
+void SubmitAtUsePreparation(std::function<void()> task);
+
+}
+
+ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, bool deferAtUse) {
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
@@ -602,6 +703,42 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
         if (!linked.empty() && !std::ranges::equal(invocationRequest.shader.code, linked)) continue;
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
+    }
+    static const bool asyncAtUse = std::getenv("APS5_SYNC_PREPARE_AT_USE") == nullptr;
+    if (deferAtUse && asyncAtUse) {
+        const auto identity = atUseIdentity(snapshot.prepared.get(), codeOffset, key, source.shader.code);
+        auto& state = atUsePreparations();
+        std::unique_lock atUseLock(state.mutex);
+        if (state.pending.contains(identity)) throw ShaderNotReady("AGC driver: a shader variant is being prepared in the background; the draw is skipped until it is ready");
+        if (!state.attempted.contains(identity)) {
+            state.pending.insert(identity);
+            atUseLock.unlock();
+            ReportPreparedAtUse(snapshot, source);
+            auto owned = ownRequest(source);
+            // The pool may run the task inline, and the task takes the shader's mutex.
+            lock.unlock();
+            SubmitAtUsePreparation([owned = std::move(owned), prepared = snapshot.prepared, codeOffset, identity, address = snapshot.codeAddress] {
+                const auto started = std::chrono::steady_clock::now();
+                std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+                try {
+                    handle = PrepareShaderWithDiagnostics(owned->request);
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[shader-prepare] background preparation at use of 0x%llx failed (the next draw prepares it in place): %s\n", static_cast<unsigned long long>(address), error.what());
+                }
+                if (handle != nullptr) {
+                    std::lock_guard preparedLock(prepared->mutex);
+                    prepared->entries.push_back({codeOffset, std::move(handle)});
+                }
+                const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+                auto& state = atUsePreparations();
+                std::lock_guard stateLock(state.mutex);
+                state.pending.erase(identity);
+                state.attempted.insert(identity);
+                ++state.built;
+                if (seconds >= 1.0) std::fprintf(stderr, "[shader-prepare] shader 0x%llx prepared at use in the background in %.1f s (%llu so far, %zu pending)\n", static_cast<unsigned long long>(address), seconds, static_cast<unsigned long long>(state.built), state.pending.size());
+            });
+            throw ShaderNotReady("AGC driver: a shader variant is being prepared in the background; the draw is skipped until it is ready");
+        }
     }
     ReportPreparedAtUse(snapshot, source);
     auto handle = PrepareShaderWithDiagnostics(source);
@@ -894,6 +1031,20 @@ public:
         task();
     }
 
+    // A task a draw waits for (skipped until it is done): ahead of the registration backlog.
+    void SubmitFront(std::function<void()> task) {
+        {
+            std::unique_lock lock(mutex);
+            if (threads != 0 && !closed) {
+                tasks.push_front({std::move(task), nullptr});
+                lock.unlock();
+                ready.notify_one();
+                return;
+            }
+        }
+        task();
+    }
+
     void Prioritize(const PreparedShaders& prepared) {
         std::lock_guard lock(mutex);
         const auto found = std::ranges::find_if(tasks, [&](const auto& task) { return task.prepared == &prepared; });
@@ -959,6 +1110,10 @@ private:
     unsigned running = 0;
     bool closed = false;
 };
+
+void SubmitAtUsePreparation(std::function<void()> task) {
+    RegistrationPreparePool::Instance().SubmitFront(std::move(task));
+}
 
 bool AsyncRegistrationPrepare() {
     static const bool sync = std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr;
@@ -1081,6 +1236,43 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
     return prepared;
 }
 
+namespace {
+
+// Graphics and static ABI preparation in the background: the title resolves ABIs on its render
+// thread, and preparing a large material shader there stopped its frames for a minute or more
+// (PlanBuilder::Collect on "Render Thread", PPSA03671). The caller returns at once; draws that come
+// first prepare at use (also in the background). One job per (shader, ABI key) at a time, as the
+// title resolves the same ABI again before the first job ends. False when APS5_SYNC_ABI_PREPARE=1:
+// the caller prepares on its own thread as before.
+bool DeferAbiPreparation(const void* owner, std::span<const std::uint64_t> key, std::function<void()> resolve) {
+    static const bool sync = std::getenv("APS5_SYNC_ABI_PREPARE") != nullptr;
+    if (sync) return false;
+    std::uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&](std::uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
+    mix(reinterpret_cast<std::uintptr_t>(owner));
+    for (const auto word : key) mix(word);
+    static std::mutex mutex;
+    static std::set<std::uint64_t> pending;
+    {
+        std::lock_guard lock(mutex);
+        if (!pending.insert(hash).second) return true;
+    }
+    SubmitRegistrationPreparation([hash, resolve = std::move(resolve)] {
+        try {
+            resolve();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[shader-prepare] background ABI preparation failed: %s\n", error.what());
+        } catch (...) {
+            std::fprintf(stderr, "[shader-prepare] background ABI preparation failed\n");
+        }
+        std::lock_guard lock(mutex);
+        pending.erase(hash);
+    });
+    return true;
+}
+
+}
+
 void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.ResolveGraphicsStagesAbi");
@@ -1118,8 +1310,9 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     const auto localDevice = device.Load();
     require(localDevice != nullptr, "graphics ABI device is missing");
     struct GraphicsAbiKeyStorage {};
-    auto& key = HostThreadLocal<std::vector<std::uint64_t>, GraphicsAbiKeyStorage>();
-    BuildRegisteredAbiKey(state, *localDevice, key);
+    auto& threadKey = HostThreadLocal<std::vector<std::uint64_t>, GraphicsAbiKeyStorage>();
+    BuildRegisteredAbiKey(state, *localDevice, threadKey);
+    const auto resolve = [state, registry, owner, localDevice, key = threadKey](ShaderPreparationTransaction& transaction) {
     const auto primitiveType = state.userConfig.find(0x242u);
     for (const auto& abi : transaction.Read(*owner).graphicsAbis) {
         if (abi.key != key || abi.registry.lock() != registry) continue;
@@ -1174,6 +1367,21 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     std::erase_if(graphicsAbis, [](const auto& entry) { return entry.registry.expired(); });
     graphicsAbis.push_back(std::move(abi));
     transaction.Commit();
+    };
+    // An ABI resolved before takes the quick path here (the title resolves the same ABIs every
+    // frame; a pool job per call cost it half its frame rate).
+    const bool known = [&] {
+        std::lock_guard lock(owner->prepared->mutex);
+        return std::ranges::any_of(owner->prepared->graphicsAbis, [&](const auto& abi) { return abi.key == threadKey && abi.registry.lock() == registry; });
+    }();
+    if (known || !DeferAbiPreparation(owner.get(), threadKey, [resolve] {
+        ShaderPreparationTransaction transaction;
+        resolve(transaction);
+    })) {
+        resolve(transaction);
+        return;
+    }
+    transaction.Commit();
 }
 
 void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
@@ -1206,8 +1414,9 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     const auto localDevice = device.Load();
     require(localDevice != nullptr, "shader registration device is missing");
     struct RegisteredAbiKeyStorage {};
-    auto& key = HostThreadLocal<std::vector<std::uint64_t>, RegisteredAbiKeyStorage>();
-    BuildRegisteredAbiKey(state, *localDevice, key);
+    auto& threadKey = HostThreadLocal<std::vector<std::uint64_t>, RegisteredAbiKeyStorage>();
+    BuildRegisteredAbiKey(state, *localDevice, threadKey);
+    const auto resolve = [snapshot, state, localDevice, key = threadKey](ShaderPreparationTransaction& transaction) {
     const auto prepare = [&] {
         try {
             const auto plan = PlanRegistered(*snapshot, *localDevice, state, false);
@@ -1234,6 +1443,24 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         if (!duplicate) prepared.entries.push_back(std::move(entry));
     }
     prepared.registeredAbis.push_back(key);
+    transaction.Commit();
+    };
+    // An ABI resolved before returns here without waiting on preparation (see the graphics case).
+    const bool known = [&] {
+        std::lock_guard lock(snapshot->prepared->mutex);
+        return std::ranges::find(snapshot->prepared->registeredAbis, threadKey) != snapshot->prepared->registeredAbis.end();
+    }();
+    if (known) {
+        transaction.Commit();
+        return;
+    }
+    if (!DeferAbiPreparation(snapshot.get(), threadKey, [resolve] {
+        ShaderPreparationTransaction transaction;
+        resolve(transaction);
+    })) {
+        resolve(transaction);
+        return;
+    }
     transaction.Commit();
 }
 

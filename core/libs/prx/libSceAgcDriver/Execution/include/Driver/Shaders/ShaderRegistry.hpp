@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -127,7 +128,13 @@ ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapsh
 ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint64_t vertexId, std::uint64_t fragmentId, const ShaderRecompiler::SpirvTarget& target);
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
-ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
+// With `deferAtUse` (draw stages), a variant not prepared yet is compiled on the preparation pool and
+// ShaderNotReady is thrown (the draw is skipped) instead of compiling it on the calling thread.
+ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, bool deferAtUse = false);
+
+struct ShaderNotReady : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 }
 
