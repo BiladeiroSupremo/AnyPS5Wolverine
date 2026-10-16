@@ -32,14 +32,16 @@ class Build:
                               encoding=self.encoding, check=True).stdout
 
     def absolute(self, path):
-        return os.path.normcase(os.path.normpath(path if os.path.isabs(path) else os.path.join(self.path, path)))
+        return os.path.normpath(path if os.path.isabs(path) else os.path.join(self.path, path))
+
+    def key(self, path):
+        return os.path.normcase(self.absolute(path))
 
     def repo(self, path):
         absolute = self.absolute(path)
-        build, source = os.path.normcase(self.path), os.path.normcase(self.source)
-        if absolute.startswith(build + os.sep) or not absolute.startswith(source + os.sep):
+        if inside(absolute, self.path) or not inside(absolute, self.source):
             return None
-        return os.path.relpath(absolute, source).replace(os.sep, "/")
+        return relative(absolute, self.source)
 
     def query(self, targets):
         found = {}
@@ -89,13 +91,21 @@ class Build:
 
     def output(self, path):
         absolute = self.absolute(path)
-        if not absolute.startswith(os.path.normcase(self.path) + os.sep):
+        if not inside(absolute, self.path):
             return None
-        return os.path.relpath(absolute, os.path.normcase(self.path)).replace(os.sep, "/")
+        return relative(absolute, self.path)
 
     def target(self, test):
         command = test.get("command") or []
         return self.output(command[0]) if command else None
+
+
+def inside(path, root):
+    return os.path.normcase(path).startswith(os.path.normcase(root) + os.sep)
+
+
+def relative(path, root):
+    return path[len(root) + 1:].replace(os.sep, "/")
 
 
 def chunks(names):
@@ -115,7 +125,7 @@ def dump(build, out):
     current = None
     for line in build.run("-t", "deps").splitlines():
         if not line.startswith(" ") and ": #deps" in line:
-            current = build.absolute(line.split(": #deps")[0])
+            current = build.key(line.split(": #deps")[0])
         elif line.strip() and current:
             path = build.repo(line.strip())
             if path:
@@ -135,7 +145,7 @@ def dump(build, out):
             path = build.repo(name)
             if path:
                 files.add(path)
-            files |= deps.get(build.absolute(name), set())
+            files |= deps.get(build.key(name), set())
             todo.extend(nodes.get(name, {"inputs": []})["inputs"])
         closures[target] = sorted(files)
     tests = {}
