@@ -605,6 +605,13 @@ bool JoinWawCheck() {
     return check;
 }
 
+// APS5_NO_EARLIER_STORE_REPLACE=1: a queued store replaces the bytes of the last queued one only,
+// as before (see RecordStore).
+bool EarlierStoreReplace() {
+    static const bool replace = std::getenv("APS5_NO_EARLIER_STORE_REPLACE") == nullptr;
+    return replace;
+}
+
 // APS5_NO_SEPARATE_QUEUED_LABELS=1: a queued label enters the recorded table and replaces a
 // recorded entry of its dword, as before (see NoteQueuedLabel).
 bool SeparateQueuedLabels() {
@@ -1540,7 +1547,27 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
         // contiguous one joins it (a joined range overlapping an earlier queued store takes the
         // WAW barrier when the run is recorded, so no join is refused).
         if (run.queued.empty()) storeRuns.fetch_add(1, std::memory_order_relaxed);
-        else if (auto& last = run.queued.back(); last.buffer == buffer) {
+        else if (EarlierStoreReplace() && run.queued.size() > 1) {
+            // A store inside an earlier queued one replaces its bytes too, when nothing queued
+            // since overlaps it (no sample dump at all): the run's updates are recorded together
+            // and only their final bytes are seen, so the WAW barrier a second update of the same
+            // label would take is not needed. A few dozen entries back at most.
+            const std::uint64_t addressEnd = address + bytes.size();
+            const std::size_t first = run.queued.size() > 64 ? run.queued.size() - 64 : 0;
+            for (std::size_t index = run.queued.size() - 1; index-- > first;) {
+                const auto& later = run.queued[index + 1];
+                if (later.dumpTarget != 0 || (address < later.End() && later.address < addressEnd)) break;
+                auto& earlier = run.queued[index];
+                if (earlier.dumpTarget != 0) break;
+                if (earlier.buffer == buffer && offset >= earlier.offset && end <= earlier.offset + earlier.bytes.size()) {
+                    std::memcpy(earlier.bytes.data() + (offset - earlier.offset), bytes.data(), bytes.size());
+                    storesReplaced.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        }
+        if (!run.queued.empty() && run.queued.back().buffer == buffer) {
+            auto& last = run.queued.back();
             const VkDeviceSize lastEnd = last.offset + last.bytes.size();
             if (offset >= last.offset && end <= lastEnd) {
                 std::memcpy(last.bytes.data() + (offset - last.offset), bytes.data(), bytes.size());
