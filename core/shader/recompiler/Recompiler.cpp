@@ -196,6 +196,13 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.nativeF32Flush = NativeF32Flush(request);
+    // f32 NaN results come from the host's own arithmetic instead of the emulated GCN NaN selection
+    // (~12 instructions per add/mul/fma): a NaN appears exactly where the guest would make one; on
+    // an AMD host its value is the guest's too unless the host compiler swaps the operands. 2026-10-16
+    // slot-4 cabin with native f32 flushing: 6.3 -> 7.4-7.8 FPS, same picture.
+    // APS5_NO_NATIVE_F32_NAN=1 emulates as before.
+    static const bool nativeNan = std::getenv("APS5_NO_NATIVE_F32_NAN") == nullptr;
+    translateOptions.nativeF32Nan = nativeNan;
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.inputInfo = inputInfo;
 

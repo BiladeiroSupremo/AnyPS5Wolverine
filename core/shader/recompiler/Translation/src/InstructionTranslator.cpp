@@ -554,6 +554,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         context.SetFloatMode(options.floatMode);
         context.SetNativeFloat16(options.nativeFloat16);
         context.SetNativeF32Flush(options.nativeF32Flush);
+        context.SetNativeF32Nan(options.nativeF32Nan);
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];
             if (isCodeTableLoad(cfg, instruction.programCounter)) {

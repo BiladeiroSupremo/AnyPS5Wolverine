@@ -37,6 +37,8 @@ struct TranslateOptions {
     // The module runs with DenormFlushToZero for f32 (the host flushes as the guest's FP_DENORM mode
     // 0 does), so no flush is emulated.
     bool nativeF32Flush = false;
+    // f32 NaN results come from the host's own arithmetic (no GCN NaN-selection emulation).
+    bool nativeF32Nan = false;
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;

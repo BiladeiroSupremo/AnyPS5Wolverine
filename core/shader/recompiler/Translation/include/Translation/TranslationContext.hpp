@@ -19,6 +19,7 @@ public:
     void SetFloatMode(const std::optional<ShaderFloatMode>& mode) { floatMode = mode; ieeeMode = mode.has_value() && mode->ieeeMode; }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
     void SetNativeF32Flush(bool enabled) { nativeF32Flush = enabled; }
+    void SetNativeF32Nan(bool enabled) { nativeF32Nan = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
 
@@ -356,6 +357,7 @@ private:
     bool ieeeMode = false;
     bool nativeFloat16 = false;
     bool nativeF32Flush = false;
+    bool nativeF32Nan = false;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;
