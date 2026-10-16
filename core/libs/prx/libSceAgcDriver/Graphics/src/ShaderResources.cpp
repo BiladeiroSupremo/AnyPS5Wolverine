@@ -1873,6 +1873,10 @@ constexpr std::array<const char*, static_cast<std::size_t>(OwnRefreshFallback::C
 struct RevalidateProfile {
     std::atomic<std::uint64_t> calls{0};
     std::atomic<std::uint64_t> nanoseconds{0};
+    // Time by outcome (fast proof, full walk, failed), on the "[rescache] revalidate time" line.
+    std::atomic<std::uint64_t> fastNanoseconds{0};
+    std::atomic<std::uint64_t> fullNanoseconds{0};
+    std::atomic<std::uint64_t> failedNanoseconds{0};
     std::atomic<std::uint64_t> fast{0};
     std::atomic<std::uint64_t> full{0};
     std::atomic<std::uint64_t> failed{0};
@@ -1977,11 +1981,14 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     auto& profile = Revalidations();
     const auto now = std::chrono::steady_clock::now();
     profile.calls.fetch_add(1, std::memory_order_relaxed);
-    profile.nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
+    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+    profile.nanoseconds.fetch_add(elapsed, std::memory_order_relaxed);
     (!ok ? profile.failed : fast ? profile.fast : profile.full).fetch_add(1, std::memory_order_relaxed);
+    (!ok ? profile.failedNanoseconds : fast ? profile.fastNanoseconds : profile.fullNanoseconds).fetch_add(elapsed, std::memory_order_relaxed);
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     auto last = profile.lastReport.load();
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate time (cumulative): fast %.1f ms over %llu, full %.1f ms over %llu, failed %.1f ms over %llu", profile.fastNanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), profile.fullNanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.full.load()), profile.failedNanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.failed.load()));
     const auto byReason = [](const auto& counts, const auto& names) {
         std::string reasons;
         for (std::size_t i = 0; i < names.size(); ++i) {
@@ -3579,13 +3586,70 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
 }
 
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {
-    const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
-    const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
-    return static_cast<std::size_t>(mib * 1024ull * 1024ull);
+    // Read once: a getenv per draw takes the CRT environment lock. Default 1 MiB (was 64): the
+    // cabin's draws snapshot ~1.9 MiB ring buffers the title keeps writing during the frame, so each
+    // draw refreshed one (~55 refreshes of ~52 us per frame, all under the GPU mutex); larger
+    // buffers are now read in place, as the title's own label waits order them on the PS5 too.
+    // A/B (2026-10-16): bindings 32 -> 13.6 us per draw, picture unchanged. =64 restores.
+    static const std::size_t bytes = [] {
+        const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
+        const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 1ull;
+        return static_cast<std::size_t>(mib * 1024ull * 1024ull);
+    }();
+    return bytes;
+}
+
+namespace {
+// Profiling (APS5_PROFILE_DRAW): PrepareDrawBindings by section, per call, on the [bindings] line
+// every 10 s, with the snapshots taken, reused and created.
+enum BindingSection : std::size_t { BindingSelect, BindingCollect, BindingReuse, BindingCreate, BindingAllocate, BindingUpdate, BindingKeep, BindingSectionCount };
+constexpr const char* BindingSectionNames[BindingSectionCount] = {"select", "collect", "reuse-lookup", "create+copy", "allocate", "update", "keep"};
+std::atomic<std::uint64_t> bindingSectionNs[BindingSectionCount]{};
+std::atomic<std::uint64_t> bindingCalls{0}, bindingSnapshots{0}, bindingReused{0}, bindingCreated{0}, bindingEmpty{0};
+std::atomic<std::int64_t> bindingReportNs{0};
+bool BindingsProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+struct BindingSplit {
+    bool on = BindingsProfiled();
+    std::chrono::steady_clock::time_point last = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void mark(BindingSection section) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        bindingSectionNs[section].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        last = now;
+    }
+    ~BindingSplit() {
+        if (!on) return;
+        const auto calls = bindingCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto previous = bindingReportNs.load(std::memory_order_relaxed);
+        if (previous == 0) {
+            bindingReportNs.compare_exchange_strong(previous, now);
+            return;
+        }
+        if (now - previous < 10'000'000'000ll || !bindingReportNs.compare_exchange_strong(previous, now)) return;
+        char line[640];
+        int n = std::snprintf(line, sizeof(line), "[bindings] %llu calls (10 s; %llu without snapshots), snapshots %llu (reused %llu, created %llu), us per call:", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(bindingEmpty.exchange(0)), static_cast<unsigned long long>(bindingSnapshots.exchange(0)), static_cast<unsigned long long>(bindingReused.exchange(0)), static_cast<unsigned long long>(bindingCreated.exchange(0)));
+        for (std::size_t i = 0; i < BindingSectionCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+            const auto ns = bindingSectionNs[i].exchange(0, std::memory_order_relaxed);
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.1f", BindingSectionNames[i], static_cast<double>(ns) / 1000.0 / static_cast<double>(calls));
+        }
+        bindingCalls.store(0, std::memory_order_relaxed);
+        const auto lookups = Recorder::TakeSnapshotLookupStats();
+        if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
+            const auto per = [](std::uint64_t total, std::uint64_t count) { return count != 0 ? static_cast<double>(total) / static_cast<double>(count) : 0.0; };
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; storage lookups %llu avg %.2f us, refreshes %llu avg %.2f us over avg %.1f KiB, %llu failed", static_cast<unsigned long long>(lookups[0]), per(lookups[1], lookups[0]) / 1000.0, static_cast<unsigned long long>(lookups[2]), per(lookups[3], lookups[2]) / 1000.0, per(lookups[4], lookups[2]) / 1024.0, static_cast<unsigned long long>(lookups[5]));
+        }
+        std::fprintf(stderr, "%s\n", line);
+    }
+};
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    BindingSplit split;
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = MaxDrawSnapshotBytes();
     std::size_t totalSnapshotBytes = 0;
@@ -3617,20 +3681,32 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
         if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        split.mark(BindingSelect);
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
+        split.mark(BindingCollect);
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+        split.mark(BindingReuse);
+        if (split.on) bindingSnapshots.fetch_add(1, std::memory_order_relaxed);
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+            if (split.on) bindingCreated.fetch_add(1, std::memory_order_relaxed);
+        } else if (split.on) {
+            bindingReused.fetch_add(1, std::memory_order_relaxed);
         }
+        split.mark(BindingCreate);
         selected.push_back(index);
         result->snapshots.push_back({begin, std::move(buffer)});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
-    if (selected.empty()) return {};
+    split.mark(BindingSelect);
+    if (selected.empty()) {
+        if (split.on) bindingEmpty.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
     for (const auto& binding : bindings) descriptions[setOf(binding)].push_back(binding.layout);
@@ -3643,6 +3719,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->fragmentAllocation = result->cache->Allocate(fragment.layout, PoolSizes(descriptions[1]));
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
+    split.mark(BindingAllocate);
     auto buffers = descriptorBuffers;
     auto writes = descriptorWrites;
     std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
@@ -3662,8 +3739,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    split.mark(BindingUpdate);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    split.mark(BindingKeep);
     return result;
 }
 

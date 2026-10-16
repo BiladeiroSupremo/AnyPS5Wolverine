@@ -1686,7 +1686,48 @@ bool DrawProgramTiming() {
 }
 }
 
+namespace {
+// Profiling (APS5_PROFILE_DRAW): recordDraw's time by section, per recorded draw, on the [record]
+// line every 10 s (the draws' 'record' phase).
+enum RecordSection : std::size_t { RecordFlush, RecordBindings, RecordPassStart, RecordBegin, RecordBind, RecordCommands, RecordLeave, RecordSectionCount };
+constexpr const char* RecordSectionNames[RecordSectionCount] = {"flush", "bindings", "pass-start", "begin", "bind+push", "commands", "leave"};
+std::atomic<std::uint64_t> recordSectionNs[RecordSectionCount]{};
+std::atomic<std::uint64_t> recordSectionDraws{0};
+std::atomic<std::int64_t> recordSectionReportNs{0};
+struct RecordSplit {
+    bool on;
+    std::chrono::steady_clock::time_point last;
+    explicit RecordSplit(bool profile) : on(profile), last(profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    void mark(RecordSection section) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        recordSectionNs[section].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        last = now;
+    }
+    ~RecordSplit() {
+        if (!on) return;
+        const auto draws = recordSectionDraws.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto previous = recordSectionReportNs.load(std::memory_order_relaxed);
+        if (previous == 0) {
+            recordSectionReportNs.compare_exchange_strong(previous, now);
+            return;
+        }
+        if (now - previous < 10'000'000'000ll || !recordSectionReportNs.compare_exchange_strong(previous, now)) return;
+        char line[512];
+        int n = std::snprintf(line, sizeof(line), "[record] %llu recorded draws (10 s), us per draw:", static_cast<unsigned long long>(draws));
+        for (std::size_t i = 0; i < RecordSectionCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+            const auto ns = recordSectionNs[i].exchange(0, std::memory_order_relaxed);
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.1f", RecordSectionNames[i], static_cast<double>(ns) / 1000.0 / static_cast<double>(draws));
+        }
+        recordSectionDraws.store(0, std::memory_order_relaxed);
+        std::fprintf(stderr, "%s\n", line);
+    }
+};
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
+    RecordSplit split(timer.profile);
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
@@ -1711,7 +1752,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    split.mark(RecordFlush);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    split.mark(RecordBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -1758,6 +1801,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
+    split.mark(RecordPassStart);
     std::unique_ptr<DeviceBuffer> scratch;
     std::shared_ptr<Buffer> meshArguments;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
@@ -1789,6 +1833,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
+    split.mark(RecordBegin);
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         const auto fragmentSet = drawBindings->fragmentAllocation.set;
@@ -1809,6 +1854,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     if (Breadcrumbs::Requested() && !shaders.empty()) Breadcrumbs::SetProgram(shaders.back().program->PipelineVariantId());
+    split.mark(RecordBind);
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state);
@@ -1818,6 +1864,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
+    split.mark(RecordCommands);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
@@ -1832,6 +1879,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    split.mark(RecordLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);

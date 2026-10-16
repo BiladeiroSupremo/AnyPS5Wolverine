@@ -2643,12 +2643,45 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
+namespace {
+std::array<std::atomic<std::uint64_t>, 6> snapshotLookupStats{};
+std::uint64_t NanosecondsBetween(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
+}
+
+std::array<std::uint64_t, 6> Recorder::TakeSnapshotLookupStats() {
+    std::array<std::uint64_t, 6> taken{};
+    for (std::size_t i = 0; i < taken.size(); ++i) taken[i] = snapshotLookupStats[i].exchange(0, std::memory_order_relaxed);
+    return taken;
+}
+
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool counted = profile && use == SnapshotUse::Storage;
+    const auto started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    struct Count {
+        bool on;
+        std::chrono::steady_clock::time_point started;
+        ~Count() {
+            if (!on) return;
+            snapshotLookupStats[0].fetch_add(1, std::memory_order_relaxed);
+            snapshotLookupStats[1].fetch_add(NanosecondsBetween(started, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        }
+    } count{counted, started};
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
-        if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
+        const auto refreshStarted = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool refreshed = sameRegistry && generation != 0 && use == SnapshotUse::Storage && refreshDrawSnapshot(found->second, address, bytes);
+        if (counted && sameRegistry && generation != 0) {
+            snapshotLookupStats[2].fetch_add(1, std::memory_order_relaxed);
+            snapshotLookupStats[3].fetch_add(NanosecondsBetween(refreshStarted, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+            snapshotLookupStats[4].fetch_add(bytes, std::memory_order_relaxed);
+            if (!refreshed) snapshotLookupStats[5].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!refreshed) {
             eraseDrawSnapshot(found);
             return {};
         }
