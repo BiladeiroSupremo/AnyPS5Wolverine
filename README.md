@@ -4,6 +4,21 @@ Tool for automatic executables porting to Linux and Windows.
 
 THIS FORK HAS A GDEFLATECOMPRESSOR SO YOU CAN COMPRESS YOUR FILES DOWN TO 105GB!!
 
+The compressor is `gdefpack` ([tools/gdefpack](tools/gdefpack)). It is built with the rest of the project on Windows, or on its own:
+
+```
+cmake -S tools/gdefpack -B build-gdefpack -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-gdefpack
+```
+
+Run it on a game folder (files in the folder itself, not subfolders):
+
+```
+gdefpack [--level N] [--min-saving P] [--threads T] <file or folder>...
+```
+
+Each file is compressed into a GDEF container, decoded again and compared with the original before it replaces it, so a failure keeps the original. Files that shrink by less than `--min-saving` percent (default 5, e.g. videos) are left as they are. Compressed files are read transparently by the emulator. `gdefpack --verify <packed> <original>` checks a packed file against an untouched copy.
+
 [**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
 
 ![anyps5_collage1](https://github.com/user-attachments/assets/0f8e13e8-1cb7-4c69-8075-39978e138994)
