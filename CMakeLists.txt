@@ -213,3 +213,7 @@ add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)
 add_subdirectory(core/libs)
 add_subdirectory(core/relinker)
+
+if(WIN32)
+    add_subdirectory(tools/gdefpack)
+endif()
