@@ -8,6 +8,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
@@ -178,6 +179,7 @@ public:
     void ReportNullRootReads(std::uint32_t* sink) { _nullRoots = sink; }
 
 private:
+    static bool MayEvaluate(const IrResourcePlan& program, IrValue* value, const IrValue* activeMask, std::unordered_set<const IrValue*>& firstLanes);
     static float Float32(std::uint64_t bits);
     static std::uint64_t Float32Bits(float value);
 
@@ -193,6 +195,8 @@ private:
     BasicEvaluator* _cleanEvaluator = nullptr;
     TNode _activeMask;
     bool _masked = false;
+    const BasicEvaluator* _outer = nullptr;
+    const void* _firstLane = nullptr;
     InaccessibleRead* _inaccessible = nullptr;
     std::uint32_t* _nullRoots = nullptr;
     EvaluatedValues _cache;

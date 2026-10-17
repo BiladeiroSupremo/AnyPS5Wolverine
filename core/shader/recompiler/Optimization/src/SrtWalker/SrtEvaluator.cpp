@@ -360,6 +360,12 @@ std::optional<bool> evaluableAlone(const IrResourcePlan& program, const IrValue&
 
 template<typename TNode>
 bool BasicEvaluator<TNode>::MayEvaluate(const IrResourcePlan& program, IrValue* value, const IrValue* activeMask) {
+    std::unordered_set<const IrValue*> firstLanes;
+    return MayEvaluate(program, value, activeMask, firstLanes);
+}
+
+template<typename TNode>
+bool BasicEvaluator<TNode>::MayEvaluate(const IrResourcePlan& program, IrValue* value, const IrValue* activeMask, std::unordered_set<const IrValue*>& firstLanes) {
     std::unordered_map<const IrValue*, bool> known;
     const auto takesActiveArm = [activeMask](const IrValue* current) {
         return activeMask != nullptr && IsRuntimeSelect(current->Opcode()) && current->ArgumentCount() == 3 && current->Argument(0)->Resolve() == activeMask;
@@ -409,7 +415,12 @@ bool BasicEvaluator<TNode>::MayEvaluate(const IrResourcePlan& program, IrValue* 
         if (current->Opcode() == IrOpcode::ReadFirstLane && current->ArgumentCount() >= 2) {
             auto* source = current->Argument(0) != nullptr ? current->Argument(0)->Resolve() : nullptr;
             const auto* mask = current->Argument(1) != nullptr ? current->Argument(1)->Resolve() : nullptr;
-            known.emplace(current, source != nullptr && MayEvaluate(program, source, mask));
+            if (!firstLanes.insert(current).second) {
+                known.emplace(current, false);
+                continue;
+            }
+            known.emplace(current, source != nullptr && MayEvaluate(program, source, mask, firstLanes));
+            firstLanes.erase(current);
             continue;
         }
         if (const auto alone = takesActiveArm(current) ? std::nullopt : evaluableAlone(program, *current)) {
@@ -453,8 +464,13 @@ bool BasicEvaluator<TNode>::EvaluateInst(const TNode& inst, std::uint64_t& resul
         case IrOpcode::GetShaderBase: result = _runtime.shaderBase; return true;
         case IrOpcode::Phi: return EvaluatePhi(inst, result);
         case IrOpcode::ReadFirstLane: {
+            for (const auto* outer = this; outer != nullptr; outer = outer->_outer) {
+                if (outer->_firstLane == inst.Value()) return false;
+            }
             const TNode mask = inst.Argument(1);
             BasicEvaluator active(_program, _runtime, _cleanFlatSlots, _cleanEvaluator, &mask);
+            active._outer = this;
+            active._firstLane = inst.Value();
             active.ReportInaccessibleReads(_inaccessible);
             active.ReportNullRootReads(_nullRoots);
             return active.EvaluateWide(inst.Argument(0), result);

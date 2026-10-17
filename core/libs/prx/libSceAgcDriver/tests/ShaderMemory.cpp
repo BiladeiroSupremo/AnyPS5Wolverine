@@ -431,12 +431,18 @@ void verifyMayEvaluate() {
     plan.srtReads = {{&input, 0u}, {&lane, 4u}, {nullptr, 8u}};
     auto& constInput = make(IrOpcode::ReadConst, IrType::U32, {&constant(0), &constant(0)});
     auto& constLane = make(IrOpcode::ReadConst, IrType::U32, {&constant(0), &constant(1)});
-    auto& constOutside = make(IrOpcode::ReadConst, IrType::U32, {&constant(0), &constant(3)});
+    auto& constOutside = make(IrOpcode::ReadConst, IrType::U32, {&constant(0), &constant(4)});
     auto& constItself = make(IrOpcode::ReadConst, IrType::U32, {&constant(0), &constant(2)});
     plan.srtReads[2].value = &constItself;
+    auto& carried = make(IrOpcode::Phi, IrType::U32, {&input});
+    auto& firstCarried = make(IrOpcode::ReadFirstLane, IrType::U32, {&carried, &varying});
+    carried.AddArgument(&make(IrOpcode::IAdd32, IrType::U32, {&firstCarried, &constant(1)}));
+    plan.srtReads.push_back({nullptr, 12u});
+    auto& constFirstItself = make(IrOpcode::ReadConst, IrType::U32, {&constant(0), &constant(3)});
+    plan.srtReads[3].value = &make(IrOpcode::ReadFirstLane, IrType::U32, {&constFirstItself, &varying});
     std::array<std::uint32_t, 1> data{4};
     SrtRuntime runtime{data};
-    for (const auto& [value, expected, name] : std::array<std::tuple<IrValue*, bool, const char*>, 19>{{
+    for (const auto& [value, expected, name] : std::array<std::tuple<IrValue*, bool, const char*>, 21>{{
              {&constant(3), true, "a constant"},
              {&input, true, "user data"},
              {&uniform, true, "a comparison of user data"},
@@ -456,6 +462,8 @@ void verifyMayEvaluate() {
              {&constLane, false, "a constant read whose slot holds a vector register"},
              {&constOutside, false, "a constant read past the last slot"},
              {&constItself, false, "a constant read whose slot reads itself"},
+             {&firstCarried, false, "a first-lane read of a loop-carried value that reaches itself through the read"},
+             {&constFirstItself, false, "a constant read whose slot reads itself through a first-lane read"},
          }}) {
         require(Detail::Evaluator::MayEvaluate(plan, value) == expected, (std::string("MayEvaluate misjudged ") + name).c_str());
         Detail::Evaluator evaluator(plan, runtime);
