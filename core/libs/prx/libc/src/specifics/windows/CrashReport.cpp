@@ -396,15 +396,11 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
-<<<<<<< HEAD
-    if (!IsFatal(record->ExceptionCode) && !g_forceReport) return EXCEPTION_CONTINUE_SEARCH;
-=======
     if ((record->ExceptionCode & GccExceptionMask) == GccException) {
         if (const auto frame = FrameWithoutUnwindData(*info->ContextRecord)) ReportUndeliverableException(info, frame);
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (!IsFatal(record->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
->>>>>>> da6948ea1 (fix(libc): report host C++ exceptions that Windows cannot deliver)
+    if (!IsFatal(record->ExceptionCode) && !g_forceReport) return EXCEPTION_CONTINUE_SEARCH;
     if (reported.exchange(true)) {
         // Another thread is already reporting; let it finish before this fault ends the process.
         Sleep(INFINITE);
