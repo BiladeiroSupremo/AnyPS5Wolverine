@@ -28,6 +28,7 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(audio_out_initialization PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test_executable(audio_out_resampling_tests tests/AudioOutResampling.cpp)
         target_include_directories(audio_out_resampling_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR})
