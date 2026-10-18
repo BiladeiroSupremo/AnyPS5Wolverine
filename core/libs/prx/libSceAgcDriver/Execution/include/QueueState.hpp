@@ -249,10 +249,25 @@ inline Registers BuildInitialContextRegisters() {
     return result;
 }
 
-inline Registers InitialContextRegisters() {
+inline const Registers& InitialContextRegisterSet() {
     static const Registers& initial = *new Registers(BuildInitialContextRegisters());
     return initial;
 }
+
+inline Registers InitialContextRegisters() {
+    return InitialContextRegisterSet();
+}
+
+// Storage a pushed context state returns to when it is popped, so the next push copies into
+// buffers it already has. A copied queue state starts without one.
+struct SpareRegisters {
+    Registers registers;
+    SpareRegisters() = default;
+    SpareRegisters(const SpareRegisters&) {}
+    SpareRegisters& operator=(const SpareRegisters&) { return *this; }
+    SpareRegisters(SpareRegisters&&) noexcept = default;
+    SpareRegisters& operator=(SpareRegisters&&) noexcept = default;
+};
 
 struct Predication {
     std::uint64_t address = 0;
@@ -266,6 +281,7 @@ struct QueueState {
     Registers context = InitialContextRegisters();
     Registers userConfig{{0x24a, 0}, {0x24b, 0}};
     std::optional<Registers> savedContext;
+    SpareRegisters spareContext;
     std::vector<std::uint32_t> constantRam;
     std::uint64_t indexBase = 0;
     std::uint64_t drawIndirectBase = 0;
@@ -277,7 +293,18 @@ struct QueueState {
     Predication predication;
 
     void ClearContext() {
-        context = InitialContextRegisters();
+        context = InitialContextRegisterSet();
+    }
+
+    void PushContext() {
+        spareContext.registers = context;
+        savedContext.emplace(std::move(spareContext.registers));
+    }
+
+    void PopContext() {
+        std::swap(context, *savedContext);
+        spareContext.registers = std::move(*savedContext);
+        savedContext.reset();
     }
 
     std::span<const std::uint32_t> ConstantRam() const {
