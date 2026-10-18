@@ -18,6 +18,8 @@
 #include <vector>
 #include <algorithm>
 
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
 namespace {
 
 bool enabled() {
@@ -170,10 +172,87 @@ void noteFree(void* pointer) {
     inside = false;
 }
 
+// APS5_ALLOC_RATE=1: allocation counts by calling site (1 in 8 sampled, every size), every 10 s
+// ([allocrate]), for finding the call sites that churn the heap.
+bool rateEnabled() {
+    static const bool on = std::getenv("APS5_ALLOC_RATE") != nullptr;
+    return on;
+}
+
+constexpr std::size_t RateSlots = 8192;
+constexpr std::uint64_t RateSample = 8;
+
+struct RateSite {
+    std::atomic<std::uintptr_t> caller{0};
+    std::atomic<std::uintptr_t> parent{0};
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> bytes{0};
+};
+
+RateSite rateSites[RateSlots];
+std::atomic<std::uint64_t> rateCalls{0};
+std::array<std::atomic<std::uint64_t>, 24> rateSizes{};
+std::atomic<long long> rateReported{0};
+
+void reportRate() {
+    std::vector<std::pair<std::uint64_t, std::size_t>, MallocAllocator<std::pair<std::uint64_t, std::size_t>>> ranked;
+    for (std::size_t slot = 0; slot < RateSlots; ++slot) {
+        const auto count = rateSites[slot].count.exchange(0, std::memory_order_relaxed);
+        if (count != 0) ranked.emplace_back(count, slot);
+    }
+    std::sort(ranked.rbegin(), ranked.rend());
+    std::fprintf(stderr, "[allocrate] %llu operator new calls (10 s); sampled sizes by log2:", static_cast<unsigned long long>(rateCalls.exchange(0, std::memory_order_relaxed)));
+    for (std::size_t bucket = 0; bucket < rateSizes.size(); ++bucket) {
+        const auto count = rateSizes[bucket].exchange(0, std::memory_order_relaxed);
+        if (count != 0) std::fprintf(stderr, " %zu:%llu", bucket, static_cast<unsigned long long>(count * RateSample));
+    }
+    std::fputc('\n', stderr);
+    const auto module = reinterpret_cast<std::uintptr_t>(&__ImageBase);
+    for (std::size_t i = 0; i < ranked.size() && i < 40; ++i) {
+        auto& site = rateSites[ranked[i].second];
+        std::fprintf(stderr, "[allocrate]   x%llu %llu KiB: +0x%llx <- +0x%llx\n", static_cast<unsigned long long>(ranked[i].first * RateSample), static_cast<unsigned long long>(site.bytes.exchange(0, std::memory_order_relaxed) * RateSample >> 10u), static_cast<unsigned long long>(site.caller.load(std::memory_order_relaxed) - 1 - module), static_cast<unsigned long long>(site.parent.load(std::memory_order_relaxed) - module));
+    }
+    std::fflush(stderr);
+}
+
+void noteRate(std::size_t bytes, void* caller) {
+    const auto serial = rateCalls.fetch_add(1, std::memory_order_relaxed);
+    if (serial % RateSample != 0) return;
+    void* frames[5] = {};
+    const auto captured = RtlCaptureStackBackTrace(0, 5, frames, nullptr);
+    const auto first = reinterpret_cast<std::uintptr_t>(caller);
+    std::uintptr_t parent = 0;
+    for (USHORT i = 0; i + 1 < captured; ++i) {
+        if (frames[i] == caller) {
+            parent = reinterpret_cast<std::uintptr_t>(frames[i + 1]);
+            break;
+        }
+    }
+    rateSizes[std::min<std::size_t>(rateSizes.size() - 1, bytes == 0 ? 0 : 64 - __builtin_clzll(bytes))].fetch_add(1, std::memory_order_relaxed);
+    const auto key = (first * 0x9e3779b97f4a7c15ull) ^ (parent * 0xc2b2ae3d27d4eb4full);
+    for (std::size_t probe = 0; probe < 32; ++probe) {
+        auto& site = rateSites[(key + probe) % RateSlots];
+        auto expected = std::uintptr_t{0};
+        if (site.caller.load(std::memory_order_relaxed) == 0 && site.caller.compare_exchange_strong(expected, first + 1, std::memory_order_relaxed)) site.parent.store(parent, std::memory_order_relaxed);
+        if (site.caller.load(std::memory_order_relaxed) == first + 1 && site.parent.load(std::memory_order_relaxed) == parent) {
+            site.count.fetch_add(1, std::memory_order_relaxed);
+            site.bytes.fetch_add(bytes, std::memory_order_relaxed);
+            break;
+        }
+    }
+    if (serial % (RateSample * 16384) == 0) {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = rateReported.load(std::memory_order_relaxed);
+        if (last == 0) rateReported.compare_exchange_strong(last, now);
+        else if (now - last >= 10 && rateReported.compare_exchange_strong(last, now)) reportRate();
+    }
+}
+
 void* allocate(std::size_t bytes, void* caller) {
     void* pointer = std::malloc(bytes == 0 ? 1 : bytes);
     if (pointer == nullptr) throw std::bad_alloc();
     if (enabled()) noteAllocation(pointer, bytes, caller);
+    if (rateEnabled()) noteRate(bytes, caller);
     return pointer;
 }
 
@@ -183,10 +262,99 @@ void release(void* pointer) {
     std::free(pointer);
 }
 
+// Small-block cache: a block of CacheMinBytes..CacheMaxBytes returned by a sized delete is kept on a
+// per-thread free list for its exact size and handed to the next allocation of that size, instead
+// of going back to the process heap (whose allocate and free were ~15% of queue 0's samples in the
+// PPSA03671 cabin). Every cached block is a whole malloc block of at least its list's size, whoever
+// allocated it, so it serves the next allocation and stays valid for another module's free().
+// APS5_NO_ALLOC_CACHE=1 turns it off (as does APS5_ALLOC_PROFILE, which tracks every block).
+constexpr std::size_t CacheMinBytes = sizeof(void*);
+constexpr std::size_t CacheMaxBytes = 1024;
+constexpr std::size_t CacheClasses = CacheMaxBytes + 1;
+constexpr std::size_t CacheBytesPerClass = 16 * 1024;
+
+struct SmallCache {
+    void* heads[CacheClasses];
+    std::uint32_t counts[CacheClasses];
+};
+
+void NTAPI releaseSmallCache(void* data) {
+    auto* cache = static_cast<SmallCache*>(data);
+    if (cache == nullptr) return;
+    for (std::size_t index = 0; index < CacheClasses; ++index) {
+        for (void* block = cache->heads[index]; block != nullptr;) {
+            void* next = *static_cast<void**>(block);
+            std::free(block);
+            block = next;
+        }
+    }
+    std::free(cache);
 }
 
-void* operator new(std::size_t bytes) { return allocate(bytes, __builtin_return_address(0)); }
-void* operator new[](std::size_t bytes) { return allocate(bytes, __builtin_return_address(0)); }
+bool cacheEnabled() {
+    static const bool on = std::getenv("APS5_NO_ALLOC_CACHE") == nullptr && !enabled();
+    return on;
+}
+
+DWORD cacheSlot() {
+    static const DWORD slot = FlsAlloc(&releaseSmallCache);
+    return slot;
+}
+
+SmallCache* smallCache() {
+    const auto slot = cacheSlot();
+    if (slot == FLS_OUT_OF_INDEXES) return nullptr;
+    const auto error = GetLastError();
+    auto* cache = static_cast<SmallCache*>(FlsGetValue(slot));
+    if (cache == nullptr) {
+        cache = static_cast<SmallCache*>(std::calloc(1, sizeof(SmallCache)));
+        if (cache != nullptr && !FlsSetValue(slot, cache)) {
+            std::free(cache);
+            cache = nullptr;
+        }
+    }
+    SetLastError(error);
+    return cache;
+}
+
+void* allocateSmall(std::size_t bytes) {
+    if (auto* cache = smallCache(); cache != nullptr && cache->heads[bytes] != nullptr) {
+        void* block = cache->heads[bytes];
+        cache->heads[bytes] = *static_cast<void**>(block);
+        --cache->counts[bytes];
+        return block;
+    }
+    void* pointer = std::malloc(bytes);
+    if (pointer == nullptr) throw std::bad_alloc();
+    return pointer;
+}
+
+void releaseSized(void* pointer, std::size_t bytes) {
+    if (pointer == nullptr) return;
+    if (bytes >= CacheMinBytes && bytes <= CacheMaxBytes && cacheEnabled()) {
+        auto* cache = smallCache();
+        if (cache != nullptr && cache->counts[bytes] < std::max<std::size_t>(4, CacheBytesPerClass / bytes)) {
+            *static_cast<void**>(pointer) = cache->heads[bytes];
+            cache->heads[bytes] = pointer;
+            ++cache->counts[bytes];
+            return;
+        }
+    }
+    release(pointer);
+}
+
+void* allocateAny(std::size_t bytes, void* caller) {
+    if (bytes >= CacheMinBytes && bytes <= CacheMaxBytes && cacheEnabled()) {
+        if (rateEnabled()) noteRate(bytes, caller);
+        return allocateSmall(bytes);
+    }
+    return allocate(bytes, caller);
+}
+
+}
+
+void* operator new(std::size_t bytes) { return allocateAny(bytes, __builtin_return_address(0)); }
+void* operator new[](std::size_t bytes) { return allocateAny(bytes, __builtin_return_address(0)); }
 void* operator new(std::size_t bytes, const std::nothrow_t&) noexcept {
     try {
         return allocate(bytes, __builtin_return_address(0));
@@ -203,8 +371,8 @@ void* operator new[](std::size_t bytes, const std::nothrow_t&) noexcept {
 }
 void operator delete(void* pointer) noexcept { release(pointer); }
 void operator delete[](void* pointer) noexcept { release(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { release(pointer); }
-void operator delete[](void* pointer, std::size_t) noexcept { release(pointer); }
+void operator delete(void* pointer, std::size_t bytes) noexcept { releaseSized(pointer, bytes); }
+void operator delete[](void* pointer, std::size_t bytes) noexcept { releaseSized(pointer, bytes); }
 void operator delete(void* pointer, const std::nothrow_t&) noexcept { release(pointer); }
 void operator delete[](void* pointer, const std::nothrow_t&) noexcept { release(pointer); }
 
