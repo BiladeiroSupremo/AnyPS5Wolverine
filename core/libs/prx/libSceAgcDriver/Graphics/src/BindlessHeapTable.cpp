@@ -23,7 +23,7 @@ namespace {
 
 // Feedback is scanned at most this often: requests from a frame are resolved while the next frames
 // are recorded.
-constexpr auto ScanInterval = std::chrono::milliseconds(2);
+constexpr auto ScanInterval = std::chrono::milliseconds(8);
 // Textures resolved per scan: each may record an upload, so a burst of requests spreads over frames.
 constexpr std::uint32_t ScanBudget = 256u;
 // Published entries are looked up again at most this often, this many per pass (round robin).
@@ -326,8 +326,9 @@ bool BindlessHeapTable::RevalidateDue() {
 }
 
 bool BindlessHeapTable::ScanDue() {
+    static const auto interval = std::chrono::milliseconds([] { const char* text = std::getenv("APS5_HEAP_SCAN_MS"); return text ? std::atoi(text) : static_cast<int>(ScanInterval.count()); }());
     const auto now = std::chrono::steady_clock::now();
-    if (now - lastScan < ScanInterval) return false;
+    if (now - lastScan < interval) return false;
     lastScan = now;
     return true;
 }
