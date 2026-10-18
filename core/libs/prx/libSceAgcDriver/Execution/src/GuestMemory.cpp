@@ -795,6 +795,7 @@ struct WriteTracker {
         if (!watched) return;
         blocks.assign(size / WriteBlockBytes + 1, 0);
         cpuBlocks.assign(size / WriteBlockBytes + 1, 0);
+        pieceBits.assign((size / WriteBlockBytes + 1 + 63) / 64, 0);
         coverage.Initialize(base, size);
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
@@ -840,6 +841,21 @@ struct WriteTracker {
         std::array<DriverPiece, 4> pieces{};
     };
     std::unordered_map<std::uint64_t, DriverPieces> driverPieces;
+#ifdef _WIN32
+    // One bit per block that has a driverPieces entry: a whole-block store over a large range asks
+    // the map only where an entry can exist.
+    std::vector<std::uint64_t> pieceBits;
+    bool mayHavePieces(std::uint64_t block) const { return (pieceBits[block / 64] >> (block % 64) & 1u) != 0; }
+    void notePieces(std::uint64_t block) { pieceBits[block / 64] |= std::uint64_t{1} << (block % 64); }
+    void dropPieces(std::uint64_t block) {
+        driverPieces.erase(block);
+        pieceBits[block / 64] &= ~(std::uint64_t{1} << (block % 64));
+    }
+#else
+    bool mayHavePieces(std::uint64_t) const { return true; }
+    void notePieces(std::uint64_t) {}
+    void dropPieces(std::uint64_t block) { driverPieces.erase(block); }
+#endif
 
     struct CpuPages {
         std::array<std::uint32_t, WritePagesPerBlock> pages{};
@@ -864,12 +880,14 @@ struct WriteTracker {
         const auto from = static_cast<std::uint32_t>(std::max(address, begin) - begin);
         const auto to = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin);
         if (from == 0 && to == WriteBlockBytes) {
+            if (!mayHavePieces(block)) return;
             if (const auto found = driverPieces.find(block); found != driverPieces.end()) {
                 found->second = DriverPieces{};
                 found->second.whole = stampGeneration;
             }
             return;
         }
+        notePieces(block);
         auto& entry = driverPieces[block];
         auto& slot = entry.pieces[entry.next++ % entry.pieces.size()];
         entry.dropped = std::max(entry.dropped, slot.generation);
@@ -990,7 +1008,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
     ++tracker.generation;
     tracker.noteCpuStore(address, address + bytes, tracker.generation);
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
-        tracker.driverPieces.erase(block);
+        tracker.dropPieces(block);
         tracker.stamp(block, tracker.generation, StampKind::Cpu);
     }
     unwatchSerial.fetch_add(1, std::memory_order_release);
