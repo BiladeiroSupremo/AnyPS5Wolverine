@@ -1,5 +1,6 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/File/include/ArchivedFile.hpp"
+#include "prx/libkernel/File/include/CompressedFile.hpp"
 #include "prx/libc/include/General.hpp"
 
 #include <algorithm>
@@ -153,6 +154,10 @@ bool TryFillFileStat(const std::filesystem::path& nativePath, FileStat* sb) {
     NativeStat st{};
     if (DoStat(nativePath, &st) != 0) return false;
     CopyNativeStat(st, sb);
+    // A GDEF container (CompressedFile.hpp) has the size of the file it holds.
+    if ((sb->st_mode & 0170000) == 0100000 && sb->st_size >= 20) {
+        if (const auto uncompressed = CompressedFile::UncompressedSize(nativePath)) sb->st_size = static_cast<decltype(sb->st_size)>(*uncompressed);
+    }
     return true;
 }
 

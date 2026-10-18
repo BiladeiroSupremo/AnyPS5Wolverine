@@ -12,6 +12,7 @@
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
+#include "prx/libkernel/File/include/CompressedFile.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <array>
@@ -64,6 +65,12 @@ std::string _foldCase(std::string text) {
     return text;
 }
 
+// The size the guest sees: a GDEF container's uncompressed size (its header), the host size else.
+std::uint64_t _guestSize(const std::filesystem::path& path, std::uint64_t hostBytes) {
+    if (hostBytes < 20) return hostBytes;
+    return CompressedFile::UncompressedSize(path).value_or(hostBytes);
+}
+
 bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
     {
         std::lock_guard lock(g_directoriesLock);
@@ -79,7 +86,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
                 do {
                     if ((entry.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) continue;
                     const auto size = (static_cast<std::uint64_t>(entry.nFileSizeHigh) << 32u) | entry.nFileSizeLow;
-                    sizes.emplace(_foldCase(std::filesystem::path(entry.cFileName).string()), size);
+                    sizes.emplace(_foldCase(std::filesystem::path(entry.cFileName).string()), _guestSize(path.parent_path() / entry.cFileName, size));
                 } while (FindNextFileW(find, &entry));
                 FindClose(find);
             }
@@ -89,7 +96,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
                 std::error_code entryError;
                 if (!it->is_regular_file(entryError)) continue;
                 const auto size = it->file_size(entryError);
-                if (!entryError) sizes.emplace(_foldCase(it->path().filename().string()), size);
+                if (!entryError) sizes.emplace(_foldCase(it->path().filename().string()), _guestSize(it->path(), size));
             }
 #endif
             listed = g_directories.emplace(directory, std::move(sizes)).first;
@@ -104,7 +111,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
     if (!std::filesystem::is_regular_file(path, error)) return false;
     FileStat stat{};
     File::FillFileStat(path, &stat);
-    bytes = static_cast<std::uint64_t>(stat.st_size);
+    bytes = _guestSize(path, static_cast<std::uint64_t>(stat.st_size));
     return true;
 }
 
@@ -156,33 +163,106 @@ int _resolveForEach(const char* prefix, const char** paths, uint32_t count, uint
     return static_cast<int>(resolvedCount);
 }
 
+// Host handles of resolved files, opened on first read and kept: titles stream thousands of small
+// reads (Wolverine ~16000 at startup), and opening the file for each took ~8 ms, minutes in all.
+// Reads are positional, so the queues' workers share a handle.
+#ifdef _WIN32
+using HostFile = HANDLE;
+const HostFile NoHostFile = INVALID_HANDLE_VALUE;
+#else
+using HostFile = int;
+constexpr HostFile NoHostFile = -1;
+#endif
+std::mutex& g_handlesLock = *new std::mutex();
+std::vector<HostFile>& g_handles = *new std::vector<HostFile>();
+
+HostFile _hostFile(std::uint32_t id, const AprFile& file) {
+    std::lock_guard lock(g_handlesLock);
+    if (id < g_handles.size() && g_handles[id] != NoHostFile) return g_handles[id];
+#ifdef _WIN32
+    const HostFile handle = CreateFileW(file.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+#else
+    const HostFile handle = open(file.path.c_str(), O_RDONLY | O_CLOEXEC);
+#endif
+    if (handle == NoHostFile) throw std::runtime_error("APR: cannot open " + file.path.string());
+    if (g_handles.size() <= id) g_handles.resize(id + 1, NoHostFile);
+    g_handles[id] = handle;
+    return handle;
+}
+
+// Reads `bytes` at `offset` into `destination`; returns the bytes read (fewer at the end of the file).
+// On Windows the bytes go through a host buffer and are copied in user mode, so demand-committed
+// guest pages fault in through the process (ReadFile cannot fill them; upstream f7953ecac).
+std::uint64_t _readAt(HostFile handle, std::uint64_t offset, std::uint8_t* destination, std::uint64_t bytes) {
+    std::uint64_t done = 0;
+#ifdef _WIN32
+    std::array<std::uint8_t, 64u * 1024u> staging;
+#endif
+    while (done < bytes) {
+#ifdef _WIN32
+        const auto chunk = static_cast<DWORD>(std::min<std::uint64_t>(bytes - done, staging.size()));
+        OVERLAPPED at{};
+        at.Offset = static_cast<DWORD>(offset + done);
+        at.OffsetHigh = static_cast<DWORD>((offset + done) >> 32u);
+        DWORD read = 0;
+        if (!ReadFile(handle, staging.data(), chunk, &read, &at) && GetLastError() != ERROR_HANDLE_EOF) throw std::runtime_error("APR: ReadFile failed with error " + std::to_string(GetLastError()));
+        if (read != 0) std::memcpy(destination + done, staging.data(), read);
+#else
+        const auto chunk = static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes - done, 1u << 30u));
+        const auto read = pread(handle, destination + done, chunk, static_cast<off_t>(offset + done));
+        if (read < 0) throw std::runtime_error("APR: pread failed with errno " + std::to_string(errno));
+#endif
+        if (read == 0) break;
+        done += static_cast<std::uint64_t>(read);
+    }
+    return done;
+}
+
+// A file's GDEF index (null for an ordinary file), probed on its first read and kept like its handle.
+std::mutex& g_compressedLock = *new std::mutex();
+std::vector<std::optional<std::shared_ptr<const CompressedFile::Index>>>& g_compressed = *new std::vector<std::optional<std::shared_ptr<const CompressedFile::Index>>>();
+
+std::shared_ptr<const CompressedFile::Index> _compressed(std::uint32_t id, const AprFile& file, HostFile handle) {
+    {
+        std::lock_guard lock(g_compressedLock);
+        if (id < g_compressed.size() && g_compressed[id].has_value()) return *g_compressed[id];
+    }
+#ifdef _WIN32
+    LARGE_INTEGER hostSize{};
+    if (!GetFileSizeEx(handle, &hostSize)) throw std::runtime_error("APR: cannot size " + file.path.string());
+    const auto hostBytes = static_cast<std::uint64_t>(hostSize.QuadPart);
+#else
+    struct stat hostStat {};
+    if (fstat(handle, &hostStat) != 0) throw std::runtime_error("APR: cannot size " + file.path.string());
+    const auto hostBytes = static_cast<std::uint64_t>(hostStat.st_size);
+#endif
+    const CompressedFile::RawRead read = [handle](std::uint64_t offset, void* destination, std::size_t bytes) { return _readAt(handle, offset, static_cast<std::uint8_t*>(destination), bytes) == bytes; };
+    auto index = CompressedFile::Probe(file.path.string(), hostBytes, read);
+    std::lock_guard lock(g_compressedLock);
+    if (g_compressed.size() <= id) g_compressed.resize(id + 1);
+    g_compressed[id] = index;
+    return index;
+}
+
 void _readFile(const Apr::ReadFileCommand& command) {
     const auto file = _file(command.fileId);
     static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
     if (trace) std::fprintf(stderr, "[apr] read %s offset=0x%llx size=0x%llx -> 0x%llx\n", file.path.string().c_str(), static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination));
-    std::ifstream stream(file.path, std::ios::binary);
-    if (!stream) throw std::runtime_error("APR: cannot open " + file.path.string());
-    stream.seekg(static_cast<std::streamoff>(command.offset));
+    const auto handle = _hostFile(command.fileId, file);
     const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
     if (!destination.Open()) throw std::runtime_error("APR: the read destination of " + file.path.string() + " is not writable guest memory");
-#ifdef _WIN32
-    std::array<char, 64u * 1024u> staging;
     std::uint64_t read = 0;
-    while (read < command.size) {
-        const auto wanted = static_cast<std::streamsize>(std::min<std::uint64_t>(command.size - read, staging.size()));
-        stream.read(staging.data(), wanted);
-        const auto obtained = static_cast<std::uint64_t>(stream.gcount());
-        if (obtained != 0) std::memcpy(reinterpret_cast<char*>(command.destination) + read, staging.data(), static_cast<std::size_t>(obtained));
-        read += obtained;
-        if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
-        if (obtained != static_cast<std::uint64_t>(wanted)) break;
+    std::uint64_t fileBytes = 0;
+    if (const auto compressed = _compressed(command.fileId, file, handle)) {
+        fileBytes = compressed->uncompressedBytes;
+        read = command.offset < fileBytes ? std::min<std::uint64_t>(command.size, fileBytes - command.offset) : 0;
+        const CompressedFile::RawRead raw = [handle](std::uint64_t offset, void* target, std::size_t bytes) { return _readAt(handle, offset, static_cast<std::uint8_t*>(target), bytes) == bytes; };
+        if (read != 0) CompressedFile::Read(*compressed, raw, command.offset, reinterpret_cast<void*>(command.destination), static_cast<std::size_t>(read));
+    } else {
+        read = _readAt(handle, command.offset, reinterpret_cast<std::uint8_t*>(command.destination), command.size);
+        if (read != command.size) fileBytes = std::filesystem::file_size(file.path);
     }
-#else
-    stream.read(reinterpret_cast<char*>(command.destination), static_cast<std::streamsize>(command.size));
-    if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
-    const auto read = static_cast<std::uint64_t>(stream.gcount());
-#endif
-    if (read != command.size && (!stream.eof() || command.offset + read < std::filesystem::file_size(file.path))) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
+    if (read != command.size && command.offset + read < fileBytes) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
     if (read != command.size) std::memset(reinterpret_cast<char*>(command.destination) + read, 0, static_cast<std::size_t>(command.size - read));
 }
 
@@ -878,7 +958,9 @@ int APS5_VABI sceKernelAprGetFileSize(uint32_t id, uint64_t* size) {
 
 int APS5_VABI sceKernelAprGetFileStat(uint32_t id, FileStat* stat) {
     if (!stat) return _fail(GUEST_EINVAL);
-    File::FillFileStat(_file(id).path, stat);
+    const auto file = _file(id);
+    File::FillFileStat(file.path, stat);
+    stat->st_size = static_cast<decltype(stat->st_size)>(file.size);
     return 0;
 }
 

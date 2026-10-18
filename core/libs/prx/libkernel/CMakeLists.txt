@@ -82,6 +82,22 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/AppMetadata/src/ParamSfoParser.cpp
 )
 
+target_sources(libkernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/File/src/CompressedFile.cpp)
+
+# libdeflate 1.8 with NVIDIA's GDEFLATE decoder (MIT / Apache-2.0, 3rdparty/libdeflate-gdeflate):
+# GDEF game files (File/src/CompressedFile.cpp) decode on the CPU.
+enable_language(C)
+set(LIBDEFLATE_GDEFLATE_DIR ${CMAKE_SOURCE_DIR}/3rdparty/libdeflate-gdeflate)
+if(NOT TARGET libdeflate_gdeflate)
+    add_library(libdeflate_gdeflate STATIC EXCLUDE_FROM_ALL
+            ${LIBDEFLATE_GDEFLATE_DIR}/lib/gdeflate_decompress.c
+            ${LIBDEFLATE_GDEFLATE_DIR}/lib/utils.c
+            ${LIBDEFLATE_GDEFLATE_DIR}/lib/x86/cpu_features.c)
+    target_include_directories(libdeflate_gdeflate PUBLIC ${LIBDEFLATE_GDEFLATE_DIR} PRIVATE ${LIBDEFLATE_GDEFLATE_DIR}/common)
+    set_target_properties(libdeflate_gdeflate PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
+endif()
+target_link_libraries(libkernel PRIVATE libdeflate_gdeflate)
+
 target_include_directories(libkernel PRIVATE ${LIBS_INCLUDE_DIR})
 target_include_directories(libkernel PRIVATE ${LIBS_INCLUDE_DIR}/nid/include)
 target_link_libraries(libkernel PRIVATE ${CMAKE_DL_LIBS})

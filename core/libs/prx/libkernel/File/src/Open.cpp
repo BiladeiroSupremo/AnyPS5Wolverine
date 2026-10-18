@@ -1,5 +1,6 @@
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
+#include "prx/libkernel/File/include/CompressedFile.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -246,6 +247,8 @@ static int OpenNative(const std::filesystem::path& native, int flags, std::uint1
     }
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))
         RecordWrittenPath_nid_no_patch(native);
+    // Descriptor reads do not decode GDEF containers (CompressedFile.hpp; APR reads do).
+    if ((flags & SCE_KERNEL_O_DIRECTORY) == 0) CompressedFile::RequireOrdinary(native, "sceKernelOpen");
     File::RememberDescriptor(fd, flags);
     return fd;
 }
