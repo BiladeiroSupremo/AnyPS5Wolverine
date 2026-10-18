@@ -364,8 +364,12 @@ public:
                     continue;
                 }
                 const auto memory = query(cursor);
-                if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                if (memory.State == MEM_RESERVE) {
+                    cursor = stop;
+                    continue;
+                }
+                if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 if (capacity == *count) return true;
                 const auto touched = (((stop + 4095) & ~static_cast<std::uintptr_t>(4095)) - (cursor & ~static_cast<std::uintptr_t>(4095))) / 4096;
                 ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, touched);
@@ -390,7 +394,7 @@ private:
                 continue;
             }
             const auto memory = query(cursor);
-            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+            if (memory.State != MEM_RESERVE && (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE)) return false;
             cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
         }
         return true;

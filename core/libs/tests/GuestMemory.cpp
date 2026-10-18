@@ -1590,6 +1590,9 @@ static void CheckFailedCollectKeepsWrites() {
     GuestArena::GuestArenaCommit_nid_postfix(block + page * 2, page, PAGE_READWRITE, page);
     Require(collect(block, page, count) && collect(block + page * 2, page, count));
     static_cast<volatile unsigned char*>(block)[8] = 1;
+    Require(collect(block, page * 3, count) && count == 1);
+    static_cast<volatile unsigned char*>(block)[8] = 2;
+    GuestArena::GuestArenaMapZero_nid_postfix(block + page, page);
     Require(!collect(block, page * 3, count));
     Require(collect(block, page, count) && count == 1);
     GuestArena::GuestArenaRelease_nid_postfix(block, page * 3);
