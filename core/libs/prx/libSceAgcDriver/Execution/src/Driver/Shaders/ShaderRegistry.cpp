@@ -34,6 +34,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <algorithm>
 #include <cinttypes>
@@ -676,7 +677,14 @@ struct AtUsePreparations {
     std::set<std::uint64_t> pending;
     std::set<std::uint64_t> attempted;
     std::uint64_t built = 0;
+    // Variants whose preparation failed in place as well: later draws are skipped at once with the
+    // same error instead of recompiling on the draw path again (two PPSA03671 gameplay shaders the
+    // recompiler rejects, bindless storage image tables, were recompiled by every draw). Tried again
+    // after AtUseRetryAfter.
+    std::unordered_map<std::uint64_t, std::pair<std::chrono::steady_clock::time_point, std::string>> failed;
 };
+
+constexpr auto AtUseRetryAfter = std::chrono::seconds(60);
 
 AtUsePreparations& atUsePreparations() {
     static auto* state = new AtUsePreparations();
@@ -720,9 +728,16 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
     }
     static const bool asyncAtUse = std::getenv("APS5_SYNC_PREPARE_AT_USE") == nullptr;
+    const auto identity = atUseIdentity(snapshot.prepared.get(), codeOffset, key, source.shader.code);
+    auto& state = atUsePreparations();
+    {
+        std::lock_guard failedLock(state.mutex);
+        if (const auto found = state.failed.find(identity); found != state.failed.end()) {
+            if (std::chrono::steady_clock::now() - found->second.first < AtUseRetryAfter) throw std::runtime_error(found->second.second);
+            state.failed.erase(found);
+        }
+    }
     if (deferAtUse && asyncAtUse) {
-        const auto identity = atUseIdentity(snapshot.prepared.get(), codeOffset, key, source.shader.code);
-        auto& state = atUsePreparations();
         std::unique_lock atUseLock(state.mutex);
         if (state.pending.contains(identity)) throw ShaderNotReady("AGC driver: a shader variant is being prepared in the background; the draw is skipped until it is ready");
         if (!state.attempted.contains(identity)) {
@@ -756,7 +771,14 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         }
     }
     ReportPreparedAtUse(snapshot, source);
-    auto handle = PrepareShaderWithDiagnostics(source);
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    try {
+        handle = PrepareShaderWithDiagnostics(source);
+    } catch (const std::exception& error) {
+        std::lock_guard failedLock(state.mutex);
+        state.failed[identity] = {std::chrono::steady_clock::now(), error.what()};
+        throw;
+    }
     invocationRequest = source;
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
     auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
@@ -1291,13 +1313,24 @@ bool DeferAbiPreparation(const void* owner, std::span<const std::uint64_t> key, 
     for (const auto word : key) mix(word);
     static std::mutex mutex;
     static std::set<std::uint64_t> pending;
+    // A failed preparation is tried again at most once a minute: the title resolves the same ABI
+    // every frame, and two PPSA03671 gameplay shaders the recompiler rejects (bindless storage image
+    // tables) were recompiled ~170 times each in the background.
+    static std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> failed;
+    constexpr auto RetryAfter = std::chrono::seconds(60);
     {
         std::lock_guard lock(mutex);
+        if (const auto found = failed.find(hash); found != failed.end()) {
+            if (std::chrono::steady_clock::now() - found->second < RetryAfter) return true;
+            failed.erase(found);
+        }
         if (!pending.insert(hash).second) return true;
     }
     SubmitRegistrationPreparation([hash, resolve = std::move(resolve)] {
+        bool succeeded = false;
         try {
             resolve();
+            succeeded = true;
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[shader-prepare] background ABI preparation failed: %s\n", error.what());
         } catch (...) {
@@ -1305,6 +1338,7 @@ bool DeferAbiPreparation(const void* owner, std::span<const std::uint64_t> key, 
         }
         std::lock_guard lock(mutex);
         pending.erase(hash);
+        if (!succeeded) failed[hash] = std::chrono::steady_clock::now();
     });
     return true;
 }
