@@ -3770,7 +3770,8 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         for (const auto& [queue, count] : aheadByQueue) stats.aheadByQueue[queue] += count;
         if (std::chrono::steady_clock::now() - stats.lastReport > std::chrono::seconds(10)) ReportSyncWaits(stats);
     }
-    if (trace) {
+    static const double traceMinMs = [] { const char* text = std::getenv("APS5_TRACE_CAPSYNC_MIN_MS"); return text ? std::atof(text) : 0.0; }();
+    if (trace && ms >= traceMinMs) {
         static std::atomic<int> lines{0};
         if (lines.fetch_add(1) < 600) {
             const auto packet = GuestMemory::CurrentPacket();

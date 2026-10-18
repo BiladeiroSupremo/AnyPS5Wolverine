@@ -287,7 +287,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto invocation = rejecting([&] { return InvocationFor(codeSnapshot, codeStart, request); });
             timing.Mark("prepared_invocation");
 
-            const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+            const auto captureStarted = traceCapSync() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             forgetAtCapture = GuestMemory::ForgetSerial();
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
@@ -295,7 +295,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }();
             captured = shaderMemory->Regions();
             request.context.memory = captured;
-            if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
+            if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - captureStarted).count());
             captureMs += phaseTiming.Elapsed();
             phaseTiming.Phase(PhaseCapture);
             if (dumpShaders) static_cast<void>(dumpRequest(address, request));

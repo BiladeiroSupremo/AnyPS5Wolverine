@@ -9,13 +9,25 @@ bool Driver::traceBudget() {
 }
 
 void Driver::traceCapture(const char* what, std::uint64_t program, std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> regions, double waitedMs) {
-    if (waitedMs < 0.05 || !traceBudget()) return;
+    static const double minMs = [] { const char* text = std::getenv("APS5_TRACE_CAPSYNC_MIN_MS"); return text ? std::atof(text) : 0.05; }();
+    if (waitedMs < minMs || !traceBudget()) return;
     std::fprintf(stderr, "[capsync] %s q0x%x program 0x%llx waited %.1f ms over %zu regions\n", what, queue, static_cast<unsigned long long>(program), waitedMs, regions.size());
+    static const bool values = std::getenv("APS5_TRACE_CAPSYNC_VALUES") != nullptr;
     for (const auto& region : regions) {
         const auto begin = region.guestAddress;
         const auto end = begin + region.bytes.size();
         const auto pageBegin = begin & ~static_cast<std::uint64_t>(4095);
         const auto pageEnd = (end + 4095) & ~static_cast<std::uint64_t>(4095);
+        if (values) {
+            std::string text;
+            for (std::size_t offset = 0; offset < std::min<std::size_t>(region.bytes.size(), 64); ++offset) {
+                char hex[4];
+                std::snprintf(hex, sizeof(hex), "%02x", static_cast<unsigned>(region.bytes[offset]));
+                text += hex;
+                if (offset % 4 == 3) text += ' ';
+            }
+            std::fprintf(stderr, "[capsync]   value 0x%llx+0x%zx: %s\n", static_cast<unsigned long long>(begin), region.bytes.size(), text.c_str());
+        }
         if (!newestWriter(pageBegin, pageEnd)) continue;
         std::fprintf(stderr, "[capsync]   region 0x%llx+0x%zx: writers of its page(s):%s; of its dwords:%s\n", static_cast<unsigned long long>(begin), region.bytes.size(), describeWriters(pageBegin, pageEnd).c_str(), describeWriters(begin, end).c_str());
     }

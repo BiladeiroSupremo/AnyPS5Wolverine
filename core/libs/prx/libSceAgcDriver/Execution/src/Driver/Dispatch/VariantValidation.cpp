@@ -58,7 +58,8 @@ bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const S
             counters.syncedWaitMs += waited;
             if (std::chrono::steady_clock::now() - counters.lastReport > std::chrono::seconds(10)) reportValidation(counters);
         }
-        if (traceCapSync() && traceBudget()) {
+        static const double traceMinMs = [] { const char* text = std::getenv("APS5_TRACE_CAPSYNC_MIN_MS"); return text ? std::atof(text) : 0.0; }();
+        if (traceCapSync() && waited >= traceMinMs && traceBudget()) {
             const auto begin = region.guestAddress;
             const auto end = begin + region.bytes.size();
             std::fprintf(stderr, "[capsync] dispatch-cache q0x%x program 0x%llx region 0x%llx+0x%zx synced before the gate: waited %.1f ms;%s; writers:%s\n", queue, static_cast<unsigned long long>(program), static_cast<unsigned long long>(begin), region.bytes.size(), waited, describeSelf(compiled, begin, end).c_str(), describeWriters(begin, end).c_str());
