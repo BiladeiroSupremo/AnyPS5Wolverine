@@ -4174,6 +4174,11 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     return result;
 }
 
+bool GuestBufferMemory::AllInPlace() const {
+    if (!uploaded || committed || space != nullptr || !lease.empty()) return false;
+    return std::all_of(regions.begin(), regions.end(), [](const Region& region) { return region.direct != nullptr && !region.gpuCopy && region.mirror == nullptr; });
+}
+
 bool GuestBufferMemory::InPlaceReadsOverlap(std::uint64_t address, std::size_t bytes) const {
     if (!uploaded || committed) return false;
     const auto end = address + bytes;

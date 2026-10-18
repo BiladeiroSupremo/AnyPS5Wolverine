@@ -167,6 +167,16 @@ public:
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
+    // Why the recorded work of this object could not run on a second queue beside the graphics
+    // work (it shares state the graphics queue's recorded work may produce or consume), or null:
+    // every buffer is bound in place and nothing else is bound but samplers and data buffers.
+    const char* LaneBlocker() const {
+        if (usesBda || HoldsLease() || bda != nullptr) return "address-based";
+        if (!storageTextures.empty()) return "storage image";
+        if (!textures.empty()) return "sampled texture";
+        if (!guestMemory.AllInPlace()) return "copied buffer";
+        return nullptr;
+    }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }

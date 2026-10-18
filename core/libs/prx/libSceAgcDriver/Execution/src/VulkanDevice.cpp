@@ -4276,6 +4276,48 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
+    // APS5_PROFILE_LANE=1: per program of the compute queues, the dispatches whose resources could
+    // run on a second queue (ShaderResources::LaneBlocker) and why the others could not ([lane]).
+    static const bool profileLane = std::getenv("APS5_PROFILE_LANE") != nullptr;
+    if (profileLane && GuestMemory::GpuLockThreadTag() != 0) {
+        struct LaneCounts {
+            std::uint64_t total = 0;
+            std::uint64_t movable = 0;
+            std::map<std::string, std::uint64_t> blockers;
+        };
+        static std::mutex laneMutex;
+        static std::map<std::uint64_t, LaneCounts> lanes;
+        static auto laneReported = std::chrono::steady_clock::now();
+        std::lock_guard laneLock(laneMutex);
+        auto& counts = lanes[record.programAddress];
+        ++counts.total;
+        if (const char* blocker = resources.LaneBlocker()) ++counts.blockers[blocker];
+        else ++counts.movable;
+        if (std::chrono::steady_clock::now() - laneReported > std::chrono::seconds(10)) {
+            laneReported = std::chrono::steady_clock::now();
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> order;
+            std::uint64_t total = 0, movable = 0;
+            for (const auto& [program, entry] : lanes) {
+                order.emplace_back(entry.total, program);
+                total += entry.total;
+                movable += entry.movable;
+            }
+            std::sort(order.rbegin(), order.rend());
+            std::string line;
+            for (std::size_t i = 0; i < order.size() && i < 80; ++i) {
+                const auto& entry = lanes[order[i].second];
+                char text[96];
+                std::snprintf(text, sizeof(text), " 0x%llx %llu/%llu", static_cast<unsigned long long>(order[i].second), static_cast<unsigned long long>(entry.movable), static_cast<unsigned long long>(entry.total));
+                line += text;
+                for (const auto& [blocker, count] : entry.blockers) {
+                    std::snprintf(text, sizeof(text), " (%s %llu)", blocker.c_str(), static_cast<unsigned long long>(count));
+                    line += text;
+                }
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[lane] compute-queue dispatches (10 s): %llu of %llu movable; by program movable/total:%s\n", static_cast<unsigned long long>(movable), static_cast<unsigned long long>(total), line.c_str());
+            lanes.clear();
+        }
+    }
     // Both trace switches are read once: a getenv per dispatch takes the CRT environment lock.
     static const char* const traceProgram = std::getenv("APS5_TRACE_PROGRAM");
     static const char* const traceWriter = std::getenv("APS5_TRACE_WRITER");

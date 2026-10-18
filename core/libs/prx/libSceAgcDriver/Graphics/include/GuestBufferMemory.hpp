@@ -268,6 +268,9 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
     // Whether [address, address + bytes) overlaps one of InPlaceReads(), without building the list.
     bool InPlaceReadsOverlap(std::uint64_t address, std::size_t bytes) const;
+    // Whether every uploaded region is bound in place through a host import: no copy, staging
+    // shadow, mirror or address space, so the recorded work touches guest memory only in place.
+    bool AllInPlace() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
 
 private:
