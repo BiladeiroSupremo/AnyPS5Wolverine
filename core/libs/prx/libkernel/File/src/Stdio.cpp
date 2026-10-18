@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <limits>
 #include "SceTypes.hpp"
+#include "prx/libkernel/File/include/CompressedFile.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/RenameDot.hpp"
@@ -241,6 +242,13 @@ static std::int64_t NativePositionedTransfer(int descriptor, void* buf, std::siz
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
         throw std::runtime_error("NativePositioned: nbytes exceeds platform limit");
     }
+    if (const auto compressed = CompressedFile::FindDescriptor(descriptor)) {
+        if (write) {
+            errno = EBADF;
+            return -1;
+        }
+        return CompressedFile::ReadDescriptor(*compressed, buf, nbytes, offset);
+    }
     if (write) {
         const auto result = File::PwriteSharedMemory_nid_no_patch(descriptor, buf, nbytes, offset);
         if (result != -2) return result;
@@ -304,6 +312,13 @@ std::int64_t File::WriteAtEnd(int descriptor, const void* buf, std::size_t nbyte
 static std::int64_t NativeTransferBuffer(int descriptor, void* buf, std::size_t nbytes, bool write) {
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("NativeTransfer: nbytes exceeds platform limit");
+    }
+    if (const auto compressed = CompressedFile::FindDescriptor(descriptor)) {
+        if (write) {
+            errno = EBADF;
+            return -1;
+        }
+        return CompressedFile::ReadDescriptor(*compressed, buf, nbytes, -1);
     }
     if (write) {
         const auto result = File::WriteSharedMemory_nid_no_patch(descriptor, buf, nbytes);

@@ -167,6 +167,7 @@ void FillFileStat(int nativeDescriptor, FileStat* sb) {
         throw std::runtime_error(std::string("FillFileStat: fstat failed for fd ") + std::to_string(nativeDescriptor));
     }
     CopyNativeStat(st, sb);
+    if (const auto compressed = CompressedFile::FindDescriptor(nativeDescriptor)) sb->st_size = static_cast<decltype(sb->st_size)>(CompressedFile::DescriptorSize(*compressed));
 }
 
 bool FillFileStatFromDescriptor(int fd, FileStat* sb) {
@@ -174,6 +175,7 @@ bool FillFileStatFromDescriptor(int fd, FileStat* sb) {
     NativeStat st{};
     if (DoFstat(fd, &st) != 0) return false;
     CopyNativeStat(st, sb);
+    if (const auto compressed = CompressedFile::FindDescriptor(fd)) sb->st_size = static_cast<decltype(sb->st_size)>(CompressedFile::DescriptorSize(*compressed));
     return true;
 }
 
