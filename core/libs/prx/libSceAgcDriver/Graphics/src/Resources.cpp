@@ -6,18 +6,23 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
 extern "C" __declspec(dllimport) int __stdcall GetModuleHandleExW(unsigned long flags, const wchar_t* name, void** module);
 extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long skip, unsigned long count, void** frames, unsigned long* hash);
+extern "C" __declspec(dllimport) void* __stdcall GetProcessHeap();
+extern "C" __declspec(dllimport) unsigned long __stdcall GetProcessHeaps(unsigned long count, void** heaps);
+extern "C" __declspec(dllimport) int __stdcall HeapSummary(void* heap, unsigned long flags, void* summary);
 #endif
 
 namespace AgcDriver::Graphics {
@@ -84,6 +89,93 @@ std::uintptr_t SiteOf(void* caller) {
     return reinterpret_cast<std::uintptr_t>(caller);
 }
 
+// Live Vulkan objects by kind, for the [vkmem] report: the Vulkan driver's own host memory (command
+// chunks, descriptor pool memory, pipeline code) is no device memory allocation of ours, so the
+// object counts point at its owner. Counted only through Context::Function lookups.
+enum ObjectKind : std::size_t { ObjectPipeline, ObjectDescriptorPool, ObjectCommandBuffer, ObjectImage, ObjectImageView, ObjectBuffer, ObjectSampler, ObjectQueryPool, ObjectShaderModule, ObjectKinds };
+constexpr std::array<const char*, ObjectKinds> ObjectNames{"pipelines", "descriptor pools", "command buffers", "images", "image views", "buffers", "samplers", "query pools", "shader modules"};
+
+std::array<std::atomic<std::int64_t>, ObjectKinds>& Objects() {
+    static std::array<std::atomic<std::int64_t>, ObjectKinds> objects{};
+    return objects;
+}
+
+#define APS5_TRACED_OBJECT(Kind, Create, Destroy, Info, Handle)                                                                                          \
+    PFN_vk##Create Real##Create = nullptr;                                                                                                             \
+    PFN_vk##Destroy Real##Destroy = nullptr;                                                                                                           \
+    VKAPI_ATTR VkResult VKAPI_CALL Traced##Create(VkDevice device, const Info* info, const VkAllocationCallbacks* callbacks, Handle* handle) {         \
+        const auto result = Real##Create(device, info, callbacks, handle);                                                                             \
+        if (result == VK_SUCCESS) Objects()[Kind].fetch_add(1, std::memory_order_relaxed);                                                             \
+        return result;                                                                                                                                 \
+    }                                                                                                                                                  \
+    VKAPI_ATTR void VKAPI_CALL Traced##Destroy(VkDevice device, Handle handle, const VkAllocationCallbacks* callbacks) {                               \
+        if (handle != VK_NULL_HANDLE) Objects()[Kind].fetch_sub(1, std::memory_order_relaxed);                                                         \
+        Real##Destroy(device, handle, callbacks);                                                                                                      \
+    }
+APS5_TRACED_OBJECT(ObjectDescriptorPool, CreateDescriptorPool, DestroyDescriptorPool, VkDescriptorPoolCreateInfo, VkDescriptorPool)
+APS5_TRACED_OBJECT(ObjectImage, CreateImage, DestroyImage, VkImageCreateInfo, VkImage)
+APS5_TRACED_OBJECT(ObjectImageView, CreateImageView, DestroyImageView, VkImageViewCreateInfo, VkImageView)
+APS5_TRACED_OBJECT(ObjectBuffer, CreateBuffer, DestroyBuffer, VkBufferCreateInfo, VkBuffer)
+APS5_TRACED_OBJECT(ObjectSampler, CreateSampler, DestroySampler, VkSamplerCreateInfo, VkSampler)
+APS5_TRACED_OBJECT(ObjectQueryPool, CreateQueryPool, DestroyQueryPool, VkQueryPoolCreateInfo, VkQueryPool)
+APS5_TRACED_OBJECT(ObjectShaderModule, CreateShaderModule, DestroyShaderModule, VkShaderModuleCreateInfo, VkShaderModule)
+#undef APS5_TRACED_OBJECT
+
+PFN_vkCreateGraphicsPipelines RealCreateGraphicsPipelines = nullptr;
+PFN_vkCreateComputePipelines RealCreateComputePipelines = nullptr;
+PFN_vkDestroyPipeline RealDestroyPipeline = nullptr;
+PFN_vkAllocateCommandBuffers RealAllocateCommandBuffers = nullptr;
+PFN_vkFreeCommandBuffers RealFreeCommandBuffers = nullptr;
+
+void CountHandles(ObjectKind kind, std::uint32_t count, const auto* handles, std::int64_t sign) {
+    std::int64_t made = 0;
+    for (std::uint32_t index = 0; index < count; ++index) made += handles[index] != VK_NULL_HANDLE;
+    Objects()[kind].fetch_add(sign * made, std::memory_order_relaxed);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TracedCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* callbacks, VkPipeline* pipelines) {
+    const auto result = RealCreateGraphicsPipelines(device, cache, count, infos, callbacks, pipelines);
+    CountHandles(ObjectPipeline, count, pipelines, 1);
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TracedCreateComputePipelines(VkDevice device, VkPipelineCache cache, std::uint32_t count, const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks* callbacks, VkPipeline* pipelines) {
+    const auto result = RealCreateComputePipelines(device, cache, count, infos, callbacks, pipelines);
+    CountHandles(ObjectPipeline, count, pipelines, 1);
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TracedDestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks* callbacks) {
+    if (pipeline != VK_NULL_HANDLE) Objects()[ObjectPipeline].fetch_sub(1, std::memory_order_relaxed);
+    RealDestroyPipeline(device, pipeline, callbacks);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TracedAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo* info, VkCommandBuffer* commands) {
+    const auto result = RealAllocateCommandBuffers(device, info, commands);
+    if (result == VK_SUCCESS) CountHandles(ObjectCommandBuffer, info->commandBufferCount, commands, 1);
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TracedFreeCommandBuffers(VkDevice device, VkCommandPool pool, std::uint32_t count, const VkCommandBuffer* commands) {
+    CountHandles(ObjectCommandBuffer, count, commands, -1);
+    RealFreeCommandBuffers(device, pool, count, commands);
+}
+
+PFN_vkVoidFunction TracedObjectFunction(std::string_view name, PFN_vkVoidFunction real) {
+#define APS5_HOOK(Name)                                                \
+    if (name == "vk" #Name) {                                          \
+        Real##Name = reinterpret_cast<PFN_vk##Name>(real);             \
+        return reinterpret_cast<PFN_vkVoidFunction>(&Traced##Name);    \
+    }
+    APS5_HOOK(CreateDescriptorPool) APS5_HOOK(DestroyDescriptorPool) APS5_HOOK(CreateImage) APS5_HOOK(DestroyImage)
+    APS5_HOOK(CreateImageView) APS5_HOOK(DestroyImageView) APS5_HOOK(CreateBuffer) APS5_HOOK(DestroyBuffer)
+    APS5_HOOK(CreateSampler) APS5_HOOK(DestroySampler) APS5_HOOK(CreateQueryPool) APS5_HOOK(DestroyQueryPool)
+    APS5_HOOK(CreateShaderModule) APS5_HOOK(DestroyShaderModule) APS5_HOOK(CreateGraphicsPipelines) APS5_HOOK(CreateComputePipelines)
+    APS5_HOOK(DestroyPipeline) APS5_HOOK(AllocateCommandBuffers) APS5_HOOK(FreeCommandBuffers)
+#undef APS5_HOOK
+    return nullptr;
+}
+
 void Report(MemoryTrace& trace, const char* why) {
     VkDeviceSize total = 0;
     for (const auto bytes : trace.typeBytes) total += bytes;
@@ -92,6 +184,27 @@ void Report(MemoryTrace& trace, const char* why) {
         if (trace.typeBytes[type] != 0) std::fprintf(stderr, " type %zu %.1f MiB", type, trace.typeBytes[type] / 1048576.0);
     }
     std::fputc('\n', stderr);
+    std::fprintf(stderr, "[vkmem] objects:");
+    for (std::size_t kind = 0; kind < ObjectKinds; ++kind) std::fprintf(stderr, " %s %lld", ObjectNames[kind], static_cast<long long>(Objects()[kind].load(std::memory_order_relaxed)));
+    std::fputc('\n', stderr);
+#ifdef _WIN32
+    // Host heaps (the process heap serves malloc of every module, the Vulkan driver's included):
+    // bytes in allocated blocks against committed bytes.
+    struct Summary {
+        unsigned long cb;
+        std::size_t allocated, committed, reserved, maxReserve;
+    };
+    void* heaps[64] = {};
+    const auto heapCount = std::min<unsigned long>(GetProcessHeaps(64, heaps), 64);
+    const auto* processHeap = GetProcessHeap();
+    std::fprintf(stderr, "[vkmem] heaps:");
+    for (unsigned long index = 0; index < heapCount; ++index) {
+        Summary summary{sizeof(Summary)};
+        if (!HeapSummary(heaps[index], 0, &summary) || summary.committed < (std::size_t{64} << 20u)) continue;
+        std::fprintf(stderr, " %p%s %.1f/%.1f MiB", heaps[index], heaps[index] == processHeap ? " (process)" : "", summary.allocated / 1048576.0, summary.committed / 1048576.0);
+    }
+    std::fputc('\n', stderr);
+#endif
     std::vector<std::pair<std::uintptr_t, MemoryTrace::Site>> ranked(trace.sites.begin(), trace.sites.end());
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
     for (std::size_t index = 0; index < ranked.size() && index < 10; ++index) {
@@ -239,7 +352,7 @@ PFN_vkVoidFunction TracedMemoryFunction(const char* name, PFN_vkVoidFunction rea
         trace.free = reinterpret_cast<PFN_vkFreeMemory>(real);
         return reinterpret_cast<PFN_vkVoidFunction>(&TracedFree);
     }
-    return nullptr;
+    return TracedObjectFunction(name, real);
 }
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {

@@ -102,7 +102,9 @@ inline std::uint64_t& DeviceProcLookups() {
 
 // APS5_TRACE_VKMEM=1: vkAllocateMemory and vkFreeMemory resolved through Context::Function are
 // wrapped to account live device memory by memory type and by call site (the module offset of the
-// caller), reported every 10 s and when an allocation fails (Resources.cpp). Null when disabled.
+// caller), reported every 10 s and when an allocation fails (Resources.cpp), with live object counts
+// (pipelines, descriptor pools, command buffers, ...) and the host heaps' committed bytes. Null when
+// disabled.
 PFN_vkVoidFunction TracedMemoryFunction(const char* name, PFN_vkVoidFunction real);
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
