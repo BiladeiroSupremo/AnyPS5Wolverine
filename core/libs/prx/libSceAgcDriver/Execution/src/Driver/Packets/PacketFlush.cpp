@@ -50,6 +50,30 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         return;
     }
     if (reap) lastReapTry = now;
+    static const bool profileParts = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    struct FlushParts {
+        double lockMs = 0, recordMs = 0, submitMs = 0, reapMs = 0;
+        std::uint64_t locks = 0, records = 0, submits = 0, reaps = 0;
+        std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+    };
+    static thread_local FlushParts parts;
+    auto partStart = profileParts ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto part = [&](double& into, std::uint64_t& count) {
+        if (!profileParts) return;
+        const auto at = std::chrono::steady_clock::now();
+        into += std::chrono::duration<double, std::milli>(at - partStart).count();
+        ++count;
+        partStart = at;
+    };
+    struct FlushReport {
+        FlushParts& parts;
+        std::uint32_t queue;
+        ~FlushReport() {
+            if (!profileParts || std::chrono::steady_clock::now() - parts.reported < std::chrono::seconds(10)) return;
+            AgcDriver::ProfilePrint_nid_no_patch("[flushparts] queue 0x%x (10 s): lock %llu/%.0f ms, label records %llu/%.0f ms, submits %llu/%.0f ms, reaps %llu/%.0f ms\n", queue, static_cast<unsigned long long>(parts.locks), parts.lockMs, static_cast<unsigned long long>(parts.records), parts.recordMs, static_cast<unsigned long long>(parts.submits), parts.submitMs, static_cast<unsigned long long>(parts.reaps), parts.reapMs);
+            parts = FlushParts{};
+        }
+    } flushReport{parts, queue};
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
 
     if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
@@ -72,9 +96,11 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         else if (selfLocking && submit) ++packetSubmitDeferred;
         return;
     }
+    part(parts.lockMs, parts.locks);
     const auto localDevice = device.Load();
     if (record || recordAtLock) {
         recordDeferredLabels(localDevice.get(), queue);
+        part(parts.recordMs, parts.records);
 
         if ((!labelPacket && packetFlush) || deferredDue) submit = true;
     }
@@ -83,11 +109,13 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
 
         if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
         localDevice->SubmitRecorded(queue == 0);
+        part(parts.submitMs, parts.submits);
         if (capped) ++capFlushes;
         else if (!labelPacket && packetFlush) ++packetFlushes;
         else ++deadlineFlushes;
     } else if (reap) {
         localDevice->ReapRecorded();
+        part(parts.reapMs, parts.reaps);
         ++boundaryReaps;
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
