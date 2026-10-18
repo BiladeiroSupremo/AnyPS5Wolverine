@@ -31,6 +31,8 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <list>
+#include <unordered_map>
 #include <set>
 #include <thread>
 #include <stop_token>
@@ -2860,11 +2862,173 @@ void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
     std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
 }
 
+// APS5_STAGING_REUSE_PROBE=1 (diagnostic): for a staged region's copy-in, whether the same guest
+// range was staged and copied back before with nothing stamped over it since, so a resident shadow
+// would have made the copy-in redundant. Reported on the [buffers] reuse probe line.
+bool stagingReuseProbe() {
+    static const bool on = std::getenv("APS5_STAGING_REUSE_PROBE") != nullptr;
+    return on;
+}
+
+struct StagingReuse {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> byBegin;
+    std::atomic<std::uint64_t> redundant{0}, redundantBytes{0}, needed{0}, neededBytes{0}, unseen{0}, unseenBytes{0};
+};
+
+StagingReuse& Reuse() {
+    static StagingReuse reuse;
+    return reuse;
+}
+
+void probeStagedCopyIn(std::uint64_t begin, std::uint64_t end) {
+    auto& reuse = Reuse();
+    std::uint64_t generation = 0;
+    {
+        std::lock_guard lock(reuse.mutex);
+        const auto found = reuse.byBegin.find(begin);
+        if (found != reuse.byBegin.end() && found->second.first == end) generation = found->second.second;
+    }
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    if (generation == 0) {
+        reuse.unseen.fetch_add(1, std::memory_order_relaxed);
+        reuse.unseenBytes.fetch_add(bytes, std::memory_order_relaxed);
+        return;
+    }
+    static_cast<void>(GuestMemory::CollectWrites(begin, bytes));
+    if (GuestMemory::UnchangedSince(begin, bytes, generation)) {
+        reuse.redundant.fetch_add(1, std::memory_order_relaxed);
+        reuse.redundantBytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else {
+        reuse.needed.fetch_add(1, std::memory_order_relaxed);
+        reuse.neededBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+// Resident staging shadows. Once a staged region's copy-back is recorded, its device-local shadow
+// holds the import's bytes (the copy-back stores the written sub-ranges, the rest is what the copy-in
+// read) unless something else stored into the range between the copy-in and the copy-back. Such a
+// shadow is handed to this registry (MarkDirectWrites) with the tracker generation after the build's
+// own write marks. The next build staging the same range (same device and usage) takes it, and its
+// copy-in is skipped when nothing was stamped over the range since that generation and no
+// address-based work, whose stores are stamped only at its completion, is in flight. The build that
+// handed a shadow back may still use it when reused: that use copies in, and its copy-back stamps the
+// range, so a later skip over the shadow fails the generation check (every use of a shadow ends in a
+// copy-back of all it may have changed). Kept up to APS5_RESIDENT_STAGING_MIB (256) by least recent
+// registration; APS5_NO_RESIDENT_STAGING=1 copies in at every use as before.
+bool residentStagingEnabled() {
+    static const bool on = std::getenv("APS5_NO_RESIDENT_STAGING") == nullptr;
+    return on;
+}
+
+std::uint64_t residentStagingBudget() {
+    static const std::uint64_t bytes = kibSetting("APS5_RESIDENT_STAGING_MIB", 256) << 10u;
+    return bytes;
+}
+
+struct ResidentShadow {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t end = 0;
+    VkBufferUsageFlags usage = 0;
+    std::shared_ptr<Buffer> buffer;
+    std::uint64_t generation = 0;
+    std::list<std::uint64_t>::iterator order;
+};
+
+struct ResidentShadows {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, ResidentShadow> byBegin;
+    std::list<std::uint64_t> recent;
+    std::uint64_t bytes = 0;
+    std::atomic<std::uint64_t> taken{0}, skipped{0}, skippedBytes{0}, refilled{0}, registered{0}, evicted{0};
+    // Shadows not handed back: their copy-in generation is unknown, or something stored over the
+    // range between the copy-in and the copy-back.
+    std::atomic<std::uint64_t> untracked{0}, storedBetween{0};
+};
+
+ResidentShadows& Residents() {
+    static auto* residents = new ResidentShadows;
+    return *residents;
+}
+
+std::shared_ptr<Buffer> eraseResident(ResidentShadows& residents, std::unordered_map<std::uint64_t, ResidentShadow>::iterator found) {
+    auto buffer = std::move(found->second.buffer);
+    residents.bytes -= found->second.end - found->first;
+    residents.recent.erase(found->second.order);
+    residents.byBegin.erase(found);
+    return buffer;
+}
+
+std::pair<std::shared_ptr<Buffer>, std::uint64_t> takeResident(VkDevice device, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage) {
+    auto& residents = Residents();
+    std::shared_ptr<Buffer> dropped;
+    std::lock_guard lock(residents.mutex);
+    const auto found = residents.byBegin.find(begin);
+    if (found == residents.byBegin.end()) return {};
+    const bool matches = found->second.device == device && found->second.end == end && found->second.usage == usage;
+    const auto generation = found->second.generation;
+    auto buffer = eraseResident(residents, found);
+    if (!matches) {
+        dropped = std::move(buffer);
+        return {};
+    }
+    residents.taken.fetch_add(1, std::memory_order_relaxed);
+    return {std::move(buffer), generation};
+}
+
+void putResident(VkDevice device, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage, std::shared_ptr<Buffer> buffer, std::uint64_t generation) {
+    auto& residents = Residents();
+    std::vector<std::shared_ptr<Buffer>> dropped;
+    std::lock_guard lock(residents.mutex);
+    if (const auto found = residents.byBegin.find(begin); found != residents.byBegin.end()) dropped.push_back(eraseResident(residents, found));
+    const auto bytes = end - begin;
+    if (bytes > residentStagingBudget()) return;
+    while (residents.bytes + bytes > residentStagingBudget() && !residents.recent.empty()) {
+        dropped.push_back(eraseResident(residents, residents.byBegin.find(residents.recent.back())));
+        residents.evicted.fetch_add(1, std::memory_order_relaxed);
+    }
+    residents.recent.push_front(begin);
+    residents.byBegin.emplace(begin, ResidentShadow{device, end, usage, std::move(buffer), generation, residents.recent.begin()});
+    residents.bytes += bytes;
+    residents.registered.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Under GuestMemory::GpuMutex: address-based work recorded by this recorder may not have completed.
+bool leaseWorkInFlight(const Recorder& recorder) {
+    const auto& state = Leases();
+    return state.leaseRecorder == &recorder && state.newestLeaseSerial > recorder.CompletedThrough();
+}
+
+void reportResidentStaging() {
+    auto& residents = Residents();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    std::uint64_t bytes = 0;
+    std::size_t entries = 0;
+    {
+        std::lock_guard lock(residents.mutex);
+        bytes = residents.bytes;
+        entries = residents.byBegin.size();
+    }
+    const auto taken = take(residents.taken), skipped = take(residents.skipped), skippedKiB = take(residents.skippedBytes) >> 10u, refilled = take(residents.refilled), registered = take(residents.registered), evicted = take(residents.evicted);
+    const auto untracked = take(residents.untracked), storedBetween = take(residents.storedBetween);
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] resident staging (10 s): %llu shadows taken, %llu copy-ins skipped (%llu KiB), %llu refilled, %llu handed back, %llu evicted; %zu resident (%.1f MiB); not handed back: %llu no copy-in generation, %llu stored over between copy-in and copy-back\n", taken, skipped, skippedKiB, refilled, registered, evicted, entries, bytes / 1048576.0, untracked, storedBetween);
+}
+
+void reportStagingReuse() {
+    if (residentStagingEnabled()) reportResidentStaging();
+    if (!stagingReuseProbe()) return;
+    auto& reuse = Reuse();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto redundant = take(reuse.redundant), redundantKiB = take(reuse.redundantBytes) >> 10u, needed = take(reuse.needed), neededKiB = take(reuse.neededBytes) >> 10u, unseen = take(reuse.unseen), unseenKiB = take(reuse.unseenBytes) >> 10u;
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] reuse probe (10 s): staged copy-ins a resident shadow would skip %llu (%llu KiB), needed after another write %llu (%llu KiB), range not staged before %llu (%llu KiB)\n", redundant, redundantKiB, needed, neededKiB, unseen, unseenKiB);
+}
+
 void reportStaging() {
     auto& stats = Copies();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = stats.lastStagingReport.load();
     if (nowMs - last < 10000 || !stats.lastStagingReport.compare_exchange_strong(last, nowMs)) return;
+    reportStagingReuse();
     // One reporter per period (the exchange above), so the previous totals need no lock.
     static std::uint64_t lastStaged = 0, lastIn = 0, lastOut = 0;
     const auto staged = stats.staged.load();
@@ -3037,7 +3201,9 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = !bindableInPlace(region.begin - entry->base, addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
+                region.shadowUsage = gpuCopyUsage(addressable);
+                if (residentStagingEnabled()) std::tie(region.buffer, region.residentGeneration) = takeResident(context.device, region.begin, region.end, region.shadowUsage);
+                if (region.buffer == nullptr) region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), region.shadowUsage);
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 if (region.buffer == nullptr) {
                     // No shadow to be had: in place when aligned, else the host copy below.
@@ -3394,7 +3560,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
-            if (region->deviceLocal) region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+            if (region->deviceLocal) {
+                region->shadowUsage = gpuCopyUsage(addressable);
+                region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), region->shadowUsage);
+            }
             if (region->buffer == nullptr) {
                 // Or no shadow to be had: a host copy serves the region instead, aligned or not.
                 region->deviceLocal = false;
@@ -3403,47 +3572,64 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
         }
-        std::vector<std::byte> expected;
-        const auto address = region->begin;
-        const auto batch = static_cast<unsigned long long>(recorder->Submissions() + 1);
-        const bool pendingWriter = recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes));
-        const bool writable = WritesOverlap(address, static_cast<std::size_t>(bytes));
-        std::shared_ptr<Buffer> inputSnapshot;
-        auto copySource = region->copySource;
-        auto copyOffset = region->begin - region->copySourceBase;
-        if (!pendingWriter && !writable) {
-            inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
-            copySource = inputSnapshot->Handle();
-            copyOffset = 0;
-            recorder->Keep(inputSnapshot);
-            CaptureTrace::Log("copy-input-snapshot batch=%llu address=%llx bytes=%llu", batch, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
-        }
-        if (capture && bytes == 32) {
-            CaptureTrace::Log("copy-input-candidate batch=%llu address=%llx bytes=%llu pendingWriter=%d writable=%d", batch, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), pendingWriter, writable);
-            if (inputSnapshot != nullptr) {
-                const auto snapshotBytes = inputSnapshot->Bytes();
-                expected.assign(snapshotBytes.begin(), snapshotBytes.end());
+        // A resident shadow still holding the import's bytes (see residentStagingEnabled) needs no
+        // copy-in; the generation recorded here is what the copy-back's hand-back checks against.
+        bool resident = false;
+        if (region->deviceLocal) {
+            const auto inGeneration = GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes));
+            if (region->residentGeneration != 0) {
+                resident = inGeneration != 0 && GuestMemory::UnchangedSince(region->begin, static_cast<std::size_t>(bytes), region->residentGeneration) && !leaseWorkInFlight(*recorder);
+                auto& residents = Residents();
+                (resident ? residents.skipped : residents.refilled).fetch_add(1, std::memory_order_relaxed);
+                if (resident) residents.skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
             }
+            region->copyInGeneration = inGeneration;
+            region->residentGeneration = 0;
         }
-        CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
-        if (!expected.empty()) {
-            auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            CopyBuffer(context, commands, region->buffer->Handle(), 0, readback->Handle(), 0, bytes);
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-            recorder->OnComplete([readback, expected = std::move(expected), address, batch] {
-                const auto actual = readback->Bytes();
-                std::size_t changed = 0;
-                for (std::size_t index = 0; index < expected.size(); ++index) {
-                    if (expected[index] == actual[index]) continue;
-                    ++changed;
-                    CaptureTrace::Log("copy-input-byte batch=%llu address=%llx offset=%zu cpu=%02x gpu=%02x", batch, static_cast<unsigned long long>(address), index, std::to_integer<unsigned>(expected[index]), std::to_integer<unsigned>(actual[index]));
+        if (!resident) {
+            std::vector<std::byte> expected;
+            const auto address = region->begin;
+            const auto batch = static_cast<unsigned long long>(recorder->Submissions() + 1);
+            const bool pendingWriter = recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes));
+            const bool writable = WritesOverlap(address, static_cast<std::size_t>(bytes));
+            std::shared_ptr<Buffer> inputSnapshot;
+            auto copySource = region->copySource;
+            auto copyOffset = region->begin - region->copySourceBase;
+            if (!pendingWriter && !writable) {
+                inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+                copySource = inputSnapshot->Handle();
+                copyOffset = 0;
+                recorder->Keep(inputSnapshot);
+                CaptureTrace::Log("copy-input-snapshot batch=%llu address=%llx bytes=%llu", batch, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+            }
+            if (capture && bytes == 32) {
+                CaptureTrace::Log("copy-input-candidate batch=%llu address=%llx bytes=%llu pendingWriter=%d writable=%d", batch, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), pendingWriter, writable);
+                if (inputSnapshot != nullptr) {
+                    const auto snapshotBytes = inputSnapshot->Bytes();
+                    expected.assign(snapshotBytes.begin(), snapshotBytes.end());
                 }
-                CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
-            });
+            }
+            if (region->deviceLocal && stagingReuseProbe()) probeStagedCopyIn(region->begin, region->end);
+            CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+            if (!expected.empty()) {
+                auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                CopyBuffer(context, commands, region->buffer->Handle(), 0, readback->Handle(), 0, bytes);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                recorder->OnComplete([readback, expected = std::move(expected), address, batch] {
+                    const auto actual = readback->Bytes();
+                    std::size_t changed = 0;
+                    for (std::size_t index = 0; index < expected.size(); ++index) {
+                        if (expected[index] == actual[index]) continue;
+                        ++changed;
+                        CaptureTrace::Log("copy-input-byte batch=%llu address=%llx offset=%zu cpu=%02x gpu=%02x", batch, static_cast<unsigned long long>(address), index, std::to_integer<unsigned>(expected[index]), std::to_integer<unsigned>(actual[index]));
+                    }
+                    CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
+                });
+            }
+            if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         }
-        if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         // Kept by the batch at record time, as every other recorded target is: the caller keeps
         // the resources only after descriptor and pipeline work that may throw, and a released
         // buffer would go back to the pool (reused or destroyed) under this copy command. The
@@ -3457,7 +3643,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             if (region->deviceLocal) {
                 stagedAny = true;
                 Copies().staged.fetch_add(1, std::memory_order_relaxed);
-                Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
+                if (!resident) Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -3749,11 +3935,41 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
+    // Shadows that may be handed back (see residentStagingEnabled): nothing was stamped over the
+    // range between their copy-in and now, before this build's own marks below.
+    std::vector<const Region*> handBack;
+    if (residentStagingEnabled() && uploaded && !committed) {
+        auto& residents = Residents();
+        for (const auto& region : regions) {
+            if (!region.deviceLocal || !region.copiedBack) continue;
+            if (region.copyInGeneration == 0 || region.buffer == nullptr || region.shadowUsage == 0) {
+                residents.untracked.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+            static_cast<void>(GuestMemory::CollectWrites(region.begin, bytes));
+            if (GuestMemory::UnchangedSince(region.begin, bytes, region.copyInGeneration)) handBack.push_back(&region);
+            else residents.storedBetween.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+    }
+    for (const auto* region : handBack) {
+        const auto generation = GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(region->end - region->begin));
+        if (generation != 0) putResident(context.device, region->begin, region->end, region->shadowUsage, region->buffer, generation);
+    }
+    if (!stagingReuseProbe() || !uploaded || committed) return;
+    auto& reuse = Reuse();
+    for (const auto& region : regions) {
+        if (!region.deviceLocal || !region.copiedBack) continue;
+        const auto generation = GuestMemory::CollectWrites(region.begin, static_cast<std::size_t>(region.end - region.begin));
+        if (generation == 0) continue;
+        std::lock_guard lock(reuse.mutex);
+        reuse.byBegin[region.begin] = {region.end, generation};
     }
 }
 

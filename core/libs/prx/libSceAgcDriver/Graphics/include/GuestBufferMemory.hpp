@@ -238,7 +238,8 @@ public:
     // Whether any written range lives in a copied buffer, so a write-back must run once the GPU is done.
     bool HasCopiedWrites() const;
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
-    // RecordCopyBacks) to the write tracking now.
+    // RecordCopyBacks) to the write tracking now, and hands staging shadows that equal the import
+    // after their copy-backs to the resident registry, where a later build may take them.
     void MarkDirectWrites() const;
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
@@ -321,6 +322,12 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // A resident shadow taken for the region held the import's bytes as of this tracker
+        // generation (0: none taken); the generation the copy-in was recorded at (0: none).
+        std::uint64_t residentGeneration = 0;
+        std::uint64_t copyInGeneration = 0;
+        // The staging shadow's buffer usage (a resident shadow serves only the same usage).
+        VkBufferUsageFlags shadowUsage = 0;
     };
 
     // How [begin, end) lies against the space's base regions.
