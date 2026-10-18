@@ -617,7 +617,14 @@ extern "C" std::filesystem::path RelinkedModulePath_nid_no_patch(const std::file
     if (std::filesystem::is_regular_file(relinked, error)) return relinked;
     NameMatch names[] = {{relinked.filename().string()}};
     MatchNames(relinked.parent_path().empty() ? "." : relinked.parent_path(), names);
-    return MatchedModuleOrPath(path, relinked, names[0]);
+    const auto matched = MatchedModuleOrPath(path, relinked, names[0]);
+    if (matched != path) return matched;
+    for (const char* directory : {"sce_module", "sce_modules"}) {
+        auto bundled = path.parent_path() / directory / path.filename();
+        bundled += ".guest.prx";
+        if (std::filesystem::is_regular_file(bundled, error)) return bundled;
+    }
+    return path;
 }
 
 extern "C" int SetWorkingDirectory_nid_no_patch(const char* resolved) {
