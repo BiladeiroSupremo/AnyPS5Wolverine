@@ -277,6 +277,9 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                     ++CaptureTotals().wordWaits;
                     CaptureTotals().wordWaitNanoseconds += nanoseconds;
                 }
+                static const bool traceSlow = std::getenv("APS5_TRACE_WORD_SYNC") != nullptr;
+                static std::atomic<int> traced{0};
+                if (traceSlow && nanoseconds >= 1000000u && traced.fetch_add(1, std::memory_order_relaxed) < 2000) std::fprintf(stderr, "[wordsync] 0x%llx waited %.2f ms: before 0x%08x after 0x%08x%s\n", static_cast<unsigned long long>(address), nanoseconds / 1e6, before, word, observed ? "" : " (before not read)");
             }
             if (observed) report(waitsBefore, before == word);
         }
