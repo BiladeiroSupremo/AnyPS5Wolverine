@@ -1254,6 +1254,83 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
     return tracker.unchanged(first, last, generation);
 }
 
+void DescribeUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t generation, char* text, std::size_t size) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) {
+        std::snprintf(text, size, "arena unwatched");
+        return;
+    }
+#ifdef _WIN32
+    if (bytes == 0 || bytes > tracker.size || address < tracker.base || address - tracker.base > tracker.size - bytes) {
+        std::snprintf(text, size, "outside the arena");
+        return;
+    }
+    const bool excluded = !tracker.coverage.Covers(address, bytes);
+    const bool host = GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+    if (excluded || host) {
+        std::snprintf(text, size, "not covered:%s%s", excluded ? " excluded" : "", host ? " host-region" : "");
+        return;
+    }
+#else
+    if (!tracker.covers(address, bytes)) {
+        std::snprintf(text, size, "not covered");
+        return;
+    }
+#endif
+    if (generation == 0) {
+#ifdef _WIN32
+        std::uint32_t viewProtection = 0;
+        std::size_t views = 0;
+        std::size_t noAccess = 0;
+        for (auto page = address & ~std::uint64_t{0x3fff}; page < address + bytes; page += 0x4000) {
+            if (!GuestArena::GuestArenaProtection_nid_postfix(static_cast<std::uintptr_t>(page), &viewProtection)) continue;
+            ++views;
+            noAccess += viewProtection == PAGE_NOACCESS;
+        }
+        std::size_t badPages = 0;
+        std::size_t privatePages = 0;
+        MEMORY_BASIC_INFORMATION bad{};
+        std::uint64_t badPage = 0;
+        for (auto page = address & ~std::uint64_t{0x3fff}; page < address + bytes; page += 0x4000) {
+            if (GuestArena::GuestArenaProtection_nid_postfix(static_cast<std::uintptr_t>(page), &viewProtection)) continue;
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(reinterpret_cast<const void*>(std::max(page, address)), &memory, sizeof(memory)) == 0) continue;
+            if (memory.State == MEM_COMMIT && memory.Type == MEM_PRIVATE) {
+                ++privatePages;
+                continue;
+            }
+            if (badPages++ == 0) {
+                bad = memory;
+                badPage = page;
+            }
+        }
+        std::snprintf(text, size, "generation 0: %zu views (%zu noaccess), %zu private, %zu other (first at +0x%llx: base 0x%llx alloc 0x%llx size 0x%llx state 0x%lx type 0x%lx protect 0x%lx)", views, noAccess, privatePages, badPages, badPages != 0 ? static_cast<unsigned long long>(badPage > address ? badPage - address : 0) : 0ull, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(bad.BaseAddress)), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(bad.AllocationBase)), static_cast<unsigned long long>(bad.RegionSize), static_cast<unsigned long>(bad.State), static_cast<unsigned long>(bad.Type), static_cast<unsigned long>(bad.Protect));
+#else
+        std::snprintf(text, size, "generation 0 (collect incomplete)");
+#endif
+        return;
+    }
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(address + bytes - 1);
+    std::size_t newer = 0;
+    std::size_t cpuNewer = 0;
+    std::uint32_t newest = 0;
+    std::uint64_t newestBlock = first;
+    for (auto block = first; block <= last; ++block) {
+        const auto stamp = tracker.stampOf(block);
+        if (stamp <= generation) continue;
+        ++newer;
+        if (tracker.cpuStampOf(block) == stamp) ++cpuNewer;
+        if (stamp > newest) {
+            newest = stamp;
+            newestBlock = block;
+        }
+    }
+    std::snprintf(text, size, "%zu of %llu blocks newer (%zu by cpu collects), newest %u vs %llu at block 0x%llx, now %u", newer, static_cast<unsigned long long>(last - first + 1), cpuNewer, newest, static_cast<unsigned long long>(generation), static_cast<unsigned long long>(tracker.blockBegin(newestBlock)), tracker.generation.load(std::memory_order_relaxed));
+}
+
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);

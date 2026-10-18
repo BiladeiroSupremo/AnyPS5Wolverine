@@ -694,7 +694,21 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (scratch.capacity() > (64u << 20u)) std::vector<std::byte>().swap(scratch);
                 return same;
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || GuestMemory::UnchangedSince(address, static_cast<std::size_t>(it->snapshotBytes), it->generation) || equalsCommitted()) {
+            static const bool traceCompare = std::getenv("APS5_TRACE_TEXTURE_COMPARE") != nullptr;
+            const auto tracedCompare = [&] {
+                const bool same = equalsCommitted();
+                static std::mutex traceMutex;
+                static std::unordered_map<std::uint64_t, std::uint32_t> traced;
+                std::lock_guard traceLock(traceMutex);
+                auto& count = traced[address];
+                if (++count == 1 || count == 100 || count == 10000) {
+                    char reason[256];
+                    GuestMemory::DescribeUnchanged(address, static_cast<std::size_t>(it->snapshotBytes), it->generation, reason, sizeof(reason));
+                    std::fprintf(stderr, "[texcompare] 0x%llx %llu bytes %ux%u fmt %u use %u: %s, entry gen %llu collect gen %llu: %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(it->snapshotBytes), resource.width, resource.height, resource.format, count, same ? "same" : "changed", static_cast<unsigned long long>(it->generation), static_cast<unsigned long long>(generation), reason);
+                }
+                return same;
+            };
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || GuestMemory::UnchangedSince(address, static_cast<std::size_t>(it->snapshotBytes), it->generation) || (traceCompare ? tracedCompare() : equalsCommitted())) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});

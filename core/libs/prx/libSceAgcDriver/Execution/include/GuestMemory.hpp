@@ -64,6 +64,8 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+// Diagnostics: why UnchangedSince(range, generation) fails, written to `text`.
+void DescribeUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t generation, char* text, std::size_t size);
 // UnchangedSince for several ranges under one tracker lock: true only when every one holds.
 struct UnchangedQuery {
     std::uint64_t address;
