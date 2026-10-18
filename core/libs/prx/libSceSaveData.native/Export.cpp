@@ -952,7 +952,7 @@ static int convert(const SaveDataConvert* param) {
         return SAVE_DATA_ERROR_NOT_FOUND;
     }
     g_convertProgress = 1.0f;
-    return SAVE_DATA_OK;
+    return SAVE_DATA_ERROR_NO_NEED_CONVERT;
 }
 
 int APS5_VABI sceSaveDataConvert(const SaveDataConvert* param) {
