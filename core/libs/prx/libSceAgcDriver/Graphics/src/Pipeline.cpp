@@ -957,6 +957,21 @@ void runPartJobs(PartBuilds& builds) {
             std::fprintf(stderr, "[pipeline] background shader part build failed (the draw compiles in place): %s\n", error.what());
         }
         const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        // Debug aid: APS5_TRACE_PART_KEYS=1 prints every build's key and SPIR-V hashes, to compare
+        // two runs of the same save (the Vulkan pipeline cache grew on every replay).
+        static const bool traceKeys = std::getenv("APS5_TRACE_PART_KEYS") != nullptr;
+        if (traceKeys) {
+            std::string line;
+            char part[96];
+            for (const auto& shader : job->shaders) {
+                std::uint64_t hash = 1469598103934665603ull;
+                const auto& words = shader.program->spirv.Words();
+                for (const auto word : words) hash = (hash ^ word) * 1099511628211ull;
+                std::snprintf(part, sizeof(part), " stage%d:%016llx/%zu@%u", static_cast<int>(shader.stage), static_cast<unsigned long long>(hash), words.size(), shader.pushConstantOffset);
+                line += part;
+            }
+            std::fprintf(stderr, "[partkey] %016llx %.2f s%s\n", static_cast<unsigned long long>(job->hash), seconds, line.c_str());
+        }
         lock.lock();
         builds.pending.erase(job->hash);
         builds.attempted.insert(job->hash);
