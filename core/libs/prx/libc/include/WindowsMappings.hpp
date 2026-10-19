@@ -5,7 +5,10 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -69,27 +72,66 @@ public:
         return created;
     }
 
+    // Debug aid: APS5_TRACE_MAPPINGS=1 prints every Reset, Map and MapZero that held the mapping lock
+    // for 5 ms or more, and every Collect that waited that long for it ([mappings]): the lock guards
+    // write tracking too, so a long remap stalls every thread that collects writes.
+    static bool TraceHolds() {
+        static const bool on = std::getenv("APS5_TRACE_MAPPINGS") != nullptr;
+        return on;
+    }
+
+    struct HoldTrace {
+        const char* what;
+        std::uintptr_t address;
+        std::size_t bytes;
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        ~HoldTrace() {
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            if (ms >= 5.0) std::fprintf(stderr, "[mappings] %s 0x%llx+0x%zx held the mapping lock %.1f ms (thread %lu)\n", what, static_cast<unsigned long long>(address), bytes, ms, GetCurrentThreadId());
+        }
+    };
+
     void Reset(void* address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        std::optional<HoldTrace> hold;
+        if (TraceHolds()) hold.emplace(HoldTrace{"Reset", reinterpret_cast<std::uintptr_t>(address), bytes});
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) {
         std::lock_guard lock(mutex);
+        std::optional<HoldTrace> hold;
+        if (TraceHolds()) hold.emplace(HoldTrace{"Map", reinterpret_cast<std::uintptr_t>(address), bytes});
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
+        const bool phases = hold.has_value();
+        std::array<double, 6> phaseMs{};
+        auto phaseStart = std::chrono::steady_clock::now();
+        const auto phase = [&](std::size_t index) {
+            if (!phases) return;
+            const auto now = std::chrono::steady_clock::now();
+            phaseMs[index] += std::chrono::duration<double, std::milli>(now - phaseStart).count();
+            phaseStart = now;
+        };
         reset(cursor, bytes);
+        phase(0);
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep shared guest section");
         const auto owned = std::make_shared<Section>(duplicate);
+        std::size_t commits = 0;
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
             split(cursor + done, pageBytes);
+            phase(1);
             void* page = reinterpret_cast<void*>(cursor + done);
             if (!map(section, GetCurrentProcess(), page, offset + done, pageBytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map shared guest page");
+            phase(2);
             MEMORY_BASIC_INFORMATION memory{};
             if (VirtualQuery(page, &memory, sizeof(memory)) != sizeof(memory)) fail("query shared guest page");
+            if (memory.State == MEM_RESERVE) ++commits;
             if (memory.State == MEM_RESERVE && !VirtualAlloc(page, pageBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
+            phase(3);
             DWORD previous;
             if (!VirtualProtect(page, pageBytes, protection, &previous)) fail("protect shared guest page");
+            phase(4);
             const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done);
             auto shared = physical[key].lock();
             if (!shared) {
@@ -101,6 +143,10 @@ public:
             views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0});
             remember(freshRanges, base, base + pageBytes);
             invalidate(*shared);
+            phase(5);
+        }
+        if (phases && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hold->started).count() >= 5.0) {
+            std::fprintf(stderr, "[mappings] Map phases (ms): reset %.1f split %.1f map %.1f query+commit %.1f (%zu commits) protect %.1f bookkeeping %.1f; %zu views live\n", phaseMs[0], phaseMs[1], phaseMs[2], phaseMs[3], commits, phaseMs[4], phaseMs[5], views.size());
         }
     }
 
@@ -109,6 +155,8 @@ public:
     // AMM PRT range's unbacked pages, gigabytes that the GPU path imports and reads).
     void MapZero(void* address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        std::optional<HoldTrace> hold;
+        if (TraceHolds()) hold.emplace(HoldTrace{"MapZero", reinterpret_cast<std::uintptr_t>(address), bytes});
         if (zeroSection == nullptr) {
             zeroSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(pageBytes), nullptr);
             if (zeroSection == nullptr) fail("create the zero guest page");
@@ -253,7 +301,12 @@ public:
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
+        const auto waitStarted = TraceHolds() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::lock_guard lock(mutex);
+        if (TraceHolds()) {
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStarted).count();
+            if (ms >= 5.0) std::fprintf(stderr, "[mappings] Collect 0x%llx+0x%zx waited %.1f ms for the mapping lock (thread %lu)\n", static_cast<unsigned long long>(address), bytes, ms, GetCurrentThreadId());
+        }
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
