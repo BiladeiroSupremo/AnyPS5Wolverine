@@ -1,7 +1,6 @@
 #include <bit>
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <cstdio>
 #include <exception>
 #include <thread>
@@ -19,16 +18,14 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
-#include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #if APS5_ENABLE_TIMING_LOG
 #include "prx/libSceVideoOut/include/FrameTimingLog.hpp"
 #endif
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
-#include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
-#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
@@ -97,6 +94,12 @@ void resolveFlipBuffer(FlipRequest& request, const VideoOutConfig& cfg) {
     request.height = request.group.attribute.height;
 }
 
+// APS5_TRACE_FLIPS=1: every flip's submission and completion.
+bool TraceFlips() {
+    static const bool trace = std::getenv("APS5_TRACE_FLIPS") != nullptr;
+    return trace;
+}
+
 class RenderingWait final : public AgcDriver::IRenderingWait {
     std::shared_ptr<VideoOutConfig> _config;
     std::uint32_t _index;
@@ -135,10 +138,7 @@ public:
         require(room, "flip queue stayed full for 60 s: the presenter is not completing flips");
     }
 
-    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info) override { return Reserve(info, false); }
-    std::shared_ptr<AgcDriver::IFlipRequest> TryReserve(const AgcDriver::FlipInfo& info) override { return Reserve(info, true); }
-
-    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info, bool limited) {
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info) override {
         // All flip modes are presented at the next vsync.
         require(info.mode >= VIDEO_OUT_FLIP_MODE_VSYNC && info.mode <= 6, "unsupported flip mode");
         require(info.index >= VIDEO_OUT_BUFFER_INDEX_BLACK && info.index < VIDEO_OUT_BUFFER_NUM_MAX, "invalid flip index");
@@ -152,15 +152,11 @@ public:
         std::lock_guard queueLock(queue->mutex);
         if (queue->failure) std::rethrow_exception(queue->failure);
         if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
-        if (limited && queue->reservations.load() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) return {};
         std::lock_guard lock(cfg->mutex);
         checkConfig(*cfg);
         request->generation = cfg->generation;
         request->flipRate = cfg->flipRate;
-        if (info.index >= 0) {
-            if (limited) require(cfg->buffers[info.index].Occupied(), "EOP flip buffer is not registered");
-            request->reuseTicket = cfg->bufferReuse[info.index].Reserve();
-        }
+        if (info.index >= 0) request->reuseTicket = cfg->bufferReuse[info.index].Reserve();
         ++queue->reservations;
         ++cfg->flipStatus.flipPendingNum;
         if (info.index >= 0) ++cfg->bufferPending[info.index];
@@ -272,7 +268,6 @@ VideoOutDriver::VideoOutDriver() {
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #ifdef _WIN32
     SDL_SetHintWithPriority(SDL_HINT_DIRECTINPUT_ENABLED, "0", SDL_HINT_DEFAULT);
-    if (std::getenv("APS5_NO_WGI") != nullptr) SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_WGI, "0", SDL_HINT_DEFAULT);
 #endif
 #ifdef __linux__
     SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland,x11");
@@ -441,25 +436,11 @@ int VideoOutDriver::SubmitFlip(int handle, int index, int flipMode, int64_t flip
     // A title that does not pace on flipPendingNum can run ahead of the presenter now that the queue
     // worker no longer waits per flip; a full queue is the documented error, not a failure.
     if (flipQueue->reservations.load() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
-    AgcDriverSubmitFlip_nid_postfix(AgcDriver::FlipInfo{static_cast<std::uint32_t>(handle), index, static_cast<std::uint32_t>(flipMode), flipArg});
-    return 0;
-}
-
-int VideoOutDriver::SubmitEopFlip(int handle, int index, int flipMode, int64_t flipArg, std::uint32_t* token) {
-    std::lock_guard lock(mutex);
-    if (handle <= 0 || handle >= VIDEO_OUT_NUM_MAX || !outputs[handle]) return VIDEO_OUT_ERROR_INVALID_HANDLE;
-    if (flipMode < VIDEO_OUT_FLIP_MODE_VSYNC || flipMode > 6) return VIDEO_OUT_ERROR_INVALID_VALUE;
-    if (index < VIDEO_OUT_BUFFER_INDEX_BLACK || index >= VIDEO_OUT_BUFFER_NUM_MAX) return VIDEO_OUT_ERROR_INVALID_INDEX;
-    const auto cfg = contexts[handle];
-    {
-        std::lock_guard cfgLock(cfg->mutex);
-        checkConfig(*cfg);
-        if (index >= 0 && !cfg->buffers[index].Occupied()) return VIDEO_OUT_ERROR_INVALID_INDEX;
-    }
-    const AgcDriver::FlipInfo info{static_cast<std::uint32_t>(handle), index, static_cast<std::uint32_t>(flipMode), flipArg};
-    const auto reserved = AgcDriverReserveEopFlip_nid_postfix(info);
-    if (reserved == 0) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
-    std::memcpy(token, &reserved, sizeof(reserved));
+    std::array<uint32_t, AgcDriver::FlipPacketWords> words{AgcDriver::FlipPacketHeader, static_cast<uint32_t>(handle), static_cast<uint32_t>(index), static_cast<uint32_t>(flipMode), static_cast<uint32_t>(static_cast<uint64_t>(flipArg)), static_cast<uint32_t>(static_cast<uint64_t>(flipArg) >> 32u)};
+    Packet packet{words.data(), static_cast<uint32_t>(words.size()), 0, {}};
+    const auto result = sceAgcDriverSubmitDcb(&packet);
+    require(result == 0, "driver rejected flip submission");
+    if (TraceFlips()) std::fprintf(stderr, "[flip] submit handle %d index %d mode %d arg 0x%llx (%u reserved) at %.3f s\n", handle, index, flipMode, static_cast<unsigned long long>(flipArg), static_cast<unsigned>(flipQueue->reservations.load()), std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
     return 0;
 }
 
@@ -495,20 +476,6 @@ void VideoOutDriver::updateDisplayRefreshRate() {
     SDL_DisplayMode mode{};
     if (SDL_GetCurrentDisplayMode(display, &mode) != 0) throw std::runtime_error(std::string("SDL_GetCurrentDisplayMode failed: ") + SDL_GetError());
     displayRefreshRate.store(mode.refresh_rate);
-}
-
-void VideoOutDriver::pollHostHdr() {
-    hdrProbe.Poll(window.Handle());
-    const auto generation = AgcDriver::CurrentHostHdr().generation;
-    if (generation == hdrGeneration) return;
-    hdrGeneration = generation;
-    std::lock_guard lock(mutex);
-    for (const auto& cfg : contexts) {
-        if (!cfg) continue;
-        std::lock_guard cfgLock(cfg->mutex);
-        if (!cfg->opened || cfg->closing || cfg->failure) continue;
-        triggerEvents(*cfg, VIDEO_OUT_EVENT_SET_MODE, reinterpret_cast<void*>(cfg->outputMode));
-    }
 }
 
 void VideoOutDriver::vblankEnd(std::uint64_t tick) {
@@ -604,11 +571,6 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.cfg->flipStatus.processTime = sceKernelGetProcessTime();
     req.cfg->flipStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
     req.cfg->flipStatus.flipArg = req.flipArg;
-    const auto previous = req.cfg->flipStatus.currentBuffer;
-    if (previous >= 0) {
-        auto& label = req.cfg->bufferLabels[previous];
-        AgcDriverStoreGuestLabel_nid_postfix(&label, 0);
-    }
     req.cfg->flipStatus.currentBuffer = req.index;
     req.cfg->width = req.width;
     req.cfg->height = req.height;
@@ -620,20 +582,17 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     }
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
-    KernelWakeSleepers_nid_no_patch();
     timing.Mark("notify_game");
+    if (TraceFlips()) std::fprintf(stderr, "[flip] done index %d arg 0x%llx count %llu pending %u at %.3f s\n", req.index, static_cast<unsigned long long>(req.flipArg), static_cast<unsigned long long>(req.cfg->flipStatus.count), static_cast<unsigned>(req.cfg->flipStatus.flipPendingNum), std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {
     try {
         window.Ensure(VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT);
         updateDisplayRefreshRate();
-        hdrProbe.Poll(window.Handle());
         const auto extensions = windowExtensions(window.Handle());
         AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr});
-        hdrGeneration = AgcDriver::CurrentHostHdr().generation;
     } catch (...) {
-        hdrProbe.Release();
         window.Destroy();
         started.set_exception(std::current_exception());
         return;
@@ -676,9 +635,8 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                     imeTextInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
                 }
             }
-            padInput.Update(window);
+            padInput.Update();
             updateDisplayRefreshRate();
-            pollHostHdr();
             mouseInput.UpdateCapture(!padInput.MouseModeEnabled());
             if (current) {
                 require(current->timing != nullptr, "missing presentation timing");
@@ -742,7 +700,6 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         std::lock_guard lock(flipQueue->mutex);
         if (!flipQueue->failure) flipQueue->failure = std::current_exception();
     }
-    hdrProbe.Release();
     window.Destroy();
 }
 

@@ -22,6 +22,9 @@ struct DisplayBuffer {
     std::uint32_t pitchInPixel = 0;
     std::uint64_t dccAddress = 0;
     std::uint64_t dccClearColor = 0;
+    // Upstream main's VideoOut records the registered alignment (4 KiB for some linear buffers);
+    // this driver's checks assume 64 KiB.
+    std::uint32_t alignment = 65536;
 };
 
 std::size_t DisplayBufferSize(const DisplayBuffer& buffer);

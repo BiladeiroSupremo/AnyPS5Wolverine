@@ -1,6 +1,10 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERPREPARATIONSCOPE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERPREPARATIONSCOPE_HPP
 
+#include <initializer_list>
+
+struct Shader;
+
 namespace AgcDriver::DriverDetail {
 class ShaderPreparationTransaction;
 }
@@ -14,6 +18,9 @@ namespace AgcDriver {
 class ShaderPreparationScope {
 public:
     ShaderPreparationScope() : transaction(AgcDriverBeginShaderPreparation_nid_postfix()) {}
+    // Upstream main's libSceAgc names the shaders a scope prepares; this driver's transaction
+    // covers every shader registered meanwhile, so the list is not needed.
+    explicit ShaderPreparationScope(std::initializer_list<const Shader*>) : ShaderPreparationScope() {}
     ~ShaderPreparationScope() { AgcDriverEndShaderPreparation_nid_postfix(transaction); }
     ShaderPreparationScope(const ShaderPreparationScope&) = delete;
     ShaderPreparationScope& operator=(const ShaderPreparationScope&) = delete;

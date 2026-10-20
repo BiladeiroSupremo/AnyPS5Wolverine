@@ -30,5 +30,8 @@ extern "C" void AgcDriverPresentClear_nid_postfix(const AgcDriver::PresentationW
 extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::PresentationWindow& window, const AgcDriver::DisplayBuffer& buffer, void (*gpuReady)(void*), void* context);
 extern "C" void AgcDriverReleaseWindow_nid_postfix(void* window);
 extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error);
+// Upstream main's VideoOut hotkeys; this driver has no performance overlay or screenshot path,
+// so they do nothing (EntryPoints.cpp).
+extern "C" void AgcDriverTogglePerformanceOverlay_nid_postfix();
 
 #endif

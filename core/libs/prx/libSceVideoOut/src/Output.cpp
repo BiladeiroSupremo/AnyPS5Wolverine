@@ -12,7 +12,6 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
-#include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 
 static constexpr std::uint32_t VIDEO_OUT_OUTPUT_OPTIONS_FIRST_WORD = 0x00FF0000;
 static constexpr std::size_t VIDEO_OUT_OUTPUT_OPTIONS_FREE_WORD = 3;
@@ -20,10 +19,8 @@ static constexpr std::size_t VIDEO_OUT_OUTPUT_OPTIONS_FREE_WORD = 3;
 static VideoOutOutputStatus outputStatus(const auto& cfg) {
     VideoOutOutputStatus status{};
     status.resolution = (cfg.width >= 3840 || cfg.height >= 2160) ? 2u : 1u;
-    const bool hdr = AgcDriver::CurrentHostHdr().available;
-    status.dynamicRange = hdr ? VIDEO_OUT_DYNAMIC_RANGE_HDR : VIDEO_OUT_DYNAMIC_RANGE_SDR;
+    status.dynamicRange = 1;
     status.refreshRate = (cfg.outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
-    status.flags = hdr ? VIDEO_OUT_OUTPUT_STATUS_FLAG_HDR : 0;
     return status;
 }
 
@@ -80,7 +77,6 @@ static void validateOpenParam(const void* param) {
 extern "C" {
 
 int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* param) try {
-    if (busType == VIDEO_OUT_BUS_TYPE_HMD2_MAIN) return VIDEO_OUT_ERROR_INVALID_VALUE;
     validateOpenParam(param);
     if (userId != 255 && userId != 0) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_VALUE");
@@ -137,13 +133,7 @@ int APS5_VABI sceVideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) t
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
-    if (cfg->ps4) {
-        const auto& current = cfg->flipStatus;
-        VideoOutFlipStatusPs4 legacy{current.count, current.processTime, 0, current.flipArg, 0, 0, current.gcQueueNum, current.flipPendingNum, current.currentBuffer, 0};
-        *reinterpret_cast<VideoOutFlipStatusPs4*>(status) = legacy;
-    } else {
-        *status = cfg->flipStatus;
-    }
+    *status = cfg->flipStatus;
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -159,13 +149,7 @@ int APS5_VABI sceVideoOutGetVblankStatus(int handle, VideoOutVblankStatus* statu
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
-    if (cfg->ps4) {
-        const auto& current = cfg->vblankStatus;
-        VideoOutVblankStatusPs4 legacy{current.count, current.processTime, 0, current.flags};
-        *reinterpret_cast<VideoOutVblankStatusPs4*>(status) = legacy;
-    } else {
-        *status = cfg->vblankStatus;
-    }
+    *status = cfg->vblankStatus;
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -335,48 +319,6 @@ int APS5_VABI sceVideoOutAdjustColor(int handle, const VideoOutColorSettings* se
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
     }
     // Output gamma is accepted but not yet applied to presentation.
-    return 0;
-} catch (const ProcessShutdown&) {
-    LibcAwaitExit_nid_postfix();
-}
-
-int APS5_VABI sceVideoOutColorSpaceConversionSettingsSetDefaultSdrToHdrConversion(VideoOutColorSpaceConversionSettings* settings) {
-    if (settings == nullptr) {
-        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
-    }
-    std::memset(settings, 0, sizeof(VideoOutColorSpaceConversionSettings));
-    return 0;
-}
-
-int APS5_VABI sceVideoOutColorSpaceConversionSettingsSetSdrToHdrConversion(VideoOutColorSpaceConversionSettings* settings, float lumaScale, uint32_t option) {
-    if (settings == nullptr) {
-        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
-    }
-    (void)lumaScale;
-    (void)option;
-    return 0;
-}
-
-int APS5_VABI sceVideoOutAdjustColorSpaceConversion(int handle, const VideoOutColorSpaceConversionSettings* settings) try {
-    if (settings == nullptr) {
-        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
-    }
-    auto cfg = VideoOutDriver::Get().GetConfig(handle);
-    if (cfg == nullptr) {
-        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
-    }
-    return 0;
-} catch (const ProcessShutdown&) {
-    LibcAwaitExit_nid_postfix();
-}
-
-int APS5_VABI sceVideoOutSetGlobalBlendSpace(int handle, uint32_t space, uint32_t option) try {
-    auto cfg = VideoOutDriver::Get().GetConfig(handle);
-    if (cfg == nullptr) {
-        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
-    }
-    (void)space;
-    (void)option;
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

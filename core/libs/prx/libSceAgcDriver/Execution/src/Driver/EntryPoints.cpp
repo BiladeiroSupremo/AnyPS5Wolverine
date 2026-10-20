@@ -123,6 +123,10 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
     AgcDriver::ReportFailure(error);
 }
 
+extern "C" void AgcDriverTogglePerformanceOverlay_nid_postfix() {}
+
+extern "C" void AgcDriverRequestScreenshot_nid_postfix() {}
+
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
 } catch (const ProcessShutdown&) {

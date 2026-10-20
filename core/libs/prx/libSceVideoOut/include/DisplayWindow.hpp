@@ -20,7 +20,6 @@ public:
     SDL_Window* Handle() const;
     void DrawableSize(std::uint32_t& width, std::uint32_t& height) const;
     void UpdateTitle();
-    std::uint64_t FrameNumber() const { return frameNum; }
     void ToggleFullscreen();
 
 private:
@@ -35,7 +34,6 @@ private:
     SDL_Window* window = nullptr;
     std::uint32_t aspectWidth = 0;
     std::uint32_t aspectHeight = 0;
-    std::uint64_t frameNum = 0;
 };
 
 #endif

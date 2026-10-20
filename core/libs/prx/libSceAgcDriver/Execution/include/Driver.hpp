@@ -17,6 +17,7 @@ extern "C" void AgcDriverLockVulkanLoader_nid_postfix();
 extern "C" void AgcDriverUnlockVulkanLoader_nid_postfix();
 extern "C" void AgcDriverShutdown_nid_postfix();
 extern "C" void AgcDriverSuspendPoint_nid_postfix();
+extern "C" void AgcDriverRequestScreenshot_nid_postfix();
 extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader);
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive);
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive);
