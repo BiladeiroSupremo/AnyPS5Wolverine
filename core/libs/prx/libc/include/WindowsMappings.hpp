@@ -152,6 +152,25 @@ public:
         }
     }
 
+    // Wolverine stack (fork ce3be64b4): read-only pages that read as zeros, all views of one
+    // pagefile-backed page nothing writes, so the range costs one physical page however large. A
+    // private commit takes a page for each one read: an AMM PRT range's unbacked pages are
+    // gigabytes that the GPU path imports and reads (PPSA03671 grew ~1.5 GB a minute without this).
+    void MapZero(void* address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        collectableRanges.clear();
+        if (zeroSection == nullptr) {
+            zeroSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(pageBytes), nullptr);
+            if (zeroSection == nullptr) fail("create the zero guest page");
+        }
+        const auto cursor = reinterpret_cast<std::uintptr_t>(address);
+        reset(cursor, bytes);
+        for (std::size_t done = 0; done < bytes; done += pageBytes) {
+            split(cursor + done, pageBytes);
+            if (!map(zeroSection, GetCurrentProcess(), reinterpret_cast<void*>(cursor + done), 0, pageBytes, MEM_REPLACE_PLACEHOLDER, PAGE_READONLY, nullptr, 0)) fail("map a zero guest page");
+        }
+    }
+
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
         collectableRanges.clear();
@@ -914,6 +933,7 @@ private:
     std::size_t granularity = 0x10000;
     bool watchResident = false;
     std::mutex mutex;
+    HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
