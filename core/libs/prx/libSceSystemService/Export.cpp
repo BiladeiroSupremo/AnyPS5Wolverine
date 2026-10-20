@@ -1,10 +1,11 @@
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
-#include <charconv>
+#include <ctime>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -15,6 +16,9 @@
 #include <windows.h>
 #elif defined(__linux__)
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <unistd.h>
 #endif
 #include "prx/libc/include/Shutdown.hpp"
 #include "SceTypes.hpp"
@@ -22,21 +26,36 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 
 namespace {
 
-int ConsoleLanguage() {
-    const char* configured = std::getenv("ANYPS5_LANGUAGE");
-    if (configured == nullptr || configured[0] == '\0') return SYSTEM_SERVICE_PARAM_LANG_ENGLISH_US;
-    const std::string_view text(configured);
-    int language = -1;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), language);
-    if (error != std::errc{} || end != text.data() + text.size() || language < SYSTEM_SERVICE_PARAM_LANG_JAPANESE || language > SYSTEM_SERVICE_PARAM_LANG_UKRAINIAN) {
-        throw std::runtime_error("sceSystemServiceParamGetInt: ANYPS5_LANGUAGE must be a console language number from " +
-            std::to_string(SYSTEM_SERVICE_PARAM_LANG_JAPANESE) + " to " + std::to_string(SYSTEM_SERVICE_PARAM_LANG_UKRAINIAN) +
-            ", not \"" + std::string(text) + "\"");
-    }
-    return language;
+struct ConsoleTimeZone {
+    int minutes;
+    bool summer;
+};
+
+ConsoleTimeZone HostTimeZone() {
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+#if defined(_WIN32)
+    const bool converted = localtime_s(&local, &now) == 0;
+#else
+    const bool converted = localtime_r(&now, &local) != nullptr;
+#endif
+    if (!converted) throw std::runtime_error("sceSystemServiceParamGetInt: the host local time is unavailable");
+    const std::chrono::sys_days date = std::chrono::year{local.tm_year + 1900} / std::chrono::month{static_cast<unsigned>(local.tm_mon + 1)} / std::chrono::day{static_cast<unsigned>(local.tm_mday)};
+    const auto localSeconds = date.time_since_epoch() + std::chrono::hours{local.tm_hour} + std::chrono::minutes{local.tm_min} + std::chrono::seconds{local.tm_sec};
+    const auto offset = std::chrono::duration_cast<std::chrono::minutes>(localSeconds - std::chrono::seconds{now});
+    const bool summer = local.tm_isdst > 0;
+#if defined(_WIN32)
+    long daylightBias = 0;
+    _get_dstbias(&daylightBias);
+    const int summerMinutes = summer ? static_cast<int>(-daylightBias / 60) : 0;
+#else
+    const int summerMinutes = summer ? 60 : 0;
+#endif
+    return {static_cast<int>(offset.count()) - summerMinutes, summer};
 }
 
 constexpr char MainExecutable[] = "/app0/eboot.bin";
@@ -148,16 +167,30 @@ void StartHostExecutable(HostLaunch& launch) {
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
 }
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 struct HostLaunch {
     std::string executable;
     std::vector<std::string> arguments;
 };
 
-HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
+std::filesystem::path OwnExecutable() {
     std::error_code error;
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> executable(size);
+    std::filesystem::path own;
+    if (_NSGetExecutablePath(executable.data(), &size) == 0) own = std::filesystem::canonical(executable.data(), error);
+    if (own.empty()) throw std::runtime_error("sceSystemServiceLoadExec: cannot locate the executable");
+#else
     const auto own = std::filesystem::read_symlink("/proc/self/exe", error);
     if (error) throw std::runtime_error("sceSystemServiceLoadExec: cannot read /proc/self/exe: " + error.message());
+#endif
+    return own;
+}
+
+HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
+    const auto own = OwnExecutable();
     HostLaunch launch;
     if (std::strcmp(path, MainExecutable) == 0) {
         const char* main = std::getenv(MainExecutableVariable);
@@ -206,9 +239,10 @@ int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* argu
     if (!path || !*path) return SYSTEM_SERVICE_ERROR_PARAMETER;
     if (std::strcmp(path, "exit") == 0) LibcExitWithoutHandlers_nid_no_patch(0);
     auto launch = PrepareLaunch(path, arguments);
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
     LoadConvertedExecutable_nid_no_patch(std::filesystem::path(launch.executable), arguments);
 #endif
+    LibcStartExit_nid_postfix();
     LibcRunShutdown_nid_postfix();
     std::fflush(nullptr);
     StartHostExecutable(launch);
@@ -228,14 +262,19 @@ int APS5_VABI sceSystemServiceGetDisplaySafeAreaInfo(SystemServiceDisplaySafeAre
  return SYSTEM_SERVICE_OK;
 }
 
+int APS5_VABI sceSystemServiceShowDisplaySafeAreaSettings(void) {
+ return SYSTEM_SERVICE_OK;
+}
+
 int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance) {
  if (luminance == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- constexpr float SdrReferenceWhiteNits = 100.0f;
- luminance->max_full_frame_tone_map_luminance = SdrReferenceWhiteNits;
- luminance->max_tone_map_luminance = SdrReferenceWhiteNits;
- luminance->min_tone_map_luminance = 0.0f;
+ const auto hdr = AgcDriver::CurrentHostHdr();
+ luminance->max_tone_map_luminance = AgcDriver::ToneMapPeakNits(hdr);
+ luminance->max_full_frame_tone_map_luminance = hdr.available ? hdr.display.maxFullFrameLuminance : AgcDriver::SdrToneMapLuminanceNits;
+ luminance->min_tone_map_luminance = hdr.available ? hdr.display.minLuminance : 0.0f;
+ AgcDriverNoteReportedToneMapPeak_nid_postfix(luminance->max_tone_map_luminance);
  return SYSTEM_SERVICE_OK;
 }
 
@@ -265,11 +304,11 @@ int APS5_VABI sceSystemServiceParamGetInt(int paramId, int* value) {
  }
  switch (paramId) {
   case SYSTEM_SERVICE_PARAM_ID_LANG:
-  case SYSTEM_SERVICE_PARAM_ID_400: *value = ConsoleLanguage(); break;
+  case SYSTEM_SERVICE_PARAM_ID_400: *value = SystemServiceConsoleLanguage("sceSystemServiceParamGetInt"); break;
   case SYSTEM_SERVICE_PARAM_ID_DATE_FORMAT: *value = SYSTEM_SERVICE_PARAM_DATE_FORMAT_DDMMYYYY; break;
   case SYSTEM_SERVICE_PARAM_ID_TIME_FORMAT: *value = SYSTEM_SERVICE_PARAM_TIME_FORMAT_24HOUR; break;
-  case SYSTEM_SERVICE_PARAM_ID_TIME_ZONE: *value = 0; break;
-  case SYSTEM_SERVICE_PARAM_ID_SUMMERTIME: *value = 0; break;
+  case SYSTEM_SERVICE_PARAM_ID_TIME_ZONE: *value = HostTimeZone().minutes; break;
+  case SYSTEM_SERVICE_PARAM_ID_SUMMERTIME: *value = HostTimeZone().summer ? 1 : 0; break;
   case SYSTEM_SERVICE_PARAM_ID_GAME_PARENTAL_LEVEL: *value = SYSTEM_SERVICE_PARAM_GAME_PARENTAL_OFF; break;
   case SYSTEM_SERVICE_PARAM_ID_ENTER_BUTTON_ASSIGN: *value = SYSTEM_SERVICE_PARAM_ENTER_BUTTON_CROSS; break;
   default: *value = 0; break;
@@ -353,6 +392,16 @@ int APS5_VABI sceSystemServiceOpenChallengeActivity(void) {
 }
 
 int APS5_VABI sceSystemServiceOpenTournamentOccurrence(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceAddLocalProcessForPsmKit(const char*, const char* const*, const void*) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceKillLocalProcessForPsmKit(int) {
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }

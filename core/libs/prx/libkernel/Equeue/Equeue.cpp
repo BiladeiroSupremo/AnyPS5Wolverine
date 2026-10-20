@@ -3,6 +3,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/File/include/HostStreams.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -98,8 +99,15 @@ void KernelEqueuePrivate::WakePollers() {
 
 void KernelEqueuePrivate::WaitForDescriptors(std::unique_lock<std::mutex>& lock, std::uint64_t deadlineNanos) {
     std::vector<GuestSockets::Interest> interests;
+    std::vector<std::shared_ptr<void>> held;
     for (const auto& e : m_events) {
-        if (e.enabled && e.filter.pollFunc != nullptr) {
+        if (!e.enabled || e.filter.pollFunc == nullptr) {
+            continue;
+        }
+        if (e.filter.waitDescriptor >= 0) {
+            interests.push_back({e.filter.waitDescriptor, false});
+            held.push_back(e.filter.owner);
+        } else {
             interests.push_back({static_cast<int>(e.event.ident), e.event.filter == EVFILT_WRITE});
         }
     }
@@ -206,6 +214,16 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
     TriggerExpiredTimers(MonotonicNs());
     PollEvents();
     return CollectTriggered(ev, num);
+}
+
+bool KernelEqueuePrivate::HasTriggeredEvents() {
+    std::unique_lock lock(m_mutex);
+    if (m_closed) {
+        return false;
+    }
+    TriggerExpiredTimers(MonotonicNs());
+    PollEvents();
+    return std::any_of(m_events.begin(), m_events.end(), [](const KernelEqueueEvent& event) { return event.enabled && event.triggered; });
 }
 
 int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros) {
@@ -613,13 +631,16 @@ int APS5_VABI sceKernelDeleteAmprSystemEvent(KernelEqueue eq, int id) {
 
 static int AddDescriptorEvent(KernelEqueue eq, int fd, std::size_t size, void* udata, int16_t filter) {
     const bool isSocket = GuestSockets::IsOpen(fd);
-    if (!isSocket && DescriptorIsOpen_nid_no_patch(fd)) {
-        NotImplemented_nid_no_patch(filter == EVFILT_READ ? "sceKernelAddReadEvent: non-socket descriptor" : "sceKernelAddWriteEvent: non-socket descriptor");
+    std::int64_t available = 0;
+    bool eof = false;
+    const bool isPipe = !isSocket && filter == EVFILT_READ && !File::IsHostStream(fd) && GuestSockets::PipeReadState(fd, &available, &eof);
+    if (!isSocket && !isPipe && DescriptorIsOpen_nid_no_patch(fd)) {
+        NotImplemented_nid_no_patch(filter == EVFILT_READ ? "sceKernelAddReadEvent: descriptor that is neither a socket nor the read end of a pipe" : "sceKernelAddWriteEvent: non-socket descriptor");
     }
-    if (size > 1) {
+    if (size > 1 && !isPipe) {
         NotImplemented_nid_no_patch(filter == EVFILT_READ ? "sceKernelAddReadEvent: low watermark" : "sceKernelAddWriteEvent: low watermark");
     }
-    if (!isSocket) {
+    if (!isSocket && !isPipe) {
         return SCE_KERNEL_ERROR_EBADF;
     }
     return EqueueAddEvent_nid_postfix(eq, EqueueDescriptorEvent(fd, filter, EV_ADD, udata));
@@ -653,6 +674,9 @@ KernelEqueueEvent EqueueDescriptorEvent(int descriptor, int16_t filter, uint16_t
         std::int64_t data = 0;
         bool eof = false;
         if (!GuestSockets::Ready(static_cast<int>(e->event.ident), e->event.filter == EVFILT_WRITE, &data, &eof)) {
+            return false;
+        }
+        if (!eof && data < e->lowWater && !GuestSockets::Listening(static_cast<int>(e->event.ident))) {
             return false;
         }
         e->event.data = static_cast<intptr_t>(data);

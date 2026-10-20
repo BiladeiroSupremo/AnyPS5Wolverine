@@ -19,6 +19,7 @@ struct Range {
     std::size_t allocationBytes;
     bool releasable = true;
     bool gpu = false;
+    std::uint64_t backingSerial = 0;
 };
 
 class Lease {
@@ -82,6 +83,7 @@ void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t 
 // until the lease is dropped by another thread.
 void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)(std::uintptr_t address, std::size_t bytes));
 void GuestAllocationsSetGpuMapObserver_nid_postfix(void (*callback)(const Mapped& ranges, std::uint64_t generation));
+void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
 void GuestAllocationsNoteGpuMapping_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
 }
 

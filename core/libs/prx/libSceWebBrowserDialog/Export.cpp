@@ -37,6 +37,7 @@ int APS5_VABI sceWebBrowserDialogTerminate(void) {
 
 int APS5_VABI sceWebBrowserDialogClose(void) {
  if (g_status.load() == COMMON_DIALOG_STATUS_NONE) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;
+ g_status = COMMON_DIALOG_STATUS_FINISHED;
  return 0;
 }
 
@@ -82,6 +83,21 @@ int APS5_VABI sceWebBrowserDialogOpenForPredeterminedContent(const void* param) 
 }
 
 int APS5_VABI sceWebBrowserDialogResetCookie() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceWebBrowserDialogGetEvent() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceWebBrowserDialogNavigate() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceWebBrowserDialogSetZoom() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

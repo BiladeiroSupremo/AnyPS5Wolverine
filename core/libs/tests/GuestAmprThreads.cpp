@@ -1,5 +1,7 @@
 #include "SceTypes.hpp"
+#include "prx/libc/include/exceptions/Runtime.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -76,6 +78,9 @@ int APS5_VABI _Mtx_unlock_nid_postfix(void** handle);
 GuestTerminate APS5_VABI _ZSt13set_terminatePFvvE_nid_postfix(GuestTerminate handler);
 const GuestTypeInfo* APS5_VABI __cxa_current_exception_type_nid_postfix();
 void* APS5_VABI __cxa_current_primary_exception_nid_postfix();
+LibcException::Header* APS5_VABI __cxa_init_primary_exception_nid_postfix(void* object, std::type_info* type, void (*destructor)(void*));
+[[noreturn]] void APS5_VABI __cxa_call_unexpected_nid_postfix(void* unwindException);
+extern const unsigned char _ZTVN10__cxxabiv117__class_type_infoE_nid_postfix[];
 }
 
 static constexpr int ThrdSuccess = 0;
@@ -183,6 +188,23 @@ static void TestThreadSleep() {
     const GuestXtime negative{borrowed.sec + 1, borrowed.nsec - NanosPerSecond};
     Require(_Thrd_sleep_nid_postfix(&negative, nullptr) == 0);
     Require(RealtimeNanos() >= borrowed.sec * NanosPerSecond + borrowed.nsec);
+
+#ifdef _WIN32
+    for (const auto duration : {100000LL, 2000000LL}) {
+        std::array<std::chrono::nanoseconds, 31> samples{};
+        for (auto& sample : samples) {
+            const auto start = std::chrono::steady_clock::now();
+            const auto shortTarget = XtimeAfter(duration);
+            Require(_Thrd_sleep_nid_postfix(&shortTarget, nullptr) == ThrdSuccess);
+            sample = std::chrono::steady_clock::now() - start;
+            Require(RealtimeNanos() >= shortTarget.sec * NanosPerSecond + shortTarget.nsec);
+        }
+        std::sort(samples.begin(), samples.end());
+        const auto median = samples[samples.size() / 2];
+        std::fprintf(stderr, "_Thrd_sleep(%lld ns) median: %lld ns\n", duration, static_cast<long long>(median.count()));
+        Require(median < std::chrono::milliseconds(12));
+    }
+#endif
 
     bool rejected = false;
     try {
@@ -487,17 +509,34 @@ static void APS5_VABI ExitWithSystemErrorCode() {
 }
 
 template <typename TCall>
-static int GuestSystemErrorCode(TCall call) {
+static int TerminateExitCode(GuestTerminate handler, TCall call) {
     const pid_t child = fork();
     Require(child >= 0);
     if (child == 0) {
-        _ZSt13set_terminatePFvvE_nid_postfix(ExitWithSystemErrorCode);
+        _ZSt13set_terminatePFvvE_nid_postfix(handler);
         call();
         _exit(2);
     }
     int status = 0;
     Require(waitpid(child, &status, 0) == child);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static const GuestTypeInfo UnexpectedType{_ZTVN10__cxxabiv117__class_type_infoE_nid_postfix + 16, "10Unexpected"};
+
+static void APS5_VABI ExitWithCaughtType() {
+    const auto* type = __cxa_current_exception_type_nid_postfix();
+    _exit(type == &UnexpectedType ? 42 : type == nullptr ? 43 : 1);
+}
+
+static void TestCallUnexpected() {
+    Require(TerminateExitCode(ExitWithCaughtType, [] {
+        void* object = __cxa_allocate_exception_nid_postfix(sizeof(int));
+        auto* type = reinterpret_cast<std::type_info*>(const_cast<GuestTypeInfo*>(&UnexpectedType));
+        LibcException::Header* header = __cxa_init_primary_exception_nid_postfix(object, type, nullptr);
+        __cxa_call_unexpected_nid_postfix(&header->unwind);
+    }) == 42);
+    Require(TerminateExitCode(ExitWithCaughtType, [] { __cxa_call_unexpected_nid_postfix(nullptr); }) == 43);
 }
 #endif
 
@@ -515,7 +554,7 @@ static void TestPadErrors() {
     Require(Throws<std::invalid_argument>([&] { _ZNSt4_Pad7_LaunchEPP7pthread_nid_postfix(&pad, nullptr); }));
     Require(!pad.started && order.load() == 0);
 #ifndef _WIN32
-    Require(GuestSystemErrorCode([&] { _ZNSt4_Pad8_ReleaseEv_nid_postfix(&pad); }) == GuestEbusy);
+    Require(TerminateExitCode(ExitWithSystemErrorCode, [&] { _ZNSt4_Pad8_ReleaseEv_nid_postfix(&pad); }) == GuestEbusy);
 #endif
     Require(!pad.started);
 
@@ -538,5 +577,8 @@ int main() {
     TestSpinLock();
     TestWcstombs();
     TestConditionSignal();
+#ifndef _WIN32
+    TestCallUnexpected();
+#endif
     return 0;
 }

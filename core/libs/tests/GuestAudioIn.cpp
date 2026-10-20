@@ -16,6 +16,9 @@ int APS5_VABI sceAudioInInit();
 int APS5_VABI sceAudioInOpen(int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
 int APS5_VABI sceAudioInHqOpen(int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
 int APS5_VABI sceAudioInAsyncOpen(int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+int32_t APS5_VABI sceAudioInIsPadEmbeddedMic(int32_t);
+int32_t APS5_VABI sceAudioInGetGain(int32_t, float*);
+int32_t APS5_VABI sceAudioInGetRerouteCount(int32_t);
 int APS5_VABI sceAudioInInput(int, void*);
 int APS5_VABI sceAudioInGetSilentState(int);
 int APS5_VABI sceAudioInClose(int);
@@ -33,6 +36,16 @@ static bool ReportsNotImplemented(const char* name, TCall call) {
     return false;
 }
 
+template <typename TCall>
+static bool ThrowsRuntimeError(TCall call) {
+    try {
+        call();
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
 static void SetEnvironment(const char* name, const std::string& value) {
 #ifdef _WIN32
     _putenv_s(name, value.c_str());
@@ -46,6 +59,7 @@ namespace {
 constexpr int user = 0x10000000;
 
 void TestValidation() {
+    constexpr int invalidHandle = static_cast<int>(0x80260101);
     constexpr int invalidSize = static_cast<int>(0x80260102);
     constexpr int invalidFreq = static_cast<int>(0x80260103);
     constexpr int invalidType = static_cast<int>(0x80260104);
@@ -64,14 +78,42 @@ void TestValidation() {
     Require(sceAudioInAsyncOpen(user, 2, 0, 128, 48000, 2) == invalidType);
     Require(sceAudioInAsyncOpen(user, 0, 1, 128, 48000, 2) == invalidParam);
     Require(sceAudioInAsyncOpen(user, 0, 0, 385, 48000, 2) == invalidSize);
+    Require(sceAudioInAsyncOpen(user, 0, 0, 200, 48000, 2) == invalidSize);
     Require(sceAudioInAsyncOpen(user, 0, 0, 256, 44100, 2) == invalidFreq);
     Require(sceAudioInAsyncOpen(user, 0, 0, 256, 48000, 0) == invalidParam);
-    Require(ReportsNotImplemented("sceAudioInHqOpen", [] { sceAudioInHqOpen(user, 0, 0, 256, 48000, 2); }));
-    Require(ReportsNotImplemented("sceAudioInHqOpen", [] { sceAudioInHqOpen(user, 0, 0, 128, 16000, 2); }));
-    Require(ReportsNotImplemented("sceAudioInAsyncOpen", [] { sceAudioInAsyncOpen(user, 0, 0, 384, 48000, 2); }));
-    Require(ReportsNotImplemented("sceAudioInOpen", [] { sceAudioInOpen(user, 0, 0, 256, 48000, 0x10); }));
-    Require(ReportsNotImplemented("sceAudioInHqOpen", [] { sceAudioInHqOpen(user, 0, 0, 128, 48000, 0x10); }));
-    Require(ReportsNotImplemented("sceAudioInAsyncOpen", [] { sceAudioInAsyncOpen(user, 0, 0, 128, 48000, 0x10); }));
+    Require(sceAudioInHqOpen(user, 0, 0, 256, 48000, 2) == invalidSize);
+    Require(sceAudioInHqOpen(user, 0, 0, 128, 16000, 2) == invalidFreq);
+    for (const int badHandle : {-1, 0, 1, 9}) {
+        float gain = -2.5f;
+        Require(sceAudioInGetGain(badHandle, &gain) == invalidHandle && gain == 1.0f);
+        Require(sceAudioInGetRerouteCount(badHandle) == invalidHandle);
+        Require(ThrowsRuntimeError([badHandle] { sceAudioInGetGain(badHandle, nullptr); }));
+    }
+    int port = sceAudioInAsyncOpen(user, 0, 0, 384, 48000, 2);
+    float gain = 0.0f;
+    Require(port > 0 && sceAudioInGetGain(port, &gain) == 0 && gain == 1.0f && sceAudioInGetRerouteCount(port) == 0);
+    Require(ThrowsRuntimeError([port] { sceAudioInGetGain(port, nullptr); }));
+    Require(sceAudioInClose(port) == 0);
+    gain = 0.25f;
+    Require(sceAudioInGetGain(port, &gain) == invalidHandle && gain == 1.0f && sceAudioInGetRerouteCount(port) == invalidHandle);
+    port = sceAudioInOpen(user, 0, 0, 256, 48000, 0x10);
+    gain = -1.0f;
+    Require(port > 0 && sceAudioInGetGain(port, &gain) == 0 && gain == 1.0f && sceAudioInGetRerouteCount(port) == 0 && sceAudioInClose(port) == 0);
+    port = sceAudioInHqOpen(user, 0, 0, 128, 48000, 0x10);
+    gain = 2.0f;
+    Require(port > 0 && sceAudioInGetGain(port, &gain) == 0 && gain == 1.0f && sceAudioInGetRerouteCount(port) == 0 && sceAudioInClose(port) == 0);
+    port = sceAudioInAsyncOpen(user, 0, 0, 384, 48000, 0x10);
+    gain = 0.5f;
+    Require(port > 0 && sceAudioInGetGain(port, &gain) == 0 && gain == 1.0f && sceAudioInGetRerouteCount(port) == 0 && sceAudioInClose(port) == 0);
+    Require(ReportsNotImplemented("sceAudioInIsPadEmbeddedMic", [] { sceAudioInIsPadEmbeddedMic(1); }));
+}
+
+void InputSound(int handle, std::vector<std::int16_t>& block) {
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        Require(sceAudioInInput(handle, block.data()) == 256);
+        if (std::any_of(block.begin(), block.end() - 1, [](std::int16_t sample) { return sample != 0; })) return;
+    }
+    Require(false);
 }
 
 void TestCapture() {
@@ -88,7 +130,7 @@ void TestCapture() {
     std::vector<std::int16_t> block(256 * 2 + 1, 0x5555);
     std::vector<std::int16_t> captured;
     for (int i = 0; i < 4; ++i) {
-        Require(sceAudioInInput(handle, block.data()) == 256);
+        InputSound(handle, block);
         captured.insert(captured.end(), block.begin(), block.end() - 1);
         Require(block.back() == 0x5555);
     }
@@ -98,7 +140,7 @@ void TestCapture() {
     Require(sceAudioInClose(handle) == 0);
     const int async = sceAudioInAsyncOpen(user, 0, 0, 256, 48000, 2);
     Require(async == handle && sceAudioInGetSilentState(async) == 0);
-    Require(sceAudioInInput(async, block.data()) == 256);
+    InputSound(async, block);
     Require(std::equal(block.begin(), block.end() - 1, recorded.begin()) && block.back() == 0x5555);
     Require(sceAudioInClose(async) == 0);
     std::filesystem::remove(path);

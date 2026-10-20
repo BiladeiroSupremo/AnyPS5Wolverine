@@ -1,10 +1,12 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import check_compile
@@ -13,6 +15,110 @@ TOOL = Path(__file__).resolve().parents[1] / "check_compile.py"
 
 
 class CheckCompileTests(unittest.TestCase):
+    def test_dependency_options_do_not_make_syntax_checks_fail_or_rewrite_outputs(self):
+        compiler = shutil.which("clang")
+        if compiler is None:
+            self.skipTest("Clang is required to check unused dependency options with -Werror")
+        source = self.source("unit.c")
+        object_file = self.build / "unit.o"
+        dependency_file = self.build / "unit.d"
+        for option in ("-MF", "-MT", "-MQ"):
+            for joined in (False, True):
+                with self.subTest(option=option, joined=joined):
+                    source.write_text("int x;\n", encoding="utf-8")
+                    value = str(dependency_file) if option == "-MF" else "target with spaces.o"
+                    flags = [option + value] if joined else [option, value]
+                    if option != "-MF":
+                        flags += ["-MF", str(dependency_file)]
+                    arguments = [compiler, "-Werror", "-MMD", *flags,
+                                 "-c", str(source), "-o", str(object_file)]
+                    original = subprocess.run(arguments, cwd=self.build, capture_output=True, text=True)
+                    self.assertEqual(original.returncode, 0, original.stderr)
+                    outputs = {path: path.read_bytes() for path in (object_file, dependency_file)}
+                    self.manifest([{"directory": str(self.build), "file": str(source),
+                                    "arguments": arguments}])
+                    result = self.tool("unit.c")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("1 translation units compile", result.stdout)
+                    for path, content in outputs.items():
+                        self.assertEqual(path.read_bytes(), content)
+                    source.write_text("#error syntax_check_must_fail\n", encoding="utf-8")
+                    result = self.tool("unit.c")
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("syntax_check_must_fail", result.stderr)
+                    for path, content in outputs.items():
+                        self.assertEqual(path.read_bytes(), content)
+
+    def test_ninja_response_file_is_expanded_before_syntax_rewriting(self):
+        compiler = shutil.which("clang") or shutil.which("gcc")
+        if compiler is None or shutil.which("ninja") is None:
+            self.skipTest("needs Ninja and a C compiler")
+        source = self.source("unit.c", "#ifndef REQUIRED\n#error missing definition\n#endif\nint x;\n")
+        command = subprocess.list2cmdline([compiler]) if os.name == "nt" else '"' + compiler + '"'
+        (self.build / "build.ninja").write_text(
+            "rule cc\n  command = " + command + " @$out.rsp\n"
+            "  rspfile = $out.rsp\n  rspfile_content = -DREQUIRED -c $in -o $out -MD -MF $out.d\n"
+            "build unit.o: cc ../unit.c\n", encoding="utf-8")
+        self.assertFalse((self.build / "unit.o.rsp").exists())
+        result = self.tool("unit.c")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 translation units compile", result.stdout)
+        self.assertFalse((self.build / "unit.o").exists())
+        self.assertFalse((self.build / "unit.o.d").exists())
+        self.assertFalse((self.build / "unit.o.rsp").exists())
+
+    def test_ninja_commands_in_a_non_ascii_build_directory_are_found(self):
+        compiler = shutil.which("clang") or shutil.which("gcc")
+        if compiler is None or shutil.which("ninja") is None:
+            self.skipTest("needs Ninja and a C compiler")
+        name = "ação"
+        build = self.root / name
+        if os.name == "nt":
+            try:
+                str(build).encode("mbcs", "strict")
+            except UnicodeEncodeError:
+                self.skipTest("the ANSI code page cannot represent the build directory")
+        build.mkdir()
+        self.source("unit.c")
+        command = subprocess.list2cmdline([compiler]) if os.name == "nt" else '"' + compiler + '"'
+        (build / "build.ninja").write_text(
+            "rule cc\n  command = " + command + " -c $in -o $out\nbuild unit.o: cc ../unit.c\n", encoding="utf-8")
+        result = self.tool("--build", name, "unit.c")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 translation units compile", result.stdout)
+
+    def test_windows_ninja_output_is_decoded_in_its_declared_build_file_encoding(self):
+        cases = (("Build file encoding: UTF-8\n", 0, "utf-8"), ("Build file encoding: ANSI\n", 0, "mbcs"),
+                 ("Build file encoding: OEM\n", 0, None), ("", 1, None))
+        for declared, status, expected in cases:
+            with self.subTest(declared=declared, status=status):
+                result = subprocess.CompletedProcess([], status, declared, "ninja: error: unknown tool" if status else "")
+                with patch.object(check_compile.sys, "platform", "win32"), \
+                        patch.object(check_compile, "capture", return_value=result):
+                    if expected is None:
+                        with self.assertRaises(ValueError):
+                            check_compile.ninja_encoding("ninja")
+                    else:
+                        self.assertEqual(check_compile.ninja_encoding("ninja"), expected)
+        with patch.object(check_compile.sys, "platform", "linux"), \
+                patch.object(check_compile, "capture", side_effect=AssertionError("queried Ninja")):
+            self.assertEqual(check_compile.ninja_encoding("ninja"), "utf-8")
+
+    def test_syntax_check_preserves_existing_clang_compilation_fragment(self):
+        compiler = shutil.which("clang")
+        if compiler is None:
+            self.skipTest("Clang is required to check compilation-fragment side effects")
+        source = self.source("unit.c")
+        fragment = self.build / "fragment.json"
+        for option in (f'-MJ "{fragment}"', f'-MJ"{fragment}"'):
+            with self.subTest(option=option):
+                fragment.write_bytes(b"previous compilation fragment")
+                self.manifest([self.entry("unit.c", f'"{compiler}" -c {option} "{source}"')])
+                result = self.tool("unit.c")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(fragment.read_bytes(), b"previous compilation fragment")
+
+
     def setUp(self):
         holder = tempfile.TemporaryDirectory()
         self.addCleanup(holder.cleanup)
@@ -27,7 +133,7 @@ class CheckCompileTests(unittest.TestCase):
         environment = dict(os.environ)
         environment.update(env or {})
         return subprocess.run([sys.executable, "-I", str(TOOL), *arguments], cwd=self.root,
-                              capture_output=True, text=True, env=environment)
+                              capture_output=True, text=True, encoding="utf-8", env=environment)
 
     def source(self, relative, text="int x;\n"):
         path = self.root / relative
@@ -79,6 +185,57 @@ class CheckCompileTests(unittest.TestCase):
         result = self.tool("unit.cpp")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(seen.read_text(encoding="utf-8")), ["-fsyntax-only", str(source)])
+
+    def test_every_configuration_is_checked_and_each_source_is_counted_once(self):
+        source = self.source("unit.cpp")
+        script = self.compiler(
+            "import json\nimport sys\nfrom pathlib import Path\n"
+            "with Path(sys.argv[1]).open('a') as log:\n"
+            "    log.write(json.dumps([str(Path.cwd()), sys.argv[2:]]) + '\\n')\n"
+            "if sys.argv[2] == '1':\n"
+            "    sys.stderr.write(sys.argv[3] + ': configuration failed\\n')\n"
+            "sys.exit(int(sys.argv[2]))\n")
+        seen = self.root / "invocations.jsonl"
+        second = self.build / "second"
+        second.mkdir()
+        for statuses in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            with self.subTest(statuses=statuses):
+                seen.write_text("", encoding="utf-8")
+                first = self.entry("unit.cpp", f'"{sys.executable}" "{script}" "{seen}" '
+                                              f'{statuses[0]} first -c -o first.o "{source}"')
+                other = {"directory": str(second), "file": os.path.relpath(source, second),
+                         "arguments": [sys.executable, str(script), str(seen),
+                                       str(statuses[1]), "second", "-c", "-o", "second.o",
+                                       os.path.relpath(source, second)]}
+                self.manifest([first, other])
+                result = self.tool("unit.cpp")
+                self.assertEqual(result.returncode, int(any(statuses)), result.stderr)
+                invocations = [json.loads(line) for line in seen.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(invocations, [
+                    [str(self.build), [str(statuses[0]), "first", "-fsyntax-only", str(source)]],
+                    [str(second), [str(statuses[1]), "second", "-fsyntax-only", str(source)]],
+                ])
+                if any(statuses):
+                    self.assertIn("1 of 1 translation units did not compile", result.stderr)
+                else:
+                    self.assertIn("1 translation units compile", result.stdout)
+                for label, status in zip(("first", "second"), statuses):
+                    self.assertEqual(f"{label}: configuration failed" in result.stderr, bool(status))
+
+    def test_a_later_configuration_with_a_real_compiler_error_fails(self):
+        compiler = shutil.which("clang")
+        if compiler is None:
+            self.skipTest("Clang is required to check configuration-dependent compilation")
+        source = self.source("unit.c", "#ifdef SECOND_TARGET\n#error second target must fail\n#endif\nint x;\n")
+        self.manifest([
+            {"directory": str(self.build), "file": str(source),
+             "arguments": [compiler, *flags, "-c", str(source)]}
+            for flags in ([], ["-DSECOND_TARGET"])
+        ])
+        result = self.tool("unit.c")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("second target must fail", result.stderr)
+        self.assertIn("1 of 1 translation units did not compile", result.stderr)
 
     @unittest.skipUnless(os.name == "nt", "Windows command-line quoting")
     def test_windows_paths_and_quoted_defines_survive_the_syntax_check(self):
@@ -204,6 +361,28 @@ class CheckCompileTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("changed.cpp:1:1: error: no", result.stderr)
 
+    def test_files_changed_only_on_the_base_since_the_branch_point_are_not_checked(self):
+        script = self.compiler("import sys\nsys.stderr.write(sys.argv[-1] + ': error: no\\n')\nsys.exit(1)\n")
+        self.manifest([self.entry(name, f'"{sys.executable}" "{script}" "{self.root / name}"')
+                       for name in ("mine.cpp", "other.cpp")])
+        git = ["git", "-C", str(self.root)]
+        self.source("other.cpp")
+        subprocess.run([*git, "add", "other.cpp"], check=True)
+        subprocess.run([*git, "commit", "-qm", "add"], check=True)
+        subprocess.run([*git, "branch", "-M", "main"], check=True)
+        subprocess.run([*git, "checkout", "-qb", "side"], check=True)
+        self.source("mine.cpp")
+        subprocess.run([*git, "add", "mine.cpp"], check=True)
+        subprocess.run([*git, "commit", "-qm", "mine"], check=True)
+        subprocess.run([*git, "checkout", "-q", "main"], check=True)
+        self.source("other.cpp", "int y;\n")
+        subprocess.run([*git, "commit", "-qam", "other"], check=True)
+        subprocess.run([*git, "checkout", "-q", "side"], check=True)
+        result = self.tool("--base", "main")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("mine.cpp: error: no", result.stderr)
+        self.assertNotIn("other.cpp", result.stderr)
+
     def test_no_changed_translation_unit_is_not_a_failure(self):
         self.source("clean.cpp")
         subprocess.run(["git", "-C", str(self.root), "add", "clean.cpp"], check=True)
@@ -220,16 +399,84 @@ class CheckCompileTests(unittest.TestCase):
         bin = self.root / "bin"
         bin.mkdir()
         stub = bin / "ninja_stub.py"
-        stub.write_text("import json\nprint(json.dumps(%r))\n" % [entry], encoding="utf-8")
+        stub.write_text("import json\nimport sys\n"
+                        "if sys.argv[1:] == ['-t', 'wincodepage']:\n    print('Build file encoding: UTF-8')\n"
+                        "else:\n    print(json.dumps(%r))\n" % [entry], encoding="utf-8")
         if os.name == "nt":
-            (bin / "ninja.cmd").write_text(f'@"{sys.executable}" "{stub}"\n', encoding="utf-8")
+            (bin / "ninja.cmd").write_text('@"%NINJA_STUB_PYTHON%" "%~dp0ninja_stub.py" %*\n', encoding="ascii")
         else:
             ninja = bin / "ninja"
             ninja.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{stub}"\n', encoding="utf-8")
             ninja.chmod(0o755)
-        result = self.tool("unit.cpp", env={"PATH": f"{bin}{os.pathsep}{os.environ['PATH']}"})
+        result = self.tool("unit.cpp", env={"PATH": f"{bin}{os.pathsep}{os.environ['PATH']}",
+                                            "NINJA_STUB_PYTHON": sys.executable})
         self.assertEqual(result.returncode, 0)
         self.assertIn("1 translation units compile", result.stdout)
+
+
+    def test_argument_arrays_preserve_tokens_and_take_precedence_over_command(self):
+        source = self.source("unit with spaces.cpp")
+        script = self.compiler(
+            "import json\nimport sys\nfrom pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))\n")
+        seen = self.root / "arguments.json"
+        flags = ['-DNAME=quoted "value"', '-IC:\\sdk files\\include\\']
+        arguments = [sys.executable, str(script), str(seen), *flags,
+                     "-c", "-o", "unit.o", "-MD", "-MT", "unit.o", "-MF", "unit.o.d",
+                     os.path.relpath(source, self.build)]
+        entry = {"directory": str(self.build), "file": str(source), "arguments": arguments}
+        for command in (None, "nonexistent-compiler -c unit.cpp"):
+            with self.subTest(command=command):
+                if command is not None:
+                    entry["command"] = command
+                self.manifest([entry])
+                result = self.tool(source.name)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(seen.read_text(encoding="utf-8")),
+                                 [*flags, "-fsyntax-only", str(source)])
+
+    def test_invalid_argument_arrays_are_rejected_without_a_traceback(self):
+        source = self.source("unit.cpp")
+        for arguments in (None, [], "compiler -c unit.cpp", ["compiler", 3], [""]):
+            with self.subTest(arguments=arguments):
+                self.manifest([{"directory": str(self.build), "file": str(source), "arguments": arguments}])
+                result = self.tool(source.name)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("arguments must be a nonempty list of strings with an executable", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_parallel_checks_overlap_but_diagnostics_keep_source_order(self):
+        barrier = self.root / "barrier"
+        barrier.mkdir()
+        compiler = self.compiler(
+            "import sys, time\nfrom pathlib import Path\n"
+            "root, name = Path(sys.argv[1]), sys.argv[2]\n"
+            "(root / name).touch()\n"
+            "deadline = time.monotonic() + 5\n"
+            "while not all((root / value).exists() for value in ('first', 'second')):\n"
+            "    if time.monotonic() > deadline: sys.exit('checks did not overlap')\n"
+            "    time.sleep(0.01)\n"
+            "if name == 'second': (root / 'second.done').touch()\n"
+            "while name == 'first' and not (root / 'second.done').exists():\n"
+            "    if time.monotonic() > deadline: sys.exit('second did not finish')\n"
+            "    time.sleep(0.01)\n"
+            "sys.exit(name + ': diagnostic')\n")
+        entries = []
+        for name in ("first", "second"):
+            source = self.source(name + ".c")
+            entries.append(self.entry(name + ".c", f'"{sys.executable}" "{compiler}" "{barrier}" {name} "{source}"'))
+        self.manifest(entries)
+        result = self.tool("--jobs", "2", "first.c", "second.c")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("2 of 2 translation units did not compile", result.stderr)
+        self.assertLess(result.stderr.index("first: diagnostic"), result.stderr.index("second: diagnostic"))
+        self.assertNotIn("did not overlap", result.stderr)
+        for jobs in ("0", "-1"):
+            with self.subTest(jobs=jobs):
+                result = self.tool("--jobs", jobs, "first.c")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("positive integer", result.stderr)
+
 
 
 if __name__ == "__main__":

@@ -17,6 +17,21 @@ void APS5_VABI _Cnd_destroy_nid_postfix(void** handle);
 int APS5_VABI _Cnd_wait_nid_postfix(void** condition, void** mutex);
 int APS5_VABI _Cnd_broadcast_nid_postfix(void** handle);
 int APS5_VABI _Cnd_signal_nid_postfix(void** handle);
+
+struct GuestPad {
+    unsigned (APS5_VABI* const* vtable)(GuestPad*);
+    void* condition;
+    void* mutex;
+    bool started;
+};
+
+void APS5_VABI _ZNSt4_PadC2Ev_nid_postfix(GuestPad* pad);
+void APS5_VABI _ZNSt4_PadD2Ev_nid_postfix(GuestPad* pad);
+void APS5_VABI _ZNSt4_Pad8_ReleaseEv_nid_postfix(GuestPad* pad);
+void APS5_VABI _ZNSt4_Pad7_LaunchEPP7pthread_nid_postfix(GuestPad* pad, void** thread);
+int APS5_VABI _Thrd_join_nid_postfix(void* thread, int* code);
+void RegisterPthreadCreate_nid_no_patch(int (APS5_VABI* fn)(void**, const void*, void* (APS5_VABI*)(void*), void*));
+void RegisterPthreadJoin_nid_no_patch(int (APS5_VABI* fn)(void*, void**));
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -183,10 +198,82 @@ static void ConditionSignal() {
     _Cnd_destroy_nid_postfix(&condition);
 }
 
+struct TestPad {
+    unsigned (APS5_VABI* const* vtable)(GuestPad*);
+    void* condition;
+    void* mutex;
+    bool started;
+    std::atomic<bool> ran{false};
+};
+
+struct HostPadThread {
+    std::thread worker;
+    void* result = nullptr;
+};
+
+static int APS5_VABI HostPthreadCreate(void** thread, const void*, void* (APS5_VABI* entry)(void*), void* arg) {
+    auto* handle = new HostPadThread{};
+    handle->worker = std::thread([handle, entry, arg] { handle->result = entry(arg); });
+    *thread = handle;
+    return 0;
+}
+
+static int APS5_VABI HostPthreadJoin(void* thread, void** value) {
+    if (!thread) return 22;
+    auto* handle = static_cast<HostPadThread*>(thread);
+    handle->worker.join();
+    if (value) *value = handle->result;
+    delete handle;
+    return 0;
+}
+
+static unsigned APS5_VABI TestPadGo(GuestPad* base) {
+    auto* pad = reinterpret_cast<TestPad*>(base);
+    pad->ran.store(true);
+    _ZNSt4_Pad8_ReleaseEv_nid_postfix(base);
+    return 42;
+}
+
+static void PadLaunchAndJoin() {
+    unsigned (APS5_VABI* vtable[1])(GuestPad*) = {TestPadGo};
+    TestPad unregPad{};
+    unregPad.vtable = vtable;
+    _ZNSt4_PadC2Ev_nid_postfix(reinterpret_cast<GuestPad*>(&unregPad));
+    RegisterPthreadCreate_nid_no_patch(nullptr);
+    RegisterPthreadJoin_nid_no_patch(nullptr);
+    void* unregThread = nullptr;
+    RequireThrows<std::runtime_error>([&] {
+        _ZNSt4_Pad7_LaunchEPP7pthread_nid_postfix(reinterpret_cast<GuestPad*>(&unregPad), &unregThread);
+    });
+    RequireThrows<std::runtime_error>([&] {
+        int code = 0;
+        _Thrd_join_nid_postfix(&unregPad, &code);
+    });
+    _ZNSt4_PadD2Ev_nid_postfix(reinterpret_cast<GuestPad*>(&unregPad));
+
+    RegisterPthreadCreate_nid_no_patch(HostPthreadCreate);
+    RegisterPthreadJoin_nid_no_patch(HostPthreadJoin);
+
+    TestPad pad{};
+    pad.vtable = vtable;
+    _ZNSt4_PadC2Ev_nid_postfix(reinterpret_cast<GuestPad*>(&pad));
+    void* thread = nullptr;
+    _ZNSt4_Pad7_LaunchEPP7pthread_nid_postfix(reinterpret_cast<GuestPad*>(&pad), &thread);
+    Require(thread != nullptr && pad.started && pad.ran.load());
+    _ZNSt4_PadD2Ev_nid_postfix(reinterpret_cast<GuestPad*>(&pad));
+    int code = 0;
+    Require(_Thrd_join_nid_postfix(thread, &code) == success && code == 42);
+    Require(_Thrd_join_nid_postfix(nullptr, &code) == 4);
+
+    RegisterPthreadCreate_nid_no_patch(nullptr);
+    RegisterPthreadJoin_nid_no_patch(nullptr);
+}
+
 int main() {
     MutexBasics();
     RecursiveMutex();
     MutualExclusion();
     ConditionBroadcast();
     ConditionSignal();
+    PadLaunchAndJoin();
 }

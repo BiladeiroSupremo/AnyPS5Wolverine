@@ -2,20 +2,29 @@
 #define CORE_LIBS_PRX_LIBC_INCLUDE_GENERAL_HPP
 
 #include <stdexcept>
+#include <string>
 #include <filesystem>
 #include <vector>
+#include <cstdio>
 
 #include "general/LogMacros.hpp"
 #include "general/VabiMacros.hpp"
 #include "general/ExportMacros.hpp"
 
-extern "C" void NotImplemented_nid_no_patch(const char* funcName);
+extern "C" [[noreturn]] void NotImplemented_nid_no_patch(const char* funcName);
 extern "C" void CxaFinalize_nid_no_patch(void* dsoHandle);
 extern "C" bool StopAtPrefixLetter_nid_no_patch(const char* str, char** endptr, int base);
 #ifndef _WIN32
 extern "C" int KeepHostStandardError_nid_no_patch();
 extern "C" int HostStandardError_nid_no_patch();
+extern "C" int KeepHostStandardOutput_nid_no_patch();
+#else
+extern "C" bool AdoptHostStandardStream_nid_no_patch(int standard, int saved);
+extern "C" std::FILE* HostStandardOutputFile_nid_no_patch();
+extern "C" std::FILE* HostStandardErrorFile_nid_no_patch();
 #endif
+
+extern "C" bool CopyGuestEnvironment_nid_no_patch(const char* name, std::string& value);
 
 extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path);
 extern "C" std::filesystem::path ResolvePathOrRelinkedModule_nid_no_patch(const char* path);
@@ -29,15 +38,23 @@ extern "C" int RenameGuestPath_nid_no_patch(const char* from, const char* to);
 // directory instead of the run directory; the prefix matches whole path components only.
 extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath);
 extern "C" void RemovePathAlias_nid_no_patch(const char* guestPrefix);
+using PathProvider = std::filesystem::path (*)(const std::filesystem::path& root);
+extern "C" void AddPathProvider_nid_no_patch(const char* guestPath, PathProvider provide);
 extern "C" void RecordWrittenPath_nid_no_patch(const std::filesystem::path& path);
 extern "C" std::vector<std::filesystem::path> WrittenPaths_nid_no_patch();
 extern "C" void SyncWrittenPaths_nid_no_patch();
 extern "C" void BlockPathAlias_nid_no_patch(const char* guestPrefix);
+extern "C" int DuplicateHostDescriptor_nid_no_patch(int descriptor);
 #ifdef _WIN32
 extern "C" int WindowsOpenError_nid_no_patch(unsigned long error);
 extern "C" void* HostStandardHandle_nid_no_patch(int descriptor);
 extern "C" void KeepStandardHandle_nid_no_patch(int descriptor, void* handle);
 #endif
+
+using PthreadCreateFn_nid_no_patch = int (APS5_VABI*)(void**, const void*, void* (APS5_VABI*)(void*), void*);
+using PthreadJoinFn_nid_no_patch = int (APS5_VABI*)(void*, void**);
+extern "C" void RegisterPthreadCreate_nid_no_patch(PthreadCreateFn_nid_no_patch fn);
+extern "C" void RegisterPthreadJoin_nid_no_patch(PthreadJoinFn_nid_no_patch fn);
 
 #define APS5_INVALID_ARG_EX throw std::invalid_argument(std::string(__func__) + ": invalid argument")
 

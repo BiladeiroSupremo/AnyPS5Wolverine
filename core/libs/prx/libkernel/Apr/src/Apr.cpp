@@ -12,7 +12,6 @@
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
-#include "prx/libkernel/File/include/CompressedFile.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <array>
@@ -34,21 +33,9 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
-#else
-#include <fcntl.h>
-#include <unistd.h>
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
-
-// The AMM submission queue's progress (defined with the queues below).
-struct AprAmmQueueState {
-    std::uint32_t submitted;
-    std::uint32_t completed;
-    std::uint32_t pending;
-    bool running;
-};
-AprAmmQueueState AprAmmQueueStatus();
 
 namespace {
 
@@ -77,12 +64,6 @@ std::string _foldCase(std::string text) {
     return text;
 }
 
-// The size the guest sees: a GDEF container's uncompressed size (its header), the host size else.
-std::uint64_t _guestSize(const std::filesystem::path& path, std::uint64_t hostBytes) {
-    if (hostBytes < 20) return hostBytes;
-    return CompressedFile::UncompressedSize(path).value_or(hostBytes);
-}
-
 bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
     {
         std::lock_guard lock(g_directoriesLock);
@@ -98,7 +79,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
                 do {
                     if ((entry.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) continue;
                     const auto size = (static_cast<std::uint64_t>(entry.nFileSizeHigh) << 32u) | entry.nFileSizeLow;
-                    sizes.emplace(_foldCase(std::filesystem::path(entry.cFileName).string()), _guestSize(path.parent_path() / entry.cFileName, size));
+                    sizes.emplace(_foldCase(std::filesystem::path(entry.cFileName).string()), size);
                 } while (FindNextFileW(find, &entry));
                 FindClose(find);
             }
@@ -108,7 +89,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
                 std::error_code entryError;
                 if (!it->is_regular_file(entryError)) continue;
                 const auto size = it->file_size(entryError);
-                if (!entryError) sizes.emplace(_foldCase(it->path().filename().string()), _guestSize(it->path(), size));
+                if (!entryError) sizes.emplace(_foldCase(it->path().filename().string()), size);
             }
 #endif
             listed = g_directories.emplace(directory, std::move(sizes)).first;
@@ -123,7 +104,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
     if (!std::filesystem::is_regular_file(path, error)) return false;
     FileStat stat{};
     File::FillFileStat(path, &stat);
-    bytes = _guestSize(path, static_cast<std::uint64_t>(stat.st_size));
+    bytes = static_cast<std::uint64_t>(stat.st_size);
     return true;
 }
 
@@ -175,147 +156,33 @@ int _resolveForEach(const char* prefix, const char** paths, uint32_t count, uint
     return static_cast<int>(resolvedCount);
 }
 
-// Host handles of resolved files, opened on first read and kept: titles stream thousands of small
-// reads (Wolverine ~16000 at startup), and opening the file for each took ~8 ms, minutes in all.
-// Reads are positional, so the queues' workers share a handle.
-#ifdef _WIN32
-using HostFile = HANDLE;
-const HostFile NoHostFile = INVALID_HANDLE_VALUE;
-#else
-using HostFile = int;
-constexpr HostFile NoHostFile = -1;
-#endif
-std::mutex& g_handlesLock = *new std::mutex();
-std::vector<HostFile>& g_handles = *new std::vector<HostFile>();
-
-HostFile _hostFile(std::uint32_t id, const AprFile& file) {
-    std::lock_guard lock(g_handlesLock);
-    if (id < g_handles.size() && g_handles[id] != NoHostFile) return g_handles[id];
-#ifdef _WIN32
-    const HostFile handle = CreateFileW(file.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-#else
-    const HostFile handle = open(file.path.c_str(), O_RDONLY | O_CLOEXEC);
-#endif
-    if (handle == NoHostFile) throw std::runtime_error("APR: cannot open " + file.path.string());
-    if (g_handles.size() <= id) g_handles.resize(id + 1, NoHostFile);
-    g_handles[id] = handle;
-    return handle;
-}
-
-// Reads `bytes` at `offset` into `destination`; returns the bytes read (fewer at the end of the file).
-std::uint64_t _readAt(HostFile handle, std::uint64_t offset, std::uint8_t* destination, std::uint64_t bytes) {
-    std::uint64_t done = 0;
-    while (done < bytes) {
-        const auto chunk = static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes - done, 1u << 30u));
-#ifdef _WIN32
-        OVERLAPPED at{};
-        at.Offset = static_cast<DWORD>(offset + done);
-        at.OffsetHigh = static_cast<DWORD>((offset + done) >> 32u);
-        DWORD read = 0;
-        if (!ReadFile(handle, destination + done, chunk, &read, &at) && GetLastError() != ERROR_HANDLE_EOF) throw std::runtime_error("APR: ReadFile failed with error " + std::to_string(GetLastError()));
-#else
-        const auto read = pread(handle, destination + done, chunk, static_cast<off_t>(offset + done));
-        if (read < 0) throw std::runtime_error("APR: pread failed with errno " + std::to_string(errno));
-#endif
-        if (read == 0) break;
-        done += static_cast<std::uint64_t>(read);
-    }
-    return done;
-}
-
-// A file's GDEF index (null for an ordinary file), probed on its first read and kept like its handle.
-std::mutex& g_compressedLock = *new std::mutex();
-std::vector<std::optional<std::shared_ptr<const CompressedFile::Index>>>& g_compressed = *new std::vector<std::optional<std::shared_ptr<const CompressedFile::Index>>>();
-
-std::shared_ptr<const CompressedFile::Index> _compressed(std::uint32_t id, const AprFile& file, HostFile handle) {
-    {
-        std::lock_guard lock(g_compressedLock);
-        if (id < g_compressed.size() && g_compressed[id].has_value()) return *g_compressed[id];
-    }
-#ifdef _WIN32
-    LARGE_INTEGER hostSize{};
-    if (!GetFileSizeEx(handle, &hostSize)) throw std::runtime_error("APR: cannot size " + file.path.string());
-    const auto hostBytes = static_cast<std::uint64_t>(hostSize.QuadPart);
-#else
-    struct stat hostStat {};
-    if (fstat(handle, &hostStat) != 0) throw std::runtime_error("APR: cannot size " + file.path.string());
-    const auto hostBytes = static_cast<std::uint64_t>(hostStat.st_size);
-#endif
-    const CompressedFile::RawRead read = [handle](std::uint64_t offset, void* destination, std::size_t bytes) { return _readAt(handle, offset, static_cast<std::uint8_t*>(destination), bytes) == bytes; };
-    auto index = CompressedFile::Probe(file.path.string(), hostBytes, read);
-    std::lock_guard lock(g_compressedLock);
-    if (g_compressed.size() <= id) g_compressed.resize(id + 1);
-    g_compressed[id] = index;
-    return index;
-}
-
-// APS5_APR_TIMING=1: every 10 s, where the reads' time went (opening the guest write, reading and
-// decoding, closing the guest write).
-struct ReadTiming {
-    std::atomic<std::uint64_t> reads{0}, bytes{0}, openNs{0}, readNs{0}, closeNs{0};
-    std::atomic<std::int64_t> lastReport{0};
-};
-
-ReadTiming* _readTiming() {
-    static ReadTiming* const timing = std::getenv("APS5_APR_TIMING") != nullptr ? new ReadTiming() : nullptr;
-    return timing;
-}
-
-void _reportReadTiming(ReadTiming& timing) {
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    auto last = timing.lastReport.load(std::memory_order_relaxed);
-    if (now - last < 10 || !timing.lastReport.compare_exchange_strong(last, now)) return;
-    const auto reads = timing.reads.exchange(0);
-    if (reads == 0) return;
-    const auto ms = [](std::atomic<std::uint64_t>& ns) { return static_cast<double>(ns.exchange(0)) / 1e6; };
-    const double bytes = static_cast<double>(timing.bytes.exchange(0)) / 1048576.0;
-    const double open = ms(timing.openNs), read = ms(timing.readNs), close = ms(timing.closeNs);
-    std::fprintf(stderr, "[apr-timing] %llu reads, %.1f MiB: open %.0f ms, read %.0f ms, close %.0f ms (%.2f ms per read)\n", static_cast<unsigned long long>(reads), bytes, open, read, close, (open + read + close) / static_cast<double>(reads));
-}
-
 void _readFile(const Apr::ReadFileCommand& command) {
     const auto file = _file(command.fileId);
     static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
-    if (trace) std::fprintf(stderr, "[apr] read %s offset=0x%llx size=0x%llx -> 0x%llx at %.3f s\n", file.path.string().c_str(), static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination), std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
-    auto* timing = _readTiming();
-    const auto started = std::chrono::steady_clock::now();
-    auto readStarted = started;
-    struct CloseTimer {
-        ReadTiming* timing;
-        std::chrono::steady_clock::time_point* readStarted;
-        std::chrono::steady_clock::time_point readDone{};
-        ~CloseTimer() {
-            if (timing == nullptr || readDone == std::chrono::steady_clock::time_point{}) return;
-            const auto end = std::chrono::steady_clock::now();
-            timing->readNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(readDone - *readStarted).count());
-            timing->closeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - readDone).count());
-            timing->reads += 1;
-            _reportReadTiming(*timing);
-        }
-    } closeTimer{timing, &readStarted};
-    const auto handle = _hostFile(command.fileId, file);
+    if (trace) std::fprintf(stderr, "[apr] read %s offset=0x%llx size=0x%llx -> 0x%llx\n", file.path.string().c_str(), static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination));
+    std::ifstream stream(file.path, std::ios::binary);
+    if (!stream) throw std::runtime_error("APR: cannot open " + file.path.string());
+    stream.seekg(static_cast<std::streamoff>(command.offset));
     const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
     if (!destination.Open()) throw std::runtime_error("APR: the read destination of " + file.path.string() + " is not writable guest memory");
-    if (timing != nullptr) {
-        readStarted = std::chrono::steady_clock::now();
-        timing->openNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(readStarted - started).count());
-        timing->bytes += command.size;
-    }
+#ifdef _WIN32
+    std::array<char, 64u * 1024u> staging;
     std::uint64_t read = 0;
-    std::uint64_t fileBytes = 0;
-    if (const auto compressed = _compressed(command.fileId, file, handle)) {
-        fileBytes = compressed->uncompressedBytes;
-        read = command.offset < fileBytes ? std::min<std::uint64_t>(command.size, fileBytes - command.offset) : 0;
-        const CompressedFile::RawRead raw = [handle](std::uint64_t offset, void* target, std::size_t bytes) { return _readAt(handle, offset, static_cast<std::uint8_t*>(target), bytes) == bytes; };
-        if (read != 0) CompressedFile::Read(*compressed, raw, command.offset, reinterpret_cast<void*>(command.destination), static_cast<std::size_t>(read));
-    } else {
-        read = _readAt(handle, command.offset, reinterpret_cast<std::uint8_t*>(command.destination), command.size);
-        if (read != command.size) fileBytes = std::filesystem::file_size(file.path);
+    while (read < command.size) {
+        const auto wanted = static_cast<std::streamsize>(std::min<std::uint64_t>(command.size - read, staging.size()));
+        stream.read(staging.data(), wanted);
+        const auto obtained = static_cast<std::uint64_t>(stream.gcount());
+        if (obtained != 0) std::memcpy(reinterpret_cast<char*>(command.destination) + read, staging.data(), static_cast<std::size_t>(obtained));
+        read += obtained;
+        if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
+        if (obtained != static_cast<std::uint64_t>(wanted)) break;
     }
-    if (timing != nullptr) closeTimer.readDone = std::chrono::steady_clock::now();
-    static const auto delay = [] { const char* text = std::getenv("APS5_APR_READ_DELAY_US"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul; }();
-    if (delay != 0) PreciseSleepUs(delay);
-    if (read != command.size && command.offset + read < fileBytes) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
+#else
+    stream.read(reinterpret_cast<char*>(command.destination), static_cast<std::streamsize>(command.size));
+    if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
+    const auto read = static_cast<std::uint64_t>(stream.gcount());
+#endif
+    if (read != command.size && (!stream.eof() || command.offset + read < std::filesystem::file_size(file.path))) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
     if (read != command.size) std::memset(reinterpret_cast<char*>(command.destination) + read, 0, static_cast<std::size_t>(command.size - read));
 }
 
@@ -407,18 +274,10 @@ TCommand _read(const Apr::CommandBufferObject& buffer, std::uint32_t cursor) {
     return command;
 }
 
-// The AMM virtual address range the title manages itself (sceKernelAmmGetVirtualAddressRanges):
-// APS5_AMM_RANGE_GB (default 256) for the main range, then 32 GiB for multimaps. KytyPS5 hands
-// PPSA03671 512 GiB (and no multimap range). At 32 GiB the title's texture VA allocation failed
-// and it streamed mips to base-0 destinations (crashed 7 of 7 runs at its slot-4 title); at 256
-// none did in 3 runs (2026-10-14/15).
-std::uint64_t AmmMainBytes() {
-    static const std::uint64_t bytes = [] { const char* text = std::getenv("APS5_AMM_RANGE_GB"); return (text != nullptr ? std::strtoull(text, nullptr, 10) : 256ull) << 30; }();
-    return bytes;
-}
-constexpr std::uint64_t AmmMultimapBytes = 32ull << 30;
-std::uint64_t AmmTotalBytes() { return AmmMainBytes() + AmmMultimapBytes; }
-constexpr std::uint64_t AmmRangeAlignment = 2ull << 20;
+constexpr std::uint64_t AmmRangeBytes = 256ull << 30;
+constexpr std::uint64_t AmmMultimapRangeBytes = 32ull << 30;
+constexpr std::uint64_t AmmReservedBytes = AmmRangeBytes + AmmMultimapRangeBytes;
+constexpr std::uint64_t AmmRangeAlignment = 64ull << 30;
 constexpr int GuestMapFixed = 0x10;
 constexpr int GuestMapNoOverwrite = 0x80;
 
@@ -449,11 +308,11 @@ std::uintptr_t _ammBase(AmmState& state) {
         std::uintptr_t arenaBase = 0;
         std::size_t arenaBytes = 0;
         GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
-        if (arenaBase == 0 || arenaBytes < AmmTotalBytes()) throw std::runtime_error("AMM: the guest address space arena cannot hold the virtual address range");
-        const auto top = GuestArena::GuestArenaHighestFree_nid_no_patch(AmmTotalBytes(), AmmRangeAlignment);
+        if (arenaBase == 0 || arenaBytes < AmmReservedBytes) throw std::runtime_error("AMM: the guest address space arena cannot hold the virtual address range");
+        const auto top = GuestArena::GuestArenaHighestFree_nid_no_patch(AmmReservedBytes, AmmRangeAlignment);
         if (top == 0) throw std::runtime_error("AMM: the guest address space arena has no free virtual address range");
         void* address = reinterpret_cast<void*>(top);
-        if (DoReserveVirtual(&address, AmmTotalBytes(), GuestMapFixed | GuestMapNoOverwrite, 0) != 0) throw std::runtime_error("AMM: cannot reserve the virtual address range");
+        if (DoReserveVirtual(&address, AmmReservedBytes, GuestMapFixed | GuestMapNoOverwrite, 0) != 0) throw std::runtime_error("AMM: cannot reserve the virtual address range");
         state.base = reinterpret_cast<std::uintptr_t>(address);
     }
     return state.base;
@@ -461,7 +320,7 @@ std::uintptr_t _ammBase(AmmState& state) {
 
 void _ammCheckRange(AmmState& state, std::uint64_t address, std::uint64_t size) {
     const auto base = _ammBase(state);
-    if (address < base || size > AmmTotalBytes() || address - base > AmmTotalBytes() - size) throw std::runtime_error("AMM: range outside the AMM virtual address range");
+    if (address < base || size > AmmReservedBytes || address - base > AmmReservedBytes - size) throw std::runtime_error("AMM: range outside the AMM virtual address range");
 }
 
 int _ammHostProtection(std::int32_t protection) {
@@ -488,43 +347,16 @@ void _returnPoolPages(AmmState& state, std::uint64_t offset, std::uint64_t bytes
     state.pool.emplace(offset, bytes);
 }
 
-bool _tryTakePoolPages(AmmState& state, std::uint64_t bytes, std::uint64_t& offset) {
+std::uint64_t _takePoolPages(AmmState& state, std::uint64_t bytes) {
     for (auto it = state.pool.begin(); it != state.pool.end(); ++it) {
         if (it->second < bytes) continue;
-        offset = it->first;
+        const auto offset = it->first;
         const auto remaining = it->second - bytes;
         state.pool.erase(it);
         if (remaining != 0) state.pool.emplace(offset + bytes, remaining);
-        return true;
+        return offset;
     }
-    return false;
-}
-
-std::uint64_t _takePoolPages(AmmState& state, std::uint64_t bytes) {
-    std::uint64_t offset = 0;
-    if (!_tryTakePoolPages(state, bytes, offset)) throw std::runtime_error("AMM: no free run of " + std::to_string(bytes) + " bytes in the direct memory given to the mapper");
-    return offset;
-}
-
-// Pool pages for `bytes` taken from several runs (first fit), for a map no single free run holds:
-// the PS5 maps the mapper's pages through page tables, so a fragmented pool still serves it
-// (PPSA03671 aborted on an 11 MB map ~4 min into a slot-4 load with only contiguous runs).
-std::vector<AmmPage> _takeScatteredPages(AmmState& state, std::uint64_t bytes, std::int32_t type, std::int32_t protection) {
-    std::uint64_t free = 0;
-    for (const auto& [offset, size] : state.pool) free += size;
-    if (free < bytes) throw std::runtime_error("AMM: " + std::to_string(bytes) + " bytes requested, " + std::to_string(free) + " free in the direct memory given to the mapper");
-    std::vector<AmmPage> pages;
-    pages.reserve(bytes / PS5_PAGE_SIZE);
-    while (pages.size() * PS5_PAGE_SIZE < bytes) {
-        auto it = state.pool.begin();
-        const auto take = std::min(it->second, bytes - pages.size() * PS5_PAGE_SIZE);
-        const auto offset = it->first;
-        const auto remaining = it->second - take;
-        state.pool.erase(it);
-        if (remaining != 0) state.pool.emplace(offset + take, remaining);
-        for (std::uint64_t page = 0; page < take; page += PS5_PAGE_SIZE) pages.push_back({offset + page, type, protection, true});
-    }
-    return pages;
+    throw std::runtime_error("AMM: no free run of " + std::to_string(bytes) + " bytes in the direct memory given to the mapper");
 }
 
 void _addPage(AmmState& state, std::uint64_t address, const AmmPage& page) {
@@ -611,7 +443,7 @@ void _requirePrt(AmmState& state, std::uint64_t address, std::uint64_t size) {
 void _zeroPrt(std::uint64_t address, std::uint64_t size) {
     constexpr int GpuRead = 0x10;
     void* target = reinterpret_cast<void*>(address);
-    if (DoMapZero(&target, size, GpuRead, GuestMapFixed) != 0) throw std::runtime_error("AMM: cannot map the unbacked PRT pages");
+    if (DoMapAnon(&target, size, GpuRead, GuestMapFixed) != 0) throw std::runtime_error("AMM: cannot map the unbacked PRT pages");
 }
 
 void _ammUnmap(const Apr::AmmUnmapCommand& command) {
@@ -673,62 +505,16 @@ void _ammAllocatePrt(const Apr::AmmProtectCommand& command) {
     }
 }
 
-// APS5_APR_TIMING=1 also reports, every 10 s, how long each command opcode took in total.
-struct OpcodeTiming {
-    std::array<std::atomic<std::uint64_t>, 32> ns{};
-    std::array<std::atomic<std::uint64_t>, 32> count{};
-    std::atomic<std::int64_t> lastReport{0};
-};
-
-OpcodeTiming* _opcodeTiming() {
-    static OpcodeTiming* const timing = std::getenv("APS5_APR_TIMING") != nullptr ? new OpcodeTiming() : nullptr;
-    return timing;
-}
-
 void _ammMap(const Apr::AmmMapCommand& command, bool direct) {
     auto& state = _amm();
     const std::lock_guard lock(state.lock);
     _ammCheckRange(state, command.address, command.size);
-    auto* timing = _opcodeTiming();
-    const auto reserveStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     _reserve(command.address, command.size);
-    // APS5_APR_TIMING: slot 30 = the reserve, slot 31 = the map of AmmMap.
-    const auto mapStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (timing != nullptr) {
-        timing->ns[30] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(mapStarted - reserveStarted).count());
-        timing->count[30] += 1;
-    }
     _forgetPages(state, command.address, command.size);
     _clearPrt(state, command.address, command.size);
-    std::uint64_t physical = direct ? command.directOffset : 0;
-    if (!direct && !_tryTakePoolPages(state, command.size, physical)) {
-        const auto pages = _takeScatteredPages(state, command.size, command.type, command.protection);
-        static std::atomic<int> reported{0};
-        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[amm] no free run of %llu bytes: mapping 0x%llx from scattered pool pages\n", static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.address));
-        std::size_t mapped = 0;
-        try {
-            for (std::size_t first = 0; first < pages.size();) {
-                std::size_t last = first + 1;
-                while (last < pages.size() && pages[last].physical == pages[last - 1].physical + PS5_PAGE_SIZE) ++last;
-                _mapRun(command.address + first * PS5_PAGE_SIZE, pages[first].physical, (last - first) * PS5_PAGE_SIZE, command.protection);
-                for (std::size_t index = first; index < last; ++index) _addPage(state, command.address + index * PS5_PAGE_SIZE, pages[index]);
-                mapped = last;
-                first = last;
-            }
-        } catch (...) {
-            _forgetPages(state, command.address, command.size);
-            for (std::size_t index = mapped; index < pages.size(); ++index) _returnPoolPages(state, pages[index].physical, PS5_PAGE_SIZE);
-            _reserve(command.address, command.size);
-            throw;
-        }
-        return;
-    }
+    const auto physical = direct ? command.directOffset : _takePoolPages(state, command.size);
     try {
         _mapRun(command.address, physical, command.size, command.protection);
-        if (timing != nullptr) {
-            timing->ns[31] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mapStarted).count());
-            timing->count[31] += 1;
-        }
     } catch (...) {
         _reserve(command.address, command.size);
         if (!direct) _returnPoolPages(state, physical, command.size);
@@ -785,114 +571,12 @@ struct ReadCursor {
     std::uint64_t nextOffset = 0;
 };
 
-bool _ammRangeMapped(AmmState& state, std::uint64_t address, std::uint64_t size) {
-    for (auto page = address & ~(std::uint64_t{PS5_PAGE_SIZE} - 1u); page < address + size; page += PS5_PAGE_SIZE) {
-        if (state.pages.find(page) == state.pages.end()) return false;
-    }
-    return true;
-}
-
-// A read into AMM pages that are not mapped yet: AMM buffers run on their own queue and can sit
-// behind a deferred wait, while a generic buffer runs at once on the submitting thread, so a read
-// could overtake the mapping it reads into (2026-10-14: 'Archive Asset IO' wrote to unmapped AMM
-// pages). Waits for the AMM queue to map them, for up to APS5_APR_AMM_WAIT_MS (2000).
-void _awaitAmmMapping(const Apr::ReadFileCommand& command) {
-    auto& state = _amm();
-    {
-        const std::lock_guard lock(state.lock);
-        if (state.base == 0 || command.destination < state.base || command.destination - state.base >= AmmTotalBytes()) return;
-        if (_ammRangeMapped(state, command.destination, command.size)) return;
-    }
-    static const auto limitMs = [] { const char* text = std::getenv("APS5_APR_AMM_WAIT_MS"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 2000ul; }();
-    const auto before = AprAmmQueueStatus();
-    const auto started = std::chrono::steady_clock::now();
-    bool mapped = false;
-    while (std::chrono::steady_clock::now() - started < std::chrono::milliseconds(limitMs)) {
-        PreciseSleepUs(100);
-        const std::lock_guard lock(state.lock);
-        if (_ammRangeMapped(state, command.destination, command.size)) {
-            mapped = true;
-            break;
-        }
-    }
-    const auto after = AprAmmQueueStatus();
-    const auto waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-    std::fprintf(stderr, "[apr] read into unmapped AMM pages 0x%llx+0x%llx: %s after %.1f ms; AMM queue before %u/%u submitted/completed, %u pending, %s; after %u/%u, %u pending\n", static_cast<unsigned long long>(command.destination), static_cast<unsigned long long>(command.size), mapped ? "mapped" : "STILL UNMAPPED", waitedMs, before.submitted, before.completed, before.pending, before.running ? "running" : "idle", after.submitted, after.completed, after.pending);
-}
-
-// Whether [address, address + bytes) is committed memory (its protection may still be read-only
-// for write tracking; the read opens the guest write itself).
-bool _committed(std::uint64_t address, std::uint64_t bytes) {
-#ifdef _WIN32
-    for (auto cursor = address; cursor < address + bytes;) {
-        MEMORY_BASIC_INFORMATION region{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT) return false;
-        cursor = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
-    }
-#else
-    (void)address;
-    (void)bytes;
-#endif
-    return true;
-}
-
-// The command buffer being executed, for the bad-destination report below.
-thread_local const Apr::CommandBufferObject* g_executing = nullptr;
-thread_local std::uint32_t g_executingCursor = 0;
-
 void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor& read) {
     if (opcode != Apr::Opcode::ReadFile) {
         if (!read.valid) throw std::runtime_error("APR: gather or scatter read without a preceding read");
         command.fileId = read.fileId;
         if (opcode == Apr::Opcode::ReadFileGather) command.destination = read.nextDestination;
         if (opcode == Apr::Opcode::ReadFileScatter) command.offset = read.nextOffset;
-    }
-    // A destination that is not committed memory: the title sometimes submits reads into base-0
-    // texture addresses (0x4000, 0x8000, 0x1560000..., 2026-10-14, with a save loaded). A read
-    // into AMM pages first waits for their mapping. Report the command and its buffer.
-    bool bad = command.destination < 0x10000u;
-    if (!bad) {
-        _awaitAmmMapping(command);
-        bad = !_committed(command.destination, command.size);
-    }
-    static std::atomic<std::uint32_t> badReads{0};
-    if (bad && badReads.fetch_add(1) >= 64u) {
-        static const bool skipQuietly = std::getenv("APS5_APR_SKIP_BAD_DESTINATION") != nullptr;
-        if (skipQuietly) {
-            read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
-            return;
-        }
-    }
-    if (bad) {
-        std::fprintf(stderr, "[apr] read into 0x%llx: opcode %u file %u (%s) size 0x%llx offset 0x%llx; cursor valid %d file %u next destination 0x%llx next offset 0x%llx\n", static_cast<unsigned long long>(command.destination), static_cast<unsigned>(opcode), command.fileId, _file(command.fileId).path.string().c_str(), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.offset), read.valid ? 1 : 0, read.fileId, static_cast<unsigned long long>(read.nextDestination), static_cast<unsigned long long>(read.nextOffset));
-        {
-            // How full the AMM is: pooled physical memory still free, pages mapped.
-            auto& state = _amm();
-            const std::lock_guard lock(state.lock);
-            std::uint64_t poolFree = 0, largest = 0;
-            for (const auto& [offset, bytes] : state.pool) {
-                poolFree += bytes;
-                largest = std::max(largest, bytes);
-            }
-            std::size_t pooledPages = 0;
-            for (const auto& [address, page] : state.pages) pooledPages += page.pooled ? 1u : 0u;
-            std::fprintf(stderr, "[apr]   AMM pool: %.1f MiB free in %zu runs (largest %.1f MiB); %zu pages mapped, %zu of them pooled (%.1f MiB)\n", static_cast<double>(poolFree) / 1048576.0, state.pool.size(), static_cast<double>(largest) / 1048576.0, state.pages.size(), pooledPages, static_cast<double>(pooledPages) * PS5_PAGE_SIZE / 1048576.0);
-        }
-        // APS5_APR_SKIP_BAD_DESTINATION=1: drop the read and go on (diagnostic).
-        static const bool skip = std::getenv("APS5_APR_SKIP_BAD_DESTINATION") != nullptr;
-        if (skip) {
-            read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
-            return;
-        }
-        if (g_executing != nullptr) {
-            const auto from = g_executingCursor > 256u ? g_executingCursor - 256u : 0u;
-            const auto to = std::min<std::uint32_t>(g_executing->offset, g_executingCursor + 128u);
-            std::fprintf(stderr, "[apr] buffer %p of 0x%x bytes, command at 0x%x; bytes 0x%x-0x%x:", static_cast<const void*>(g_executing->base), g_executing->offset, g_executingCursor, from, to);
-            for (auto at = from; at < to; ++at) std::fprintf(stderr, "%s%02x", (at - from) % 32u == 0u ? "\n[apr]   " : " ", g_executing->base[at]);
-            std::fprintf(stderr, "\n");
-        }
-        std::fflush(stderr);
-        throw std::runtime_error("APR: read destination 0x" + std::to_string(command.destination) + " is not guest memory");
     }
     _readFile(command);
     read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
@@ -903,32 +587,9 @@ struct Deferred {
     ReadCursor read;
 };
 
-void _noteOpcode(OpcodeTiming& timing, std::uint32_t opcode, std::chrono::steady_clock::time_point started) {
-    const auto now = std::chrono::steady_clock::now();
-    timing.ns[opcode & 31u] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - started).count());
-    timing.count[opcode & 31u] += 1;
-    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-    auto last = timing.lastReport.load(std::memory_order_relaxed);
-    if (seconds - last < 10 || !timing.lastReport.compare_exchange_strong(last, seconds)) return;
-    std::string text;
-    for (std::uint32_t index = 0; index < 32u; ++index) {
-        const auto count = timing.count[index].exchange(0);
-        const auto ns = timing.ns[index].exchange(0);
-        if (count == 0) continue;
-        char entry[96];
-        std::snprintf(entry, sizeof(entry), " op%u: %llu in %.0f ms (%.3f ms each);", index, static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6, static_cast<double>(ns) / 1e6 / static_cast<double>(count));
-        text += entry;
-    }
-    std::fprintf(stderr, "[apr-opcodes] 10 s:%s\n", text.c_str());
-}
-
 std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::uint32_t start = 0, ReadCursor read = {}, bool defer = false) {
     std::uint32_t cursor = start;
-    g_executing = &buffer;
-    auto* opcodeTiming = _opcodeTiming();
     while (cursor < buffer.offset) {
-        g_executingCursor = cursor;
-        const auto opcodeStarted = opcodeTiming != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (cursor + sizeof(Apr::CommandHeader) > buffer.offset) throw std::runtime_error("APR: truncated command buffer");
         Apr::CommandHeader header;
         std::memcpy(&header, buffer.base + cursor, sizeof(header));
@@ -989,9 +650,6 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
             break;
         case Apr::Opcode::WriteAddress: {
             const auto command = _read<Apr::WriteAddressCommand>(buffer, cursor);
-            // APS5_TRACE_APR_WRITES=1: every WriteAddress, with the executing thread.
-            static const bool traceWrites = std::getenv("APS5_TRACE_APR_WRITES") != nullptr;
-            if (traceWrites) std::fprintf(stderr, "[apr-write] 0x%llx <- 0x%llx (thread %zx at %.4f s)\n", static_cast<unsigned long long>(command.address), static_cast<unsigned long long>(command.value), std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffffu, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
             _writeAddress(command);
             break;
         }
@@ -1015,9 +673,7 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
         }
         case Apr::Opcode::WriteKernelEventQueue: {
             const auto command = _read<Apr::WriteKernelEventQueueCommand>(buffer, cursor);
-            const int result = EqueueTriggerEvent_nid_postfix(static_cast<KernelEqueue>(command.equeue), static_cast<uintptr_t>(command.ident), EVFILT_AMPR, reinterpret_cast<void*>(command.data));
-            static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
-            if (result != 0 || trace) std::fprintf(stderr, "[apr] kernel event queue %p ident %llu data 0x%llx -> 0x%x\n", reinterpret_cast<void*>(command.equeue), static_cast<unsigned long long>(command.ident), static_cast<unsigned long long>(command.data), static_cast<unsigned>(result));
+            EqueueTriggerEvent_nid_postfix(static_cast<KernelEqueue>(command.equeue), static_cast<uintptr_t>(command.ident), EVFILT_AMPR, reinterpret_cast<void*>(command.data));
             break;
         }
         case Apr::Opcode::WriteAddressFromTimeCounter: {
@@ -1036,10 +692,6 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
         default:
             throw std::runtime_error("APR: unknown opcode " + std::to_string(static_cast<std::uint32_t>(header.opcode)));
         }
-        if (opcodeTiming != nullptr) _noteOpcode(*opcodeTiming, static_cast<std::uint32_t>(header.opcode), opcodeStarted);
-        // Experiment: APS5_APR_AMM_DELAY_US=<us> sleeps after every AMM map/unmap/remap command.
-        static const auto ammDelayUs = [] { const char* text = std::getenv("APS5_APR_AMM_DELAY_US"); return text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul; }();
-        if (ammDelayUs != 0 && static_cast<std::uint32_t>(header.opcode) >= 17u && static_cast<std::uint32_t>(header.opcode) <= 28u) PreciseSleepUs(ammDelayUs);
         cursor += header.bytes;
     }
     return std::nullopt;
@@ -1054,7 +706,6 @@ int APS5_VABI sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchE
 int AmmGiveDirectMemory_nid_no_patch(std::int64_t searchStart, std::int64_t searchEnd, std::size_t size, std::size_t alignment, int usage, std::int64_t* offset) {
     if (!offset || (usage != 0 && usage != 1)) return SCE_KERNEL_ERROR_EINVAL;
     const int result = sceKernelAllocateDirectMemory(searchStart, searchEnd, size, alignment, 0, offset);
-    std::fprintf(stderr, "[amm] give direct memory 0x%zx bytes (%.1f MiB) usage %d -> 0x%x offset 0x%llx\n", size, static_cast<double>(size) / 1048576.0, usage, static_cast<unsigned>(result), static_cast<unsigned long long>(result == 0 ? *offset : 0));
     if (result != 0 || usage == 0) return result;
     auto& state = _amm();
     const std::lock_guard lock(state.lock);
@@ -1067,9 +718,9 @@ void AmmVirtualAddressRanges_nid_no_patch(std::uint64_t* start, std::uint64_t* e
     const std::lock_guard lock(state.lock);
     const auto base = _ammBase(state);
     if (start) *start = base;
-    if (end) *end = base + AmmMainBytes();
-    if (multimapStart) *multimapStart = base + AmmMainBytes();
-    if (multimapEnd) *multimapEnd = base + AmmTotalBytes();
+    if (end) *end = base + AmmRangeBytes;
+    if (multimapStart) *multimapStart = base + AmmRangeBytes;
+    if (multimapEnd) *multimapEnd = base + AmmReservedBytes;
 }
 
 struct AprQueue {
@@ -1088,12 +739,9 @@ struct AprQueue {
     std::uint32_t completed = 0;
 };
 
-AprQueue* _startQueue(bool amm) {
+AprQueue* _startQueue() {
     auto* created = new AprQueue();
-    std::thread([created, amm] {
-#ifdef _WIN32
-        SetThreadDescription(GetCurrentThread(), amm ? L"APR queue (AMM)" : L"APR queue (generic)");
-#endif
+    std::thread([created] {
         for (;;) {
             AprQueue::Work work;
             {
@@ -1123,26 +771,11 @@ AprQueue* _startQueue(bool amm) {
 }
 
 AprQueue& _queue(bool amm) {
-    static AprQueue* const queues[2] = {_startQueue(false), _startQueue(true)};
+    static AprQueue* const queues[2] = {_startQueue(), _startQueue()};
     return *queues[amm ? 1 : 0];
 }
 
 std::uint32_t _submit(const std::uint8_t* base, std::uint32_t bytes, bool amm) {
-    // APS5_TRACE_APR_OPS=1: the opcodes of each submitted buffer, with the submitting thread.
-    static const bool traceOps = std::getenv("APS5_TRACE_APR_OPS") != nullptr;
-    if (traceOps) {
-        std::string ops;
-        for (std::uint32_t cursor = 0; cursor + sizeof(Apr::CommandHeader) <= bytes;) {
-            Apr::CommandHeader header;
-            std::memcpy(&header, base + cursor, sizeof(header));
-            const auto opcode = static_cast<std::uint32_t>(header.opcode) & 0xffu;
-            ops += ' ' + std::to_string(opcode);
-            if (opcode == static_cast<std::uint32_t>(Apr::Opcode::CompactReadFileGather)) cursor += sizeof(Apr::CompactReadFileGatherCommand);
-            else if (header.bytes < sizeof(header)) break;
-            else cursor += header.bytes;
-        }
-        std::fprintf(stderr, "[apr-ops] %s thread %zx at %.4f s:%s\n", amm ? "amm" : "generic", std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffffu, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(), ops.c_str());
-    }
     auto& queue = _queue(amm);
     std::lock_guard submitLock(queue.submit);
     std::uint32_t id;
@@ -1159,14 +792,11 @@ std::uint32_t _submit(const std::uint8_t* base, std::uint32_t bytes, bool amm) {
         }
         queue.ready.notify_one();
     };
-    static const bool traceQueue = std::getenv("APS5_TRACE_APR_WRITES") != nullptr;
     if (queued) {
-        if (traceQueue) std::fprintf(stderr, "[apr-queue] %s id %u queued behind the running buffer at %.4f s\n", amm ? "amm" : "generic", id, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
         enqueue({});
         return id;
     }
     if (const auto deferred = _execute(Apr::CommandBufferObject{Apr::BufferType::Generic, 0, bytes, 0, bytes, const_cast<std::uint8_t*>(base)}, 0, {}, true)) {
-        if (traceQueue) std::fprintf(stderr, "[apr-queue] %s id %u deferred at byte 0x%x (an unmet wait) at %.4f s\n", amm ? "amm" : "generic", id, deferred->cursor, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
         enqueue(*deferred);
         return id;
     }
@@ -1248,9 +878,7 @@ int APS5_VABI sceKernelAprGetFileSize(uint32_t id, uint64_t* size) {
 
 int APS5_VABI sceKernelAprGetFileStat(uint32_t id, FileStat* stat) {
     if (!stat) return _fail(GUEST_EINVAL);
-    const auto file = _file(id);
-    File::FillFileStat(file.path, stat);
-    stat->st_size = static_cast<decltype(stat->st_size)>(file.size);
+    File::FillFileStat(_file(id).path, stat);
     return 0;
 }
 
@@ -1326,10 +954,4 @@ int APS5_VABI sceKernelWriteRemapIntoPrtCommand(std::uint32_t* dst, std::uint64_
     return 0;
 }
 
-}
-
-AprAmmQueueState AprAmmQueueStatus() {
-    auto& queue = _queue(true);
-    std::lock_guard lock(queue.mutex);
-    return {queue.submitted, queue.completed, static_cast<std::uint32_t>(queue.pending.size()), queue.running};
 }

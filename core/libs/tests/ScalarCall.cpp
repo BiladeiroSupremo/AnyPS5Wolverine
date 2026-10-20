@@ -151,10 +151,8 @@ static void CheckUserDataCalls() {
     Require(std::equal(addFive.begin(), addFive.end(), linked.begin() + 12) && std::equal(addSixtyFour.begin(), addSixtyFour.end(), linked.begin() + 14));
     auto readsPc = caller;
     readsPc[1] = 0xbe941f00u;
-    ExpectThrow("cannot have user-data callees linked", [&] {
-        const auto readsPcProgram = RdnaInstructionDecoder{}.Decode(readsPc);
-        static_cast<void>(LinkUserDataCalls(readsPcProgram, FindUserDataCalls(readsPcProgram, swappc), callees));
-    });
+    const auto readsPcProgram = RdnaInstructionDecoder{}.Decode(readsPc);
+    Require(LinkUserDataCalls(readsPcProgram, FindUserDataCalls(readsPcProgram, swappc), callees).size() == 17u);
 
     const auto linkedProgram = RdnaInstructionDecoder{}.Decode(linked);
     const auto cfg = GraphBuilder{}.Build(linkedProgram, &swappc);
@@ -179,6 +177,196 @@ static void CheckUserDataCalls() {
     auto sameCopy = linked;
     sameCopy[7] = 0xbb0e0004u;
     ExpectThrow("is shared with another call", [&] { static_cast<void>(GraphBuilder{}.Build(RdnaInstructionDecoder{}.Decode(sameCopy), &swappc)); });
+}
+
+static std::vector<std::uint32_t> TableCaller() {
+    return {0x8f148414u, 0xf4080406u, 0xfa000270u, 0xbf8cc07fu, 0xf4280208u, 0x28000000u, 0xbf8cc07fu, 0xbe8e0308u, 0xbe8f0309u, 0xbe8e210eu, 0xbf810000u};
+}
+
+static ControlFlowGraph BuildCode(std::span<const std::uint32_t> code, const SwappcInfo& swappc) {
+    return GraphBuilder{}.Build(RdnaInstructionDecoder{}.Decode(code), &swappc);
+}
+
+static IrProgram TranslateCode(std::span<const std::uint32_t> code, const SwappcInfo& swappc) {
+    const auto program = RdnaInstructionDecoder{}.Decode(code);
+    const auto cfg = GraphBuilder{}.Build(program, &swappc);
+    ShaderComputeInputInfo computeInfo{};
+    TranslateOptions options{};
+    options.stage = ShaderStageKind::Compute;
+    options.inputInfo.compute = &computeInfo;
+    options.userDataCount = swappc.userDataCount;
+    return InstructionTranslator{}.Translate(program, cfg, options);
+}
+
+static void CheckConstantTableCall() {
+    const std::vector<std::uint32_t> caller{0xbeea03ffu, 0xe0040000u, 0xbeeb038fu, 0xf4080135u, 0xfa000000u, 0xbf8cc07fu, 0xf4240382u, 0xfa000020u, 0xbf8cc07fu, 0xbf130e80u,
+        0xbf840004u, 0xf4240402u, 0xfa000028u, 0xbf8cc07fu, 0xbe8e210eu, 0xbf810000u};
+    const SwappcInfo swappc{false, 0u, 16u};
+    const auto calls = FindTableCalls(RdnaInstructionDecoder{}.Decode(caller), swappc);
+    Require(calls.size() == 1u);
+    Require(calls[0].constantPointer == std::optional<std::uint64_t>(0xfe0040000ull) && calls[0].descriptorOffset == 0u && calls[0].entryOffset == 0x20u && calls[0].entryStride == 0u);
+    Require(calls[0].linkRegister == 14u && calls[0].targetRegister == 14u);
+    auto changedHigh = caller;
+    changedHigh[2] = 0xbeeb0380u;
+    const auto zero = FindTableCalls(RdnaInstructionDecoder{}.Decode(changedHigh), swappc);
+    Require(zero.size() == 1u && zero[0].constantPointer == std::optional<std::uint64_t>(0xe0040000ull));
+    auto computed = caller;
+    computed[2] = 0xbeeb0302u;
+    Require(FindTableCalls(RdnaInstructionDecoder{}.Decode(computed), swappc).empty());
+}
+
+static void CheckTableCalls() {
+    CheckConstantTableCall();
+    const SwappcInfo swappc{false, 0u, 16u};
+    const auto caller = TableCaller();
+    const auto program = RdnaInstructionDecoder{}.Decode(caller);
+    const auto calls = FindTableCalls(program, swappc);
+    Require(calls.size() == 1u);
+    Require(calls[0].programCounter == 0x24u && calls[0].linkRegister == 14u && calls[0].targetRegister == 14u && calls[0].userDataRegister == 12u);
+    Require(calls[0].descriptorOffset == 0x270u && calls[0].entryOffset == 0u && calls[0].entryStride == 16u);
+    Require(FindUserDataCalls(program, swappc).empty());
+    const auto table = [&](std::size_t word, std::uint32_t value, std::uint32_t userDataCount = 16u) {
+        auto code = caller;
+        code[word] = value;
+        return FindTableCalls(RdnaInstructionDecoder{}.Decode(code), SwappcInfo{false, 0u, userDataCount});
+    };
+    Require(table(0u, 0x8f148114u).empty());
+    Require(table(2u, 0x28000270u).empty());
+    Require(table(8u, 0xbe8f030au).empty());
+    Require(table(10u, 0xbf810000u, 12u).empty());
+    Require(table(5u, 0x28000008u).size() == 1u && table(5u, 0x28000008u)[0].entryOffset == 8u);
+    Require(table(0u, 0xbe940380u).empty());
+    auto readsLane = caller;
+    readsLane.insert(readsLane.begin(), {0xd4c2000bu, 0x00020300u});
+    const auto readsLaneProgram = RdnaInstructionDecoder{}.Decode(readsLane);
+    Require(FindTableCalls(readsLaneProgram, SwappcInfo{false, 0u, 16u, 32u}).size() == 1u);
+    Require(FindTableCalls(readsLaneProgram, SwappcInfo{false, 0u, 16u, 64u}).empty());
+
+    ExpectThrow("not statically resolvable", [&] { static_cast<void>(BuildCode(caller, swappc)); });
+    const std::array<std::uint32_t, 1> fallback{0x24u};
+    SwappcInfo listed = swappc;
+    listed.linkedCallFallbacks = fallback;
+    Require(BuildCode(caller, listed).unlinkedCallProgramCounters == std::vector<std::uint32_t>{0x24u});
+    const auto unlinked = TranslateCode(caller, listed);
+    Require(unlinked.Info().usesFaultBuffer && ProgramToString(unlinked).find("UnlinkedCall") != std::string::npos);
+
+    const std::vector<std::uint32_t> first{0xbf068000u, 0x4a020285u, 0xbe80200eu};
+    const std::vector<std::uint32_t> second{0x4a0202c0u, 0xbf068001u, 0xbe80200eu};
+    const std::vector<std::vector<TableCallee>> callees{{{0x1122334455ull, first}, {0x66778899aaull, second}}};
+    const auto linkedCalls = LinkCalls(program, {}, {}, calls, callees);
+    const auto& linked = linkedCalls.code;
+    Require(linkedCalls.fallbacks == std::vector<std::uint32_t>{50u * 4u});
+    ExpectThrow("is shared with another call", [&] { static_cast<void>(BuildCode(linked, swappc)); });
+    SwappcInfo linkedSwappc = swappc;
+    linkedSwappc.linkedCallFallbacks = linkedCalls.fallbacks;
+    Require(linked.size() == 59u && linked[9] == 0xbf820001u && linked[11] == 0xbf850010u && linked[58] == 0xbf9f0000u);
+    Require(linked[12] == 0xbf07ff0eu && linked[13] == 0x22334455u && linked[14] == 0xbf850004u && linked[15] == 0xbf07ff0fu && linked[16] == 0x11u && linked[17] == 0xbf850001u && linked[18] == 0xbf82001bu);
+    Require(linked[20] == 0x778899aau && linked[26] == 0xbf078080u && linked[27] == 0xbf820016u && linked[34] == 0xbf068080u && linked[35] == 0xbf82000au && linked[44] == 0xbf068080u && linked[45] == 0xbf820004u);
+    Require(linked[46] == 0xbb0e0005u && linked[47] == 0xbf82ffdau && linked[48] == 0xbb0e0006u && linked[49] == 0xbf82ffd8u && linked[50] == 0xbe8e210eu && linked[51] == 0xbf82ffd6u);
+    Require(std::equal(first.begin(), first.end(), linked.begin() + 52) && std::equal(second.begin(), second.end(), linked.begin() + 55));
+    const auto cfg = BuildCode(linked, linkedSwappc);
+    const auto block = [&](std::uint32_t word) { return cfg.FindBlockByProgramCounter(word * 4u).id; };
+    Require(cfg.FindBlockByProgramCounter(46u * 4u).terminator.trueBlock == block(52u));
+    Require(cfg.FindBlockByProgramCounter(52u * 4u).terminator.trueBlock == block(47u));
+    Require(cfg.FindBlockByProgramCounter(48u * 4u).terminator.trueBlock == block(55u));
+    Require(cfg.FindBlockByProgramCounter(55u * 4u).terminator.trueBlock == block(49u));
+    Require(cfg.unlinkedCallProgramCounters == std::vector<std::uint32_t>{50u * 4u});
+    static_cast<void>(TranslateCode(linked, linkedSwappc));
+
+    std::vector<std::uint32_t> large(0x8000u, 0xbf800000u);
+    const std::vector<std::vector<TableCallee>> far{{{0x10ull, large}, {0x20ull, first}}};
+    ExpectThrow("out of s_call_b64 range", [&] { static_cast<void>(LinkCalls(program, {}, {}, calls, far)); });
+
+    const std::vector<std::uint32_t> jumpTable{
+        0xbe8c1f00u, 0x800cff0cu, 0x00000058u, 0x820d800du, 0x83928202u, 0xd4c40016u, 0x02000500u, 0x8f128212u, 0xf4000386u, 0x24000000u,
+        0xbf8cc07fu, 0x7d820003u, 0x808c0e0cu, 0x828d800du, 0xbefd210cu, 0x7e020281u, 0xbf820003u, 0x7e020282u, 0xbf820001u, 0x7e020283u,
+        0xe0700000u, 0x80000100u, 0xbf810000u, 0x00000020u, 0x00000018u, 0x00000010u};
+    ExpectThrow("jumps through a table in its code", [&] { static_cast<void>(LinkCalls(RdnaInstructionDecoder{}.Decode(jumpTable), {}, {}, {}, {})); });
+    const std::array<std::uint32_t, 1> compare{0xbf068008u};
+    const auto comparesLink = Build({DecodeRdnaSopc(0u, compare, 0u), Call(4u, 8u, 1u), Sopp(8u, 1u), Sop1(12u, 0u, 0x20u, 8u)});
+    Require(comparesLink.FindBlockByProgramCounter(0u).terminator.trueBlock == comparesLink.FindBlockByProgramCounter(12u).id);
+    const auto readsFirst = Build({Sop1(0u, 0u, 3u, 8u), Call(4u, 8u, 1u), Sopp(8u, 1u), Sop1(12u, 0u, 0x20u, 8u)});
+    Require(readsFirst.FindBlockByProgramCounter(0u).terminator.trueBlock == readsFirst.FindBlockByProgramCounter(12u).id);
+    ExpectThrow("escapes the constant-offset call/return model", [] {
+        Build({Sop1(0u, 0u, 3u, 8u), Call(4u, 8u, 2u), Sopp(8u, 2u, 0xfffdu), Sopp(12u, 1u), Sop1(16u, 0u, 0x20u, 8u)});
+    });
+}
+
+enum class HoistedShape { InLoop, Hoisted, SecondWriterOnArm, LoadOnArmOnly, WriterAfterCall, WriterAfterLoop, CallOnArm, ConstantPointer, SkipsNullTarget, LongBranchWriter };
+
+static std::vector<std::uint32_t> HoistedTableCaller(HoistedShape shape) {
+    std::vector<std::uint32_t> code;
+    const auto descriptorLoad = [&] { code.insert(code.end(), {0xf4081800u, 0xfa000010u, 0xbf8cc07fu}); };
+    if (shape == HoistedShape::ConstantPointer) code.insert(code.end(), {0xbeea03ffu, 0xe0040000u, 0xbeeb038fu, 0xf4081835u, 0xfa000000u, 0xbf8cc07fu});
+    else if (shape != HoistedShape::InLoop && shape != HoistedShape::LoadOnArmOnly) descriptorLoad();
+    code.push_back(0xbf068002u);
+    code.push_back(shape == HoistedShape::LoadOnArmOnly ? 0xbf850003u : 0xbf850001u);
+    if (shape == HoistedShape::LoadOnArmOnly) descriptorLoad();
+    else code.push_back(shape == HoistedShape::SecondWriterOnArm ? 0xbee00380u : shape == HoistedShape::CallOnArm ? 0xbb1e0000u : shape == HoistedShape::LongBranchWriter ? 0xbf820000u : 0x7e020280u);
+    const auto arm = code.size() - 1u;
+    code.push_back(0xbee5037eu);
+    const auto loop = code.size();
+    code.push_back(0xbee4037eu);
+    if (shape == HoistedShape::InLoop) descriptorLoad();
+    code.insert(code.end(), {0x7ed40500u, 0x7da4006au, 0x8f6a846au, 0xf4280430u, 0xd4000000u, 0xbf8cc07fu, 0xbe8e0310u, 0xbe8f0311u, 0xbe900312u, 0xbe910313u});
+    if (shape == HoistedShape::SkipsNullTarget) code.insert(code.end(), {0xbf130e80u, 0xbf840001u});
+    code.push_back(0xbe8e210eu);
+    if (shape == HoistedShape::WriterAfterCall) code.push_back(0xbee10301u);
+    code.push_back(0x897e7e64u);
+    code.push_back(0xbf890000u | ((static_cast<std::uint32_t>(loop) - static_cast<std::uint32_t>(code.size()) - 1u) & 0xffffu));
+    code.push_back(0xbefe0365u);
+    if (shape == HoistedShape::WriterAfterLoop) code.push_back(0xbee00380u);
+    code.push_back(0xbf810000u);
+    if (shape == HoistedShape::CallOnArm) {
+        code[arm] |= static_cast<std::uint32_t>(code.size() - arm - 1u);
+        code.insert(code.end(), {0xbe80201eu, 0xbf9f0000u});
+    }
+    if (shape == HoistedShape::LongBranchWriter) {
+        code[arm] |= static_cast<std::uint32_t>(code.size() - arm - 1u);
+        const auto getpc = code.size() + 3u;
+        code.insert(code.end(), {0xf4081800u, 0xfa000020u, 0xbf8cc07fu, 0xbe841f00u, 0x8084ff04u, static_cast<std::uint32_t>((getpc - arm) * 4u), 0xbe802004u, 0xbf9f0000u});
+    }
+    return code;
+}
+
+static void CheckHoistedTableCalls() {
+    const std::vector<std::uint32_t> callee{0x4a0202c0u, 0xbe80200eu};
+    const std::vector<std::vector<TableCallee>> callees{{{0x1122334455ull, callee}}};
+    for (const auto shape : {HoistedShape::InLoop, HoistedShape::Hoisted, HoistedShape::SecondWriterOnArm, HoistedShape::LoadOnArmOnly, HoistedShape::WriterAfterCall, HoistedShape::WriterAfterLoop, HoistedShape::CallOnArm,
+             HoistedShape::ConstantPointer, HoistedShape::SkipsNullTarget, HoistedShape::LongBranchWriter}) {
+        const bool linkable = shape == HoistedShape::InLoop || shape == HoistedShape::Hoisted || shape == HoistedShape::WriterAfterLoop || shape == HoistedShape::ConstantPointer ||
+                              shape == HoistedShape::SkipsNullTarget;
+        for (const std::uint32_t waveSize : {32u, 64u}) {
+            const auto code = HoistedTableCaller(shape);
+            const auto program = RdnaInstructionDecoder{}.Decode(code);
+            SwappcInfo swappc{false, 0u, 16u, waveSize};
+            const auto calls = FindTableCalls(program, swappc);
+            if (!linkable) {
+                Require(calls.empty());
+                ExpectThrow("not statically resolvable", [&] { static_cast<void>(BuildCode(code, swappc)); });
+                continue;
+            }
+            const bool constant = shape == HoistedShape::ConstantPointer;
+            Require(calls.size() == 1u && calls[0].userDataRegister == 0u && calls[0].descriptorOffset == (constant ? 0u : 0x10u) && calls[0].entryOffset == 0u && calls[0].entryStride == 16u);
+            Require(calls[0].constantPointer == (constant ? std::optional<std::uint64_t>(0xfe0040000ull) : std::nullopt));
+            const auto linked = LinkCalls(program, {}, {}, calls, callees);
+            swappc.linkedCallFallbacks = linked.fallbacks;
+            static_cast<void>(TranslateCode(linked.code, swappc));
+        }
+    }
+    const std::vector<std::uint32_t> calledEntry{
+        0xf4081800u, 0xfa000000u, 0xbf8cc07fu, 0xbb1e0001u, 0xbf810000u, 0xbf840003u, 0xf4081800u, 0xfa000010u,
+        0xbf8cc07fu, 0xf4280430u, 0xfa000000u, 0xbf8cc07fu, 0xbe8e0310u, 0xbe8f0311u, 0xbe8e210eu, 0xbe80201eu, 0xbf9f0000u};
+    Require(FindTableCalls(RdnaInstructionDecoder{}.Decode(calledEntry), SwappcInfo{false, 0u, 16u}).empty());
+    const std::vector<std::uint32_t> fallsIntoEntry{
+        0xbf840002u, 0xbb1e0003u, 0xbf810000u, 0xf4081800u, 0xfa000010u, 0xbf8cc07fu, 0xf4280430u, 0xfa000000u,
+        0xbf8cc07fu, 0xbe8e0310u, 0xbe8f0311u, 0xbe8e210eu, 0xbe80201eu, 0xbf9f0000u};
+    Require(FindTableCalls(RdnaInstructionDecoder{}.Decode(fallsIntoEntry), SwappcInfo{false, 0u, 16u}).empty());
+    const std::vector<std::uint32_t> callBetween{
+        0xf4081800u, 0xfa000010u, 0xbf8cc07fu, 0xbb1e0007u, 0xf4280430u, 0xfa000000u, 0xbf8cc07fu, 0xbe8e0310u,
+        0xbe8f0311u, 0xbe8e210eu, 0xbf810000u, 0xbe80201eu, 0xbf9f0000u};
+    const auto between = FindTableCalls(RdnaInstructionDecoder{}.Decode(callBetween), SwappcInfo{false, 0u, 16u});
+    Require(between.size() == 1u && between[0].descriptorOffset == 0x10u);
 }
 
 static void CheckRejections() {
@@ -280,6 +468,8 @@ int main(int argc, char** argv) {
             CheckCallAfterEnd();
             CheckRejections();
             CheckUserDataCalls();
+            CheckTableCalls();
+            CheckHoistedTableCalls();
             CheckGuards("");
         } else {
             Require(argc == 2);

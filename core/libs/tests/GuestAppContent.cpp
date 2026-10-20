@@ -12,6 +12,7 @@ int APS5_VABI sceAppContentAddcontMount(uint32_t, const NpUnifiedEntitlementLabe
 int APS5_VABI sceAppContentAddcontUnmount(const AppContentMountPoint*);
 int APS5_VABI sceAppContentAddcontEnqueueDownload(uint32_t, const NpUnifiedEntitlementLabel*);
 int APS5_VABI sceAppContentAddcontDelete(uint32_t, const NpUnifiedEntitlementLabel*);
+int APS5_VABI sceAppContentGetAddcontDownloadProgress(uint32_t, const NpUnifiedEntitlementLabel*, void*);
 int APS5_VABI sceAppContentTemporaryDataMount2(uint32_t, AppContentMountPoint*);
 int APS5_VABI sceAppContentTemporaryDataUnmount(const AppContentMountPoint*);
 int APS5_VABI sceAppContentTemporaryDataFormat(const AppContentMountPoint*);
@@ -50,6 +51,9 @@ int main() {
     Require(sceAppContentDownloadDataGetAvailableSpaceKb(&download, &availableKb) == 0);
     Require(availableKb == 0);
     Require(sceAppContentDownloadDataGetAvailableSpaceKb(&download, nullptr) == ErrorParameter);
+    Require(sceAppContentDownloadDataGetAvailableSpaceKb(nullptr, &availableKb) == ErrorParameter);
+    AppContentMountPoint invalidMount{};
+    Require(sceAppContentDownloadDataGetAvailableSpaceKb(&invalidMount, &availableKb) == ErrorNotMounted);
     const auto downloadData = ResolvePath_nid_no_patch("/download0");
     Require(sceAppContentDownloadDataFormat(&download) == 0);
     Require(std::filesystem::is_directory(downloadData) && std::filesystem::is_empty(downloadData));
@@ -57,6 +61,7 @@ int main() {
     { std::ofstream file(downloadData / "cache" / "old.bin"); file << "downloaded"; }
     { std::ofstream file(downloadData / "index.dat"); file << "downloaded"; }
     Require(sceAppContentDownloadDataFormat(nullptr) == ErrorParameter);
+    Require(sceAppContentDownloadDataFormat(&invalidMount) == ErrorNotMounted);
     Require(std::filesystem::exists(downloadData / "index.dat"));
     Require(sceAppContentDownloadDataFormat(&download) == 0);
     Require(std::filesystem::is_directory(downloadData) && std::filesystem::is_empty(downloadData));
@@ -88,6 +93,15 @@ int main() {
     Require(sceAppContentAddcontEnqueueDownload(7, &label) == ErrorNotFound);
     Require(sceAppContentAddcontDelete(0, &label) == ErrorNotFound);
     Require(sceAppContentAddcontDelete(7, nullptr) == ErrorParameter);
+    unsigned char progress[64];
+    std::memset(progress, 0x5a, sizeof(progress));
+    unsigned char progressBefore[sizeof(progress)];
+    std::memcpy(progressBefore, progress, sizeof(progress));
+    Require(sceAppContentGetAddcontDownloadProgress(0, &label, progress) == ErrorNotFound);
+    Require(sceAppContentGetAddcontDownloadProgress(7, &label, progress) == ErrorNotFound);
+    Require(sceAppContentGetAddcontDownloadProgress(0, nullptr, progress) == ErrorParameter);
+    Require(sceAppContentGetAddcontDownloadProgress(0, &label, nullptr) == ErrorParameter);
+    Require(std::memcmp(progress, progressBefore, sizeof(progress)) == 0);
     Require(sceAppContentAddcontEnqueueDownload(0, nullptr) == ErrorParameter);
     Require(sceAppContentAddcontMount(0, &label, &mountPoint) == ErrorNotFound);
 

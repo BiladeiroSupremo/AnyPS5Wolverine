@@ -7,8 +7,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <map>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -120,50 +118,12 @@ int APS5_VABI sceNpEntitlementAccessInitialize(const NpEntitlementAccessInitPara
     return 0;
 }
 
-// There is no entitlement server: a list request has finished when it is created, and the console
-// owns no unified or service entitlements (consumables, currency, subscriptions), so every list
-// polls empty with both paging offsets invalid (add-ons come from GetAddcontEntitlementInfoList).
-static constexpr int SCE_NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND = static_cast<int>(0x817D0015);
-static constexpr int SCE_NP_ENTITLEMENT_ACCESS_ERROR_ABORTED = static_cast<int>(0x817D0016);
-static constexpr int64_t REQUEST_ID_OFFSET = 0x10000000;
-static constexpr int32_t INVALID_OFFSET = -1;
-
-static std::mutex g_requestMutex;
-static int64_t g_requestCount = 0;
-static std::map<int64_t, bool> g_requests; // id -> aborted
-
-static int CreateListRequest(const void* param, const void* list, uint32_t list_num, int64_t* request_id) {
-    if (!param || !request_id || (!list && list_num != 0)) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
-    std::lock_guard lock(g_requestMutex);
-    const auto id = REQUEST_ID_OFFSET + ++g_requestCount;
-    g_requests[id] = false;
-    *request_id = id;
-    return 0;
+int APS5_VABI sceNpEntitlementAccessAbortRequest(void) {
+ return 0;
 }
 
-static int PollEmptyList(int64_t request_id, int* result, uint32_t* hit_num, int32_t* next_offset, int32_t* previous_offset) {
-    if (!result) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
-    std::lock_guard lock(g_requestMutex);
-    const auto request = g_requests.find(request_id);
-    if (request == g_requests.end()) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND;
-    *result = request->second ? SCE_NP_ENTITLEMENT_ACCESS_ERROR_ABORTED : 0;
-    if (hit_num) *hit_num = 0;
-    if (next_offset) *next_offset = INVALID_OFFSET;
-    if (previous_offset) *previous_offset = INVALID_OFFSET;
-    return 0;
-}
-
-int APS5_VABI sceNpEntitlementAccessAbortRequest(int64_t request_id) {
-    std::lock_guard lock(g_requestMutex);
-    const auto request = g_requests.find(request_id);
-    if (request == g_requests.end()) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND;
-    request->second = true;
-    return 0;
-}
-
-int APS5_VABI sceNpEntitlementAccessDeleteRequest(int64_t request_id) {
-    std::lock_guard lock(g_requestMutex);
-    return g_requests.erase(request_id) == 0 ? SCE_NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND : 0;
+int APS5_VABI sceNpEntitlementAccessDeleteRequest(void) {
+ return 0;
 }
 
 int APS5_VABI sceNpEntitlementAccessGenerateTransactionId(void* transaction_id) {
@@ -215,28 +175,40 @@ int APS5_VABI sceNpEntitlementAccessGetGameTrialsFlag(uint32_t* flag) {
     return 0;
 }
 
-int APS5_VABI sceNpEntitlementAccessPollServiceEntitlementInfoList(int64_t request_id, int* result, void* list, uint32_t list_num, uint32_t* hit_num, int32_t* next_offset, int32_t* previous_offset) {
-    (void)list;
-    (void)list_num;
-    return PollEmptyList(request_id, result, hit_num, next_offset, previous_offset);
+int APS5_VABI sceNpEntitlementAccessPollServiceEntitlementInfoList() {
+    return SCE_NP_ERROR_SIGNED_OUT;
 }
 
-int APS5_VABI sceNpEntitlementAccessPollUnifiedEntitlementInfoList(int64_t request_id, int* result, void* list, uint32_t list_num, uint32_t* hit_num, int32_t* next_offset, int32_t* previous_offset) {
-    (void)list;
-    (void)list_num;
-    return PollEmptyList(request_id, result, hit_num, next_offset, previous_offset);
+int APS5_VABI sceNpEntitlementAccessPollUnifiedEntitlementInfoList() {
+    return SCE_NP_ERROR_SIGNED_OUT;
 }
 
-int APS5_VABI sceNpEntitlementAccessRequestServiceEntitlementInfoList(int user_id, uint32_t service_label, const void* param, int64_t* request_id) {
-    (void)user_id;
-    (void)service_label;
-    return CreateListRequest(param, nullptr, 0, request_id);
+int APS5_VABI sceNpEntitlementAccessRequestServiceEntitlementInfoList() {
+    return SCE_NP_ERROR_SIGNED_OUT;
 }
 
-int APS5_VABI sceNpEntitlementAccessRequestUnifiedEntitlementInfoList(int user_id, uint32_t service_label, const NpUnifiedEntitlementLabel* list, uint32_t list_num, const void* param, int64_t* request_id) {
-    (void)user_id;
-    (void)service_label;
-    return CreateListRequest(param, list, list_num, request_id);
+int APS5_VABI sceNpEntitlementAccessRequestUnifiedEntitlementInfoList() {
+    return SCE_NP_ERROR_SIGNED_OUT;
+}
+
+int APS5_VABI sceNpEntitlementAccessGetAddcontEntitlementInfoIndividual() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpEntitlementAccessPollConsumableEntitlementInfo() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpEntitlementAccessRequestConsumableEntitlementInfo() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpEntitlementAccessRequestConsumeEntitlement() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
 }

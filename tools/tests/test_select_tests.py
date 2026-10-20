@@ -38,8 +38,14 @@ class SelectTests(unittest.TestCase):
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
         (Path(cls.directory.name) / "real").mkdir()
-        (Path(cls.directory.name) / "link").symlink_to("real", target_is_directory=True)
         root = Path(cls.directory.name) / "link"
+        try:
+            root.symlink_to("real", target_is_directory=True)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+            import _winapi
+            _winapi.CreateJunction(str(Path(cls.directory.name) / "real"), str(root))
         cls.source, cls.build, cls.graph = root / "source", root / "build", root / "graph.json"
         for name, content in PROJECT.items():
             (cls.source / name).parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +119,86 @@ class SelectTests(unittest.TestCase):
         subprocess.run(["cmake", "--build", str(self.build)], check=True, capture_output=True)
         self.assertEqual(built, {"alpha_tests"})
 
+    def test_explain_reports_input_and_fixture_reasons_without_a_build_cache(self):
+        changed = self.build / "explain-changed.txt"
+        cache = self.build / "CMakeCache.txt"
+        saved = self.build / "CMakeCache.saved"
+        cache.rename(saved)
+        try:
+            for path in ("alpha/alpha.h", "beta/main.c", "CMakeLists.txt"):
+                with self.subTest(path=path):
+                    changed.write_text(path + "\n", encoding="utf-8")
+                    report = json.loads(self.tool("explain", self.graph, changed))
+                    picked, full = select_tests.select(json.loads(self.graph.read_text(encoding="utf-8")), [path])
+                    self.assertEqual(report["tests"], sorted(picked) if picked is not None else None)
+                    self.assertEqual(report["full_run_paths"], full)
+                    if path == "alpha/alpha.h":
+                        self.assertIn("input: alpha/alpha.h", report["reasons"]["alpha"])
+                        self.assertIn("no build executable", report["reasons"]["script"])
+                    elif path == "beta/main.c":
+                        self.assertIn("fixture setup for: beta", report["reasons"]["beta_setup"])
+        finally:
+            saved.rename(cache)
+
+
+
+@unittest.skipUnless(shutil.which("ninja") and (shutil.which("gcc") or shutil.which("cc")), "needs ninja and a C compiler")
+class FixtureBuildTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        root = Path(cls.directory.name)
+        cls.source, cls.build, cls.graph = root / "source", root / "build", root / "graph.json"
+        project = dict(PROJECT)
+        project["CMakeLists.txt"] += "add_subdirectory(cleanup)\n"
+        project["cleanup/CMakeLists.txt"] = (
+            "add_executable(cleanup_tests main.c)\nadd_test(NAME beta_cleanup COMMAND cleanup_tests)\n"
+            "set_tests_properties(beta_cleanup PROPERTIES FIXTURES_CLEANUP beta_fixture)\n")
+        project["cleanup/main.c"] = ('#include <stdio.h>\nint main(void) { FILE *f = fopen("cleanup.ran", "w"); '
+                                     'if (!f) return 1; return fclose(f) != 0; }\n')
+        for name, content in project.items():
+            (cls.source / name).parent.mkdir(parents=True, exist_ok=True)
+            (cls.source / name).write_text(content, encoding="utf-8")
+        compiler = shutil.which("gcc") or shutil.which("cc")
+        subprocess.run(["cmake", "-S", str(cls.source), "-B", str(cls.build), "-G", "Ninja", f"-DCMAKE_C_COMPILER={compiler}"],
+                       check=True, capture_output=True)
+        subprocess.run(["cmake", "--build", str(cls.build)], check=True, capture_output=True)
+        SelectTests.tool("dump", cls.build, cls.graph)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def run_selected(self, changed, graph):
+        subprocess.run(["cmake", "--build", str(self.build)], check=True, capture_output=True)
+        marker = self.build / "cleanup/cleanup.ran"
+        marker.unlink(missing_ok=True)
+        listed = self.build / "changed.txt"
+        listed.write_text(changed + "\n", encoding="utf-8")
+        SelectTests.tool("select", self.build, graph, listed)
+        subprocess.run(["ninja", "-C", str(self.build), "-t", "clean"], check=True, capture_output=True)
+        subprocess.run(["ninja", "-C", str(self.build), "-f", "select.ninja", "selected"], check=True, capture_output=True)
+        result = subprocess.run([sys.executable, str(TOOL), "ctest", str(self.build), "--output-on-failure"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(marker.is_file(), "CTest did not execute the fixture cleanup")
+        return result.stdout
+
+    def test_cleanup_executable_is_built_when_ctest_adds_it(self):
+        output = self.run_selected("beta/main.c", self.graph)
+        self.assertIn("beta_cleanup", output)
+        self.assertNotIn("alpha", output)
+        self.assertFalse(any(path.is_file() for path in (self.build / "alpha").glob("alpha_tests*")))
+
+    def test_new_test_gets_its_current_setup_and_cleanup(self):
+        graph = json.loads(self.graph.read_text(encoding="utf-8"))
+        del graph["tests"]["beta"]
+        older = self.build / "older.json"
+        older.write_text(json.dumps(graph), encoding="utf-8")
+        output = self.run_selected("alpha/main.c", older)
+        for name in ("alpha", "alpha_data", "beta", "beta_setup", "beta_cleanup"):
+            self.assertIn(name, output)
+
 
 class CaseInsensitivePathTests(unittest.TestCase):
     def build(self):
@@ -128,6 +214,30 @@ class CaseInsensitivePathTests(unittest.TestCase):
             self.assertEqual(build.repo(os.path.join(os.sep, "work", "source", "core", "libSceAgc", "Driver.cpp")), "core/libSceAgc/Driver.cpp")
             self.assertIsNone(build.repo(os.path.join(os.sep, "WORK", "SOURCE", "BUILD", "Generated.h")))
             self.assertEqual(build.key(os.path.join("tests", "MemoryPoolTest.exe")), build.key(os.path.join(os.sep, "WORK", "SOURCE", "BUILD", "TESTS", "memorypooltest.exe")))
+
+    def test_trailing_separator_in_root_is_handled(self):
+        with mock.patch.object(select_tests.os.path, "normcase", str.lower):
+            build = self.build()
+            build.source = build.source + os.sep
+            build.path = build.path + os.sep
+            self.assertEqual(build.output(os.path.join(os.sep, "work", "source", "build", "tests", "MemoryPoolTest.exe")), "tests/MemoryPoolTest.exe")
+            self.assertEqual(build.output(os.path.join("tests", "MemoryPoolTest.exe")), "tests/MemoryPoolTest.exe")
+            self.assertEqual(build.repo(os.path.join(os.sep, "work", "source", "core", "libSceAgc", "Driver.cpp")), "core/libSceAgc/Driver.cpp")
+            self.assertIsNone(build.repo(os.path.join(os.sep, "WORK", "SOURCE", "BUILD", "Generated.h")))
+
+
+class PlanTests(unittest.TestCase):
+    def test_plan_empty_run_avoids_invoking_ctest(self):
+        build = mock.Mock()
+        build.tests.return_value = ({}, [{"name": "alpha", "command": ["/build/alpha_tests"]}])
+        build.leaves.return_value = ["tests/alpha_tests"]
+        build.target.side_effect = lambda t: "tests/alpha_tests"
+        graph = {"tests": {"alpha": {}}}
+        run, leaves, count = select_tests.plan(build, graph, set())
+        self.assertEqual(run, [])
+        self.assertEqual(leaves, [])
+        self.assertEqual(count, 1)
+        build.tests.assert_called_once_with()
 
 
 if __name__ == "__main__":

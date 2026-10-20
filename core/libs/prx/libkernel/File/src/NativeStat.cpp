@@ -1,16 +1,16 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
-#include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
-#include "prx/libkernel/File/include/CompressedFile.hpp"
 #include "prx/libkernel/File/include/ArchivedFile.hpp"
 #include "prx/libc/include/General.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <stdexcept>
 #include <string>
 
 #ifdef _WIN32
 #include "prx/libkernel/File/include/WindowsFileTime.hpp"
 #include "prx/libkernel/File/include/WindowsSymbolicLink.hpp"
+#include "prx/libc/include/WindowsDescriptor.hpp"
 #include <io.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -30,12 +30,11 @@ static int ReadHandleInfo(HANDLE handle, NativeStat* st) {
     st->hasIdentity = GetFileInformationByHandle(handle, &st->identity) != 0;
     return 0;
 }
-static std::uint32_t FoldFileIndex(const BY_HANDLE_FILE_INFORMATION& identity) {
-    const std::uint32_t folded = identity.nFileIndexLow ^ (identity.nFileIndexHigh * 0x9E3779B1u);
-    return folded == 0 ? 1 : folded;
-}
 static int DoStat(const std::filesystem::path& p, NativeStat* st) {
-    if (_wstat64(p.c_str(), st) != 0) return -1;
+    if (_wstat64(p.c_str(), st) != 0) {
+        if (_doserrno == ERROR_CANT_RESOLVE_FILENAME) File::WindowsFileTime::Failure(_doserrno);
+        return -1;
+    }
     const auto handle = CreateFileW(p.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return File::WindowsFileTime::Failure(GetLastError());
@@ -44,7 +43,10 @@ static int DoStat(const std::filesystem::path& p, NativeStat* st) {
     return result;
 }
 static int DoFstat(int fd, NativeStat* st) {
-    if (const auto directory = File::DirectoryDescriptorPath(fd)) return DoStat(*directory, st);
+    if (WindowsDescriptorHandle_nid_no_patch(fd) == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
     if (_fstat64(fd, st) != 0) return -1;
     return ReadHandleInfo(reinterpret_cast<HANDLE>(::_get_osfhandle(fd)), st);
 }
@@ -52,8 +54,8 @@ static int DoLstat(const std::filesystem::path& p, NativeStat* st) {
     const auto attributes = GetFileAttributesW(p.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) return DoStat(p, st);
     std::string target;
-    if (!File::WindowsSymbolicLink::ReadRelative(p, target, "lstat"))
-        NotImplemented_nid_no_patch("lstat of a Windows reparse point other than a relative symbolic link");
+    if (!File::WindowsSymbolicLink::Read(p, target, "lstat") && !File::WindowsSymbolicLink::ReadJunction(p, target, "lstat"))
+        NotImplemented_nid_no_patch("lstat of a Windows reparse point other than a symbolic link");
     const auto handle = CreateFileW(p.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return File::WindowsFileTime::Failure(GetLastError());
@@ -109,7 +111,7 @@ static void CopyNativeStat(const NativeStat& st, FileStat* sb) {
     }
     if (st.hasIdentity) {
         sb->st_dev = st.identity.dwVolumeSerialNumber;
-        sb->st_ino = FoldFileIndex(st.identity);
+        sb->st_ino = WindowsFileNumber_nid_no_patch(st.identity);
         sb->st_nlink = static_cast<std::uint16_t>(std::min<DWORD>(st.identity.nNumberOfLinks, 0xffff));
     }
 #else
@@ -142,15 +144,16 @@ static void CopyNativeStat(const NativeStat& st, FileStat* sb) {
 namespace File {
 
 void FillFileStat(const std::filesystem::path& nativePath, FileStat* sb) {
-    NativeStat st{};
-    if (DoStat(nativePath, &st) != 0) {
+    if (!TryFillFileStat(nativePath, sb)) {
         throw std::runtime_error(std::string("FillFileStat: stat failed for ") + nativePath.string());
     }
+}
+
+bool TryFillFileStat(const std::filesystem::path& nativePath, FileStat* sb) {
+    NativeStat st{};
+    if (DoStat(nativePath, &st) != 0) return false;
     CopyNativeStat(st, sb);
-    // A GDEF container (CompressedFile.hpp) has the size of the file it holds.
-    if ((sb->st_mode & 0170000) == 0100000 && sb->st_size >= 20) {
-        if (const auto uncompressed = CompressedFile::UncompressedSize(nativePath)) sb->st_size = static_cast<decltype(sb->st_size)>(*uncompressed);
-    }
+    return true;
 }
 
 void FillFileStat(int nativeDescriptor, FileStat* sb) {
@@ -159,7 +162,6 @@ void FillFileStat(int nativeDescriptor, FileStat* sb) {
         throw std::runtime_error(std::string("FillFileStat: fstat failed for fd ") + std::to_string(nativeDescriptor));
     }
     CopyNativeStat(st, sb);
-    if (const auto compressed = CompressedFile::FindDescriptor(nativeDescriptor)) sb->st_size = static_cast<decltype(sb->st_size)>(CompressedFile::DescriptorSize(*compressed));
 }
 
 bool FillFileStatFromDescriptor(int fd, FileStat* sb) {
@@ -167,7 +169,6 @@ bool FillFileStatFromDescriptor(int fd, FileStat* sb) {
     NativeStat st{};
     if (DoFstat(fd, &st) != 0) return false;
     CopyNativeStat(st, sb);
-    if (const auto compressed = CompressedFile::FindDescriptor(fd)) sb->st_size = static_cast<decltype(sb->st_size)>(CompressedFile::DescriptorSize(*compressed));
     return true;
 }
 
