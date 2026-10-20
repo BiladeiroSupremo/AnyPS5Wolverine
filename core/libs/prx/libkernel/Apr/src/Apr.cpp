@@ -427,16 +427,43 @@ void _returnPoolPages(AmmState& state, std::uint64_t offset, std::uint64_t bytes
     state.pool.emplace(offset, bytes);
 }
 
-std::uint64_t _takePoolPages(AmmState& state, std::uint64_t bytes) {
+bool _tryTakePoolPages(AmmState& state, std::uint64_t bytes, std::uint64_t& offset) {
     for (auto it = state.pool.begin(); it != state.pool.end(); ++it) {
         if (it->second < bytes) continue;
-        const auto offset = it->first;
+        offset = it->first;
         const auto remaining = it->second - bytes;
         state.pool.erase(it);
         if (remaining != 0) state.pool.emplace(offset + bytes, remaining);
-        return offset;
+        return true;
     }
-    throw std::runtime_error("AMM: no free run of " + std::to_string(bytes) + " bytes in the direct memory given to the mapper");
+    return false;
+}
+
+std::uint64_t _takePoolPages(AmmState& state, std::uint64_t bytes) {
+    std::uint64_t offset = 0;
+    if (!_tryTakePoolPages(state, bytes, offset)) throw std::runtime_error("AMM: no free run of " + std::to_string(bytes) + " bytes in the direct memory given to the mapper");
+    return offset;
+}
+
+// Wolverine stack (fork c205785ba): pool pages for `bytes` taken from several runs (first fit),
+// for a map no single free run holds. The PS5 maps the mapper's pages through page tables, so a
+// fragmented pool still serves it (PPSA03671 aborted on 5-11 MB maps in the cabin otherwise).
+std::vector<AmmPage> _takeScatteredPages(AmmState& state, std::uint64_t bytes, std::int32_t type, std::int32_t protection) {
+    std::uint64_t free = 0;
+    for (const auto& [offset, size] : state.pool) free += size;
+    if (free < bytes) throw std::runtime_error("AMM: " + std::to_string(bytes) + " bytes requested, " + std::to_string(free) + " free in the direct memory given to the mapper");
+    std::vector<AmmPage> pages;
+    pages.reserve(bytes / PS5_PAGE_SIZE);
+    while (pages.size() * PS5_PAGE_SIZE < bytes) {
+        auto it = state.pool.begin();
+        const auto take = std::min(it->second, bytes - pages.size() * PS5_PAGE_SIZE);
+        const auto offset = it->first;
+        const auto remaining = it->second - take;
+        state.pool.erase(it);
+        if (remaining != 0) state.pool.emplace(offset + take, remaining);
+        for (std::uint64_t page = 0; page < take; page += PS5_PAGE_SIZE) pages.push_back({offset + page, type, protection, true});
+    }
+    return pages;
 }
 
 void _addPage(AmmState& state, std::uint64_t address, const AmmPage& page) {
@@ -592,7 +619,29 @@ void _ammMap(const Apr::AmmMapCommand& command, bool direct) {
     _reserve(command.address, command.size);
     _forgetPages(state, command.address, command.size);
     _clearPrt(state, command.address, command.size);
-    const auto physical = direct ? command.directOffset : _takePoolPages(state, command.size);
+    std::uint64_t physical = direct ? command.directOffset : 0;
+    if (!direct && !_tryTakePoolPages(state, command.size, physical)) {
+        const auto pages = _takeScatteredPages(state, command.size, command.type, command.protection);
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[amm] no free run of %llu bytes: mapping 0x%llx from scattered pool pages\n", static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.address));
+        std::size_t mapped = 0;
+        try {
+            for (std::size_t first = 0; first < pages.size();) {
+                std::size_t last = first + 1;
+                while (last < pages.size() && pages[last].physical == pages[last - 1].physical + PS5_PAGE_SIZE) ++last;
+                _mapRun(command.address + first * PS5_PAGE_SIZE, pages[first].physical, (last - first) * PS5_PAGE_SIZE, command.protection);
+                for (std::size_t index = first; index < last; ++index) _addPage(state, command.address + index * PS5_PAGE_SIZE, pages[index]);
+                mapped = last;
+                first = last;
+            }
+        } catch (...) {
+            _forgetPages(state, command.address, command.size);
+            for (std::size_t index = mapped; index < pages.size(); ++index) _returnPoolPages(state, pages[index].physical, PS5_PAGE_SIZE);
+            _reserve(command.address, command.size);
+            throw;
+        }
+        return;
+    }
     try {
         _mapRun(command.address, physical, command.size, command.protection);
     } catch (...) {

@@ -830,8 +830,10 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         try {
             entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
         } catch (const std::runtime_error&) {
-            if (entry.ranges.size() == 1) throw;
-            if (joined) {
+            // Upstream main's libc keeps single-alias direct memory as resident private runs,
+            // which cannot be aliased in part: a range mixing them with shared views is not
+            // imported and its readers take copies, as for any refused import.
+            if (entry.ranges.size() == 1 || joined) {
                 failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
                 return nullptr;
             }

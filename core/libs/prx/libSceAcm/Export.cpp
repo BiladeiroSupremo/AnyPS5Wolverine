@@ -91,18 +91,19 @@ int APS5_VABI sceAcm_Panner(void) {
     return 0;
 }
 
-int APS5_VABI sceAcmBatchJobPriority(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+// Wolverine stack: PPSA03671 sets batch job priorities and builds reverb/IFFT jobs during the
+// title; like the fork's ACM, these are accepted (a priority is only a scheduling hint, and the
+// jobs produce nothing, as for sceAcm_FFT above).
+int APS5_VABI sceAcmBatchJobPriority(void* job, std::uint32_t priority) {
+    static_cast<void>(priority);
+    return job == nullptr ? static_cast<int>(0x80E30002u) : 0;
 }
 
 int APS5_VABI sceAcm_ConvReverb_SharedIr() {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceAcm_IFFT() {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
