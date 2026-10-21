@@ -1439,6 +1439,9 @@ VkCommandBuffer Recorder::OpenPrePass() {
         }
         throw;
     }
+    // Everything before the split (the records' writers included) precedes the conversions.
+    recordBarrier(prePass, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    CountBarriers(CommandClass::Draw);
     open->earlier.push_back(open->commands);
     open->earlier.push_back(prePass);
     open->openPrePasses.push_back(prePass);
@@ -2533,7 +2536,10 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
         }
     }
     if (meshArgumentState < 0) return false;
-    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    // A pre-pass holds only conversions, each into a buffer of its own from records nothing in it
+    // writes: its one leading barrier (OpenPrePass) and one trailing barrier (Submit) order them.
+    const bool inPrePass = open != nullptr && std::find(open->openPrePasses.begin(), open->openPrePasses.end(), commands) != open->openPrePasses.end();
+    if (!inPrePass) recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, meshArgumentPipeline);
     struct {
         VkDeviceAddress record;
@@ -2543,6 +2549,7 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     static_assert(sizeof(parameters) == PushBytes);
     function(cmdPushConstants, "vkCmdPushConstants")(commands, meshArgumentLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
     function(cmdDispatch, "vkCmdDispatch")(commands, 1, 1, 1);
+    if (inPrePass) return true;
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
     CountBarriers(CommandClass::Draw, 2);
     return true;
@@ -3476,7 +3483,12 @@ void Recorder::Submit() {
             if (batch != nullptr && !batch->submitted) recorder.discard(std::move(batch));
         }
     } discardUnsubmitted{*this, batch};
-    for (const auto prePass : batch->openPrePasses) Check(function(endCommandBuffer, "vkEndCommandBuffer")(prePass), "vkEndCommandBuffer recorder pre-pass");
+    for (const auto prePass : batch->openPrePasses) {
+        // The conversions' results, for the indirect reads of the passes after them.
+        recordBarrier(prePass, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+        CountBarriers(CommandClass::Draw);
+        Check(function(endCommandBuffer, "vkEndCommandBuffer")(prePass), "vkEndCommandBuffer recorder pre-pass");
+    }
     batch->openPrePasses.clear();
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
     std::vector<VkCommandBuffer> chunks;
