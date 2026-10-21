@@ -6,6 +6,7 @@
 #include "Decoder/Png.hpp"
 #include "SDL_vulkan.h"
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -114,6 +115,19 @@ void DisplayWindow::UpdateTitle() {
     const auto frequency = sceKernelGetProcessTimeCounterFrequency();
     frameNum++;
     fpsFrames++;
+    // APS5_FRAME_TIMES=<file>: one line per presented frame, "<seconds since the first frame>
+    // <microseconds since the previous frame>", for average and 1% / 0.1% low frame rates.
+    static FILE* frameTimes = [] {
+        const char* path = std::getenv("APS5_FRAME_TIMES");
+        return path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : nullptr;
+    }();
+    if (frameTimes != nullptr) {
+        static const std::uint64_t firstFrame = now;
+        static std::uint64_t previousFrame = now;
+        std::fprintf(frameTimes, "%.6f %.1f\n", static_cast<double>(now - firstFrame) / static_cast<double>(frequency), static_cast<double>(now - previousFrame) * 1e6 / static_cast<double>(frequency));
+        previousFrame = now;
+        if (frameNum % 64 == 0) std::fflush(frameTimes);
+    }
     if (now - fpsStart >= frequency * 2) {
         currentFps = static_cast<double>(fpsFrames) * static_cast<double>(frequency) / static_cast<double>(now - fpsStart);
         fpsStart = now;

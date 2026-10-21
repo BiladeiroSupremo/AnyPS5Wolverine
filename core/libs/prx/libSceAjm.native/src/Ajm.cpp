@@ -187,6 +187,8 @@ std::atomic<std::uint32_t> g_nextInstance{1};
 std::atomic<std::uint32_t> g_nextBatch{1};
 std::mutex& g_batchLock = *new std::mutex();
 std::map<std::uint32_t, std::uint32_t>& g_batches = *new std::map<std::uint32_t, std::uint32_t>();
+// How far each batch buffer has been run by sceAjmBatchStart since its sceAjmBatchInitialize.
+std::map<const void*, std::size_t>& g_batchStarted = *new std::map<const void*, std::size_t>();
 
 enum class JobKind : std::uint32_t {
     Initialize = 1,
@@ -1155,7 +1157,13 @@ void RunPcm(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, c
     if (job.flags & ~SIDEBAND_STREAM) NotImplemented_nid_no_patch("AJM codec 23 run with flags other than SIDEBAND_STREAM");
     const auto encoding = PcmEncoding(instance);
     if (encoding > 2) throw std::runtime_error("AJM codec 23: PCM encoding " + std::to_string(encoding) + " is not implemented");
-    if (instance.resampler.change != 0.0f) NotImplemented_nid_no_patch("AJM codec 23 run with a resample ratio change per sample");
+    // A ratio that slides per sample (pitch glides) runs at its starting ratio for PCM (Wolverine
+    // stack: PPSA03671 asks for it in gameplay, 2026-10-14). Reported once.
+    if (instance.resampler.change != 0.0f) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[ajm] codec 23 resample ratio change per sample %g runs at the start ratio\n", static_cast<double>(instance.resampler.change));
+        instance.resampler.change = 0.0f;
+    }
     if (instance.gapless.totalSamples != 0 || instance.gapless.skipSamples != 0) NotImplemented_nid_no_patch("AJM codec 23 run with gapless decode counts");
     if (instance.pcmResampled) NotImplemented_nid_no_patch("AJM codec 23 run after a resampled run without an initialize or context clear in between");
     const JobInput input(job, inputs);
@@ -1730,6 +1738,10 @@ int APS5_VABI sceAjmBatchInitialize(void* buffer, size_t size, AjmBatchInfo* inf
     info->p_buffer = buffer;
     info->offset = 0;
     info->size = size;
+    {
+        std::lock_guard lock(g_batchLock);
+        g_batchStarted.erase(buffer);
+    }
     return 0;
 }
 
@@ -1838,6 +1850,22 @@ int APS5_VABI sceAjmBatchStart(uint32_t context, const AjmBatchInfo* info, int p
     AJM_TRACE("[ajm] batch start: context %u, priority %d, %llu of %llu buffer bytes used\n", context, priority, static_cast<unsigned long long>(info->offset), static_cast<unsigned long long>(info->size));
     const auto* cursor = static_cast<const std::uint8_t*>(info->p_buffer);
     const auto* end = cursor + info->offset;
+    // A batch started again without sceAjmBatchInitialize runs only the jobs appended since its last
+    // start: running the earlier ones again decoded into their output buffers a second time, which
+    // the title may have freed and reused (PPSA03671's Wwise AudioOut2 port table was overwritten
+    // with the same decoded PCM in every crash). A start whose offset went back (the title reset
+    // it itself) runs from the beginning. APS5_AJM_RERUN_BATCHES=1 always runs the whole buffer.
+    static const bool rerun = std::getenv("APS5_AJM_RERUN_BATCHES") != nullptr;
+    {
+        std::lock_guard lock(g_batchLock);
+        auto& started = g_batchStarted[info->p_buffer];
+        if (!rerun && started != 0 && started <= info->offset) {
+            static std::atomic<int> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[ajm] batch buffer %p started again without initialize: skipping %zu bytes of jobs already run, running %zu\n", info->p_buffer, started, static_cast<std::size_t>(info->offset) - started);
+            cursor += started;
+        }
+        started = info->offset;
+    }
     std::vector<AjmBuffer> buffers;
     while (cursor < end) {
         PackedJob record;
