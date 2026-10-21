@@ -1185,6 +1185,8 @@ Recorder::~Recorder() {
         context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     }
     spare.clear();
+    for (auto commands : spareCommands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+    spareCommands.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
     sparePools.clear();
     // Sync() above waited for every batch, so no submission still signals the timeline.
@@ -1378,9 +1380,75 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     // for a caller whose ranges overlap a queued store: FlushStores).
     if (open->renderPass.open) endOpenRenderPass();
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
+    // Work recorded outside a pass after OpenPrePass lies between the pre-pass and the pass to
+    // come: a conversion there could read records it writes, so that pass takes none.
+    open->nextPrePass = VK_NULL_HANDLE;
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
     return open->commands;
+}
+
+VkCommandBuffer Recorder::beginCommands() {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (!spareCommands.empty()) {
+        commands = spareCommands.back();
+        spareCommands.pop_back();
+    } else {
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = context.pool;
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers recorder pre-pass");
+    }
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (const auto result = function(beginCommandBuffer, "vkBeginCommandBuffer")(commands, &begin); result != VK_SUCCESS) {
+        spareCommands.push_back(commands);
+        Check(result, "vkBeginCommandBuffer recorder pre-pass");
+    }
+    return commands;
+}
+
+VkCommandBuffer Recorder::OpenPrePass() {
+    static const bool enabled = std::getenv("APS5_NO_PREPASS_ARGUMENTS") == nullptr;
+    ensureOpen();
+    // A query begins and ends in one command buffer: the batch-wide sample query (counted samples
+    // outside segment mode) refuses the split; a segment's query lies inside its pass's buffer.
+    static std::atomic<std::uint64_t> outcomes[3]{};
+    static std::atomic<std::int64_t> lastReport{0};
+    const int outcome = !enabled ? 0 : (open->renderPass.open || open->segmentActive || open->sampleActive) ? 1 : 2;
+    ++outcomes[outcome];
+    if (DrawProfiled()) {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        if (auto last = lastReport.load(); now - last > 10'000'000'000ll && lastReport.compare_exchange_strong(last, now)) {
+            AgcDriver::ProfilePrint_nid_no_patch("[prepass] opened %llu, refused (query or open pass) %llu, disabled %llu; segment mode %d, counting samples %d\n", static_cast<unsigned long long>(outcomes[2].load()), static_cast<unsigned long long>(outcomes[1].load()), static_cast<unsigned long long>(outcomes[0].load()), segmentMode() ? 1 : 0, countingSamples ? 1 : 0);
+        }
+    }
+    if (outcome != 2) return VK_NULL_HANDLE;
+    const auto prePass = beginCommands();
+    VkCommandBuffer pass = VK_NULL_HANDLE;
+    try {
+        pass = beginCommands();
+        Check(function(endCommandBuffer, "vkEndCommandBuffer")(open->commands), "vkEndCommandBuffer recorder before a pre-pass");
+    } catch (...) {
+        function(endCommandBuffer, "vkEndCommandBuffer")(prePass);
+        spareCommands.push_back(prePass);
+        if (pass != VK_NULL_HANDLE) {
+            function(endCommandBuffer, "vkEndCommandBuffer")(pass);
+            spareCommands.push_back(pass);
+        }
+        throw;
+    }
+    open->earlier.push_back(open->commands);
+    open->earlier.push_back(prePass);
+    open->openPrePasses.push_back(prePass);
+    open->commands = pass;
+    open->nextPrePass = prePass;
+    return pass;
+}
+
+VkCommandBuffer Recorder::PrePassCommands() const {
+    return open != nullptr && open->renderPass.open ? open->renderPass.prePass : VK_NULL_HANDLE;
 }
 
 void Recorder::MarkCovered(VkAccessFlags access) {
@@ -1423,6 +1491,8 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     if (!pass.open) {
         pass.timing = timing;
         pass.afterPass = std::move(afterPass);
+        pass.prePass = open->nextPrePass;
+        open->nextPrePass = VK_NULL_HANDLE;
     }
     pass.open = true;
     pass.key = key;
@@ -3406,10 +3476,17 @@ void Recorder::Submit() {
             if (batch != nullptr && !batch->submitted) recorder.discard(std::move(batch));
         }
     } discardUnsubmitted{*this, batch};
+    for (const auto prePass : batch->openPrePasses) Check(function(endCommandBuffer, "vkEndCommandBuffer")(prePass), "vkEndCommandBuffer recorder pre-pass");
+    batch->openPrePasses.clear();
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
+    std::vector<VkCommandBuffer> chunks;
+    if (!batch->earlier.empty()) {
+        chunks = batch->earlier;
+        chunks.push_back(batch->commands);
+    }
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submission.commandBufferCount = 1;
-    submission.pCommandBuffers = &batch->commands;
+    submission.commandBufferCount = chunks.empty() ? 1u : static_cast<std::uint32_t>(chunks.size());
+    submission.pCommandBuffers = chunks.empty() ? &batch->commands : chunks.data();
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size(), batch->writes.size());
@@ -4004,6 +4081,21 @@ void Recorder::release(Batch& batch) noexcept {
     batch.samplePool.reset();
     batch.segments = VK_NULL_HANDLE;
     batch.segmentPool.reset();
+    // A discarded batch's pre-passes are still recording: ended, they can be begun again.
+    for (const auto prePass : batch.openPrePasses) function(endCommandBuffer, "vkEndCommandBuffer")(prePass);
+    batch.openPrePasses.clear();
+    for (const auto commands : batch.earlier) {
+        if (spareCommands.size() < 256) {
+            try {
+                spareCommands.push_back(commands);
+                continue;
+            } catch (...) {
+            }
+        }
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+    }
+    batch.earlier.clear();
+    batch.nextPrePass = VK_NULL_HANDLE;
     // A completed (or never submitted) batch's objects are kept for reuse: the fence is signaled or
     // untouched, so resetting it cannot block, and the command buffer is no longer pending.
     if (batch.commands != VK_NULL_HANDLE && batch.fence != VK_NULL_HANDLE && spare.size() < 64 && function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {

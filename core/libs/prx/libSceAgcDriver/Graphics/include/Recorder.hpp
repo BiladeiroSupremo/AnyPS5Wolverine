@@ -68,6 +68,14 @@ public:
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     // Whether a draw's render pass is open in the open batch (the [passes] counters).
     bool RenderPassOpen() const;
+    // Mesh indirect draws convert their records with a dispatch, which a render pass cannot hold.
+    // OpenPrePass, called by a draw about to begin its pass, ends the batch's command buffer and
+    // returns a new one for the pass; a second one, submitted between the two, takes the argument
+    // conversions of the later mesh indirect draws that continue that pass (PrePassCommands), so
+    // they need not end it. Off (VK_NULL_HANDLE) while samples are counted or with
+    // APS5_NO_PREPASS_ARGUMENTS=1.
+    VkCommandBuffer OpenPrePass();
+    VkCommandBuffer PrePassCommands() const;
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -642,7 +650,15 @@ private:
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
+            // The pre-pass command buffer submitted before this pass (see OpenPrePass), if any.
+            VkCommandBuffer prePass = VK_NULL_HANDLE;
         } renderPass;
+        // Command buffers recorded before `commands` (OpenPrePass), submitted first, in order; the
+        // pre-pass ones still take conversions until Submit ends them. `nextPrePass` waits for the
+        // pass the draw that opened it leaves open (dropped if other work is recorded first).
+        std::vector<VkCommandBuffer> earlier;
+        std::vector<VkCommandBuffer> openPrePasses;
+        VkCommandBuffer nextPrePass = VK_NULL_HANDLE;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
@@ -821,6 +837,9 @@ private:
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
+    // Command buffers of completed batches' `earlier` lists, reused by OpenPrePass.
+    std::vector<VkCommandBuffer> spareCommands;
+    VkCommandBuffer beginCommands();
     std::vector<VkQueryPool> sparePools;
     mutable std::mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;

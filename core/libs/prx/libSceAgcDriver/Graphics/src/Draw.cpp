@@ -1757,6 +1757,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     split.mark(RecordBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
+    // A pass opened with a pre-pass takes a mesh indirect draw's record conversion there
+    // (Recorder::OpenPrePass): the draw continues it like any other.
+    const VkCommandBuffer prePass = meshIndirect ? recorder->PrePassCommands() : VK_NULL_HANDLE;
     const bool addressBased = resources.HoldsLease();
     auto passReads = addressBased ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{} : resources.DeviceReads();
     if (gpuIndirect) {
@@ -1775,14 +1778,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->RenderPassOpen()) {
         if (capture) Recorder::CountPassStart(Recorder::PassStart::ForcedCapture);
         else if (readsTarget) Recorder::CountPassStart(Recorder::PassStart::ForcedReadsTarget);
-        else if (meshIndirect) Recorder::CountPassStart(Recorder::PassStart::ForcedMeshIndirect);
-        else if (gpuIndirect) Recorder::CountPassStart(Recorder::PassStart::ForcedGpuIndirect);
+        else if (meshIndirect && prePass == VK_NULL_HANDLE) Recorder::CountPassStart(Recorder::PassStart::ForcedMeshIndirect);
+        else if (gpuIndirect && !meshIndirect) Recorder::CountPassStart(Recorder::PassStart::ForcedGpuIndirect);
     }
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const bool forcedIndirect = meshIndirect ? prePass == VK_NULL_HANDLE : gpuIndirect;
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || forcedIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
-    const auto commands = start.commands;
+    auto commands = start.commands;
     if (!continued) recorder->PrepareSampleSlot();
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
@@ -1810,6 +1814,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
         record.pipeline->Continue(commands, state);
+        if (meshIndirect) {
+            meshArguments = recordMeshArguments(context, prePass, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
+            argumentBuffer = meshArguments->Handle();
+        }
     } else {
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
@@ -1824,6 +1832,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (meshIndirect) {
             meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
             argumentBuffer = meshArguments->Handle();
+            // The pass's later mesh indirect draws convert their records ahead of it.
+            if (const auto passCommands = recorder->OpenPrePass(); passCommands != VK_NULL_HANDLE) commands = passCommands;
         } else if (gpuIndirect) {
             rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
         }
