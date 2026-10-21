@@ -1756,9 +1756,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     split.mark(RecordBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
-    // A pass opened with a pre-pass takes a mesh indirect draw's record conversion there
-    // (Recorder::OpenPrePass): the draw continues it like any other.
-    const VkCommandBuffer prePass = meshIndirect ? recorder->PrePassCommands() : VK_NULL_HANDLE;
+    // A pass opened with a pre-pass takes a mesh indirect draw's record conversion, or a GPU-side
+    // indirect draw's argument barrier and rewrite, there (Recorder::OpenPrePass): the draw
+    // continues it like any other.
+    const VkCommandBuffer prePass = meshIndirect || gpuIndirect ? recorder->PrePassCommands() : VK_NULL_HANDLE;
     const bool addressBased = resources.HoldsLease();
     auto passReads = addressBased ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{} : resources.DeviceReads();
     if (gpuIndirect) {
@@ -1778,9 +1779,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (capture) Recorder::CountPassStart(Recorder::PassStart::ForcedCapture);
         else if (readsTarget) Recorder::CountPassStart(Recorder::PassStart::ForcedReadsTarget);
         else if (meshIndirect && prePass == VK_NULL_HANDLE) Recorder::CountPassStart(Recorder::PassStart::ForcedMeshIndirect);
-        else if (gpuIndirect && !meshIndirect) Recorder::CountPassStart(Recorder::PassStart::ForcedGpuIndirect);
+        else if (gpuIndirect && !meshIndirect && prePass == VK_NULL_HANDLE) Recorder::CountPassStart(Recorder::PassStart::ForcedGpuIndirect);
     }
-    const bool forcedIndirect = meshIndirect ? prePass == VK_NULL_HANDLE : gpuIndirect;
+    const bool forcedIndirect = (meshIndirect || gpuIndirect) && prePass == VK_NULL_HANDLE;
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || forcedIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -1816,6 +1817,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (meshIndirect) {
             meshArguments = recordMeshArguments(context, prePass, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
             argumentBuffer = meshArguments->Handle();
+        } else if (gpuIndirect) {
+            rewritten = recordIndirectArguments(context, prePass, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
         }
     } else {
         for (const auto& proxy : record.proxies) {
@@ -1835,6 +1838,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             if (const auto passCommands = recorder->OpenPrePass(); passCommands != VK_NULL_HANDLE) commands = passCommands;
         } else if (gpuIndirect) {
             rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
+            if (const auto passCommands = recorder->OpenPrePass(); passCommands != VK_NULL_HANDLE) commands = passCommands;
         }
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
