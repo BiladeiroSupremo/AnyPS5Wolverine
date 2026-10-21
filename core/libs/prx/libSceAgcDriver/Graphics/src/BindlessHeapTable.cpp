@@ -330,6 +330,7 @@ bool BindlessHeapTable::ScanDue() {
     const auto now = std::chrono::steady_clock::now();
     if (now - lastScan < interval) return false;
     lastScan = now;
+    nextScan.store((now + interval).time_since_epoch().count(), std::memory_order_relaxed);
     return true;
 }
 
@@ -473,7 +474,7 @@ void reportHeaps() {
 
 void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
     auto* table = context.bindlessHeaps;
-    if (table == nullptr || Heaps::RegionsGeneration() == 0u) return;
+    if (table == nullptr || Heaps::RegionsGeneration() == 0u || !table->ScanMaybeDue()) return;
     std::lock_guard lock(table->Mutex());
     if (!table->ScanDue()) return;
     const auto regions = Heaps::Regions();
@@ -500,24 +501,43 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
     // The feedback words are read in one copy per region: in device-local host-visible memory a
     // word-by-word scan costs a bus round trip per word.
     thread_local std::vector<std::uint32_t> requested;
+    // A scan also stops after APS5_HEAP_REQUEST_US (3000 by default; 0: no limit): each request may
+    // make a texture on this thread (read, detile, upload), and a burst of new textures in
+    // PPSA03671 gameplay held the queue-0 worker up to ~0.9 s in one scan. Requests left over keep
+    // their feedback word and are taken by the next scans.
+    static const auto scanTime = std::chrono::microseconds([] { const char* text = std::getenv("APS5_HEAP_REQUEST_US"); return text ? std::atoi(text) : 3000; }());
+    const auto scanStart = std::chrono::steady_clock::now();
+    const auto inTime = [&] { return scanTime.count() == 0 || std::chrono::steady_clock::now() - scanStart < scanTime; };
+    std::chrono::steady_clock::duration slowestEntry{};
     for (const auto& region : regions) {
+        if (!inTime()) break;
         const auto count = std::min(region.entries, region.capacity);
         requested.resize(count);
         if (count != 0) std::memcpy(requested.data(), feedback.data() + region.base, count * sizeof(std::uint32_t));
         for (std::uint32_t key = 0; key < count && published.size() < ScanBudget; key++) {
+            if (requested[key] != 0u && !published.empty() && !inTime()) break;
             const auto index = region.base + key;
             if (requested[key] == 0u) continue;
             feedback[index] = 0u;
             if (!table->Claim(index)) continue;
             std::uint32_t word = Heaps::Unusable;
+            const auto entryStart = std::chrono::steady_clock::now();
             try {
                 word = resolveHeapEntry(context, *table, recorder, index, region.heapBase + region.entryOffset + static_cast<std::uint64_t>(key) * 32u);
             } catch (const std::exception& error) {
                 static std::atomic<int> reported{0};
                 if (reported.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[bindless] heap 0x%llx key %u is unusable: %s\n", static_cast<unsigned long long>(region.heapBase), key, error.what());
             }
+            slowestEntry = std::max(slowestEntry, std::chrono::steady_clock::now() - entryStart);
             published.emplace_back(index, word);
         }
+    }
+    // APS5_PROFILE_DRAW: a request scan that took a frame's worth of time.
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profiled) {
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scanStart).count();
+        static std::atomic<int> printed{0};
+        if (ms >= 10.0 && printed.fetch_add(1, std::memory_order_relaxed) < 200) std::fprintf(stderr, "[bindless] request scan took %.1f ms for %zu entries (slowest %.1f ms)\n", ms, published.size(), std::chrono::duration<double, std::milli>(slowestEntry).count());
     }
     counters.requests.fetch_add(published.size(), std::memory_order_relaxed);
     for (const auto& entry : published) (entry.second != Heaps::Unusable ? counters.usable : counters.failed).fetch_add(1, std::memory_order_relaxed);

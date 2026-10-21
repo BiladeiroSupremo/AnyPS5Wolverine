@@ -2725,12 +2725,24 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
 
 void Recorder::BoundKeptBytes() {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
+    const bool profile = DrawProfiled();
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto openBytes = open != nullptr ? open->keptBytes : 0;
+    const auto inFlightBytes = inFlightKeptBytes;
+    std::size_t waited = 0;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), true, 4, true);
+        ++waited;
+    }
+    // APS5_PROFILE_DRAW: a bound that took a frame's worth of time, and why.
+    if (profile) {
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        static std::atomic<int> printed{0};
+        if (ms >= 5.0 && printed.fetch_add(1, std::memory_order_relaxed) < 200) std::fprintf(stderr, "[recorder] kept-bytes bound took %.1f ms: open batch %.0f MiB, in flight %.0f MiB, %zu batches finished with a wait\n", ms, static_cast<double>(openBytes) / 1048576.0, static_cast<double>(inFlightBytes) / 1048576.0, waited);
     }
 }
 

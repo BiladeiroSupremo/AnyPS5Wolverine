@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <string_view>
 #include <vector>
@@ -584,6 +585,26 @@ struct GeometryStageLimits {
 };
 
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
+
+// For the draw path: while a DeferSpecializationScope lives on a thread, materializing a prepared
+// shader whose specialized module is not built yet queues the build on a background worker and
+// throws SpecializationPending (the caller skips the draw) instead of building it on the thread
+// (~100-200 ms per large module; PPSA03671 gameplay stalls). Dispatches build in place.
+// APS5_SYNC_SPECIALIZATION=1 builds in place everywhere.
+struct SpecializationPending : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+class DeferSpecializationScope {
+public:
+    DeferSpecializationScope();
+    ~DeferSpecializationScope();
+    DeferSpecializationScope(const DeferSpecializationScope&) = delete;
+    DeferSpecializationScope& operator=(const DeferSpecializationScope&) = delete;
+
+private:
+    bool previous;
+};
 
 }
 

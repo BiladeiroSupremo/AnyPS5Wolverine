@@ -2030,9 +2030,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     ThrowIfShaderPartsPending(shaders);
     const auto drawStart = std::chrono::steady_clock::now();
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
+    const auto boundAt = std::chrono::steady_clock::now();
     // Heap keys requested by earlier work: their slots are published before this draw, before it
     // allocates anything (a lookup may submit the open batch; publishing ends an open pass).
     if (context.recorder != nullptr) ResolveBindlessHeapRequests(context, *context.recorder);
+    const auto heapsAt = std::chrono::steady_clock::now();
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -2319,7 +2321,18 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 const auto before = std::chrono::duration<double, std::milli>(pipelineStart - drawStart).count();
                 const auto inside = std::chrono::duration<double, std::milli>(now - pipelineStart).count();
                 static std::atomic<int> printed{0};
-                if (before + inside >= 5.0 && printed.fetch_add(1, std::memory_order_relaxed) < 300) std::fprintf(stderr, "[draw] part skip: %.1f ms before the pipeline lookup, %.1f ms in it\n", before, inside);
+                if (before + inside >= 5.0 && printed.fetch_add(1, std::memory_order_relaxed) < 300) {
+                    timer.phase(PhaseSetup);
+                    std::string phases;
+                    for (std::size_t i = 0; i < PhaseCount; ++i) {
+                        if (timer.us[i] < 1000.0) continue;
+                        char item[48];
+                        std::snprintf(item, sizeof(item), " %s %.1f", DrawPhaseNames[i], timer.us[i] / 1000.0);
+                        phases += item;
+                    }
+                    const auto& build = resources->Timing();
+                    std::fprintf(stderr, "[draw] part skip: %.1f ms before the pipeline lookup (kept-bytes bound %.1f, heap requests %.1f), %.1f ms in it; phases (ms):%s; build: bindings %.1f upload %.1f descriptors %.1f prepare %.1f complete %.1f\n", before, std::chrono::duration<double, std::milli>(boundAt - drawStart).count(), std::chrono::duration<double, std::milli>(heapsAt - boundAt).count(), inside, phases.c_str(), build.bindingsMs, build.uploadMs, build.descriptorsMs, build.prepareMs, build.completeMs);
+                }
             }
             throw;
         }

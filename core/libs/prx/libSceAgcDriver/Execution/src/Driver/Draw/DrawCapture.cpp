@@ -80,7 +80,12 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     phaseTiming.Phase(DrawRowCapture);
 
     timing.Mark("capture_resources");
-    stageCapture.compiled = invocation.Materialize(*capture);
+    // A specialized module the draw needs that is not built yet is built in the background and the
+    // draw skipped (ShaderRecompiler::SpecializationPending), as for its pipeline parts.
+    stageCapture.compiled = [&] {
+        const ShaderRecompiler::DeferSpecializationScope defer;
+        return invocation.Materialize(*capture);
+    }();
     timing.Mark("materialize");
     // The shared result itself: a copy per stage and draw (its binding, push and export vectors)
     // was most of the recompile phase. A caller that patches it (CPU-side indirect records)

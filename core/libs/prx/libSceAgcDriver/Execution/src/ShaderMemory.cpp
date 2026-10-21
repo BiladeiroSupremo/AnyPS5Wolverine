@@ -164,7 +164,7 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     pages.insert(position, {base, owned.release()});
     lastBase = base;
     lastPage = &page;
-    ++CaptureTotals().pages;
+    if (CaptureProfiled()) CaptureTotals().pages.fetch_add(1, std::memory_order_relaxed);
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
@@ -204,7 +204,9 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         if (reported.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[gpu] shader resource walk read the null page at 0x%llx; the value is left unknown\n", static_cast<unsigned long long>(address));
         return false;
     }
-    ++CaptureTotals().reads;
+    // Counted only for the [capture] line: an atomic add per word (~120 per capture, from queue 0 and
+    // the async compute worker on one cache line) was a cost of every capture.
+    if (CaptureProfiled()) CaptureTotals().reads.fetch_add(1, std::memory_order_relaxed);
     if (!self.initial.empty()) {
         const auto next = self.initial.upper_bound(address);
         if (next != self.initial.begin()) {

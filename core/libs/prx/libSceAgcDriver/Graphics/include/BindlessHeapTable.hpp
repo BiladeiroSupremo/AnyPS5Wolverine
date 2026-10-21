@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "Optimization/BindlessHeaps.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -42,6 +43,9 @@ public:
     void Retire(std::uint32_t word, Recorder& recorder);
     // Whether a feedback scan is due (at most one per interval).
     bool ScanDue();
+    // ScanDue's answer without the mutex, for the check every draw and dispatch makes: false until
+    // the interval after the last scan ends (ScanDue still decides under the mutex).
+    bool ScanMaybeDue() const { return std::chrono::steady_clock::now().time_since_epoch().count() >= nextScan.load(std::memory_order_relaxed); }
     // Marks a translation entry handled (its word published or about to be); false when it already
     // was. The GPU writes the word later, so the CPU copy can still read Pending meanwhile.
     bool Claim(std::uint32_t index);
@@ -95,6 +99,7 @@ private:
     std::shared_ptr<std::array<std::vector<std::uint32_t>, ShaderRecompiler::BindlessHeaps::KindCount>> freeSlots = std::make_shared<std::array<std::vector<std::uint32_t>, ShaderRecompiler::BindlessHeaps::KindCount>>();
     std::vector<std::uint8_t> claimed;
     std::chrono::steady_clock::time_point lastScan{};
+    std::atomic<std::chrono::steady_clock::rep> nextScan{0};
     std::vector<Entry> entries;
     std::size_t revalidateCursor = 0;
     std::chrono::steady_clock::time_point lastRevalidate{};

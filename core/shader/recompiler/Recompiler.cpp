@@ -13,6 +13,9 @@
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
 #include <list>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <functional>
 #include <map>
 #include <set>
@@ -746,7 +749,63 @@ struct PreparedModuleEntry {
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
     DescriptorBindingPlan bindings;
+    // DeferSpecializationScope: the build was handed to a background worker / has finished
+    // (`ready` ran; `failure` or `module` is set).
+    std::atomic<bool> queued{false};
+    std::atomic<bool> done{false};
+    // When it was queued (steady_clock ticks): a draw still waiting after
+    // APS5_SPECIALIZATION_WAIT_MS builds it in place (or waits for the worker's build) instead of
+    // being skipped again, so a burst queued behind the workers cannot keep a pass missing for
+    // seconds (PPSA03671 gameplay: up to 4.5 s, the scene black).
+    std::atomic<std::chrono::steady_clock::rep> queuedAt{0};
 };
+
+std::chrono::milliseconds SpecializationWait() {
+    static const std::chrono::milliseconds wait([] { const char* text = std::getenv("APS5_SPECIALIZATION_WAIT_MS"); return text ? std::atoi(text) : 300; }());
+    return wait;
+}
+
+thread_local bool deferSpecialization = false;
+
+bool DeferringSpecialization() {
+    static const bool sync = std::getenv("APS5_SYNC_SPECIALIZATION") != nullptr;
+    return deferSpecialization && !sync;
+}
+
+// Background specialization builds (DeferSpecializationScope): APS5_SPECIALIZATION_THREADS workers
+// (default 4; a burst of new modules queued up to 4.5 s behind two), started at the first job.
+struct SpecializationWorkers {
+    std::mutex mutex;
+    std::condition_variable work;
+    std::deque<std::function<void()>> jobs;
+    bool started = false;
+};
+
+void SubmitSpecialization(std::function<void()> job) {
+    static auto* workers = new SpecializationWorkers();
+    std::lock_guard lock(workers->mutex);
+    workers->jobs.push_back(std::move(job));
+    if (!workers->started) {
+        workers->started = true;
+        const char* text = std::getenv("APS5_SPECIALIZATION_THREADS");
+        const int threads = text != nullptr ? std::max(1, std::atoi(text)) : 4;
+        for (int thread = 0; thread < threads; ++thread) {
+            std::thread([] {
+                for (;;) {
+                    std::function<void()> next;
+                    {
+                        std::unique_lock lock(workers->mutex);
+                        workers->work.wait(lock, [] { return !workers->jobs.empty(); });
+                        next = std::move(workers->jobs.front());
+                        workers->jobs.pop_front();
+                    }
+                    next();
+                }
+            }).detach();
+        }
+    }
+    workers->work.notify_one();
+}
 
 struct PreparedBindingPlan {
     std::once_flag ready;
@@ -867,7 +926,41 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     return entry->module;
 }
 
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false) {
+// Builds a prepared module entry: the variant's module specialized for the constants the module key
+// encodes (push data offset, pixel export packing and flags, vertex input selectors), and the plan's
+// bindings selected for it.
+void prepareModuleEntry(PreparedModuleEntry& entry, const PreparedBindingPlan& plan, const CompiledVariant& variant, std::span<const std::uint32_t> moduleKey, bool pixel, const std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources>& vertexClasses, const SpirvTarget& target) {
+    const auto& artifact = variant.artifact;
+    auto constants = plan.bindings.specialization;
+    std::size_t index = 0;
+    if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});
+    if (pixel) {
+        for (std::uint32_t exportTarget = 0; exportTarget < std::tuple_size_v<decltype(ShaderPixelStageInfo::targetExportPacking)>; ++exportTarget) constants.push_back({PipelineSpecialization::ExportPackingBase + exportTarget, moduleKey[index++]});
+        constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
+        if (variant.info.info.rasterPrimitive) constants.push_back({PipelineSpecialization::RasterPrimitive, moduleKey[index++]});
+        if (variant.info.info.layerExported) constants.push_back({PipelineSpecialization::LayerExported, moduleKey[index++]});
+    }
+    if (!artifact.vertexInputPatches.empty()) {
+        for (const auto& input : artifact.vertexInputs) {
+            const auto selectors = moduleKey[index++];
+            const auto first = PipelineSpecialization::VertexBase + input.location * PipelineSpecialization::VertexWords;
+            for (std::uint32_t component = 0; component < 4u; ++component) constants.push_back({first + component, (selectors >> (component * 3u)) & 7u});
+            const auto kind = selectors >> 12u;
+            constants.push_back({first + 4u, kind == 0u ? 0x3f800000u : 1u});
+            constants.push_back({first + 5u, kind});
+        }
+    }
+    const auto module = artifact.registrationModule && plan.bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(artifact, vertexClasses, constants, target); }) : specializeModule(artifact, vertexClasses, constants, target);
+    if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
+    auto selected = DescriptorBindingBuilder{}.Select(plan.bindings, module->bindings);
+    entry.bindings = std::move(selected);
+    entry.module = module;
+}
+
+// `owner` (the shared variant of a prepared shader, when the caller has it) lets a draw under
+// DeferSpecializationScope build a missing specialized module in the background.
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false, const std::shared_ptr<const CompiledVariant>* owner = nullptr) {
+    const auto materializeStart = std::chrono::steady_clock::now();
     RecompileResult result;
     const auto& artifact = variant.artifact;
     static_cast<CompiledShaderArtifact&>(result) = {
@@ -892,8 +985,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .barycentricEmulation = artifact.barycentricEmulation,
         .variantId = artifact.variantId
     };
+    const auto planStart = std::chrono::steady_clock::now();
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
+    const auto lookupStart = std::chrono::steady_clock::now();
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
     auto& moduleKey = HostThreadLocal<std::vector<std::uint32_t>, LocalModuleKeyStorage>();
@@ -943,39 +1038,60 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             const auto found = plan->modules.find(moduleKey);
             entry = found != plan->modules.end() ? found->second : plan->modules.emplace(moduleKey, std::make_shared<PreparedModuleEntry>()).first->second;
         }
-        const auto prepare = [&] {
-            auto constants = plan->bindings.specialization;
-            std::size_t index = 0;
-            if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});
-            if (request.context.pixel) {
-                for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
-                constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
-                if (variant.info.info.rasterPrimitive) constants.push_back({PipelineSpecialization::RasterPrimitive, moduleKey[index++]});
-                if (variant.info.info.layerExported) constants.push_back({PipelineSpecialization::LayerExported, moduleKey[index++]});
-            }
-            if (!artifact.vertexInputPatches.empty()) {
-                for (const auto& input : result.vertexInputs) {
-                    const auto selectors = moduleKey[index++];
-                    const auto first = PipelineSpecialization::VertexBase + input.location * PipelineSpecialization::VertexWords;
-                    for (std::uint32_t component = 0; component < 4u; ++component) constants.push_back({first + component, (selectors >> (component * 3u)) & 7u});
-                    const auto kind = selectors >> 12u;
-                    constants.push_back({first + 4u, kind == 0u ? 0x3f800000u : 1u});
-                    constants.push_back({first + 5u, kind});
-                }
-            }
-            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
-            if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
-            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
-            entry->bindings = std::move(selected);
-            entry->module = module;
+        const bool pixel = request.context.pixel.has_value();
+        const auto overdue = [&] {
+            const auto queuedAt = entry->queuedAt.load(std::memory_order_acquire);
+            return queuedAt != 0 && std::chrono::steady_clock::now().time_since_epoch().count() - queuedAt >= std::chrono::duration_cast<std::chrono::steady_clock::duration>(SpecializationWait()).count();
         };
+        if (owner != nullptr && DeferringSpecialization() && !entry->done.load(std::memory_order_acquire) && !overdue()) {
+            if (!entry->queued.exchange(true, std::memory_order_acq_rel)) {
+                entry->queuedAt.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+                // The worker gets its own copies: the module key is this thread's scratch, and only
+                // the SPIR-V options of the target are used (its spans name the device's lists).
+                SpirvTarget target{};
+                target.vulkanVersion = request.target.vulkanVersion;
+                target.spirvVersion = request.target.spirvVersion;
+                target.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
+                SubmitSpecialization([entry, plan, variant = *owner, key = std::vector<std::uint32_t>(moduleKey.begin(), moduleKey.end()), pixel, vertexClasses, target, queuedAt = std::chrono::steady_clock::now()] {
+                    const auto started = std::chrono::steady_clock::now();
+                    struct Report {
+                        std::chrono::steady_clock::time_point queuedAt, started;
+                        std::uint64_t variantId;
+                        ~Report() {
+                            // APS5_PROFILE_DRAW: how long a skipped draw's specialization kept it skipped.
+                            static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+                            if (!profile) return;
+                            const auto now = std::chrono::steady_clock::now();
+                            const auto total = std::chrono::duration<double, std::milli>(now - queuedAt).count();
+                            static std::atomic<int> printed{0};
+                            if (total >= 50.0 && printed.fetch_add(1, std::memory_order_relaxed) < 300) std::fprintf(stderr, "[specialize] variant 0x%llx ready after %.1f ms (queued %.1f ms, built %.1f ms)\n", static_cast<unsigned long long>(variantId), total, std::chrono::duration<double, std::milli>(started - queuedAt).count(), std::chrono::duration<double, std::milli>(now - started).count());
+                        }
+                    } report{queuedAt, started, variant->artifact.variantId};
+                    std::call_once(entry->ready, [&] {
+                        try {
+                            prepareModuleEntry(*entry, *plan, *variant, key, pixel, vertexClasses, target);
+                        } catch (...) {
+                            entry->failure = std::current_exception();
+                        }
+                    });
+                    entry->done.store(true, std::memory_order_release);
+                });
+            }
+            // The message carries where the time went before the throw (a slow skip names it).
+            const auto now = std::chrono::steady_clock::now();
+            const auto ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
+            char text[200];
+            std::snprintf(text, sizeof(text), "ShaderRecompiler: a shader specialization is being built in the background; the draw is skipped until it is ready (setup %.1f ms, plan %.1f ms, lookup %.1f ms)", ms(materializeStart, planStart), ms(planStart, lookupStart), ms(lookupStart, now));
+            throw SpecializationPending(text);
+        }
         std::call_once(entry->ready, [&] {
             try {
-                prepare();
+                prepareModuleEntry(*entry, *plan, variant, moduleKey, pixel, vertexClasses, request.target);
             } catch (...) {
                 entry->failure = std::current_exception();
             }
         });
+        entry->done.store(true, std::memory_order_release);
         if (entry->failure) std::rethrow_exception(entry->failure);
         const auto& module = entry->module;
         result.specializationId = module->specializationId;
@@ -1202,7 +1318,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         }
     }
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
+    auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, &variant));
     result->cacheHit = cacheHit;
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     counters.misses.fetch_add(1, std::memory_order_relaxed);
@@ -1396,9 +1512,17 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const S
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
     if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
-    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
+    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot, false, &handle->artifact));
     result->cacheHit = true;
     return result;
+}
+
+DeferSpecializationScope::DeferSpecializationScope() : previous(deferSpecialization) {
+    deferSpecialization = true;
+}
+
+DeferSpecializationScope::~DeferSpecializationScope() {
+    deferSpecialization = previous;
 }
 
 const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle) {

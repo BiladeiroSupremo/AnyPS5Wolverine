@@ -726,6 +726,15 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
     ShaderRecompiler::BuildPreparedShaderKey(source, key);
     std::unique_lock lock(snapshot.prepared->mutex);
+    // A draw skips a shader whose registration-time preparation is still running (moved to the front
+    // of the queue) instead of waiting for it on the draw path: a newly streamed-in shader held the
+    // queue-0 worker ~200 ms per first draw in PPSA03671 gameplay. Dispatches wait as before.
+    // APS5_AWAIT_REGISTERED_DRAWS=1 waits for draws too.
+    static const bool awaitDraws = std::getenv("APS5_AWAIT_REGISTERED_DRAWS") != nullptr;
+    if (deferAtUse && !awaitDraws && snapshot.prepared->pending) {
+        PrioritizeRegistrationPreparation(*snapshot.prepared);
+        throw ShaderNotReady("AGC driver: the shader is still being prepared in the background; the draw is skipped until it is ready");
+    }
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
@@ -741,6 +750,9 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         if (const auto found = state.failed.find(identity); found != state.failed.end()) {
             if (std::chrono::steady_clock::now() - found->second.first < AtUseRetryAfter) throw std::runtime_error(found->second.second);
             state.failed.erase(found);
+            // The retry goes to the background like the first attempt: left in `attempted`, it was
+            // prepared in place (PPSA03671: 0x11d1e59a00, ~3.2 s on the draw path every minute).
+            state.attempted.erase(identity);
         }
     }
     if (deferAtUse && asyncAtUse) {
