@@ -921,6 +921,7 @@ struct PartJob {
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> programs;
     std::vector<CompiledShader> shaders;
     std::uint64_t hash = 0;
+    std::uint64_t shaderSet = 0;
 };
 
 struct PartBuilds {
@@ -929,6 +930,9 @@ struct PartBuilds {
     std::deque<std::unique_ptr<PartJob>> jobs;
     // Queued or building.
     std::unordered_set<std::uint64_t> pending;
+    // The shader sets (ShaderSetKey) of the queued or building jobs, with the job's hash: a draw of
+    // such a set is skipped before it builds its resources (ThrowIfShaderPartsPending).
+    std::unordered_map<std::uint64_t, std::uint64_t> pendingShaderSets;
     // Built once (or failed): a draw that misses again compiles in place.
     std::unordered_set<std::uint64_t> attempted;
     std::uint64_t built = 0;
@@ -974,6 +978,7 @@ void runPartJobs(PartBuilds& builds) {
         }
         lock.lock();
         builds.pending.erase(job->hash);
+        if (const auto set = builds.pendingShaderSets.find(job->shaderSet); set != builds.pendingShaderSets.end() && set->second == job->hash) builds.pendingShaderSets.erase(set);
         builds.attempted.insert(job->hash);
         ++builds.built;
         if (!failed && seconds >= 1.0) std::fprintf(stderr, "[pipeline] background shader parts built in %.1f s (%llu built, %zu queued)\n", seconds, static_cast<unsigned long long>(builds.built), builds.jobs.size());
@@ -992,7 +997,7 @@ bool deferParts(std::uint64_t hash) {
 }
 
 void queueParts(std::uint64_t hash, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
-    auto job = std::make_unique<PartJob>(PartJob{context, state, vertexInput, resources.main, resources.fragment, resources.split, {resources.mainKey.begin(), resources.mainKey.end()}, {resources.fragmentKey.begin(), resources.fragmentKey.end()}, {}, {}, hash});
+    auto job = std::make_unique<PartJob>(PartJob{context, state, vertexInput, resources.main, resources.fragment, resources.split, {resources.mainKey.begin(), resources.mainKey.end()}, {resources.fragmentKey.begin(), resources.fragmentKey.end()}, {}, {}, hash, ShaderSetKey(shaders)});
     for (const auto& shader : shaders) {
         job->programs.push_back(std::make_shared<const ShaderRecompiler::RecompileResult>(*shader.program));
         job->shaders.push_back({shader.stage, job->programs.back().get(), shader.pushConstantOffset});
@@ -1000,6 +1005,7 @@ void queueParts(std::uint64_t hash, const Context& context, const State& state, 
     auto& builds = partBuilds();
     std::lock_guard lock(builds.mutex);
     if (!builds.pending.insert(hash).second) return;
+    builds.pendingShaderSets[job->shaderSet] = hash;
     if (builds.threads == 0) {
         const char* text = std::getenv("APS5_PIPELINE_PART_THREADS");
         builds.threads = text != nullptr ? static_cast<std::size_t>(std::max(1, std::atoi(text))) : std::size_t{2};
@@ -1009,6 +1015,27 @@ void queueParts(std::uint64_t hash, const Context& context, const State& state, 
     builds.work.notify_one();
 }
 
+}
+
+std::uint64_t ShaderSetKey(std::span<const CompiledShader> shaders) {
+    std::uint64_t key = 1469598103934665603ull;
+    const auto mix = [&](std::uint64_t value) { key = (key ^ value) * 1099511628211ull; };
+    for (const auto& shader : shaders) {
+        mix(static_cast<std::uint64_t>(shader.stage));
+        mix(shader.program->variantId);
+        mix(shader.program->specializationId);
+        mix(shader.pushConstantOffset);
+    }
+    return key;
+}
+
+void ThrowIfShaderPartsPending(std::span<const CompiledShader> shaders) {
+    static const bool enabled = std::getenv("APS5_SYNC_PIPELINE_PARTS") == nullptr && std::getenv("APS5_NO_EARLY_PART_SKIP") == nullptr;
+    if (!enabled) return;
+    auto& builds = partBuilds();
+    const auto key = ShaderSetKey(shaders);
+    std::lock_guard lock(builds.mutex);
+    if (builds.pendingShaderSets.contains(key)) throw ShaderPartNotReady("graphics pipeline shader part is compiling in the background");
 }
 
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {

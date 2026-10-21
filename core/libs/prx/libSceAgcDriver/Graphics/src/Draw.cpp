@@ -2027,6 +2027,8 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+    ThrowIfShaderPartsPending(shaders);
+    const auto drawStart = std::chrono::steady_clock::now();
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     // Heap keys requested by earlier work: their slots are published before this draw, before it
     // allocates anything (a lookup may submit the open batch; publishing ends an open pass).
@@ -2306,7 +2308,22 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto built = resources->SetLayouts();
         Require(described.layouts.main == built.main && described.layouts.fragment == built.fragment && described.layouts.split == built.split && std::ranges::equal(described.mainKey, built.mainKey) && std::ranges::equal(described.fragmentKey, built.fragmentKey), "set layouts described from the shaders differ from the draw's");
     }
-    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    const auto pipelineStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto pipeline = [&] {
+        try {
+            return CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        } catch (const ShaderPartNotReady&) {
+            // APS5_PROFILE_DRAW: where a draw skipped for its pipeline parts spent its time.
+            if (profile) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto before = std::chrono::duration<double, std::milli>(pipelineStart - drawStart).count();
+                const auto inside = std::chrono::duration<double, std::milli>(now - pipelineStart).count();
+                static std::atomic<int> printed{0};
+                if (before + inside >= 5.0 && printed.fetch_add(1, std::memory_order_relaxed) < 300) std::fprintf(stderr, "[draw] part skip: %.1f ms before the pipeline lookup, %.1f ms in it\n", before, inside);
+            }
+            throw;
+        }
+    }();
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;

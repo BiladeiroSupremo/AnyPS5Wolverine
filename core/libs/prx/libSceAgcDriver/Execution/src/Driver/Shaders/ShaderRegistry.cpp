@@ -25,6 +25,7 @@
 #include <functional>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <atomic>
 #include <pthread.h>
@@ -755,10 +756,12 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
             SubmitAtUsePreparation([owned = std::move(owned), prepared = snapshot.prepared, codeOffset, identity, address = snapshot.codeAddress] {
                 const auto started = std::chrono::steady_clock::now();
                 std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+                std::optional<std::string> failure;
                 try {
                     handle = PrepareShaderWithDiagnostics(owned->request);
                 } catch (const std::exception& error) {
-                    std::fprintf(stderr, "[shader-prepare] background preparation at use of 0x%llx failed (the next draw prepares it in place): %s\n", static_cast<unsigned long long>(address), error.what());
+                    std::fprintf(stderr, "[shader-prepare] background preparation at use of 0x%llx failed (draws skip it for %llds): %s\n", static_cast<unsigned long long>(address), static_cast<long long>(AtUseRetryAfter.count()), error.what());
+                    failure = error.what();
                 }
                 if (handle != nullptr) {
                     std::lock_guard preparedLock(prepared->mutex);
@@ -769,6 +772,9 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
                 std::lock_guard stateLock(state.mutex);
                 state.pending.erase(identity);
                 state.attempted.insert(identity);
+                // The same request fails the same way in place (~10 ms on the draw path, per draw):
+                // later draws skip it with this error until AtUseRetryAfter.
+                if (failure) state.failed[identity] = {std::chrono::steady_clock::now(), std::move(*failure)};
                 ++state.built;
                 if (seconds >= 1.0) std::fprintf(stderr, "[shader-prepare] shader 0x%llx prepared at use in the background in %.1f s (%llu so far, %zu pending)\n", static_cast<unsigned long long>(address), seconds, static_cast<unsigned long long>(state.built), state.pending.size());
             });

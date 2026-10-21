@@ -168,6 +168,14 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     VkPipelineDepthStencilStateCreateInfo dynamicDepth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     static const bool backgroundLinking = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
     const bool optimize = backgroundLinking && context.pipelineLinkTimeOptimization;
+    // A draw that defers missing shader parts checks for them before it creates any part: the vertex
+    // input part's vkCreateGraphicsPipelines (same VkPipelineCache) waited behind a background part
+    // compile, up to ~870 ms per skipped draw in PPSA03671 gameplay, only to skip the draw anyway.
+    if (deferShaderParts && !partsOnly) {
+        for (const std::size_t part : {std::size_t{1}, std::size_t{2}}) {
+            if (!device.parts[part].contains(Combined(*partKeys[part], *contextKeys[part]))) throw ShaderPartNotReady("graphics pipeline shader part is compiling in the background");
+        }
+    }
     std::vector<VkPipeline> libraries;
     for (std::size_t part = 0; part < flags.size(); ++part) {
         if (part == 0 && mesh) continue;

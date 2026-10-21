@@ -102,6 +102,13 @@ private:
 // draw as before.
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+// The stage modules of a draw (stage, variant, specialization, push offset) as one key.
+std::uint64_t ShaderSetKey(std::span<const CompiledShader> shaders);
+// Throws ShaderPartNotReady while background shader parts for these stage modules are queued or
+// building: such a draw is skipped before it builds its resources, as CachedPipeline would skip it
+// after (PPSA03671 gameplay: up to ~0.7 s of resource work per skipped draw, the same draws again
+// every frame while their parts built). APS5_NO_EARLY_PART_SKIP=1 leaves it to CachedPipeline.
+void ThrowIfShaderPartsPending(std::span<const CompiledShader> shaders);
 struct DescribedSetLayouts {
     PipelineSetLayouts layouts;
     std::vector<std::uint32_t> mainKey;

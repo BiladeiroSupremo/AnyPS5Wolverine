@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include <atomic>
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
@@ -315,6 +316,13 @@ void Driver::execute(const Submission& submission) {
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
+                    // The skips that cost a frame (APS5_PROFILE_DRAW): which reason took >= 5 ms.
+                    if (profileDraws) {
+                        static std::atomic<int> slowSkips{0};
+                        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+                        if (ms >= 5.0 && slowSkips.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[draw] slow skip %.1f ms (%s): %.200s\n", ms, DescribeThrownDrawPhases().c_str(), error.what());
+                        ThrownDrawPhases() = {};
+                    }
                     // A draw that cannot be translated is reported and skipped, so one unsupported
                     // state does not end a title; APS5_STRICT_DRAWS=1 makes it fatal.
                     static const bool strictDraws = std::getenv("APS5_STRICT_DRAWS") != nullptr;

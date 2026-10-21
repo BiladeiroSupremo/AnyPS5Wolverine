@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdio>
+#include <exception>
 #include <algorithm>
 #include <cstdlib>
 #include <mutex>
@@ -22,6 +23,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto phaseLap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     DrawPhaseTiming phaseTiming{profile, phaseMs, phaseLap};
     if (profile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[DrawRowPrologue] = std::chrono::duration<double, std::milli>(phaseLap - packetStartedAt()).count();
+    // A draw that throws leaves its phases for the slow-skip line (PacketExecution).
+    struct ThrownPhases {
+        DrawPhaseTiming& timing;
+        int exceptions = std::uncaught_exceptions();
+        ~ThrownPhases() {
+            if (!timing.profile || std::uncaught_exceptions() <= exceptions) return;
+            timing.Phase(DrawRowSkipped);
+            ThrownDrawPhases() = timing.phaseMs;
+        }
+    } thrownPhases{phaseTiming};
 
     const auto drawn = [&] {
         phaseTiming.Phase(DrawRowVectors);

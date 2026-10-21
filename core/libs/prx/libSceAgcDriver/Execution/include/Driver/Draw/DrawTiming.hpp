@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <list>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -31,6 +32,11 @@ struct DrawPhaseTiming {
     std::chrono::steady_clock::time_point& phaseLap;
     void Phase(DrawDriverPhase which);
 };
+
+// APS5_PROFILE_DRAW: the phases of this thread's last draw that ended in an exception (the time after
+// its last phase as "skipped"), and the three largest as text for the slow-skip line.
+std::array<double, DrawDriverPhaseCount>& ThrownDrawPhases();
+std::string DescribeThrownDrawPhases();
 
 }
 
