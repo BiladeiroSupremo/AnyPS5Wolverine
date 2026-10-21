@@ -97,6 +97,10 @@ struct ShaderSnapshot {
 // KytyPS5's hashes): its draws and dispatches are skipped, as if it failed to compile. To step past
 // a shader that loses the device, or to see what one contributes.
 void RejectSkippedShader(const ShaderSnapshot& snapshot);
+// Whether APS5_SKIP_SHADERS lists the shader, without throwing: dispatches return early on it (the
+// title issues tens of thousands of skip-listed dispatches a second, and an exception each cost
+// ~10 us of the async-compute worker).
+bool SkipListed(const ShaderSnapshot& snapshot);
 
 
 std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address);

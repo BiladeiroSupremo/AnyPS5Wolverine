@@ -29,13 +29,7 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
     {
         const auto shaderRegister = [&](std::uint32_t offset) { const auto it = queue.shader.find(offset); return it == queue.shader.end() ? 0u : it->second; };
         const auto program = (static_cast<std::uint64_t>(shaderRegister(0x20c)) << 8u) | (static_cast<std::uint64_t>(shaderRegister(0x20d) & 0xffu) << 40u);
-        if (const auto snapshot = RegisteredProgram(*submission.shaders, program, {0})) {
-            try {
-                RejectSkippedShader(*snapshot);
-            } catch (const std::runtime_error& error) {
-                throw DispatchShaderRejected(error.what());
-            }
-        }
+        if (const auto snapshot = RegisteredProgram(*submission.shaders, program, {0}); snapshot != nullptr && SkipListed(*snapshot)) return;
     }
     static const bool gpuIndirect = std::getenv("APS5_NO_GPU_INDIRECT") == nullptr;
     const auto arguments = Pm4::DispatchArgumentAddress(packet, queue);

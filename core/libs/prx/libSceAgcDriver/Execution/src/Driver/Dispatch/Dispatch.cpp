@@ -24,11 +24,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
-    try {
-        RejectSkippedShader(snapshot);
-    } catch (const std::runtime_error& error) {
-        throw DispatchShaderRejected(error.what());
-    }
+    if (SkipListed(snapshot)) return;
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
     std::vector<std::uint32_t> userData;
     for (std::uint32_t i = 0; i < userCount; ++i) {

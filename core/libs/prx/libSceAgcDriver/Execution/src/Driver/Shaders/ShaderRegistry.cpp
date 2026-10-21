@@ -45,6 +45,13 @@
 namespace AgcDriver::DriverDetail {
 
 void RejectSkippedShader(const ShaderSnapshot& snapshot) {
+    if (!SkipListed(snapshot)) return;
+    char reason[128];
+    std::snprintf(reason, sizeof(reason), "shader 0x%llx (hash 0x%016" PRIx64 ") is skipped (APS5_SKIP_SHADERS)", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash);
+    throw std::runtime_error(reason);
+}
+
+bool SkipListed(const ShaderSnapshot& snapshot) {
     static const std::vector<std::uint64_t> skipped = [] {
         std::vector<std::uint64_t> hashes;
         const char* value = std::getenv("APS5_SKIP_SHADERS");
@@ -70,16 +77,14 @@ void RejectSkippedShader(const ShaderSnapshot& snapshot) {
     // shader); the content hash is then reported once, for a stable list.
     const bool byHash = snapshot.contentHash != 0 && std::find(skipped.begin(), skipped.end(), snapshot.contentHash) != skipped.end();
     const bool byAddress = !byHash && std::find(skipped.begin(), skipped.end(), static_cast<std::uint64_t>(snapshot.codeAddress)) != skipped.end();
-    if (!byHash && !byAddress) return;
+    if (!byHash && !byAddress) return false;
     if (byAddress) {
         static std::mutex reportedMutex;
         static std::set<std::uint64_t> reported;
         std::lock_guard lock(reportedMutex);
         if (reported.insert(snapshot.codeAddress).second) std::fprintf(stderr, "[gpu] skipping shader 0x%llx by address: its hash is 0x%016" PRIx64 "\n", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash);
     }
-    char reason[128];
-    std::snprintf(reason, sizeof(reason), "shader 0x%llx (hash 0x%016" PRIx64 ") is skipped (APS5_SKIP_SHADERS)", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.contentHash);
-    throw std::runtime_error(reason);
+    return true;
 }
 
 namespace {
