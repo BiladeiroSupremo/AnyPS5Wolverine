@@ -28,6 +28,9 @@ struct SpirvTargetOptions {
     bool f32FlushToZero = false;
     // FPInterpolateF32/F16 (v_interp, v_fma_mix) as a host f32 fma instead of the exact f64 emulation.
     bool nativeInterpolation = false;
+    // FPSin/FPCos (v_sin_f32, v_cos_f32) as the host's sin/cos of the reduced turn instead of the
+    // series that corrects the host result when it is more than 4 ulp off.
+    bool nativeTrig = false;
     // SpirvTarget::robustBufferAccess2.
     bool robustBufferAccess2 = false;
 };

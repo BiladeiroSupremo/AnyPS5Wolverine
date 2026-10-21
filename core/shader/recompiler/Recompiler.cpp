@@ -505,6 +505,11 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     // exact. APS5_NO_NATIVE_INTERPOLATE=1 emulates every one as before.
     static const bool nativeInterpolation = std::getenv("APS5_NO_NATIVE_INTERPOLATE") == nullptr;
     targetOptions.nativeInterpolation = nativeInterpolation;
+    // v_sin_f32 / v_cos_f32 from the host sin/cos of the reduced turn alone (AMD hosts run the same
+    // v_sin/v_cos), without the two exact series and selects per call (~40 instructions each; a
+    // Wolverine gameplay pixel shader has ~280). APS5_NO_NATIVE_TRIG=1 keeps the exact series.
+    static const bool nativeTrig = std::getenv("APS5_NO_NATIVE_TRIG") == nullptr;
+    targetOptions.nativeTrig = nativeTrig;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;

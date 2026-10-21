@@ -256,6 +256,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.robustBufferAccess2 = target.robustBufferAccess2;
     state.f32FlushToZero = target.f32FlushToZero;
     state.nativeInterpolation = target.nativeInterpolation;
+    state.nativeTrig = target.nativeTrig;
     state.hostSubgroupSize = target.subgroupSize;
     if (HostSubgroupSingleLane(state)) {
         state.requirements.subgroupBallot = false;

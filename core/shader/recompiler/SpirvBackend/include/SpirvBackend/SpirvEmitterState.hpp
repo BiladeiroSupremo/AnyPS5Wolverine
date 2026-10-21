@@ -95,6 +95,7 @@ struct SpirvEmitterState {
     bool float16DenormPreserve = false;
     bool f32FlushToZero = false;
     bool nativeInterpolation = false;
+    bool nativeTrig = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds

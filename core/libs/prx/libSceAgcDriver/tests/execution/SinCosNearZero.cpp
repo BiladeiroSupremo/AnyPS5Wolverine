@@ -176,6 +176,12 @@ void Check() {
 }
 
 int main() {
+    // The exact series (the default host sin/cos is only close to the hardware's results).
+#ifdef _WIN32
+    _putenv_s("APS5_NO_NATIVE_TRIG", "1");
+#else
+    setenv("APS5_NO_NATIVE_TRIG", "1", 1);
+#endif
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
