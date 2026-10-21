@@ -244,6 +244,9 @@ struct SpirvTarget {
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;
     bool float16DenormPreserve = false;
+    // The device enabled robustBufferAccess2: an out-of-range storage buffer load reads zero and a
+    // store is dropped, so a word access needs no range check of its own against the binding.
+    bool robustBufferAccess2 = false;
 };
 
 struct BindingLayout {

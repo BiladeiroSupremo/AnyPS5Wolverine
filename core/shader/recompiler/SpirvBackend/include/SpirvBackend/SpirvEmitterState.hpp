@@ -103,6 +103,9 @@ struct SpirvEmitterState {
     std::span<const std::uint32_t> supportedCapabilities;
     std::span<const std::string_view> supportedExtensions;
     bool nonConstantImageOffsets = false;
+    // SpirvTarget::robustBufferAccess2: the binding-range check of an aligned word access is the
+    // device's (SpirvRuntimeBuffer readBuffer / writeBuffer).
+    bool robustBufferAccess2 = false;
     // A bindless table's runtime slot is wave-uniform; it is uniform over the invocation group
     // only for a single-wave compute workgroup, elsewhere it needs the NonUniform decoration.
     bool tableIndexNonUniform = true;

@@ -28,6 +28,8 @@ struct SpirvTargetOptions {
     bool f32FlushToZero = false;
     // FPInterpolateF32/F16 (v_interp, v_fma_mix) as a host f32 fma instead of the exact f64 emulation.
     bool nativeInterpolation = false;
+    // SpirvTarget::robustBufferAccess2.
+    bool robustBufferAccess2 = false;
 };
 
 class SpirvEmitter {

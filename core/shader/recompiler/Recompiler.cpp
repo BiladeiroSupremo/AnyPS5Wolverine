@@ -497,6 +497,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
+    targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
     targetOptions.f32FlushToZero = NativeF32Flush(request);
     // v_interp / v_fma_mix results from a host f32 fma (f16 results rounded once more, to nearest
     // even) instead of the exact f64 emulation (~1,600 f64 operations in the largest modules; f64

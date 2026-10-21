@@ -48,6 +48,7 @@ bool g_prepare = false;
 bool g_materialize = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
+bool g_robust = false;
 bool g_code = false;
 
 bool Replay(const char* path) {
@@ -141,6 +142,7 @@ bool Replay(const char* path) {
     }
     try {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
+        if (g_robust) request.request.target.robustBufferAccess2 = true;
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
         if (g_spirv) {
@@ -197,6 +199,11 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--maintenance8") {
             g_maintenance8 = true;
+            continue;
+        }
+        // --robust: as on a device with robustBufferAccess2 (binding-range checks left to it).
+        if (std::string(argv[i]) == "--robust") {
+            g_robust = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {

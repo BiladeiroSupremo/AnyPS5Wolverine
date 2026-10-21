@@ -25,9 +25,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     // Diagnostic: APS5_DUMP_SHADERS also writes the requests of graphics stages prepared at a draw
-    // (once per address; agc_shader_replay reads them).
+    // (once per address, after the capture so the request holds its memory; agc_shader_replay
+    // reads them).
     static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
-    if (dumpShaders) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
     const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request, true);
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
@@ -48,6 +48,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
     }
     request.context.memory = memory;
+    if (dumpShaders) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     if (profile) {
         ++captures;

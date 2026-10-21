@@ -299,6 +299,9 @@ struct VulkanDevice::State {
     // VK_AMD_buffer_marker enabled for APS5_GPU_BREADCRUMBS.
     bool bufferMarker = false;
     bool maintenance8 = false;
+    // VK_EXT_robustness2 robustBufferAccess2 enabled: shaders leave aligned word accesses' binding
+    // range checks to the device (SpirvTarget::robustBufferAccess2).
+    bool robustBufferAccess2 = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
@@ -1655,9 +1658,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         VkPhysicalDeviceFeatures2 queried{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &queried);
     }
-    if (robustness2.nullDescriptor == VK_TRUE) {
+    // robustBufferAccess2 (with core robustBufferAccess, which it requires): the device's bounds
+    // replace the shaders' own binding-range checks of aligned words. APS5_NO_ROBUST_BUFFERS=1
+    // keeps the checks in the shaders.
+    static const bool robustBuffers = std::getenv("APS5_NO_ROBUST_BUFFERS") == nullptr;
+    const bool robustBufferAccess2 = robustBuffers && robustness2.robustBufferAccess2 == VK_TRUE && enabled.robustBufferAccess == VK_TRUE;
+    if (robustness2.nullDescriptor == VK_TRUE || robustBufferAccess2) {
+        const bool nullDescriptor = robustness2.nullDescriptor == VK_TRUE;
         robustness2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
-        robustness2.nullDescriptor = VK_TRUE;
+        robustness2.nullDescriptor = nullDescriptor ? VK_TRUE : VK_FALSE;
+        robustness2.robustBufferAccess2 = robustBufferAccess2 ? VK_TRUE : VK_FALSE;
+        state->robustBufferAccess2 = robustBufferAccess2;
         robustness2.pNext = bdaFeatures.pNext;
         bdaFeatures.pNext = &robustness2;
         deviceExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
@@ -3190,6 +3201,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     ShaderRecompiler::SpirvTarget target{VK_API_VERSION_1_1, state->meshShader ? 0x00010400u : 0x00010300u, state->subgroup.subgroupSize, ShaderRecompiler::BdaAbi::Version, state->capabilities, state->spirvExtensions, false, {limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, {}, {}};
     target.fragmentShaderBarycentricEnabled = state->fragmentShaderBarycentric;
     target.nonConstantImageOffsets = state->maintenance8;
+    target.robustBufferAccess2 = state->robustBufferAccess2;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
     target.float16DenormPreserve = state->float16DenormPreserve;

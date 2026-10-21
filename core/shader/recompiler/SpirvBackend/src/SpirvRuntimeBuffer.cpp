@@ -153,6 +153,29 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
     return EmitAddU32(state, relative, base);
 }
 
+// The binding-range check of a word access (the guest V#'s own bounds are checked apart). Under
+// robustBufferAccess2 the device makes an out-of-range load read zero and drops a store, so an
+// access of one aligned word needs none: the condition holds whenever the base is aligned (a
+// specialization constant, folded at pipeline creation). An unaligned access combines two words
+// (zero for both when the second is out of range) and keeps the check.
+// A word read through a bound buffer whose result is zero unless `condition` holds (the guest V#'s
+// bounds, a component the format reads). Under robustBufferAccess2 the read is made whatever the
+// condition and a select keeps or drops it (a read past the binding reads zero, one inside it
+// reads bytes the select discards), so no branch splits the wave around every access. A
+// pointer-based (BDA) read records faults and keeps its branch.
+template<typename Read>
+std::uint32_t readOrZero(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t condition, Read&& read) {
+    auto& state = context.state;
+    if (!state.robustBufferAccess2 || context.Memory(instruction).gpuDescriptor) return EmitValueOrZeroIfCondition(state, condition, read);
+    return Select(state, TypeU32(state), condition, read(), ConstantU32(state, 0u));
+}
+
+std::uint32_t bindingRangeCheck(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t last, std::uint32_t unaligned) {
+    const auto inBounds = EmitMemoryElementInBounds(state, access, last);
+    if (!state.robustBufferAccess2) return inBounds;
+    return Binary(state, spv::OpLogicalOr, TypeBool(state), Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), inBounds);
+}
+
 std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits) {
     if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
     auto& state = context.state;
@@ -162,7 +185,7 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto unaligned = nonzero(state, misalignment);
     const auto next = EmitAddU32(state, index, ConstantU32(state, 1u));
     const auto last = Select(state, TypeU32(state), unaligned, next, index);
-    return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, access, last), [&] {
+    return EmitValueOrZeroIfCondition(state, bindingRangeCheck(state, access, last, unaligned), [&] {
         const auto load = [&](std::uint32_t word) {
             const auto value = state.module.AllocateId();
             const auto pointer = EmitMemoryElementPointer(state, access, word);
@@ -237,7 +260,9 @@ void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std
         });
         return;
     }
-    EmitIfCondition(state, EmitMemoryElementInBounds(state, access, last), [&] {
+    // A partial word is stored by an atomic update, whose out-of-range result robustness leaves
+    // undefined: only a whole word takes the device's check.
+    EmitIfCondition(state, bits == 32u ? bindingRangeCheck(state, access, last, unaligned) : EmitMemoryElementInBounds(state, access, last), [&] {
         auto mask = ConstantU32(state, bits == 32u ? 0xffffffffu : (1u << bits) - 1u);
         auto masked = Binary(state, spv::OpBitwiseAnd, u32, value, mask);
         if (bits != 32u) {
@@ -335,7 +360,7 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
         return ConstantU32(state, 0u);
     }
     for (std::uint32_t component = 0; component < info.componentCount; ++component) {
-        values[component] = EmitValueOrZeroIfCondition(state, both(state, inBounds, required[component]), [&] {
+        values[component] = readOrZero(context, instruction, both(state, inBounds, required[component]), [&] {
             const auto bits = info.componentBits[component];
             auto raw = readBuffer(context, instruction, addresses[component].guest, info.packedBitfield ? 32u : bits);
             if (bits != 32u) {
@@ -583,7 +608,7 @@ std::uint32_t EmitRuntimeBufferLoad(SpirvValueEmitContext& context, const IrValu
             std::array<std::uint32_t, 4> values{};
             for (std::uint32_t component = 0; component < components; ++component) {
                 const auto access = address(context, instruction, resource, component * 4u, memory.dataBits / 8u);
-                values[component] = EmitValueOrZeroIfCondition(state, access.inBounds, [&] { return readBuffer(context, instruction, access.guest, memory.dataBits); });
+                values[component] = readOrZero(context, instruction, access.inBounds, [&] { return readBuffer(context, instruction, access.guest, memory.dataBits); });
             }
             return composite(state, components, values);
         };
