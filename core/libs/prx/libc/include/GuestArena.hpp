@@ -57,6 +57,8 @@ void GuestArenaMapFile_nid_postfix(void* pointer, std::size_t bytes, void* secti
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaUnmapAlias_nid_postfix(void* alias);
 bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end);
+// Demotes the resident runs overlapping a range to shared views; false while a host write is open.
+bool GuestArenaDemoteResident_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaForgetSection_nid_postfix(void* section);
 #else
 void GuestArenaSetSharedBacking_nid_postfix(SharedBackingResolver resolver);

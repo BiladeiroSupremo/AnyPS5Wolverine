@@ -165,6 +165,7 @@ public:
     bool NeedsCompletion() const { return bda != nullptr || guestMemory.HasCopiedWrites(); }
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
+    std::string DescribeCopiedWrite() const { return guestMemory.DescribeCopiedWrite(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
     // Why the recorded work of this object could not run on a second queue beside the graphics

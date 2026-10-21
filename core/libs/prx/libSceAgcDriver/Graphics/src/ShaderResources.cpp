@@ -2360,7 +2360,23 @@ void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
+    const bool copied = context.copiedWriters != nullptr && overlaps(*context.copiedWriters);
+    const bool drawn = !copied && overlaps(*drawWriters);
+    const bool labelled = !copied && !drawn && labels && recorder->PendingLabelIn(address, bytes);
+    if (copied || drawn || labelled) {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) {
+            static std::atomic<std::uint64_t> reasons[3]{};
+            static std::atomic<std::uint64_t> lastAddress{0}, lastBytes{0};
+            static std::atomic<std::int64_t> lastReport{0};
+            ++reasons[copied ? 0 : drawn ? 1 : 2];
+            lastAddress = address;
+            lastBytes = bytes;
+            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            if (auto last = lastReport.load(); now - last > 10'000'000'000ll && lastReport.compare_exchange_strong(last, now)) {
+                AgcDriver::ProfilePrint_nid_no_patch("[pending-cpu] syncs by reason: copied writer %llu, draw writer %llu, pending label %llu; last 0x%llx+0x%llx\n", static_cast<unsigned long long>(reasons[0].load()), static_cast<unsigned long long>(reasons[1].load()), static_cast<unsigned long long>(reasons[2].load()), static_cast<unsigned long long>(lastAddress.load()), static_cast<unsigned long long>(lastBytes.load()));
+            }
+        }
         Recorder::CountSync(4);
         recorder->SyncThrough(address, bytes);
     }

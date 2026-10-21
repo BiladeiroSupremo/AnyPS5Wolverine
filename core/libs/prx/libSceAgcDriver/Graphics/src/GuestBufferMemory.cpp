@@ -726,7 +726,16 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         return current;
     }
     auto run = importRun(lease, address);
-    if (run.ranges.empty()) return nullptr;
+    if (run.ranges.empty()) {
+        static std::uint64_t unregistered = 0;
+        static auto lastUnregisteredReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+        ++unregistered;
+        if (std::chrono::steady_clock::now() - lastUnregisteredReport > std::chrono::seconds(10)) {
+            lastUnregisteredReport = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[gpu] host import found no registered range %llu times so far, last 0x%llx (%zu leased ranges)\n", static_cast<unsigned long long>(unregistered), static_cast<unsigned long long>(address), lease.size());
+        }
+        return nullptr;
+    }
     return importRunAt(context, state, std::move(run), false, address, lease);
 }
 
@@ -799,6 +808,13 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     entry.range = run.ranges.front();
     entry.ranges = std::move(run.ranges);
 #ifdef _WIN32
+    // Upstream main's libc keeps direct memory as resident private runs and demotes a run to
+    // shared views when it is aliased; a run pinned by an import would then leave the GPU on
+    // stale pages, so runs are demoted before any import.
+    if (std::uintptr_t residentStart = 0, residentEnd = 0; GuestArena::GuestArenaResidentSpan_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), &residentStart, &residentEnd) && !GuestArena::GuestArenaDemoteResident_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes))) {
+        failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
+        return nullptr;
+    }
     // Drivers pin imported pages, so every page must be committed and accessible.
     bool writable = true;
     bool readOnly = true;
@@ -806,6 +822,13 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            static std::uint64_t inaccessible = 0;
+            static auto lastInaccessibleReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+            ++inaccessible;
+            if (std::chrono::steady_clock::now() - lastInaccessibleReport > std::chrono::seconds(10)) {
+                lastInaccessibleReport = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[gpu] host import refused %llu times so far (page not committed or not accessible), last 0x%llx+0x%llx at 0x%llx: state 0x%lx protection 0x%lx type 0x%lx\n", static_cast<unsigned long long>(inaccessible), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(cursor), info.State, info.Protect, info.Type);
+            }
             failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
             return nullptr;
         }
@@ -818,6 +841,13 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
     if (!writable && readOnly) {
+        static std::uint64_t readOnlyRefusals = 0;
+        static auto lastReadOnlyReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+        ++readOnlyRefusals;
+        if (std::chrono::steady_clock::now() - lastReadOnlyReport > std::chrono::seconds(10)) {
+            lastReadOnlyReport = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[gpu] host import refused %llu times so far (read-only memory), last 0x%llx+0x%llx\n", static_cast<unsigned long long>(readOnlyRefusals), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+        }
         failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
         return nullptr;
     }
@@ -829,10 +859,14 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         }
         try {
             entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
-        } catch (const std::runtime_error&) {
-            // Upstream main's libc keeps single-alias direct memory as resident private runs,
-            // which cannot be aliased in part: a range mixing them with shared views is not
-            // imported and its readers take copies, as for any refused import.
+        } catch (const std::runtime_error& error) {
+            static std::uint64_t refusedAliases = 0;
+            static auto lastAliasReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+            ++refusedAliases;
+            if (std::chrono::steady_clock::now() - lastAliasReport > std::chrono::seconds(10)) {
+                lastAliasReport = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[gpu] host import alias refused %llu times so far, last 0x%llx+0x%llx: %s\n", static_cast<unsigned long long>(refusedAliases), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), error.what());
+            }
             if (entry.ranges.size() == 1 || joined) {
                 failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
                 return nullptr;
@@ -3919,6 +3953,28 @@ bool GuestBufferMemory::HasCopiedWrites() const {
         return true;
     }
     return false;
+}
+
+std::string GuestBufferMemory::DescribeCopiedWrite() const {
+    for (const auto& [begin, end] : writes) {
+        const auto* found = owner(begin, end);
+        if (found == nullptr) continue;
+        const auto& region = *found;
+        if (region.direct != nullptr || (region.gpuCopy && (region.copiedBack || region.deviceLocal)) || (region.mirror != nullptr && !region.mirror->writable)) continue;
+        unsigned long state = 0, protection = 0, type = 0;
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(region.begin), &info, sizeof(info)) != 0) {
+            state = info.State;
+            protection = info.Protect;
+            type = info.Type;
+        }
+#endif
+        char text[400];
+        std::snprintf(text, sizeof(text), "write 0x%llx-0x%llx in region 0x%llx-0x%llx: buffer %d mirror %d hostBacked %d sparse %d sparseHeap %d gpuCopy %d copiedBack %d unstaged %d writable %d; memory state 0x%lx protection 0x%lx type 0x%lx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), region.buffer != nullptr, region.mirror != nullptr, region.hostBacked, region.sparse, region.sparseHeap, region.gpuCopy, region.copiedBack, region.unstaged, region.writable, state, protection, type);
+        return text;
+    }
+    return {};
 }
 
 bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const {

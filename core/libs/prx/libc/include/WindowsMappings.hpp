@@ -239,6 +239,23 @@ public:
         return true;
     }
 
+    // Turns every resident run overlapping the range, whole, back into shared views (Wolverine
+    // stack: the fork's driver imports only shared views, so a run it pinned is never demoted).
+    bool DemoteResident(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        auto first = residentRuns.upper_bound(address);
+        if (first != residentRuns.begin() && std::prev(first)->second.end > address) --first;
+        std::vector<std::uintptr_t> starts;
+        for (auto run = first; run != residentRuns.end() && run->first < address + bytes; ++run) {
+            for (auto page = views.find(run->first); page != views.end() && page->first < run->second.end; ++page) {
+                if (page->second.hostWrites != 0) return false;
+            }
+            starts.push_back(run->first);
+        }
+        for (const auto start : starts) demote(start);
+        return true;
+    }
+
     void ForgetSection(HANDLE section) {
         std::lock_guard lock(mutex);
         const auto key = reinterpret_cast<std::uintptr_t>(section);

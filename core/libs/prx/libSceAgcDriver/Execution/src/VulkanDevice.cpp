@@ -4408,7 +4408,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             kept->WriteBackBuffers();
         });
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
-        if (resources.HasCopiedWrites()) writers->push_back(kept);
+        if (resources.HasCopiedWrites()) {
+            writers->push_back(kept);
+            static std::uint64_t copiedDispatches = 0;
+            static auto lastCopiedReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+            ++copiedDispatches;
+            if (std::chrono::steady_clock::now() - lastCopiedReport > std::chrono::seconds(10)) {
+                lastCopiedReport = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[gpu] dispatches with copied writes: %llu so far; last %s\n", static_cast<unsigned long long>(copiedDispatches), kept->DescribeCopiedWrite().c_str());
+            }
+        }
     }
     recordStep(PhaseRecordCompletion);
 }

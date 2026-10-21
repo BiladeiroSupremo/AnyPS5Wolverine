@@ -237,6 +237,8 @@ public:
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Writes() const { return writes; }
     // Whether any written range lives in a copied buffer, so a write-back must run once the GPU is done.
     bool HasCopiedWrites() const;
+    // The first written region HasCopiedWrites counts, for a profile line ("" when none).
+    std::string DescribeCopiedWrite() const;
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now, and hands staging shadows that equal the import
     // after their copy-backs to the resident registry, where a later build may take them.

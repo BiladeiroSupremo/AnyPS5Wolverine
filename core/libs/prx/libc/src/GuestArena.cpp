@@ -516,6 +516,10 @@ bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t byte
     return WindowsMappings::Get().ResidentSpan(address, bytes, start, end);
 }
 
+bool GuestArenaDemoteResident_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().DemoteResident(address, bytes);
+}
+
 void GuestArenaForgetSection_nid_postfix(void* section) {
     WindowsMappings::Get().ForgetSection(section);
 }

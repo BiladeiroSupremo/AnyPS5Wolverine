@@ -636,7 +636,10 @@ Lease GuestAllocationsAcquire_nid_postfix() {
     if (auto shared = registry().readableLease) return Lease(std::move(shared));
     auto ranges = std::make_shared<Lease::Ranges>();
     for (const auto& [address, range] : registry().ranges) {
-        if (range->readable && range->bytes != 0) ranges->push_back(range);
+        // GPU-only memory (no guest CPU access) is readable by the GPU and by the host: GPU work
+        // reads it through host imports like CPU-readable memory. APS5_NO_GPU_ONLY_IMPORT=1 leaves it out.
+        static const bool gpuOnly = std::getenv("APS5_NO_GPU_ONLY_IMPORT") == nullptr;
+        if ((range->readable || (gpuOnly && range->gpu)) && range->bytes != 0) ranges->push_back(range);
     }
     registry().readableLease = ranges;
     return Lease(std::move(ranges));
