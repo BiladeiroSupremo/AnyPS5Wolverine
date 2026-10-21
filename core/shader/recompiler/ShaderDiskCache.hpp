@@ -54,6 +54,20 @@ void MakeStoredEvictable(std::span<const std::byte> key, CompiledVariant& varian
 void Flush();
 [[nodiscard]] Counters Totals();
 
+// Specialized modules (Recompiler's specializeModule): a prepared module with its specialization
+// constants folded in and optimized again, ~100-200 ms for the large ones, made on the draw path the
+// first time each is used in a session. Stored by content (the caller's key bytes) under
+// <entries>/specialized, so later sessions load them instead.
+struct StoredSpecialization {
+    std::vector<std::uint32_t> spirv;
+    std::vector<std::uint32_t> bindings;
+    bool pushData = false;
+};
+// The entries' content hash (for keys that name large inputs by hash).
+[[nodiscard]] std::uint64_t ContentHash(std::span<const std::byte> bytes, std::uint64_t seed);
+[[nodiscard]] bool LoadSpecialized(std::span<const std::byte> key, StoredSpecialization& module);
+void StoreSpecialized(std::span<const std::byte> key, const StoredSpecialization& module);
+
 }
 
 #endif

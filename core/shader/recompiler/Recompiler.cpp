@@ -690,6 +690,51 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     return module;
 }
 
+// buildSpecializedModule through the disk cache (ShaderDiskCache::LoadSpecialized): the large modules
+// took 100-200 ms each on the draw path the first time they were used in every session (PPSA03671
+// gameplay: ~17 s of skipped-draw stalls per run). APS5_NO_SPECIALIZED_CACHE=1 always builds.
+std::shared_ptr<const SpecializedModule> loadOrBuildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    static const bool disk = std::getenv("APS5_NO_SPECIALIZED_CACHE") == nullptr;
+    if (!disk || !ShaderDiskCache::Enabled()) return buildSpecializedModule(artifact, classes, constants, target);
+    std::vector<std::byte> key;
+    const auto value = [&](std::uint64_t word) {
+        const auto bytes = std::as_bytes(std::span(&word, 1));
+        key.insert(key.end(), bytes.begin(), bytes.end());
+    };
+    const auto words = std::as_bytes(std::span(artifact.spirv.Words()));
+    value(words.size());
+    value(ShaderDiskCache::ContentHash(words, 0x5eed0101ull));
+    value(ShaderDiskCache::ContentHash(words, 0x5eed0102ull));
+    value(artifact.vertexInputPatches.size());
+    for (const auto& patch : artifact.vertexInputPatches) {
+        value(patch.location);
+        value(patch.word);
+        for (const auto word : patch.values) value(word);
+    }
+    value(classes.size());
+    for (const auto kind : classes) value(kind);
+    value(constants.size());
+    for (const auto& constant : constants) value((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
+    value(target.vulkanVersion);
+    value(target.spirvVersion);
+    value(target.nonConstantImageOffsets ? 1u : 0u);
+    ShaderDiskCache::StoredSpecialization stored;
+    if (ShaderDiskCache::LoadSpecialized(key, stored)) {
+        auto module = std::make_shared<SpecializedModule>();
+        module->spirv = std::move(stored.spirv);
+        module->bindings = std::move(stored.bindings);
+        module->pushData = stored.pushData;
+        module->specializationId = constants.empty() ? 0u : nextVariantId();
+        return module;
+    }
+    auto module = buildSpecializedModule(artifact, classes, constants, target);
+    stored.spirv = module->spirv.Words();
+    stored.bindings = module->bindings;
+    stored.pushData = module->pushData;
+    ShaderDiskCache::StoreSpecialized(key, stored);
+    return module;
+}
+
 struct SpecializedModuleEntry {
     std::once_flag ready;
     std::exception_ptr failure;
@@ -813,7 +858,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     }
     std::call_once(entry->ready, [&] {
         try {
-            entry->module = buildSpecializedModule(artifact, classes, constants, target);
+            entry->module = loadOrBuildSpecializedModule(artifact, classes, constants, target);
         } catch (...) {
             entry->failure = std::current_exception();
         }

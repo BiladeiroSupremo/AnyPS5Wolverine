@@ -1070,6 +1070,69 @@ Counters Totals() {
     return store().Totals();
 }
 
+namespace {
+
+constexpr std::uint32_t SpecializedMagic = 0x43505353u;
+
+std::filesystem::path specializedPath(std::span<const std::byte> key) {
+    return EntryDirectory() / "specialized" / EntryName(key);
+}
+
+}
+
+std::uint64_t ContentHash(std::span<const std::byte> bytes, std::uint64_t seed) {
+    return HashBytes(bytes, seed);
+}
+
+bool LoadSpecialized(std::span<const std::byte> key, StoredSpecialization& module) {
+    if (!Enabled()) return false;
+    std::vector<std::byte> file;
+    if (!ReadWholeFile(specializedPath(key), file) || file.size() < sizeof(FileHeader)) return false;
+    FileHeader header;
+    std::memcpy(&header, file.data(), sizeof(header));
+    if (header.magic != SpecializedMagic || header.format != FormatVersion || header.sourceVersion != SourceVersion()) return false;
+    const auto span = std::span<const std::byte>(file);
+    const auto body = file.size() - sizeof(header);
+    if (header.keyBytes > body || header.payloadBytes != body - header.keyBytes) return false;
+    const auto storedKey = span.subspan(sizeof(header), static_cast<std::size_t>(header.keyBytes));
+    const auto stored = span.subspan(sizeof(header) + static_cast<std::size_t>(header.keyBytes));
+    if (!std::equal(storedKey.begin(), storedKey.end(), key.begin(), key.end()) || HashBytes(stored) != header.payloadHash) return false;
+    if (header.rawPayloadBytes == 0 || header.rawPayloadBytes > (1ull << 30)) return false;
+    std::vector<std::byte> payload(static_cast<std::size_t>(header.rawPayloadBytes));
+    const int inflated = stbi_zlib_decode_buffer(reinterpret_cast<char*>(payload.data()), static_cast<int>(payload.size()), reinterpret_cast<const char*>(stored.data()), static_cast<int>(stored.size()));
+    if (inflated < 0 || static_cast<std::uint64_t>(inflated) != header.rawPayloadBytes) return false;
+    Reader reader(payload);
+    StoredSpecialization decoded;
+    reader.Value(decoded.pushData);
+    reader.Values(decoded.bindings);
+    reader.Values(decoded.spirv);
+    if (!reader.Done() || decoded.spirv.size() < 5u) return false;
+    module = std::move(decoded);
+    return true;
+}
+
+void StoreSpecialized(std::span<const std::byte> key, const StoredSpecialization& module) {
+    if (!Enabled()) return;
+    std::vector<std::byte> payload;
+    payload.reserve(module.spirv.size() * sizeof(std::uint32_t) + module.bindings.size() * sizeof(std::uint32_t) + 32u);
+    Writer writer(payload);
+    writer.Value(module.pushData);
+    writer.Values(std::span<const std::uint32_t>(module.bindings));
+    writer.Values(std::span<const std::uint32_t>(module.spirv));
+    int deflatedBytes = 0;
+    unsigned char* deflated = stbi_zlib_compress(reinterpret_cast<unsigned char*>(payload.data()), static_cast<int>(payload.size()), &deflatedBytes, 8);
+    if (deflated == nullptr) return;
+    const std::span<const std::byte> stored(reinterpret_cast<const std::byte*>(deflated), static_cast<std::size_t>(deflatedBytes));
+    const FileHeader header{SpecializedMagic, FormatVersion, SourceVersion(), key.size(), stored.size(), HashBytes(key), HashBytes(stored), payload.size()};
+    std::vector<std::byte> file(sizeof(header) + key.size() + stored.size());
+    std::memcpy(file.data(), &header, sizeof(header));
+    std::memcpy(file.data() + sizeof(header), key.data(), key.size());
+    std::memcpy(file.data() + sizeof(header) + key.size(), stored.data(), stored.size());
+    STBIW_FREE(deflated);
+    static std::atomic<int> failures{0};
+    if (!WriteFileAtomically(specializedPath(key), file) && failures.fetch_add(1, std::memory_order_relaxed) < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", specializedPath(key).string().c_str());
+}
+
 }
 
 namespace ShaderRecompiler {
