@@ -127,8 +127,12 @@ void PipelineCache::save(bool final) {
 }
 
 void PipelineCache::run() {
+    static const int interval = [] {
+        const char* text = std::getenv("APS5_PIPELINE_CACHE_SAVE_S");
+        return text != nullptr && std::atoi(text) > 0 ? std::atoi(text) : SaveIntervalSeconds;
+    }();
     std::unique_lock lock(mutex);
-    while (!wake.wait_for(lock, std::chrono::seconds(SaveIntervalSeconds), [&] { return stopping; })) {
+    while (!wake.wait_for(lock, std::chrono::seconds(interval), [&] { return stopping; })) {
         lock.unlock();
         save(false);
         lock.lock();

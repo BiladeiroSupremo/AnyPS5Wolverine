@@ -126,7 +126,9 @@ void DisplayWindow::UpdateTitle() {
         static std::uint64_t previousFrame = now;
         std::fprintf(frameTimes, "%.6f %.1f\n", static_cast<double>(now - firstFrame) / static_cast<double>(frequency), static_cast<double>(now - previousFrame) * 1e6 / static_cast<double>(frequency));
         previousFrame = now;
-        if (frameNum % 64 == 0) std::fflush(frameTimes);
+        // Every line at once: a watcher reads a stalled file as a frozen game (64 frames were 16 s
+        // at 4 FPS).
+        std::fflush(frameTimes);
     }
     if (now - fpsStart >= frequency * 2) {
         currentFps = static_cast<double>(fpsFrames) * static_cast<double>(frequency) / static_cast<double>(now - fpsStart);

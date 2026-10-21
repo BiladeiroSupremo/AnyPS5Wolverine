@@ -14,6 +14,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <functional>
+#include <map>
+#include <string>
 #include <shared_mutex>
 
 namespace AgcDriver::DriverDetail {
@@ -320,8 +322,31 @@ void Driver::execute(const Submission& submission) {
                     if (profileDraws) {
                         static std::atomic<int> slowSkips{0};
                         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-                        if (ms >= 5.0 && slowSkips.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[draw] slow skip %.1f ms (%s): %.200s\n", ms, DescribeThrownDrawPhases().c_str(), error.what());
+                        if (ms >= 5.0 && slowSkips.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[draw] slow skip %.1f ms at present %llu (%s): %.200s\n", ms, static_cast<unsigned long long>(Graphics::Recorder::Presents()), DescribeThrownDrawPhases().c_str(), error.what());
                         ThrownDrawPhases() = {};
+                        // Per presented frame, the skipped draws by reason when a frame lost 5 or more
+                        // (which frames a missing pass or a black picture came from).
+                        static std::uint64_t framePresent = 0;
+                        static std::map<std::string, std::uint32_t> frameReasons;
+                        static std::atomic<int> framesPrinted{0};
+                        const auto present = Graphics::Recorder::Presents();
+                        if (present != framePresent) {
+                            // Counted: the skips of work still being built in the background (shader
+                            // preparation, specialization, pipeline parts); the steady per-frame ones
+                            // (unsupported states) would print every frame.
+                            std::uint32_t skipped = 0;
+                            for (const auto& [reason, count] : frameReasons) {
+                                if (reason.find("background") != std::string::npos || reason.find("being prepared") != std::string::npos || reason.find("being built") != std::string::npos) skipped += count;
+                            }
+                            if (skipped >= 3 && framesPrinted.fetch_add(1, std::memory_order_relaxed) < 2000) {
+                                std::string text;
+                                for (const auto& [reason, count] : frameReasons) text += " " + std::to_string(count) + "x " + reason + ";";
+                                std::fprintf(stderr, "[draw] present %llu skipped %u draws:%s\n", static_cast<unsigned long long>(framePresent), skipped, text.c_str());
+                            }
+                            frameReasons.clear();
+                            framePresent = present;
+                        }
+                        ++frameReasons[std::string(error.what()).substr(0, 60)];
                     }
                     // A draw that cannot be translated is reported and skipped, so one unsupported
                     // state does not end a title; APS5_STRICT_DRAWS=1 makes it fatal.

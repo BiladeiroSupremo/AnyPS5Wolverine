@@ -13,7 +13,10 @@ namespace AgcDriver::Graphics {
 
 class PipelineCache {
 public:
-    static constexpr int SaveIntervalSeconds = 10;
+    // Between saves while running (APS5_PIPELINE_CACHE_SAVE_S overrides; teardown always saves). A
+    // save serializes the whole cache (330-580 MiB for PPSA03671) twice in memory and writes it out:
+    // every 10 s that was a ~1 GiB RAM spike and tens of MB/s of disk writes during gameplay.
+    static constexpr int SaveIntervalSeconds = 120;
 
     PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties);
     ~PipelineCache();

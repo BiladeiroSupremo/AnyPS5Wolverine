@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
@@ -981,7 +982,7 @@ void runPartJobs(PartBuilds& builds) {
         if (const auto set = builds.pendingShaderSets.find(job->shaderSet); set != builds.pendingShaderSets.end() && set->second == job->hash) builds.pendingShaderSets.erase(set);
         builds.attempted.insert(job->hash);
         ++builds.built;
-        if (!failed && seconds >= 1.0) std::fprintf(stderr, "[pipeline] background shader parts built in %.1f s (%llu built, %zu queued)\n", seconds, static_cast<unsigned long long>(builds.built), builds.jobs.size());
+        if (!failed && seconds >= 0.25) std::fprintf(stderr, "[pipeline] background shader parts built in %.2f s, done at present %llu (%llu built, %zu queued)\n", seconds, static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(builds.built), builds.jobs.size());
     }
 }
 

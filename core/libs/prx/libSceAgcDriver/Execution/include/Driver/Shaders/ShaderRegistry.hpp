@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <array>
+#include <chrono>
 #include <optional>
 #include <span>
 #include <atomic>
@@ -70,6 +71,9 @@ struct PreparedShaders : PreparedShaderState {
     std::exception_ptr failure;
     std::atomic<bool> demanded{false};
     bool pending = false;
+    // When a draw first skipped this shader for its pending preparation (InvocationFor, under
+    // `mutex`): after a bound draws wait for it, so a backed-up queue cannot keep a pass missing.
+    std::chrono::steady_clock::time_point firstSkip{};
 };
 
 struct RegisteredShaderState {

@@ -1084,6 +1084,12 @@ std::uint64_t ContentHash(std::span<const std::byte> bytes, std::uint64_t seed) 
     return HashBytes(bytes, seed);
 }
 
+bool SpecializedStored(std::span<const std::byte> key) {
+    if (!Enabled()) return false;
+    std::error_code error;
+    return std::filesystem::is_regular_file(specializedPath(key), error);
+}
+
 bool LoadSpecialized(std::span<const std::byte> key, StoredSpecialization& module) {
     if (!Enabled()) return false;
     std::vector<std::byte> file;

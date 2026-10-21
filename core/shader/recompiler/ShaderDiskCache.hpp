@@ -66,6 +66,8 @@ struct StoredSpecialization {
 // The entries' content hash (for keys that name large inputs by hash).
 [[nodiscard]] std::uint64_t ContentHash(std::span<const std::byte> bytes, std::uint64_t seed);
 [[nodiscard]] bool LoadSpecialized(std::span<const std::byte> key, StoredSpecialization& module);
+// Whether an entry for the key exists (a cheap probe; LoadSpecialized still verifies it).
+[[nodiscard]] bool SpecializedStored(std::span<const std::byte> key);
 void StoreSpecialized(std::span<const std::byte> key, const StoredSpecialization& module);
 
 }

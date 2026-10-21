@@ -730,10 +730,17 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     // of the queue) instead of waiting for it on the draw path: a newly streamed-in shader held the
     // queue-0 worker ~200 ms per first draw in PPSA03671 gameplay. Dispatches wait as before.
     // APS5_AWAIT_REGISTERED_DRAWS=1 waits for draws too.
+    // A draw still skipped APS5_REGISTERED_SKIP_MS (300) after the first skip waits instead.
     static const bool awaitDraws = std::getenv("APS5_AWAIT_REGISTERED_DRAWS") != nullptr;
+    static const auto skipFor = std::chrono::milliseconds([] { const char* text = std::getenv("APS5_REGISTERED_SKIP_MS"); return text ? std::atoi(text) : 300; }());
     if (deferAtUse && !awaitDraws && snapshot.prepared->pending) {
-        PrioritizeRegistrationPreparation(*snapshot.prepared);
-        throw ShaderNotReady("AGC driver: the shader is still being prepared in the background; the draw is skipped until it is ready");
+        auto& firstSkip = snapshot.prepared->firstSkip;
+        const auto now = std::chrono::steady_clock::now();
+        if (firstSkip == std::chrono::steady_clock::time_point{}) firstSkip = now;
+        if (now - firstSkip < skipFor) {
+            PrioritizeRegistrationPreparation(*snapshot.prepared);
+            throw ShaderNotReady("AGC driver: the shader is still being prepared in the background; the draw is skipped until it is ready");
+        }
     }
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
     for (const auto& entry : snapshot.prepared->entries) {

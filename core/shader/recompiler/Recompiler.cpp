@@ -693,12 +693,14 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     return module;
 }
 
-// buildSpecializedModule through the disk cache (ShaderDiskCache::LoadSpecialized): the large modules
-// took 100-200 ms each on the draw path the first time they were used in every session (PPSA03671
-// gameplay: ~17 s of skipped-draw stalls per run). APS5_NO_SPECIALIZED_CACHE=1 always builds.
-std::shared_ptr<const SpecializedModule> loadOrBuildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+bool SpecializedDiskCache() {
     static const bool disk = std::getenv("APS5_NO_SPECIALIZED_CACHE") == nullptr;
-    if (!disk || !ShaderDiskCache::Enabled()) return buildSpecializedModule(artifact, classes, constants, target);
+    return disk && ShaderDiskCache::Enabled();
+}
+
+// The disk cache key of a specialized module: its content (the module's SPIR-V hash and size, vertex
+// input patches and classes, the constants and the target's SPIR-V options).
+std::vector<std::byte> SpecializedKey(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     std::vector<std::byte> key;
     const auto value = [&](std::uint64_t word) {
         const auto bytes = std::as_bytes(std::span(&word, 1));
@@ -721,6 +723,15 @@ std::shared_ptr<const SpecializedModule> loadOrBuildSpecializedModule(const Comp
     value(target.vulkanVersion);
     value(target.spirvVersion);
     value(target.nonConstantImageOffsets ? 1u : 0u);
+    return key;
+}
+
+// buildSpecializedModule through the disk cache (ShaderDiskCache::LoadSpecialized): the large modules
+// took 100-200 ms each on the draw path the first time they were used in every session (PPSA03671
+// gameplay: ~17 s of skipped-draw stalls per run). APS5_NO_SPECIALIZED_CACHE=1 always builds.
+std::shared_ptr<const SpecializedModule> loadOrBuildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    if (!SpecializedDiskCache()) return buildSpecializedModule(artifact, classes, constants, target);
+    const auto key = SpecializedKey(artifact, classes, constants, target);
     ShaderDiskCache::StoredSpecialization stored;
     if (ShaderDiskCache::LoadSpecialized(key, stored)) {
         auto module = std::make_shared<SpecializedModule>();
@@ -929,7 +940,9 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
 // Builds a prepared module entry: the variant's module specialized for the constants the module key
 // encodes (push data offset, pixel export packing and flags, vertex input selectors), and the plan's
 // bindings selected for it.
-void prepareModuleEntry(PreparedModuleEntry& entry, const PreparedBindingPlan& plan, const CompiledVariant& variant, std::span<const std::uint32_t> moduleKey, bool pixel, const std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources>& vertexClasses, const SpirvTarget& target) {
+// The specialization constants a prepared module entry folds in: the plan's, then those the module
+// key encodes (push data offset, pixel export packing and flags, vertex input selectors).
+std::vector<PipelineSpecializationConstant> specializationConstants(const PreparedBindingPlan& plan, const CompiledVariant& variant, std::span<const std::uint32_t> moduleKey, bool pixel) {
     const auto& artifact = variant.artifact;
     auto constants = plan.bindings.specialization;
     std::size_t index = 0;
@@ -950,6 +963,12 @@ void prepareModuleEntry(PreparedModuleEntry& entry, const PreparedBindingPlan& p
             constants.push_back({first + 5u, kind});
         }
     }
+    return constants;
+}
+
+void prepareModuleEntry(PreparedModuleEntry& entry, const PreparedBindingPlan& plan, const CompiledVariant& variant, std::span<const std::uint32_t> moduleKey, bool pixel, const std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources>& vertexClasses, const SpirvTarget& target) {
+    const auto& artifact = variant.artifact;
+    const auto constants = specializationConstants(plan, variant, moduleKey, pixel);
     const auto module = artifact.registrationModule && plan.bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(artifact, vertexClasses, constants, target); }) : specializeModule(artifact, vertexClasses, constants, target);
     if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
     auto selected = DescriptorBindingBuilder{}.Select(plan.bindings, module->bindings);
@@ -1043,7 +1062,14 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             const auto queuedAt = entry->queuedAt.load(std::memory_order_acquire);
             return queuedAt != 0 && std::chrono::steady_clock::now().time_since_epoch().count() - queuedAt >= std::chrono::duration_cast<std::chrono::steady_clock::duration>(SpecializationWait()).count();
         };
-        if (owner != nullptr && DeferringSpecialization() && !entry->done.load(std::memory_order_acquire) && !overdue()) {
+        // A module the disk cache holds loads here in milliseconds: only one that must be built goes
+        // to the workers (deferring cached ones too skipped ~500 draws of one frame, a black picture,
+        // when new content came into view).
+        const auto onDisk = [&] {
+            if (entry->queued.load(std::memory_order_acquire) || !SpecializedDiskCache()) return false;
+            return ShaderDiskCache::SpecializedStored(SpecializedKey(artifact, vertexClasses, specializationConstants(*plan, variant, moduleKey, pixel), request.target));
+        };
+        if (owner != nullptr && DeferringSpecialization() && !entry->done.load(std::memory_order_acquire) && !overdue() && !onDisk()) {
             if (!entry->queued.exchange(true, std::memory_order_acq_rel)) {
                 entry->queuedAt.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
                 // The worker gets its own copies: the module key is this thread's scratch, and only
