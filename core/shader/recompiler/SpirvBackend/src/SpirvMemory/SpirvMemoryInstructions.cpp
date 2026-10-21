@@ -1380,10 +1380,21 @@ std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
                 return value;
             };
             const auto guard = static_cast<std::uint32_t>(found - guarded.begin());
+            const auto boolean = TypeBool(state);
+            // The summary word after the flags is the same invariant load at every guarded read (the
+            // compiler merges them): the common case, nothing poisoned, then loads no flag at all.
+            const auto summary = load(ConstantU32(state, resources.srtGuardOffset + static_cast<std::uint32_t>(guarded.size())));
+            const auto anyPoisoned = Binary(state, spv::OpINotEqual, boolean, summary, ConstantU32(state, 0u));
+            const auto entryLabel = state.currentLabel;
+            const auto check = state.module.AllocateId();
+            const auto checked = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, checked, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, anyPoisoned, check, checked);
+            EmitLabel(state, check);
             const auto flag = load(ConstantU32(state, resources.srtGuardOffset + guard));
-            const auto poisoned = Binary(state, spv::OpINotEqual, TypeBool(state), flag, ConstantU32(state, 0u));
-            EmitIfCondition(state, poisoned, [&] {
-                const auto records = resources.srtGuardOffset + static_cast<std::uint32_t>(guarded.size());
+            const auto flagged = Binary(state, spv::OpINotEqual, boolean, flag, ConstantU32(state, 0u));
+            EmitIfCondition(state, flagged, [&] {
+                const auto records = resources.srtGuardOffset + static_cast<std::uint32_t>(guarded.size()) + 1u;
                 const auto record = Binary(state, spv::OpIAdd, u32, ConstantU32(state, records), Binary(state, spv::OpIMul, u32, Binary(state, spv::OpISub, u32, flag, ConstantU32(state, 1u)), ConstantU32(state, 3u)));
                 const auto word = [&](std::uint32_t offset) { return load(Binary(state, spv::OpIAdd, u32, record, ConstantU32(state, offset))); };
                 const auto pc = word(0u);
@@ -1391,6 +1402,11 @@ std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
                 const auto high = word(2u);
                 RecordBdaFaultWords(state, low, high, ConstantU32(state, 4u), pc, BdaAbi::FaultReason::Unmapped);
             });
+            const auto checkEnd = state.currentLabel;
+            state.module.AddFunction(spv::OpBranch, checked);
+            EmitLabel(state, checked);
+            const auto poisoned = state.module.AllocateId();
+            state.module.AddFunction(spv::OpPhi, boolean, poisoned, ConstantBool(state, false), entryLabel, flagged, checkEnd);
             StopBdaInvocationIf(state, poisoned);
         }
     }

@@ -677,7 +677,10 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
 void materializeSrtGuards(const IrResourcePlan& plan, ResourceSnapshot& snapshot) {
     const auto& guarded = plan.guardedSrtSlots;
     const auto flags = snapshot.flattenedSrt.size();
-    snapshot.flattenedSrt.resize(flags + guarded.size(), 0u);
+    // The guard flags, then one summary word (any guard poisoned: a shader tests it before loading
+    // its own flag), then the poison records.
+    snapshot.flattenedSrt.resize(flags + guarded.size() + (guarded.empty() ? 0u : 1u), 0u);
+    if (!guarded.empty() && !snapshot.srtPoison.empty()) snapshot.flattenedSrt[flags + guarded.size()] = 1u;
     for (std::uint32_t record = 0u; record < snapshot.srtPoison.size(); ++record) {
         const auto& poison = snapshot.srtPoison[record];
         const auto found = std::lower_bound(guarded.begin(), guarded.end(), poison.slot);

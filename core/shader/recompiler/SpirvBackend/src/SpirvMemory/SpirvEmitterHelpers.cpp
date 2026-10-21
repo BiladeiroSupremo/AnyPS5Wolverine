@@ -8,6 +8,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -381,6 +382,17 @@ void DefineOutputs(SpirvEmitterState& state) {
     }
 }
 
+// A buffer the driver fills for the dispatch or draw (the SRT copy, the BDA page table): shaders
+// only read it and no other binding aliases it, so the compiler may hoist and merge its loads
+// (the guarded-slot checks reload the same flag words). APS5_NO_READONLY_DRIVER_BUFFERS=1 drops
+// the decorations.
+static void ReadOnlyDriverBuffer(SpirvEmitterState& state, std::uint32_t variable) {
+    static const bool disabled = std::getenv("APS5_NO_READONLY_DRIVER_BUFFERS") != nullptr;
+    if (disabled) return;
+    state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+    state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationRestrict);
+}
+
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
@@ -421,6 +433,7 @@ void DefineDescriptors(SpirvEmitterState& state) {
             break;
         case DescriptorBindingKind::BdaPagetable:
             state.bdaPagetableVariable = Define(StorageBufferBlockType(state), "bda_pagetable");
+            ReadOnlyDriverBuffer(state, state.bdaPagetableVariable);
             break;
         case DescriptorBindingKind::FaultBuffer:
             state.faultBufferVariable = Define(StorageBufferBlockType(state), "fault_buffer");
@@ -430,6 +443,7 @@ void DefineDescriptors(SpirvEmitterState& state) {
             break;
         case DescriptorBindingKind::FlattenedSrt:
             state.flattenedSrtVariable = Define(StorageBufferBlockType(state), "flattened_srt");
+            ReadOnlyDriverBuffer(state, state.flattenedSrtVariable);
             break;
         case DescriptorBindingKind::Samplers:
             state.samplerVariable = Define(ArrayType(state.module.Type(spv::OpTypeSampler)), "samplers", spv::StorageClassUniformConstant);

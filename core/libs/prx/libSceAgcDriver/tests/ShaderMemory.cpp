@@ -3402,14 +3402,16 @@ bool GuardRecords(const ShaderRecompiler::ResourceCapture& capture) {
     const auto& poison = capture.snapshot.srtPoison;
     const auto flags = plan.srtReads.size();
     const auto guards = plan.guardedSrtSlots.size();
-    if (flat.size() != flags + guards + 3u * poison.size()) return false;
+    const auto summary = guards == 0 ? std::size_t{0} : std::size_t{1};
+    if (flat.size() != flags + guards + summary + 3u * poison.size()) return false;
     for (std::size_t guard = 0; guard < guards; ++guard) {
         const auto record = std::find_if(poison.begin(), poison.end(), [&](const ShaderRecompiler::SrtReadPoison& entry) { return entry.slot == plan.guardedSrtSlots[guard]; });
         const auto expected = record == poison.end() ? 0u : static_cast<std::uint32_t>(record - poison.begin()) + 1u;
         if (flat[flags + guard] != expected) return false;
     }
+    if (summary != 0 && flat[flags + guards] != (poison.empty() ? 0u : 1u)) return false;
     for (std::size_t record = 0; record < poison.size(); ++record) {
-        const auto* words = flat.data() + flags + guards + 3u * record;
+        const auto* words = flat.data() + flags + guards + summary + 3u * record;
         if (words[0] != poison[record].pc || words[1] != static_cast<std::uint32_t>(poison[record].address) || words[2] != static_cast<std::uint32_t>(poison[record].address >> 32u) || flat.at(poison[record].slot) != 0u) return false;
     }
     return true;
