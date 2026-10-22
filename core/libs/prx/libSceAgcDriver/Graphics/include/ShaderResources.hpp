@@ -139,6 +139,11 @@ public:
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            // A moved buffer larger than a snapshot is read in place instead: the host import's
+            // buffer at this offset (buffer is null then).
+            VkBuffer inPlace = VK_NULL_HANDLE;
+            VkDeviceSize inPlaceOffset = 0;
+            VkDeviceSize inPlaceBytes = 0;
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation fragmentAllocation;

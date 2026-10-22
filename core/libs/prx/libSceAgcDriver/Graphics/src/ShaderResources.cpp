@@ -3643,7 +3643,7 @@ namespace {
 enum BindingSection : std::size_t { BindingSelect, BindingCollect, BindingReuse, BindingCreate, BindingAllocate, BindingUpdate, BindingKeep, BindingSectionCount };
 constexpr const char* BindingSectionNames[BindingSectionCount] = {"select", "collect", "reuse-lookup", "create+copy", "allocate", "update", "keep"};
 std::atomic<std::uint64_t> bindingSectionNs[BindingSectionCount]{};
-std::atomic<std::uint64_t> bindingCalls{0}, bindingSnapshots{0}, bindingReused{0}, bindingCreated{0}, bindingEmpty{0};
+std::atomic<std::uint64_t> bindingCalls{0}, bindingSnapshots{0}, bindingReused{0}, bindingCreated{0}, bindingEmpty{0}, bindingCreatedBytes{0}, bindingCreatedLarge{0}, bindingInPlace{0};
 std::atomic<std::int64_t> bindingReportNs{0};
 bool BindingsProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3669,7 +3669,9 @@ struct BindingSplit {
         }
         if (now - previous < 10'000'000'000ll || !bindingReportNs.compare_exchange_strong(previous, now)) return;
         char line[640];
-        int n = std::snprintf(line, sizeof(line), "[bindings] %llu calls (10 s; %llu without snapshots), snapshots %llu (reused %llu, created %llu), us per call:", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(bindingEmpty.exchange(0)), static_cast<unsigned long long>(bindingSnapshots.exchange(0)), static_cast<unsigned long long>(bindingReused.exchange(0)), static_cast<unsigned long long>(bindingCreated.exchange(0)));
+        const auto created = bindingCreated.exchange(0);
+        const auto createdBytes = bindingCreatedBytes.exchange(0);
+        int n = std::snprintf(line, sizeof(line), "[bindings] %llu calls (10 s; %llu without snapshots), snapshots %llu (reused %llu, created %llu: avg %.1f KiB, %llu over 16 KiB; %llu large moved buffers read in place), us per call:", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(bindingEmpty.exchange(0)), static_cast<unsigned long long>(bindingSnapshots.exchange(0)), static_cast<unsigned long long>(bindingReused.exchange(0)), static_cast<unsigned long long>(created), created != 0 ? static_cast<double>(createdBytes) / 1024.0 / static_cast<double>(created) : 0.0, static_cast<unsigned long long>(bindingCreatedLarge.exchange(0)), static_cast<unsigned long long>(bindingInPlace.exchange(0)));
         for (std::size_t i = 0; i < BindingSectionCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
             const auto ns = bindingSectionNs[i].exchange(0, std::memory_order_relaxed);
             n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.1f", BindingSectionNames[i], static_cast<double>(ns) / 1000.0 / static_cast<double>(calls));
@@ -3719,6 +3721,18 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
         if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        // A moved buffer over the snapshot limit is read in place, as an unmoved one is (PPSA03671:
+        // ~650 moved buffers of ~14 MiB per 10 s, ~1 GiB/s of copies on the committer).
+        // APS5_SNAPSHOT_LARGE_MOVED=1 copies them as before.
+        static const bool copyLargeMoved = std::getenv("APS5_SNAPSHOT_LARGE_MOVED") != nullptr;
+        if (override != moved.end() && bytes > maxSnapshotBytes && !copyLargeMoved) {
+            if (const auto* import = InPlaceDrawInput(context, begin, bytes, context.limits.minStorageBufferOffsetAlignment)) {
+                selected.push_back(index);
+                result->snapshots.push_back({begin, nullptr, import->buffer, begin - import->base, bytes});
+                if (split.on) bindingInPlace.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+        }
         split.mark(BindingSelect);
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
@@ -3730,7 +3744,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
-            if (split.on) bindingCreated.fetch_add(1, std::memory_order_relaxed);
+            if (split.on) {
+                bindingCreated.fetch_add(1, std::memory_order_relaxed);
+                bindingCreatedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                if (bytes > 16384) bindingCreatedLarge.fetch_add(1, std::memory_order_relaxed);
+            }
         } else if (split.on) {
             bindingReused.fetch_add(1, std::memory_order_relaxed);
         }
@@ -3773,13 +3791,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];
-            buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+            buffers[offset + element] = snapshot.buffer != nullptr ? VkDescriptorBufferInfo{snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()} : VkDescriptorBufferInfo{snapshot.inPlace, snapshot.inPlaceOffset, snapshot.inPlaceBytes};
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     split.mark(BindingUpdate);
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    for (const auto& snapshot : result->snapshots) {
+        if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    }
     split.mark(BindingKeep);
     return result;
 }
