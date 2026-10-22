@@ -346,6 +346,19 @@ void testIndirectDraw() {
     records = {3, 2, 7, 9, 11, 0, 0, 0, 0, 0};
     const auto indexedRecord = AgcDriver::Pm4::ReadDrawArguments(*AgcDriver::Pm4::ResolveDraw(makePacket(0x25, {0, 0x8c, 0x280, 0}), state).indirect, 0);
     check(indexedRecord.count == 3 && indexedRecord.instances == 2 && indexedRecord.firstVertexOrIndex == 7 && indexedRecord.vertexOffset == 9 && indexedRecord.firstInstance == 11, "indexed record layout mismatch");
+    const auto unsized = [&] {
+        auto draw = AgcDriver::Pm4::ResolveDraw(makePacket(0x25, {0, 0x8c, 0x280, 0}), state);
+        draw.indirect->unsizedIndices = true;
+        draw.indexCount = 0;
+        return draw;
+    };
+    records = {3, 2, 4, 9, 11, 0, 0, 0, 0, 0};
+    auto bounded = unsized();
+    AgcDriver::Pm4::BoundUnsizedIndices(bounded);
+    check(bounded.indexCount == 7 && bounded.indexAddress == state.indexBase, "an unsized indexed indirect draw was not bounded by its record");
+    records = {0, 2, 4, 9, 11, 0, 0, 0, 0, 0};
+    auto empty = unsized();
+    expectFailure([&] { AgcDriver::Pm4::BoundUnsizedIndices(empty); }, "draw no indices");
     alignas(4) std::uint32_t countValue = 2;
     const auto counted = AgcDriver::Pm4::ResolveDraw(makePacket(0x2c, {0, 0x280, 0x280, 0x280 | (1u << 30u), 5, low(&countValue), high(&countValue), 16, 2}), state);
     check(counted.indirect->countIndirect && counted.indirect->count == 5 && counted.indirect->countAddress == reinterpret_cast<std::uintptr_t>(&countValue) && AgcDriver::Pm4::ReadDrawCount(*counted.indirect) == 2, "indirect draw count mismatch");

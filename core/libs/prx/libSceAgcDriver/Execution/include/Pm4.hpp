@@ -54,6 +54,9 @@ struct DrawParameters {
         std::int32_t baseVertexSgpr = -1;
         std::int32_t startInstanceSgpr = -1;
         std::int32_t drawIndexSgpr = -1;
+        // An indexed draw issued with INDEX_BUFFER_SIZE unset: indexCount stays 0 until
+        // BoundUnsizedIndices sizes the index range from the records.
+        bool unsizedIndices = false;
         // Bytes of the record range: (count - 1) * stride + recordBytes, or 0 for no records.
         std::uint64_t RangeBytes() const { return count == 0 ? 0 : static_cast<std::uint64_t>(count - 1) * stride + recordBytes; }
         std::uint32_t VertexDwordOffset() const { return recordBytes == 20 ? 12u : 8u; }
@@ -75,6 +78,10 @@ struct DrawArguments {
 // path (which waits for recorded GPU work that writes them).
 DrawArguments ReadDrawArguments(const DrawParameters::IndirectDraw& indirect, std::uint32_t record);
 std::uint32_t ReadDrawCount(const DrawParameters::IndirectDraw& indirect);
+// Sizes an unsized indexed indirect draw's index range to the records' furthest firstIndex +
+// indexCount (each record draws its own count unclamped, as without INDEX_BUFFER_SIZE nothing clamps
+// it). Throws when the records draw no indices.
+void BoundUnsizedIndices(DrawParameters& draw);
 inline bool IndirectDrawOpcode(std::uint32_t opcode) { return opcode == 0x24 || opcode == 0x25 || opcode == 0x2c || opcode == 0x38; }
 inline bool DrawOpcode(std::uint32_t opcode) { return opcode == 0x27 || opcode == 0x2d || opcode == 0x35 || IndirectDrawOpcode(opcode); }
 

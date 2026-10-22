@@ -635,8 +635,23 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
 
 void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, const std::vector<TableResolution>& tables) {
     for (std::uint32_t i = 0u; i < plan.info.buffers.size(); ++i) {
-        const auto decoded = decodeBufferDescriptor(snapshot.buffers.at(i));
-        if (decoded.Type() != 0u) throw std::runtime_error("buffer descriptor uses an unsupported type");
+        auto& value = snapshot.buffers.at(i);
+        const auto decoded = decodeBufferDescriptor(value);
+        if (decoded.Type() != 0u) {
+            // APS5_NULL_TYPED_BUFFERS=1 binds such a descriptor as a null buffer (all words 0: reads
+            // 0, writes dropped), as Kyty does, instead of skipping the draw. The first 20 skips name
+            // the words, to tell an image descriptor or garbage from a buffer.
+            static const bool nullTyped = std::getenv("APS5_NULL_TYPED_BUFFERS") != nullptr;
+            if (nullTyped) {
+                std::fill(value.dwords.begin(), value.dwords.begin() + 4, 0u);
+                continue;
+            }
+            static std::atomic<int> described{0};
+            if (described.fetch_add(1, std::memory_order_relaxed) >= 20) throw std::runtime_error("buffer descriptor uses an unsupported type");
+            char text[160];
+            std::snprintf(text, sizeof(text), "buffer descriptor uses an unsupported type (buffer %u V# %08x %08x %08x %08x)", i, value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3]);
+            throw std::runtime_error(text);
+        }
         if (plan.stage != IrShaderStage::Compute && decoded.AddTid()) throw std::runtime_error("buffer ADD_TID is only valid for compute shaders");
     }
     if (snapshot.flattenedSrt.size() != plan.srtReads.size()) throw std::runtime_error("runtime SRT size differs from the static interface");

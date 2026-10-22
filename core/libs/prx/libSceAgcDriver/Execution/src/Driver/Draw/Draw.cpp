@@ -45,6 +45,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return DrawVerdict::Drawn;
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
+    if (drawParameters.indirect && drawParameters.indirect->unsizedIndices) {
+        recordQueuedLabelsBeforeRead(submission.queue);
+        Pm4::BoundUnsizedIndices(drawParameters);
+        static std::atomic<std::uint64_t> unsizedDraws{0};
+        if (const auto drawn = unsizedDraws.fetch_add(1, std::memory_order_relaxed); drawn < 4 || (drawn & (drawn + 1)) == 0) std::fprintf(stderr, "[draw] indexed indirect draw without INDEX_BUFFER_SIZE drawn with the records' %u indices (%llu so far)\n", drawParameters.indexCount, static_cast<unsigned long long>(drawn + 1));
+    }
     bool traceIndirect = false;
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
     phaseTiming.Phase(DrawRowPrecheck);

@@ -745,6 +745,18 @@ DrawParameters resolveIndirectDraw(std::span<const std::uint32_t> packet, const 
         // The CP clamps firstIndex + indexCount to INDEX_BUFFER_SIZE: the declared range is the
         // hardware's view of the index buffer, so that is what gets bound.
         const auto indexSize = indexSizeOf(queue);
+        // APS5_UNSIZED_INDEX_DRAWS=1: without INDEX_BUFFER_SIZE the records' own counts are drawn
+        // (Driver sizes the range from them), as Kyty does; by default such draws are skipped.
+        // PPSA03671 gameplay issues ~8k of them per run (35620 indices each); the one run with them
+        // drawn lost the device ~275 s in (GPU page fault), the run before did not (2026-10-22).
+        static const bool unsized = std::getenv("APS5_UNSIZED_INDEX_DRAWS") != nullptr;
+        if (queue.indexBufferSize == 0 && unsized) {
+            indirect.unsizedIndices = true;
+            draw.indexAddress = queue.indexBase;
+            draw.indexSize = indexSize;
+            draw.indirect = indirect;
+            return draw;
+        }
         require(queue.indexBufferSize != 0, "INDEX_BUFFER_SIZE has not been set");
         const auto bytes = static_cast<std::uint64_t>(queue.indexBufferSize) * indexSize;
         require(bytes <= std::numeric_limits<std::size_t>::max() && bytes <= std::numeric_limits<std::uint64_t>::max() - queue.indexBase, "index range size overflow");
@@ -775,6 +787,24 @@ std::uint32_t ReadDrawCount(const DrawParameters::IndirectDraw& indirect) {
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::IndirectArguments);
     GuestMemory::Read(indirect.countAddress, std::as_writable_bytes(std::span(&count, 1)), 4);
     return count;
+}
+
+void BoundUnsizedIndices(DrawParameters& draw) {
+    require(draw.indirect && draw.indirect->unsizedIndices, "the draw has a sized index range");
+    const auto& indirect = *draw.indirect;
+    const auto count = std::min(indirect.countIndirect ? ReadDrawCount(indirect) : indirect.count, indirect.count);
+    std::uint64_t end = 0;
+    for (std::uint32_t record = 0; record < count; ++record) {
+        const auto arguments = ReadDrawArguments(indirect, record);
+        if (arguments.count == 0 || arguments.instances == 0) continue;
+        end = std::max(end, static_cast<std::uint64_t>(arguments.firstVertexOrIndex) + arguments.count);
+    }
+    require(end != 0, "INDEX_BUFFER_SIZE has not been set and the records draw no indices");
+    require(end <= std::numeric_limits<std::uint32_t>::max(), "unsized index range overflow");
+    const auto bytes = end * draw.indexSize;
+    require(bytes <= std::numeric_limits<std::size_t>::max() && bytes <= std::numeric_limits<std::uint64_t>::max() - draw.indexAddress, "index range size overflow");
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(bytes), draw.indexSize);
+    draw.indexCount = static_cast<std::uint32_t>(end);
 }
 
 DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueState& queue) {
