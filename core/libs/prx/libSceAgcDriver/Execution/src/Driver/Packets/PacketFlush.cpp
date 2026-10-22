@@ -51,9 +51,13 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         return;
     }
     if (reap) lastReapTry = now;
-    // Labels recorded or work submitted now must come after the pipelined draws queued before this
-    // packet (APS5_PIPELINED_DRAWS).
-    if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Flush, (header >> 8u) & 0xffu);
+    // With pipelined draws queued (APS5_PIPELINED_DRAWS): labels recorded now must come after them,
+    // so they drain first; a submit (a pending label's, the batch cap's) is left to the committer,
+    // whose commits submit both (Driver::commitDraw); a reap records nothing and goes ahead.
+    if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) {
+        if (record) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Flush, (header >> 8u) & 0xffu);
+        else if (!reap) return;
+    }
     static const bool profileParts = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct FlushParts {
         double lockMs = 0, recordMs = 0, submitMs = 0, reapMs = 0;

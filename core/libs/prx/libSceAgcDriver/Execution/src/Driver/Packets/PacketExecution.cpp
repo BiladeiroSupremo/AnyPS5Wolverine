@@ -169,7 +169,22 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
-        if (pipelined && (!keepsDrawPipeline(packet, header, opcode) || (Pm4::Predicated(header) && queue.predication.operation != 0)) && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0x100u : opcode);
+        if (pipelined && DrawPipeline::Queue0().Busy()) {
+            // A label behind queued draws is stored by the committer after them (commitLabelPacket);
+            // APS5_NO_PIPELINED_LABELS=1 waits for the draws and stores it here instead.
+            static const bool labelItems = std::getenv("APS5_NO_PIPELINED_LABELS") == nullptr;
+            if (labelItems && !Pm4::Predicated(header) && labelCommitItem(packet)) {
+                const auto label = Pm4::DecodeLabelWrite(packet);
+                std::vector<DrawPipeline::Range> writes{{label->address, label->address + label->Bytes().size()}};
+                const auto labelQueue = submission.queue;
+                DrawPipeline::Queue0().Enqueue([this, labelQueue, words = std::vector<std::uint32_t>(packet.begin(), packet.end())] { commitLabelPacket(labelQueue, words); }, std::move(writes));
+                cursor = nextCursor;
+                continue;
+            }
+            // A predicated packet reads its predicate first: queued draws that may write it go first.
+            const bool predicateQueued = Pm4::Predicated(header) && queue.predication.operation != 0 && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4);
+            if (!keepsDrawPipeline(packet, header, opcode) || predicateQueued) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0x100u : opcode);
+        }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");

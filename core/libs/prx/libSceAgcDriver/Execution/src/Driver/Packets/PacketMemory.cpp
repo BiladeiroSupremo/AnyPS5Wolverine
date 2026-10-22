@@ -16,6 +16,45 @@
 
 namespace AgcDriver::DriverDetail {
 
+// A label packet (RELEASE_MEM 0x49 or WRITE_DATA 0x37 storing a label) that queue 0 hands to the draw
+// committer while pipelined draws are queued (APS5_PIPELINED_DRAWS), instead of waiting for them:
+// commitLabelPacket stores it after them, as preparePacketMemory stores an immediate label.
+bool Driver::labelCommitItem(std::span<const std::uint32_t> packet) {
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    if (opcode != 0x49 && opcode != 0x37) return false;
+    const auto label = Pm4::DecodeLabelWrite(packet);
+    return label.has_value() && !label->Bytes().empty();
+}
+
+void Driver::commitLabelPacket(std::uint32_t queue, std::span<const std::uint32_t> packet) {
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    GuestMemory::SetCurrentPacket(opcode, queue);
+    const auto interruptSelect = opcode == 0x49 ? (packet[2] >> 24u) & 7u : 0u;
+    const bool endOfPipeInterrupt = interruptSelect != 0 && interruptSelect != 3;
+    bool interruptDeferred = false;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        const auto localDevice = device.Load();
+        const auto label = Pm4::DecodeLabelWrite(packet);
+        require(label.has_value(), "a label commit item has no label");
+        const auto bytes = label->Bytes();
+        const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+        const auto stamp = ++eventSerial;
+        const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, queue) : 4;
+        if (reason != 0 && reason != 5) GuestMemory::Write(label->address, bytes, 4);
+        noteLabelStore(label->address, bytes, stamp, queue);
+        Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+        countLabelOutcome(reason);
+        ++immediateLabels;
+        if (endOfPipeInterrupt && localDevice != nullptr && (reason == 0 || reason == 5)) {
+            interruptDeferred = localDevice->AfterRecordedWork([queue] { AgcDriverDeliverEopInterrupt(queue); }, queue == 0);
+            if (interruptDeferred && workOpen) localDevice->SubmitRecorded(queue == 0);
+        }
+    }
+    if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(queue);
+}
+
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

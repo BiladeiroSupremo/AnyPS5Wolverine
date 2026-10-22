@@ -47,15 +47,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return DrawVerdict::Drawn;
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
-    // APS5_PIPELINED_DRAWS: direct draws are recorded by the committer behind this worker (see the
-    // end of this function); everything recorded inline, or that reads memory queued draws may write
-    // (an indirect draw's records), waits for the queued ones first.
+    // APS5_PIPELINED_DRAWS: draws are recorded by the committer behind this worker (see the end of
+    // this function); everything recorded inline, or that reads memory queued draws may write (the
+    // records of a CPU-path indirect draw), waits for the queued ones first.
     const bool pipelined = DrawPipeline::Active();
     const auto drainPipeline = [&](DrawPipeline::DrainReason reason) {
         if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(reason, (packet[0] >> 8u) & 0xffu);
     };
-    if (drawParameters.indirect) drainPipeline(DrawPipeline::DrainReason::Indirect);
     if (drawParameters.indirect && drawParameters.indirect->unsizedIndices) {
+        drainPipeline(DrawPipeline::DrainReason::Indirect);
         recordQueuedLabelsBeforeRead(submission.queue);
         Pm4::BoundUnsizedIndices(drawParameters);
         static std::atomic<std::uint64_t> unsizedDraws{0};
@@ -360,7 +360,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
-
+        // The records are read here, after what queued draws write.
+        drainPipeline(DrawPipeline::DrainReason::Indirect);
         const auto indirect = *drawParameters.indirect;
         // The records patch the results below: each stage's (a cached variant's or a shared
         // materialized one) is copied into `results` first.
@@ -457,7 +458,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // The commit owns everything the recording reads: the stages' results, the snapshots and the
     // regions and pages they point into. With labels deferred on this worker the draw stays inline
     // (they would be recorded after it).
-    if (pipelined && !drawParameters.indirect && deferredLabels().labels.empty()) {
+    // GPU-side indirect draws too: their records are read by the GPU, or by Graphics::Draw on the
+    // committer, after everything before them.
+    if (pipelined && deferredLabels().labels.empty()) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
         const auto commitQueue = submission.queue;
@@ -511,6 +514,8 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         std::shared_ptr<const DrawRecipe> built;
         localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
         if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+        // The batch cap's submit, which the worker leaves to the committer while draws are queued.
+        if (batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap()) localDevice->SubmitRecorded(queue == 0);
     } catch (const std::exception& error) {
         static const bool strictDraws = std::getenv("APS5_STRICT_DRAWS") != nullptr;
         if (strictDraws) throw;
