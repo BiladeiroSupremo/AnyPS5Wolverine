@@ -2,6 +2,7 @@
 #include "Translation/TranslationContext.hpp"
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -136,7 +137,12 @@ void TranslationContext::emitFloatCompare(const RdnaInstruction& inst, IrOpcode 
             emitCompareResult(inst, floatCompareWithConstant(oriented, IrU32(lhsConstant.has_value() ? *rhsBits : *lhsBits), lhsConstant.has_value() ? *lhsConstant : *rhsConstant), false, cmpx);
             return;
         }
-        if ((f32DenormalFlush & 1u) == 0u) {
+        // Denormals kept by the guest while the host may flush them: compare the bits. With the
+        // module's native flush (nativeF32Flush, guest mode 0) the host compare flushes its inputs
+        // as the guest's does, and no flag is left here to say so. APS5_NO_NATIVE_F32_COMPARES=1
+        // compares the bits there too.
+        static const bool nativeCompares = std::getenv("APS5_NO_NATIVE_F32_COMPARES") == nullptr;
+        if ((f32DenormalFlush & 1u) == 0u && !(nativeF32Flush && nativeCompares)) {
             emitCompareResult(inst, floatCompareKeepingDenormals(opcode, IrU32(*lhsBits), IrU32(*rhsBits)), false, cmpx);
             return;
         }
