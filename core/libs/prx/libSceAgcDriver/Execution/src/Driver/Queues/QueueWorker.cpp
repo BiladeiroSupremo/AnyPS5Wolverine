@@ -258,7 +258,11 @@ void Driver::run(std::uint32_t id) noexcept {
                 pending.pop_front();
                 if (APS5_ENABLE_TIMING_LOG) submission.dequeuedAt = std::chrono::steady_clock::now();
                 if (id == 0) queue0Executing = submission.suspend ? 0 : submission.received;
-                if (submission.waitFree) {
+                // APS5_NO_QUEUE0_ORDER=1 starts another queue's wait-free submission at once instead of
+                // after queue 0's earlier ones (the order was for PPSA21564's unlabelled video refills;
+                // PPSA03671's async compute held ~78 ms per frame by it, trace 2026-10-22).
+                static const bool unordered = std::getenv("APS5_NO_QUEUE0_ORDER") != nullptr;
+                if (submission.waitFree && !unordered) {
                     orderHolders.fetch_add(1, std::memory_order_acq_rel);
                     const auto released = [&] { return failure || stopping || orderReleased(id, submission.received); };
                     while (!released()) poll(released);
