@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -45,6 +47,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return DrawVerdict::Drawn;
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
+    // APS5_PIPELINED_DRAWS: direct draws are recorded by the committer behind this worker (see the
+    // end of this function); everything recorded inline, or that reads memory queued draws may write
+    // (an indirect draw's records), waits for the queued ones first.
+    const bool pipelined = DrawPipeline::Active();
+    const auto drainPipeline = [&](DrawPipeline::DrainReason reason) {
+        if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(reason, (packet[0] >> 8u) & 0xffu);
+    };
+    if (drawParameters.indirect) drainPipeline(DrawPipeline::DrainReason::Indirect);
     if (drawParameters.indirect && drawParameters.indirect->unsizedIndices) {
         recordQueuedLabelsBeforeRead(submission.queue);
         Pm4::BoundUnsizedIndices(drawParameters);
@@ -207,7 +217,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
     }
-    ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    // Heap-owned, so a pipelined draw's commit owns the capture's pages (memory's regions point there).
+    auto shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     std::vector<ShaderRecompiler::RecompileResult> results;
     // Materialized stages, shared with the capture (not copied); `results` holds the derived and
     // patched ones. `stages` points into both, so neither grows past its reservation.
@@ -271,7 +282,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     break;
                 }
             }
-            heldResults.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+            heldResults.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
             if (!rejected.empty()) return DrawVerdict::Rejected;
             programResults[i] = heldResults.back().get();
         }
@@ -332,6 +343,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         if (gpuLock.owns_lock()) return;
+        drainPipeline(DrawPipeline::DrainReason::Packet);
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
@@ -403,7 +415,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 auto& result = results[resultIndex[programIndex]];
                 const auto pushBytes = result.pushConstants.size();
                 decodeVertexInfo(programIndex);
-                result = *materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
+                result = *materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
             }
@@ -441,6 +453,26 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return DrawVerdict::Rejected;
         }
     }
+    // A pipelined direct draw: the committer records it (commitDraw) after the draws queued before it.
+    // The commit owns everything the recording reads: the stages' results, the snapshots and the
+    // regions and pages they point into. With labels deferred on this worker the draw stays inline
+    // (they would be recorded after it).
+    if (pipelined && !drawParameters.indirect && deferredLabels().labels.empty()) {
+        phaseTiming.Phase(DrawRowVectors);
+        auto writes = drawWriteRanges(graphics, stages);
+        const auto commitQueue = submission.queue;
+        const auto commitPacket = (packet[0] >> 8u) & 0xffu;
+        const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), entry = std::move(entry), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory)] {
+            DrawPipeline::FollowEpoch(epoch);
+            commitDraw(localDevice, commitQueue, commitPacket, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
+        };
+        auto held = std::make_shared<decltype(commit)>(std::move(commit));
+        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+        phaseTiming.Phase(DrawRowLockWait);
+        timing.Mark("draw_enqueued");
+        return drawn();
+    }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
@@ -459,6 +491,31 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
     return drawn();
+}
+
+// A pipelined draw's recording, on the committer. A draw that cannot be recorded is reported and
+// skipped as an inline one is (PacketExecution); APS5_STRICT_DRAWS=1 makes it fatal, which stops
+// the pipeline.
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, std::uint32_t packetOpcode, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
+    GuestMemory::SetCurrentPacket(packetOpcode, queue);
+    try {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+        recordLabelsForPacket(localDevice.get(), queue);
+        noteDrawWriters(stages, queue);
+        if (recipe != nullptr) {
+            if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) return;
+            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+        }
+        std::shared_ptr<const DrawRecipe> built;
+        localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+        if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    } catch (const std::exception& error) {
+        static const bool strictDraws = std::getenv("APS5_STRICT_DRAWS") != nullptr;
+        if (strictDraws) throw;
+        reportSkip("draw", error.what());
+    }
 }
 
 }

@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -72,6 +74,11 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     if (live != nullptr) live->clear();
     const bool masked = live != nullptr && !variant.dataPositions.empty();
     const DataMask mask{variant.dataPositions, live};
+    // Runs that a pipelined draw queued on this worker may write are compared after it is recorded.
+    if (DrawPipeline::Active()) {
+        auto& pipeline = DrawPipeline::Queue0();
+        if (pipeline.Busy() && std::any_of(variant.runs.begin(), variant.runs.end(), [&](const auto& run) { return pipeline.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+    }
     PendingView pending;
     pending.Load();
     if (!syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling)) return EntryOutcome::Differing;

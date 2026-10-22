@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -50,6 +51,9 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         return;
     }
     if (reap) lastReapTry = now;
+    // Labels recorded or work submitted now must come after the pipelined draws queued before this
+    // packet (APS5_PIPELINED_DRAWS).
+    if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Flush, (header >> 8u) & 0xffu);
     static const bool profileParts = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct FlushParts {
         double lockMs = 0, recordMs = 0, submitMs = 0, reapMs = 0;

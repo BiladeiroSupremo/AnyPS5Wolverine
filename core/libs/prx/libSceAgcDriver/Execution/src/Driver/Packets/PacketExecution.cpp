@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -19,6 +20,30 @@
 #include <shared_mutex>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// The packets queue 0 executes with pipelined draws still queued (APS5_PIPELINED_DRAWS): draws (an
+// indirect one drains in draw()), the register, constant-RAM and draw-state packets (the indirect
+// register loads 0x63/0x64/0x9f take lists read at submission), and the events this driver executes
+// as nothing (0x42, 0x46 but the sample dump 0x39, 0x58, 0x59). None reads or writes guest memory or
+// records GPU work. Every other packet waits for the queued draws first. Upstream's list also keeps
+// fills, DMA, labels and satisfied waits, which need its ordered commit items.
+bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
+    if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
+    if (Pm4::DrawOpcode(opcode)) return true;
+    switch (opcode) {
+        case 0x11: case 0x12: case 0x13: case 0x26: case 0x2a: case 0x2f: case 0x3f: case 0x42: case 0x58: case 0x59: case 0x63: case 0x64: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: case 0x9f: return true;
+        case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
+        case 0x10: {
+            const auto operation = (header >> 2u) & 0x3fu;
+            return operation == 0 || operation == 0x09 || operation == 0x0b || operation == 0x0c || operation == 0x1a;
+        }
+        default: return false;
+    }
+}
+
+}
 
 template <typename TWork>
 void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
@@ -46,7 +71,23 @@ void Driver::execute(const Submission& submission) {
         }
         ~FlipHold() { Release(); }
     } flipHold{*this, submission.holdsFlip};
+    // APS5_PIPELINED_DRAWS: queue 0's worker hands its direct draws to the committer
+    // (DrawPipeline); a submission ends with them recorded, so its completion and everything after it
+    // see their work (also when a packet throws).
+    const bool pipelined = submission.queue == 0 && DrawPipeline::Depth() != 0;
+    DrawPipeline::Active() = pipelined;
+    struct PipelineDrain {
+        bool on;
+        ~PipelineDrain() {
+            if (!on || !DrawPipeline::Queue0().Busy()) return;
+            try {
+                DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+            } catch (...) {
+            }
+        }
+    } pipelineDrain{pipelined};
     if (submission.suspend) {
+        if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
         PerformanceContext timingContext(submissionTiming);
         PerformanceTimer timing("Driver.Suspend");
 
@@ -128,6 +169,7 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        if (pipelined && (!keepsDrawPipeline(packet, header, opcode) || (Pm4::Predicated(header) && queue.predication.operation != 0)) && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0x100u : opcode);
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
@@ -380,6 +422,7 @@ void Driver::execute(const Submission& submission) {
         else timing.Finish();
         cursor = nextCursor;
     }
+    if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
