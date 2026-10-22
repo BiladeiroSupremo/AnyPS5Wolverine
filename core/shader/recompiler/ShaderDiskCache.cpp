@@ -24,13 +24,16 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <type_traits>
+#include <unordered_map>
 
 // Entries are deflated with stb's zlib codec: SPIR-V shrinks about 3x, and a cache version runs to gigabytes.
 #define STB_IMAGE_STATIC
@@ -1061,9 +1064,14 @@ void MakeStoredEvictable(std::span<const std::byte> key, CompiledVariant& varian
     if (instance.Enabled()) instance.MakeStoredEvictable(key, variant);
 }
 
+namespace {
+void flushSpecialized();
+}
+
 void Flush() {
     auto& instance = store();
     if (instance.Enabled()) instance.Flush();
+    flushSpecialized();
 }
 
 Counters Totals() {
@@ -1074,8 +1082,203 @@ namespace {
 
 constexpr std::uint32_t SpecializedMagic = 0x43505353u;
 
+std::filesystem::path specializedDirectory() {
+    return EntryDirectory() / "specialized";
+}
+
 std::filesystem::path specializedPath(std::span<const std::byte> key) {
-    return EntryDirectory() / "specialized" / EntryName(key);
+    return specializedDirectory() / EntryName(key);
+}
+
+std::size_t specializedEntryCap() {
+    static const std::size_t cap = [] {
+        const char* text = std::getenv("APS5_SPECIALIZED_DISK_CACHE_ENTRIES");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return value != 0 ? static_cast<std::size_t>(value) : std::size_t{65536};
+    }();
+    return cap;
+}
+
+std::uint64_t specializedByteCap() {
+    static const std::uint64_t cap = [] {
+        const char* text = std::getenv("APS5_SPECIALIZED_DISK_CACHE_MAX_MIB");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return (value != 0 ? value : 2048ull) << 20u;
+    }();
+    return cap;
+}
+
+// The specialized entries under <entries>/specialized: an index in use order (least recent first,
+// rebuilt from the files' write times at first use, a hit stamps its file), a background writer that
+// compresses and writes new entries off the thread that built them, and eviction of the least recently
+// used entries past APS5_SPECIALIZED_DISK_CACHE_ENTRIES (65536) or APS5_SPECIALIZED_DISK_CACHE_MAX_MIB
+// (2048), which grew without a bound before.
+class SpecializedStore {
+public:
+    void Hit(const std::string& name) {
+        std::lock_guard lock(mutex);
+        scan();
+        ++hits;
+        if (const auto found = index.find(name); found != index.end()) entries.splice(entries.end(), entries, found->second);
+        std::error_code error;
+        std::filesystem::last_write_time(directory / name, std::filesystem::file_time_type::clock::now(), error);
+        report();
+    }
+
+    void Miss() {
+        std::lock_guard lock(mutex);
+        ++misses;
+        report();
+    }
+
+    void Enqueue(std::string name, std::vector<std::byte> payload, std::vector<std::byte> key) {
+        {
+            std::lock_guard lock(mutex);
+            scan();
+            if (!started) {
+                started = true;
+                std::thread([this] { run(); }).detach();
+            }
+            jobs.push_back({std::move(name), std::move(payload), std::move(key)});
+        }
+        wake.notify_one();
+    }
+
+    void Flush() {
+        std::unique_lock lock(mutex);
+        idle.wait(lock, [&] { return jobs.empty() && !writing; });
+    }
+
+private:
+    struct Entry {
+        std::string name;
+        std::uint64_t bytes = 0;
+    };
+    struct Job {
+        std::string name;
+        std::vector<std::byte> payload;
+        std::vector<std::byte> key;
+    };
+
+    void scan() {
+        if (scanned) return;
+        scanned = true;
+        directory = specializedDirectory();
+        std::vector<std::tuple<std::filesystem::file_time_type, std::string, std::uint64_t>> found;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
+            std::error_code fileError;
+            if (!it->is_regular_file(fileError)) continue;
+            const auto name = it->path().filename().string();
+            const auto time = it->last_write_time(fileError);
+            // A write cut off by the process exiting; another process's write in flight is younger.
+            if (name.find(".tmp.") != std::string::npos) {
+                if (!fileError && std::filesystem::file_time_type::clock::now() - time > std::chrono::minutes(10)) std::filesystem::remove(it->path(), fileError);
+                continue;
+            }
+            const auto size = it->file_size(fileError);
+            if (!fileError) found.emplace_back(time, name, size);
+        }
+        std::sort(found.begin(), found.end());
+        for (auto& [time, name, size] : found) add(std::move(name), size);
+        evict();
+    }
+
+    void add(std::string name, std::uint64_t bytes) {
+        if (const auto found = index.find(name); found != index.end()) {
+            totalBytes -= found->second->bytes;
+            entries.erase(found->second);
+            index.erase(found);
+        }
+        totalBytes += bytes;
+        entries.push_back({name, bytes});
+        index.emplace(std::move(name), std::prev(entries.end()));
+    }
+
+    void evict() {
+        while (!entries.empty() && (entries.size() > specializedEntryCap() || totalBytes > specializedByteCap())) {
+            const auto victim = entries.front();
+            std::error_code error;
+            std::filesystem::remove(directory / victim.name, error);
+            index.erase(victim.name);
+            entries.pop_front();
+            totalBytes -= victim.bytes;
+            ++evictions;
+        }
+    }
+
+    void run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            wake.wait(lock, [&] { return !jobs.empty(); });
+            auto job = std::move(jobs.front());
+            jobs.pop_front();
+            writing = true;
+            lock.unlock();
+            int deflatedBytes = 0;
+            unsigned char* deflated = stbi_zlib_compress(reinterpret_cast<unsigned char*>(job.payload.data()), static_cast<int>(job.payload.size()), &deflatedBytes, 8);
+            bool written = false;
+            std::uint64_t fileBytes = 0;
+            if (deflated != nullptr) {
+                const std::span<const std::byte> stored(reinterpret_cast<const std::byte*>(deflated), static_cast<std::size_t>(deflatedBytes));
+                const FileHeader header{SpecializedMagic, FormatVersion, SourceVersion(), job.key.size(), stored.size(), HashBytes(job.key), HashBytes(stored), job.payload.size()};
+                std::vector<std::byte> file(sizeof(header) + job.key.size() + stored.size());
+                std::memcpy(file.data(), &header, sizeof(header));
+                std::memcpy(file.data() + sizeof(header), job.key.data(), job.key.size());
+                std::memcpy(file.data() + sizeof(header) + job.key.size(), stored.data(), stored.size());
+                STBIW_FREE(deflated);
+                written = WriteFileAtomically(directory / job.name, file);
+                fileBytes = file.size();
+            }
+            lock.lock();
+            writing = false;
+            if (written) {
+                ++writes;
+                add(job.name, fileBytes);
+                evict();
+            } else if (writeFailures++ < 4) {
+                std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / job.name).string().c_str());
+            }
+            report();
+            if (jobs.empty()) idle.notify_all();
+        }
+    }
+
+    // One line per 10 s with activity: this interval's hits, misses, writes and evictions, and the
+    // entries held against the caps.
+    void report() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport < std::chrono::seconds(10)) return;
+        lastReport = now;
+        if (hits == 0 && misses == 0 && writes == 0 && evictions == 0) return;
+        std::fprintf(stderr, "[shader-disk-cache] specialized (10 s): %llu hits, %llu misses, %llu writes, %llu evicted; %zu entries (%.1f MiB) of %zu / %llu MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), static_cast<unsigned long long>(writes), static_cast<unsigned long long>(evictions), entries.size(), static_cast<double>(totalBytes) / 1048576.0, specializedEntryCap(), static_cast<unsigned long long>(specializedByteCap() >> 20u));
+        hits = misses = writes = evictions = 0;
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable idle;
+    std::deque<Job> jobs;
+    bool started = false;
+    bool writing = false;
+    bool scanned = false;
+    std::filesystem::path directory;
+    std::list<Entry> entries;
+    std::unordered_map<std::string, std::list<Entry>::iterator> index;
+    std::uint64_t totalBytes = 0;
+    std::uint64_t hits = 0, misses = 0, writes = 0, evictions = 0, writeFailures = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+SpecializedStore& specializedStore() {
+    static auto* instance = new SpecializedStore();
+    return *instance;
+}
+
+bool loadSpecialized(std::span<const std::byte> key, StoredSpecialization& module);
+
+void flushSpecialized() {
+    if (Enabled()) specializedStore().Flush();
 }
 
 }
@@ -1092,6 +1295,26 @@ bool SpecializedStored(std::span<const std::byte> key) {
 
 bool LoadSpecialized(std::span<const std::byte> key, StoredSpecialization& module) {
     if (!Enabled()) return false;
+    const bool loaded = loadSpecialized(key, module);
+    if (loaded) specializedStore().Hit(EntryName(key));
+    else specializedStore().Miss();
+    return loaded;
+}
+
+void StoreSpecialized(std::span<const std::byte> key, const StoredSpecialization& module) {
+    if (!Enabled()) return;
+    std::vector<std::byte> payload;
+    payload.reserve(module.spirv.size() * sizeof(std::uint32_t) + module.bindings.size() * sizeof(std::uint32_t) + 32u);
+    Writer writer(payload);
+    writer.Value(module.pushData);
+    writer.Values(std::span<const std::uint32_t>(module.bindings));
+    writer.Values(std::span<const std::uint32_t>(module.spirv));
+    specializedStore().Enqueue(EntryName(key), std::move(payload), std::vector<std::byte>(key.begin(), key.end()));
+}
+
+namespace {
+
+bool loadSpecialized(std::span<const std::byte> key, StoredSpecialization& module) {
     std::vector<std::byte> file;
     if (!ReadWholeFile(specializedPath(key), file) || file.size() < sizeof(FileHeader)) return false;
     FileHeader header;
@@ -1117,26 +1340,6 @@ bool LoadSpecialized(std::span<const std::byte> key, StoredSpecialization& modul
     return true;
 }
 
-void StoreSpecialized(std::span<const std::byte> key, const StoredSpecialization& module) {
-    if (!Enabled()) return;
-    std::vector<std::byte> payload;
-    payload.reserve(module.spirv.size() * sizeof(std::uint32_t) + module.bindings.size() * sizeof(std::uint32_t) + 32u);
-    Writer writer(payload);
-    writer.Value(module.pushData);
-    writer.Values(std::span<const std::uint32_t>(module.bindings));
-    writer.Values(std::span<const std::uint32_t>(module.spirv));
-    int deflatedBytes = 0;
-    unsigned char* deflated = stbi_zlib_compress(reinterpret_cast<unsigned char*>(payload.data()), static_cast<int>(payload.size()), &deflatedBytes, 8);
-    if (deflated == nullptr) return;
-    const std::span<const std::byte> stored(reinterpret_cast<const std::byte*>(deflated), static_cast<std::size_t>(deflatedBytes));
-    const FileHeader header{SpecializedMagic, FormatVersion, SourceVersion(), key.size(), stored.size(), HashBytes(key), HashBytes(stored), payload.size()};
-    std::vector<std::byte> file(sizeof(header) + key.size() + stored.size());
-    std::memcpy(file.data(), &header, sizeof(header));
-    std::memcpy(file.data() + sizeof(header), key.data(), key.size());
-    std::memcpy(file.data() + sizeof(header) + key.size(), stored.data(), stored.size());
-    STBIW_FREE(deflated);
-    static std::atomic<int> failures{0};
-    if (!WriteFileAtomically(specializedPath(key), file) && failures.fetch_add(1, std::memory_order_relaxed) < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", specializedPath(key).string().c_str());
 }
 
 }

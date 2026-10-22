@@ -68,6 +68,9 @@ struct StoredSpecialization {
 [[nodiscard]] bool LoadSpecialized(std::span<const std::byte> key, StoredSpecialization& module);
 // Whether an entry for the key exists (a cheap probe; LoadSpecialized still verifies it).
 [[nodiscard]] bool SpecializedStored(std::span<const std::byte> key);
+// Queues the entry for the background writer (compressed and written there; the least recently used
+// entries go past APS5_SPECIALIZED_DISK_CACHE_ENTRIES / APS5_SPECIALIZED_DISK_CACHE_MAX_MIB).
+// Flush also waits for these writes.
 void StoreSpecialized(std::span<const std::byte> key, const StoredSpecialization& module);
 
 }

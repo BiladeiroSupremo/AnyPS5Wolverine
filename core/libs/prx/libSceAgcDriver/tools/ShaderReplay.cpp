@@ -8,6 +8,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Recompiler.hpp"
+#include "ShaderDiskCache.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -238,5 +239,6 @@ int main(int argc, char** argv) {
             ++failures;
         }
     }
+    ShaderRecompiler::ShaderDiskCache::Flush();
     return failures == 0 ? 0 : 1;
 }
