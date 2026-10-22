@@ -1262,6 +1262,7 @@ private:
             return;
         }
         IndexMemoryUsers();
+        std::vector<IrValue*> droppedStores;
         for (auto& block : m_program.Blocks()) {
             for (IrValue* inst : block->Instructions()) {
                 const auto imageInfo = ImageOpcodeInfoOf(inst->Opcode());
@@ -1289,7 +1290,15 @@ private:
                     constexpr SrtWalker walker;
                     if (walker.ValidateRuntimeValue(m_program.Resources(), plan.key)) continue;
                 }
-                // A store through a table would mark every bound slot pending write-back.
+                // A store through a table would mark every bound slot pending write-back. Diagnostic:
+                // APS5_DROP_TABLE_STORES=1 drops a plain write instead, so the draw renders without it
+                // (PPSA03671's 0x11d1e5b500 / 0x11d1e59a00 paint into heap[per-wave key]; their ~35
+                // draws a frame then smear rainbow streaks over explosions, so they stay rejected).
+                static const bool dropStores = std::getenv("APS5_DROP_TABLE_STORES") != nullptr;
+                if (imageInfo.resourceClass == ImageResourceClass::Storage && imageInfo.access == ImageAccess::Write && inst->Type() == IrType::Void && dropStores) {
+                    droppedStores.push_back(inst);
+                    continue;
+                }
                 if (imageInfo.resourceClass == ImageResourceClass::Storage) {
                     ResourceMaterializer::CountBindlessRejection(BindlessRejection::Storage);
                     fail("bindless storage image tables are unsupported");
@@ -1299,6 +1308,11 @@ private:
                 }
             }
         }
+        for (IrValue* inst : droppedStores) {
+            inst->Invalidate();
+            inst->Parent()->RemoveInstruction(inst);
+        }
+        if (!droppedStores.empty()) std::fprintf(stderr, "[bindless] dropped %zu image stores through a non-uniform storage table\n", droppedStores.size());
         m_memoryUsersIndexed = false;
         m_memoryUsers.clear();
     }
