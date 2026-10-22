@@ -140,6 +140,11 @@ private:
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
+    // APS5_PREPARE_AHEAD (DrawAhead.hpp): a draw packet on the pipelined queue-0 worker, taken from a
+    // task prepared ahead when one is ready, and the windows of such tasks.
+    DrawVerdict drawAhead(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, std::size_t cursor);
+    void startDrawWindow(const QueueState& queue, const Submission& submission, std::size_t from);
+    void finishDrawWindow();
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();

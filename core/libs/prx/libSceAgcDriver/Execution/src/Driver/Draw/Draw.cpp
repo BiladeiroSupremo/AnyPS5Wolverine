@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -50,8 +51,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // APS5_PIPELINED_DRAWS: draws are recorded by the committer behind this worker (see the end of
     // this function); everything recorded inline, or that reads memory queued draws may write (the
     // records of a CPU-path indirect draw), waits for the queued ones first.
-    const bool pipelined = DrawPipeline::Active();
+    // Prepared ahead on a pool thread (APS5_PREPARE_AHEAD, DrawAhead.hpp): the draw ends in its task
+    // instead of the committer, and any path that would wait for queued draws or record here gives
+    // it back to the worker (DrawAheadSerial).
+    auto* const ahead = CurrentDrawAhead();
+    const bool pipelined = DrawPipeline::Active() || ahead != nullptr;
     const auto drainPipeline = [&](DrawPipeline::DrainReason reason) {
+        if (ahead != nullptr) throw DrawAheadSerial{};
         if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(reason, (packet[0] >> 8u) & 0xffu);
     };
     if (drawParameters.indirect && drawParameters.indirect->unsizedIndices) {
@@ -344,6 +350,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto lockForDraw = [&] {
         if (gpuLock.owns_lock()) return;
         drainPipeline(DrawPipeline::DrainReason::Packet);
+        if (DrawWindowWrites() != nullptr) DrawWindowInvalidated() = true;
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
@@ -463,6 +470,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (pipelined && deferredLabels().labels.empty()) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
+        // The guest memory this draw's preparation read (its captures, the decode's reads).
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+        if (ahead != nullptr) {
+            reads.reserve(memory.size());
+            for (const auto& region : memory) reads.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+        }
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
@@ -471,6 +484,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             commitDraw(localDevice, commitQueue, commitPacket, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
+        if (ahead != nullptr) {
+            ahead->commit = [held] { (*held)(); };
+            ahead->writes = std::move(writes);
+            ahead->reads = std::move(reads);
+            return drawn();
+        }
+        if (auto* windowWrites = DrawWindowWrites()) windowWrites->insert(windowWrites->end(), writes.begin(), writes.end());
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");

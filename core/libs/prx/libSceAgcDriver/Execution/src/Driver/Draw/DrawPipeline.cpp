@@ -258,6 +258,13 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     return std::nullopt;
 }
 
+std::vector<DrawPipeline::Range> DrawPipeline::QueuedWrites() {
+    std::vector<Range> ranges;
+    std::lock_guard lock(mutex);
+    for (const auto& item : items) ranges.insert(ranges.end(), item.writes.begin(), item.writes.end());
+    return ranges;
+}
+
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     std::lock_guard lock(mutex);

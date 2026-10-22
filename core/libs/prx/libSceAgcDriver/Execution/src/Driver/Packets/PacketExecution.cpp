@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -79,7 +80,10 @@ void Driver::execute(const Submission& submission) {
     struct PipelineDrain {
         bool on;
         ~PipelineDrain() {
-            if (!on || !DrawPipeline::Queue0().Busy()) return;
+            if (!on) return;
+            // Draws prepared ahead read this submission's packets: none outlives it.
+            Driver::Get().finishDrawWindow();
+            if (!DrawPipeline::Queue0().Busy()) return;
             try {
                 DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
             } catch (...) {
@@ -169,18 +173,20 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        // A label behind queued draws, or inside a window of draws prepared ahead (DrawAhead.hpp), is
+        // stored by the committer after them (commitLabelPacket); APS5_NO_PIPELINED_LABELS=1 waits for
+        // the draws and stores it here instead.
+        static const bool labelItems = std::getenv("APS5_NO_PIPELINED_LABELS") == nullptr;
+        if (pipelined && labelItems && (DrawPipeline::Queue0().Busy() || DrawWindowWrites() != nullptr) && !Pm4::Predicated(header) && labelCommitItem(packet)) {
+            const auto label = Pm4::DecodeLabelWrite(packet);
+            std::vector<DrawPipeline::Range> writes{{label->address, label->address + label->Bytes().size()}};
+            if (auto* windowWrites = DrawWindowWrites()) windowWrites->insert(windowWrites->end(), writes.begin(), writes.end());
+            const auto labelQueue = submission.queue;
+            DrawPipeline::Queue0().Enqueue([this, labelQueue, words = std::vector<std::uint32_t>(packet.begin(), packet.end())] { commitLabelPacket(labelQueue, words); }, std::move(writes));
+            cursor = nextCursor;
+            continue;
+        }
         if (pipelined && DrawPipeline::Queue0().Busy()) {
-            // A label behind queued draws is stored by the committer after them (commitLabelPacket);
-            // APS5_NO_PIPELINED_LABELS=1 waits for the draws and stores it here instead.
-            static const bool labelItems = std::getenv("APS5_NO_PIPELINED_LABELS") == nullptr;
-            if (labelItems && !Pm4::Predicated(header) && labelCommitItem(packet)) {
-                const auto label = Pm4::DecodeLabelWrite(packet);
-                std::vector<DrawPipeline::Range> writes{{label->address, label->address + label->Bytes().size()}};
-                const auto labelQueue = submission.queue;
-                DrawPipeline::Queue0().Enqueue([this, labelQueue, words = std::vector<std::uint32_t>(packet.begin(), packet.end())] { commitLabelPacket(labelQueue, words); }, std::move(writes));
-                cursor = nextCursor;
-                continue;
-            }
             // A predicated packet reads its predicate first: queued draws that may write it go first.
             const bool predicateQueued = Pm4::Predicated(header) && queue.predication.operation != 0 && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4);
             if (!keepsDrawPipeline(packet, header, opcode) || predicateQueued) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0x100u : opcode);
@@ -361,7 +367,7 @@ void Driver::execute(const Submission& submission) {
 
                 try {
                     std::string rejected;
-                    const auto verdict = draw(queue, packet, submission, rejected);
+                    const auto verdict = pipelined && DrawAheadThreads() != 0 ? drawAhead(queue, packet, submission, rejected, cursor) : draw(queue, packet, submission, rejected);
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
@@ -437,7 +443,10 @@ void Driver::execute(const Submission& submission) {
         else timing.Finish();
         cursor = nextCursor;
     }
-    if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    if (pipelined) {
+        finishDrawWindow();
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    }
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
@@ -458,6 +467,164 @@ void Driver::execute(const Submission& submission) {
     }
     endTiming.Finish();
     if (submission.rewindTail != nullptr) executeRewindTail(submission);
+}
+
+namespace {
+
+// The queue-0 worker's window of draws prepared ahead (APS5_PREPARE_AHEAD, DrawAhead.hpp): the tasks
+// by packet offset, and the ranges the draws queued before or enqueued since their captures may write.
+struct DrawWindow {
+    const Submission* submission = nullptr;
+    std::map<std::size_t, std::shared_ptr<DrawAheadTask>> tasks;
+    std::vector<DrawPipeline::Range> writes;
+    std::uint64_t windows = 0, prepared = 0, used = 0, serial = 0, overlapped = 0, invalidated = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+DrawWindow& drawWindow() {
+    static thread_local DrawWindow window;
+    return window;
+}
+
+bool overlapsAny(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, const std::vector<DrawPipeline::Range>& writes) {
+    for (const auto& [begin, end] : reads) {
+        for (const auto& [first, limit] : writes) {
+            if (begin < limit && first < end) return true;
+        }
+    }
+    return false;
+}
+
+}
+
+void Driver::finishDrawWindow() {
+    auto& window = drawWindow();
+    for (auto& [cursor, task] : window.tasks) task->ready.wait();
+    window.tasks.clear();
+    window.writes.clear();
+    window.submission = nullptr;
+    DrawWindowWrites() = nullptr;
+    DrawWindowInvalidated() = false;
+}
+
+void Driver::startDrawWindow(const QueueState& live, const Submission& submission, std::size_t from) {
+    static const std::size_t maxDraws = [] {
+        const char* text = std::getenv("APS5_PREPARE_AHEAD_DRAWS");
+        return text != nullptr ? std::max<std::size_t>(1, std::strtoull(text, nullptr, 10)) : std::max<std::size_t>(1, DrawAheadThreads() * 4);
+    }();
+    // Captures read memory after the waits this worker deferred and before labels it would record.
+    if (DrawAheadThreads() == 0 || !deferredLabels().labels.empty() || !pendingWaits().empty()) return;
+    auto& window = drawWindow();
+    QueueState scratch = live;
+    scratch.markers.clear();
+    const auto& commands = submission.commands;
+    std::size_t launched = 0;
+    for (std::size_t cursor = from; cursor < commands.size() && launched < maxDraws;) {
+        const auto header = commands[cursor];
+        if (Pm4::FillerPacket(header)) {
+            ++cursor;
+            continue;
+        }
+        const auto count = Pm4::PacketWords(header);
+        if (cursor + count > commands.size()) break;
+        const auto packet = std::span(commands).subspan(cursor, count);
+        const auto opcode = (header >> 8u) & 0xffu;
+        // A label the worker will hand to the committer (in the window it always does) changes no state.
+        static const bool labelItems = std::getenv("APS5_NO_PIPELINED_LABELS") == nullptr;
+        if (labelItems && (opcode == 0x49 || opcode == 0x37) && !Pm4::Predicated(header) && labelCommitItem(packet)) {
+            cursor += count;
+            continue;
+        }
+        if (!keepsDrawPipeline(packet, header, opcode) || (Pm4::Predicated(header) && scratch.predication.operation != 0)) break;
+        if (Pm4::DrawOpcode(opcode)) {
+            if (Pm4::IndirectDrawOpcode(opcode)) break;
+            if (window.tasks.empty()) {
+                window.submission = &submission;
+                window.writes = DrawPipeline::Queue0().QueuedWrites();
+                DrawWindowWrites() = &window.writes;
+                DrawWindowInvalidated() = false;
+                ++window.windows;
+            }
+            auto task = std::make_shared<DrawAheadTask>();
+            task->state = scratch;
+            task->packet = packet;
+            task->ready = task->done.get_future().share();
+            window.tasks.emplace(cursor, task);
+            ++launched;
+            ++window.prepared;
+            RunDrawAhead([this, task, prepared = &submission] {
+                CurrentDrawAhead() = task.get();
+                GuestMemory::SetCurrentPacket((task->packet[0] >> 8u) & 0xffu, prepared->queue);
+                try {
+                    std::string rejected;
+                    task->verdict = draw(task->state, task->packet, *prepared, rejected);
+                    task->rejected = std::move(rejected);
+                } catch (const DrawAheadSerial&) {
+                    task->serial = true;
+                } catch (const std::exception& error) {
+                    task->error = error.what();
+                } catch (...) {
+                    task->serial = true;
+                }
+                CurrentDrawAhead() = nullptr;
+                task->done.set_value();
+            });
+        } else if (opcode != 0x3f && opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
+            // The same state the worker's own execution of the packet leaves.
+            try {
+                if (Pm4::IndirectRegisterOpcode(opcode)) Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(cursor), scratch);
+                else Pm4::Execute(packet, scratch);
+            } catch (const std::exception&) {
+                break;
+            }
+        }
+        cursor += count;
+    }
+}
+
+DrawVerdict Driver::drawAhead(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, std::size_t cursor) {
+    auto& window = drawWindow();
+    if (window.submission != nullptr && window.submission != &submission) finishDrawWindow();
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile && std::chrono::steady_clock::now() - window.reported > std::chrono::seconds(10)) {
+        window.reported = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[draw-ahead] (10 s) %llu windows, %llu draws prepared ahead: %llu used, %llu given back, %llu read what an earlier draw writes, %llu after an inline draw\n", static_cast<unsigned long long>(window.windows), static_cast<unsigned long long>(window.prepared), static_cast<unsigned long long>(window.used), static_cast<unsigned long long>(window.serial), static_cast<unsigned long long>(window.overlapped), static_cast<unsigned long long>(window.invalidated));
+        window.windows = window.prepared = window.used = window.serial = window.overlapped = window.invalidated = 0;
+    }
+    if (const auto found = window.tasks.find(cursor); found != window.tasks.end()) {
+        const auto task = found->second;
+        window.tasks.erase(found);
+        task->ready.wait();
+        bool usable = true;
+        if (task->serial) {
+            usable = false;
+            ++window.serial;
+        } else if (DrawWindowInvalidated()) {
+            usable = false;
+            ++window.invalidated;
+        } else if (task->commit && overlapsAny(task->reads, window.writes)) {
+            usable = false;
+            ++window.overlapped;
+        }
+        if (usable) {
+            ++window.used;
+            if (window.tasks.empty()) finishDrawWindow();
+            if (task->error) throw std::runtime_error(*task->error);
+            if (task->commit) {
+                if (DrawWindowWrites() != nullptr) window.writes.insert(window.writes.end(), task->writes.begin(), task->writes.end());
+                DrawPipeline::Queue0().Enqueue(std::move(task->commit), std::move(task->writes));
+            }
+            rejected = std::move(task->rejected);
+            if (window.tasks.empty()) startDrawWindow(queue, submission, cursor + packet.size());
+            return task->verdict;
+        }
+    }
+    const auto verdict = draw(queue, packet, submission, rejected);
+    if (window.tasks.empty()) {
+        finishDrawWindow();
+        startDrawWindow(queue, submission, cursor + packet.size());
+    }
+    return verdict;
 }
 
 }

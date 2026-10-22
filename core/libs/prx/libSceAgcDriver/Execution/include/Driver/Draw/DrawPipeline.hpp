@@ -39,6 +39,8 @@ public:
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
+    // The write ranges of every item still queued (DrawAhead: a window's tasks capture before them).
+    std::vector<Range> QueuedWrites();
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
     static bool HeldReads(std::uint64_t address, std::size_t bytes);
     void ReleaseRunningReads();
