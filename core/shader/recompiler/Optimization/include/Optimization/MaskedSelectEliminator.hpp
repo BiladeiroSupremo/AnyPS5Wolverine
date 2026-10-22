@@ -11,6 +11,10 @@ struct MaskedSelectEliminationStats {
     std::uint64_t steps = 0;
 };
 
+// Whether an instruction of this opcode only reads its own lane's operands and has no side effects
+// (no cross-lane, derivative or memory access), so where it runs does not change its result.
+[[nodiscard]] bool IsLaneLocalOpcode(IrOpcode opcode);
+
 class MaskedSelectEliminator {
 public:
     [[nodiscard]] MaskedSelectEliminationStats Eliminate(IrProgram& program) const;

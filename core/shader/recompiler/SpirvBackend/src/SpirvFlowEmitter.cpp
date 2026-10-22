@@ -2,6 +2,8 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
+#include "Optimization/MaskedSelectEliminator.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -9,7 +11,10 @@
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace ShaderRecompiler {
 namespace {
@@ -718,10 +723,173 @@ void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionSta
     EmitDirectInstruction(ctx, inst);
 }
 
+// Lane regions (APS5_LANE_REGIONS=1): a guest vector write under a partial exec mask is translated
+// as "active ? new : old" (a select on the lane's exec bit), and the host compiler keeps both
+// values live and merges them with v_cndmask, writes upon writes; PPSA03671's large compute
+// programs compile to ~3x the instructions and VGPRs they would with every lane active. Here the
+// selects of a block that share one condition are emitted as one per-lane if: the lane-local
+// instructions that only feed their "new" side run inside it, and each select becomes a phi of
+// its new value (taken) and its old value (skipped), which the host compiles to exec masking.
+struct LaneRegion {
+    const IrValue* condition = nullptr;
+    std::vector<const IrValue*> selects;
+    std::vector<const IrValue*> sunk;
+};
+
+struct LaneRegionPlan {
+    std::unordered_map<const IrValue*, std::size_t> regionOf;
+    std::vector<LaneRegion> regions;
+};
+
+bool LaneRegionsEnabled() {
+    static const bool enabled = std::getenv("APS5_LANE_REGIONS") != nullptr;
+    return enabled;
+}
+
+bool IsRegionSelect(const IrValue& inst) {
+    const auto opcode = inst.Opcode();
+    if (opcode != IrOpcode::SelectU1 && opcode != IrOpcode::SelectU32 && opcode != IrOpcode::SelectF32) return false;
+    return inst.ArgumentCount() == 3u && !inst.Argument(0)->Resolve()->HasImmediate();
+}
+
+const std::vector<std::pair<const IrValue*, std::size_t>>& UsersOf(const IrProgram& program, StructuredFunctionState& functionState, const IrValue* value) {
+    if (!functionState.usersBuilt) {
+        functionState.usersBuilt = true;
+        for (const IrBlock* block : program.BlockOrder()) {
+            if (block == nullptr) continue;
+            for (const IrValue* inst : block->Instructions()) {
+                if (inst->IsIdentity()) continue;
+                for (std::size_t index = 0; index < inst->ArgumentCount(); ++index) {
+                    if (const IrValue* argument = inst->Argument(index); argument != nullptr) functionState.users[argument->Resolve()].emplace_back(inst, index);
+                }
+            }
+        }
+    }
+    static const std::vector<std::pair<const IrValue*, std::size_t>> none;
+    const auto found = functionState.users.find(value);
+    return found == functionState.users.end() ? none : found->second;
+}
+
+LaneRegionPlan PlanLaneRegions(const IrProgram& program, StructuredFunctionState& functionState, const IrBlock* block) {
+    LaneRegionPlan plan;
+    std::vector<const IrValue*> order;
+    std::unordered_map<const IrValue*, std::size_t> position;
+    std::vector<const IrValue*> conditions;
+    std::unordered_map<const IrValue*, std::vector<const IrValue*>> groups;
+    for (const IrValue* inst : block->Instructions()) {
+        position.emplace(inst, order.size());
+        order.push_back(inst);
+        if (!IsRegionSelect(*inst)) continue;
+        const IrValue* condition = inst->Argument(0)->Resolve();
+        auto& group = groups[condition];
+        if (group.empty()) conditions.push_back(condition);
+        group.push_back(inst);
+    }
+    constexpr std::size_t outside = ~std::size_t{0};
+    const auto at = [&](const IrValue* value) {
+        const auto found = position.find(value);
+        return found == position.end() ? outside : found->second;
+    };
+    std::unordered_map<const IrValue*, std::size_t> chunkOf;
+    std::vector<LaneRegion> chunks;
+    for (const IrValue* condition : conditions) {
+        const auto& selects = groups[condition];
+        std::unordered_set<const IrValue*> members(selects.begin(), selects.end());
+        // A chunk ends before a select that comes after a use of an earlier select of the chunk by
+        // anything but the group's selects: the region sits at the chunk's last select.
+        std::size_t limit = outside;
+        bool open = false;
+        for (const IrValue* select : selects) {
+            if (open && at(select) > limit) open = false;
+            if (!open) {
+                chunks.push_back({condition, {}, {}});
+                limit = outside;
+                open = true;
+            }
+            chunks.back().selects.push_back(select);
+            chunkOf.emplace(select, chunks.size() - 1u);
+            for (const auto& [user, operand] : UsersOf(program, functionState, select)) {
+                if (!members.contains(user)) limit = std::min(limit, at(user));
+            }
+        }
+    }
+    // Lane-local instructions whose every use is the "new" side of one chunk's selects, or another
+    // instruction sunk into that chunk, move into it (none reads a select of its chunk).
+    std::unordered_map<const IrValue*, std::size_t> sunkInto;
+    for (std::size_t index = order.size(); index-- > 0u;) {
+        const IrValue* inst = order[index];
+        if (inst->IsIdentity() || inst->IsPhi() || inst->Type() == IrType::Void || chunkOf.contains(inst) || !IsLaneLocalOpcode(inst->Opcode())) continue;
+        bool readsSelect = false;
+        for (std::size_t argument = 0; argument < inst->ArgumentCount(); ++argument) readsSelect |= chunkOf.contains(inst->Argument(argument)->Resolve());
+        if (readsSelect) continue;
+        std::size_t target = outside;
+        bool sinkable = true;
+        for (const auto& [user, operand] : UsersOf(program, functionState, inst)) {
+            std::size_t want = outside;
+            if (const auto select = chunkOf.find(user); select != chunkOf.end() && operand == 1u) want = select->second;
+            else if (const auto sunk = sunkInto.find(user); sunk != sunkInto.end()) want = sunk->second;
+            if (want == outside || (target != outside && target != want)) {
+                sinkable = false;
+                break;
+            }
+            target = want;
+        }
+        if (sinkable && target != outside) sunkInto.emplace(inst, target);
+    }
+    for (std::size_t index = 0; index < order.size(); ++index) {
+        if (const auto found = sunkInto.find(order[index]); found != sunkInto.end()) chunks[found->second].sunk.push_back(order[index]);
+    }
+    // A region pays for its branch when it moves some work under it.
+    constexpr std::size_t minimumWork = 6u;
+    for (std::size_t index = 0; index < chunks.size(); ++index) {
+        if (chunks[index].selects.size() + chunks[index].sunk.size() < minimumWork) continue;
+        const auto region = plan.regions.size();
+        plan.regions.push_back(std::move(chunks[index]));
+        for (const IrValue* select : plan.regions.back().selects) plan.regionOf.emplace(select, region);
+        for (const IrValue* sunk : plan.regions.back().sunk) plan.regionOf.emplace(sunk, region);
+    }
+    return plan;
+}
+
+void EmitLaneRegion(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const LaneRegion& region) {
+    auto& state = ctx.state;
+    const std::unordered_set<const IrValue*> members(region.selects.begin(), region.selects.end());
+    const auto through = [&](const IrValue* select, std::size_t operand) {
+        const IrValue* value = select->Argument(operand)->Resolve();
+        while (members.contains(value)) value = value->Argument(operand)->Resolve();
+        return value;
+    };
+    const auto entry = state.currentLabel;
+    const auto taken = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, ctx.Def(region.condition), taken, merge);
+    EmitLabel(state, taken);
+    for (const IrValue* inst : region.sunk) EmitStructuredInstruction(ctx, functionState, *inst);
+    std::vector<std::uint32_t> active;
+    active.reserve(region.selects.size());
+    for (const IrValue* select : region.selects) active.push_back(ctx.Def(through(select, 1u)));
+    const auto takenExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, merge);
+    for (std::size_t index = 0; index < region.selects.size(); ++index) {
+        const IrValue* select = region.selects[index];
+        state.module.AddFunction(spv::OpPhi, TypeId(state, select->Type()), ctx.Result(*select), active[index], takenExit, ctx.Def(through(select, 2u)), entry);
+    }
+}
+
 void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrBlock* block) {
     auto& state = ctx.state;
     state.currentBlock = block;
     EmitLabel(state, ctx.Label(block));
+    LaneRegionPlan lanes;
+    // Compute only: in PPSA03671's pixel shaders the selects are mostly float special cases and the
+    // regions raised VGPRs (0x11d1c86d00 93 -> 134), while its compute programs dropped (127 -> 94,
+    // 177 -> 134 without the scratch spill).
+    if (LaneRegionsEnabled() && state.laneCount == 1u && !state.continueTarget && state.program.Resources().stage == IrShaderStage::Compute) {
+        const BlockInfo* info = BlockInfoFor(state.program, block);
+        if (info != nullptr && !info->terminator.loopHeader) lanes = PlanLaneRegions(state.program, functionState, block);
+    }
     bool emittedNonPhi = false;
     // Wave LDS ordering (see WaveLdsScope): a barrier separates an LDS write from the next LDS access
     // and a read from the next write. The block may be entered right after a write.
@@ -750,6 +918,11 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 ldsWritten |= writes;
                 ldsRead |= access != SharedAccess::Write;
             }
+        }
+        if (const auto region = lanes.regionOf.find(inst); region != lanes.regionOf.end()) {
+            const auto& planned = lanes.regions[region->second];
+            if (inst == planned.selects.back()) EmitLaneRegion(ctx, functionState, planned);
+            continue;
         }
         const bool shared = state.laneCount == 2u && inst->Type() != IrType::Void && !IrOpcodeHasSideEffects(inst->Opcode()) && state.sharedLaneValues.contains(inst);
         for (std::uint32_t half = 0; half < state.laneCount; half++) {

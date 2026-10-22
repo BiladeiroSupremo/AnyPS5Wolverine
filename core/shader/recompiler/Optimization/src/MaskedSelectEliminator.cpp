@@ -1003,6 +1003,10 @@ std::uint32_t removeFullWaveSelects(IrProgram& program) {
 
 }
 
+bool IsLaneLocalOpcode(IrOpcode opcode) {
+    return isLaneLocal(opcode);
+}
+
 MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& program) const {
     MaskedSelectEliminationStats stats;
     const auto regions = blockRegions(program);

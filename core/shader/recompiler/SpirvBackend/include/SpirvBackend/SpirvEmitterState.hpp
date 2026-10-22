@@ -241,6 +241,10 @@ struct SpirvDeferredPhiPatch {
 struct StructuredFunctionState {
     std::unordered_map<const IrBlock*, std::uint32_t> blockExitLabels;
     std::vector<SpirvDeferredPhiPatch> deferredPhis;
+    // Lane regions (SpirvFlowEmitter): every instruction's users with the operand index they read it
+    // at, built from the argument lists on first use.
+    std::unordered_map<const IrValue*, std::vector<std::pair<const IrValue*, std::size_t>>> users;
+    bool usersBuilt = false;
 };
 
 enum class SpirvFormatComponentType {
