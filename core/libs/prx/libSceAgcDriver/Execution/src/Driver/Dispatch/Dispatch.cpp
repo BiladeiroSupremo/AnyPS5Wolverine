@@ -2,6 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderCalls.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -16,8 +19,21 @@
 
 namespace AgcDriver::DriverDetail {
 
+// Queue 0's direct dispatches join the draw pipeline (APS5_PIPELINED_DRAWS) unless
+// APS5_NO_PIPELINED_DISPATCHES=1 keeps them inline (draining the queued draws at each one).
+bool Driver::pipelinedDispatches() {
+    static const bool enabled = std::getenv("APS5_NO_PIPELINED_DISPATCHES") == nullptr;
+    return enabled;
+}
+
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
+    // A direct dispatch reaches here with draws (and dispatches) still queued on the committer: work
+    // this worker records itself goes after them.
+    const bool pipelined = DrawPipeline::Active() && pipelinedDispatches();
+    const auto drainPipeline = [&] {
+        if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    };
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (address == SkippedShader() && address != 0) return;
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
@@ -79,9 +95,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
     } else {
-        if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        // The notes are read when draws record: queued draws record first.
+        if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
+            drainPipeline();
+            Graphics::NoteHtileDepthClear(htile);
+        }
         if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
-            if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
+            if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) {
+                drainPipeline();
+                Graphics::NoteMemoryValueFill(*fill);
+            }
         }
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
@@ -348,6 +371,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     if (verifyDataHits() && dataHit) verifyDataHit(codeSnapshot, codeStart, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
+    if (!deferredLabels().labels.empty()) drainPipeline();
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);
         return;
@@ -445,6 +469,37 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
+    // A pipelined direct dispatch: the committer prepares and records it (commitDispatch) after the
+    // work queued before it. The commit owns what the recording reads: the program, the snapshots and
+    // the captured regions they point into. With labels deferred on this worker, or a draw window open,
+    // the dispatch stays inline.
+    if (pipelined && indirectArguments == 0 && !fromAhead && !probeThis && deferredLabels().labels.empty() && DrawWindowWrites() == nullptr) {
+        PipelinedDispatch commit;
+        commit.device = std::move(localDevice);
+        commit.compiled = compiledResult;
+        commit.snapshots = std::move(snapshots);
+        commit.groups = groups;
+        commit.threads = dispatchThreads;
+        commit.address = address;
+        commit.queue = submission.queue;
+        commit.recipe = std::move(recipeHit);
+        commit.keepVariant = std::move(keepVariant);
+        commit.attachVariant = std::move(attachVariant);
+        commit.attach = attachTo != nullptr;
+        commit.dataHit = dataHit;
+        commit.noteWrites = noteWrites;
+        commit.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        commit.owners = {registeredShader, expanded, shaderMemory, capture};
+        commit.liveWords = std::move(liveWords);
+        commit.captured = std::move(captured);
+        auto writes = dispatchWriteRanges(*compiledResult);
+        auto held = std::make_shared<PipelinedDispatch>(std::move(commit));
+        DrawPipeline::Queue0().Enqueue([this, held] { commitDispatch(*held); }, std::move(writes));
+        timing.Mark("dispatch_enqueued");
+        return;
+    }
+    drainPipeline();
+
     for (;;) {
 
         std::shared_ptr<PreparedDispatch> prepared;
@@ -532,6 +587,61 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         pending.tailAt = phaseLap;
     }
     if (profile && ++dispatches % 100 == 0) AgcDriver::ProfilePrint_nid_no_patch( "[gpu] %llu dispatches (%llu dispatch cache hits, %llu evictions, %llu recompile cache hits): capture %.1f s, cache key %.1f s, recompile %.1f s, device %.1f s\n", static_cast<unsigned long long>(dispatches), static_cast<unsigned long long>(dispatchCacheHits), static_cast<unsigned long long>(dispatchCacheEvictions), static_cast<unsigned long long>(cacheHits), captureMs / 1000, keyMs / 1000, recompileMs / 1000, deviceMs / 1000);
+}
+
+// A pipelined dispatch's preparation and recording, on the committer (the inline path's loop). A
+// dispatch that cannot be recorded is reported and skipped; APS5_STRICT_DRAWS=1 makes it fatal.
+void Driver::commitDispatch(PipelinedDispatch& commit) {
+    DrawPipeline::FollowEpoch(commit.epoch);
+    GuestMemory::SetCurrentPacket(0x15, commit.queue);
+    const auto& compiled = *commit.compiled;
+    auto* const attachTo = !commit.attach ? nullptr : commit.keepVariant != nullptr ? commit.keepVariant.get() : commit.attachVariant.get();
+    try {
+        auto recipe = commit.recipe;
+        std::shared_ptr<const Recipe> builtRecipe;
+        bool writersNoted = false;
+        for (;;) {
+            std::shared_ptr<PreparedDispatch> prepared;
+            if (recipe == nullptr || VulkanDevice::VerifyRecipes()) prepared = commit.device->PrepareDispatch(compiled, commit.snapshots, commit.threads);
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            recordLabelsForPacket(commit.device.get(), commit.queue);
+            if (commit.noteWrites && writerKeyedEvidence() && !writersNoted) {
+                noteWrittenBuffers(commit.address, commit.queue, compiled);
+                writersNoted = true;
+            }
+            if (recipe != nullptr) {
+                VulkanDevice::IndirectOutcome outcome{0, 0};
+                if (commit.device->DispatchRecipe(compiled, commit.groups[0], commit.groups[1], commit.groups[2], 0, commit.address, recipe, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, commit.dataHit) == RecipeOutcome::Rebuild) {
+                    recipe = nullptr;
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                    continue;
+                }
+            } else {
+                commit.device->Dispatch(compiled, commit.groups[0], commit.groups[1], commit.groups[2], commit.snapshots, commit.address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
+            }
+            if (builtRecipe != nullptr) {
+                if (commit.dataHit) {
+                    auto own = std::make_shared<Recipe>(*builtRecipe);
+                    own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, commit.keepVariant->compiled.get(), 0});
+                    builtRecipe = std::move(own);
+                }
+                attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+            }
+            if (commit.noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(commit.address, commit.queue, compiled);
+            // The batch cap's submit, which the worker leaves to the committer while work is queued.
+            if (batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap()) commit.device->SubmitRecorded(commit.queue == 0);
+            break;
+        }
+    } catch (const std::exception& error) {
+        static const bool strictDraws = std::getenv("APS5_STRICT_DRAWS") != nullptr;
+        if (strictDraws) throw;
+        countFrameSkip(error.what());
+        char where[64];
+        std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(commit.address));
+        reportSkip("dispatch", where + std::string(error.what()));
+    }
 }
 
 }

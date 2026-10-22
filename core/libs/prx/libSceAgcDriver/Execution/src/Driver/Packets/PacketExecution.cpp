@@ -189,7 +189,9 @@ void Driver::execute(const Submission& submission) {
         if (pipelined && DrawPipeline::Queue0().Busy()) {
             // A predicated packet reads its predicate first: queued draws that may write it go first.
             const bool predicateQueued = Pm4::Predicated(header) && queue.predication.operation != 0 && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4);
-            if (!keepsDrawPipeline(packet, header, opcode) || predicateQueued) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0x100u : opcode);
+            // A direct dispatch joins the queue itself (Driver::dispatch drains for what it records inline).
+            const bool queuedDispatch = opcode == 0x15 && pipelinedDispatches() && DrawWindowWrites() == nullptr;
+            if ((!keepsDrawPipeline(packet, header, opcode) && !queuedDispatch) || predicateQueued) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0x100u : opcode);
         }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());

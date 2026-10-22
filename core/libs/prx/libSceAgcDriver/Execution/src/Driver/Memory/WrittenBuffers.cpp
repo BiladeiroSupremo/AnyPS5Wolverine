@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -47,30 +48,51 @@ void Driver::noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint
 // written storage buffers and images and its color and depth targets, estimated generously (upstream's
 // non-exact DrawWriteRanges): twice the color bytes plus slack, 8 bytes per 256-aligned depth pixel,
 // 64 MiB where a size is unknown.
+namespace {
+constexpr std::uint64_t UnknownBytes = 64ull * 1024 * 1024;
+}
+
+// A program's written storage buffers and images.
+void Driver::appendProgramWriteRanges(const ShaderRecompiler::RecompileResult& program, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
+        if (begin != 0) ranges.emplace_back(begin, begin + bytes);
+    };
+    appendWrittenRanges(program, ranges);
+    for (const auto& binding : program.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
+            if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) continue;
+            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+            if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
+            const auto resource = Graphics::DecodeTextureResource(words);
+            if (resource.baseAddress == 0) continue;
+            const auto surfaceBytes = Graphics::DescribeSurface(resource).guestBytes;
+            add(resource.baseAddress, surfaceBytes != 0 ? surfaceBytes : UnknownBytes);
+            add(resource.dccAddress, surfaceBytes != 0 ? surfaceBytes / 256 + 1 : UnknownBytes);
+        }
+    }
+}
+
+// The guest ranges a pipelined dispatch may write: its storage buffers and images; a program that
+// writes through pointers (a BDA page table) may write anything.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::dispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    appendProgramWriteRanges(compiled, ranges);
+    const bool pointers = std::any_of(compiled.bindings.begin(), compiled.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
+    if (pointers) ranges.emplace_back(0, std::numeric_limits<std::uint64_t>::max());
+    return ranges;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
     constexpr std::uint64_t Slack = 64 * 1024;
-    constexpr std::uint64_t UnknownBytes = 64ull * 1024 * 1024;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
         if (begin != 0) ranges.emplace_back(begin, begin + bytes);
     };
     for (const auto& stage : stages) {
         if (stage.program == nullptr) continue;
-        appendWrittenRanges(*stage.program, ranges);
-        for (const auto& binding : stage.program->bindings) {
-            if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
-            for (std::uint32_t element = 0; element < binding.count; ++element) {
-                const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
-                if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) continue;
-                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
-                if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
-                const auto resource = Graphics::DecodeTextureResource(words);
-                if (resource.baseAddress == 0) continue;
-                const auto surfaceBytes = Graphics::DescribeSurface(resource).guestBytes;
-                add(resource.baseAddress, surfaceBytes != 0 ? surfaceBytes : UnknownBytes);
-                add(resource.dccAddress, surfaceBytes != 0 ? surfaceBytes / 256 + 1 : UnknownBytes);
-            }
-        }
+        appendProgramWriteRanges(*stage.program, ranges);
     }
     const auto addColor = [&](const Graphics::ColorTarget& color) {
         const std::uint64_t bytes = color.bytes != 0 ? static_cast<std::uint64_t>(color.bytes) : UnknownBytes;

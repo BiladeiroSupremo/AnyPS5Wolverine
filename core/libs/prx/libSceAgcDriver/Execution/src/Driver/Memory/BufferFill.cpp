@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferFill.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
@@ -155,6 +156,8 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     auto dwordFill = MatchDwordPatternFill(packet, code, userData, compute);
     if (!dwordFill) dwordFill = MatchZeroDwordFill(packet, code, userData, compute);
     if (!dwordFill && !matchesFillKernel(code, userData, compute)) return false;
+    // The fill records here: dispatches and draws queued on the pipeline record first.
+    if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     std::uint64_t base;
     std::size_t bytes;
     std::array<std::uint32_t, 4> pattern;
