@@ -356,6 +356,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_RELEASE_ON_UNLOCK` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | destroys deferred batches on the unlocking thread instead of a release thread |
 | `APS5_RELEASE_QUEUE_MAX` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` | 256 | maximum deferred batches handed to the release thread before a thread destroys its own |
 | `APS5_RELEASE_UNDER_LOCK` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | destroys deferred batches in finish() under the lock instead of on a release thread |
+| `APS5_REPEAT_FRAME_SKIPS` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Packets/PacketExecution.cpp` | 32 | draws a frame may skip for shaders or pipeline parts still being built before it is not shown and the previous picture stays on screen; 0 shows every frame |
 | `APS5_RESOURCE_CACHE_ENTRIES` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` | 1024 | maximum entries in the per-device shader-resource cache |
 | `APS5_RESOURCE_CACHE_TABLE_ELEMENTS` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` | 65536 | number of image-table elements the shader-resource cache keeps (0 keeps the default) |
 | `APS5_SAMPLE_THREADS` | string | `core/libs/prx/libSceAgcDriver/Execution/src/WorkerSampler.cpp` |  | samples every thread of the process every 2 ms and writes each busy thread's hottest frames to a file (Windows only) |
