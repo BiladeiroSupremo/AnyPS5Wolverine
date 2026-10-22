@@ -32,6 +32,9 @@ void Report(const char* format, ...) {
     va_end(args);
     if (length <= 0) return;
     if (length > static_cast<int>(sizeof(buffer)) - 1) length = sizeof(buffer) - 1;
+    // stderr is buffered (see g_crashReportInstalled): what it holds goes out first, without its
+    // lock, which the crashing thread may hold.
+    _fflush_nolock(stderr);
     DWORD written = 0;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer, static_cast<DWORD>(length), &written, nullptr);
 }
@@ -658,6 +661,18 @@ struct ExitReporter {
 const bool g_crashReportInstalled = [] {
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
+    // MinGW's fprintf writes an unbuffered stream one character per WriteFile: PPSA03671's queue-0
+    // worker spent ~7% of its samples there (2026-10-22, tr36). stderr is buffered instead and
+    // flushed every 200 ms here and by every crash report (Report). APS5_UNBUFFERED_STDERR=1 keeps it
+    // unbuffered.
+    if (!IsEnvironmentSet("APS5_UNBUFFERED_STDERR") && std::setvbuf(stderr, nullptr, _IOFBF, 1u << 16u) == 0) {
+        CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            for (;;) {
+                Sleep(200);
+                std::fflush(stderr);
+            }
+        }, nullptr, 0, nullptr);
+    }
     AddVectoredExceptionHandler(1, ReportCrash);
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
