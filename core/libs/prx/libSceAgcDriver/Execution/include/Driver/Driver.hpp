@@ -202,6 +202,10 @@ private:
     static void appendWrittenRanges(const ShaderRecompiler::RecompileResult& compiled, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
+    // Draws a frame skipped because their shaders or pipeline parts are still being built (counted from
+    // the skip reports, on the worker and the committer, taken at the flip).
+    static void countFrameSkip(const char* reason);
+    static std::uint32_t takeFrameSkips();
     static bool labelCommitItem(std::span<const std::uint32_t> packet);
     void commitLabelPacket(std::uint32_t queue, std::span<const std::uint32_t> packet);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);

@@ -74,6 +74,9 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             presenting->Resize(drawableWidth, drawableHeight);
             timing.Mark("resize");
             presentable = presenting->Presentable();
+            // A frame the driver marked as mostly missing (FrameTiming::repeatPrevious) is not shown:
+            // the window keeps the previous picture, as for a window that cannot present.
+            if (window.timing != nullptr && window.timing->repeatPrevious.load(std::memory_order_relaxed)) presentable = false;
             if (buffer != nullptr) require(buffer->width == window.width && buffer->height == window.height, "display buffer extent differs from output");
         }
 

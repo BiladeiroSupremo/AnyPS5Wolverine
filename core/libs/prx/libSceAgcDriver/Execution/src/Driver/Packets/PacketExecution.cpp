@@ -303,6 +303,18 @@ void Driver::execute(const Submission& submission) {
             frame->NoteFlipBatches(batchesAtFlip, unsignaledAtFlip);
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             flipHold.Release();
+            // A frame that skipped at least APS5_REPEAT_FRAME_SKIPS (32; 0 never) draws for shaders or
+            // pipeline parts still being built keeps the previous picture on screen instead of showing
+            // the mostly black one (PPSA03671: 69 such skips at a new area's first frame).
+            static const std::uint32_t repeatSkips = [] {
+                const char* text = std::getenv("APS5_REPEAT_FRAME_SKIPS");
+                return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 32u;
+            }();
+            if (const auto skipped = takeFrameSkips(); repeatSkips != 0 && skipped >= repeatSkips) {
+                frame->repeatPrevious.store(true, std::memory_order_relaxed);
+                static std::atomic<int> printed{0};
+                if (printed.fetch_add(1, std::memory_order_relaxed) < 100) std::fprintf(stderr, "[present] frame %llu skipped %u draws for work still being built: the previous picture stays on screen\n", static_cast<unsigned long long>(frameSerial), skipped);
+            }
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
             landPendingWaits(submission.queue);
@@ -415,6 +427,7 @@ void Driver::execute(const Submission& submission) {
                     // state does not end a title; APS5_STRICT_DRAWS=1 makes it fatal.
                     static const bool strictDraws = std::getenv("APS5_STRICT_DRAWS") != nullptr;
                     if (strictDraws) throw;
+                    countFrameSkip(error.what());
                     reportSkip("draw", error.what());
                 }
             });
@@ -467,6 +480,21 @@ void Driver::execute(const Submission& submission) {
     }
     endTiming.Finish();
     if (submission.rewindTail != nullptr) executeRewindTail(submission);
+}
+
+namespace {
+
+std::atomic<std::uint32_t> frameSkips{0};
+
+}
+
+void Driver::countFrameSkip(const char* reason) {
+    const std::string_view text(reason);
+    if (text.find("background") != std::string_view::npos || text.find("being prepared") != std::string_view::npos || text.find("being built") != std::string_view::npos) frameSkips.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint32_t Driver::takeFrameSkips() {
+    return frameSkips.exchange(0, std::memory_order_relaxed);
 }
 
 namespace {

@@ -539,6 +539,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     } catch (const std::exception& error) {
         static const bool strictDraws = std::getenv("APS5_STRICT_DRAWS") != nullptr;
         if (strictDraws) throw;
+        countFrameSkip(error.what());
         reportSkip("draw", error.what());
     }
 }

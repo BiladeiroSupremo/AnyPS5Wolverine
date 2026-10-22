@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -234,6 +235,12 @@ private:
     double gpuGapMs = 0;
     Clock::duration lastSubmitAfterFlip{};
     Clock::duration blitSubmitAfterFlip{};
+
+public:
+    // A frame that lost so many draws to work still being built in the background that it would show
+    // as a mostly black picture: presentation leaves the previous one on screen (Driver::Present).
+    // Last, so the other members keep their offsets for modules built before it.
+    std::atomic<bool> repeatPrevious{false};
 };
 
 class PerformanceContext {
