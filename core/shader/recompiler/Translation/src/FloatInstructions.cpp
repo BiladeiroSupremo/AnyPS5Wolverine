@@ -2,6 +2,7 @@
 #include "Translation/TranslationContext.hpp"
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -581,7 +582,40 @@ bool TranslationContext::vDivFixupF32(const RdnaInstruction& inst) {
 bool TranslationContext::floatUnary(const RdnaInstruction& inst, IrOpcode opcode) {
     const IrU32 bits = flushF32Denormal(readU32(sourceAt(inst, 0u)));
     const IrF32 argument(ir.BitCastF32(bits.Value()));
-    const auto [result, invalid] = unaryFloatSpecials(opcode, argument, IrF32(ir.Emit(opcode, IrType::F32, {&argument.Value()})));
+    const IrF32 native(ir.Emit(opcode, IrType::F32, {&argument.Value()}));
+    // With the host flushing f32 denormals and producing its own NaNs (an AMD GPU, as the guest's), a
+    // NaN operand gives a NaN result (only which NaN differs) and the transcendental units return
+    // the special values unaryFloatSpecials builds: rcp/rsq of +-0 or a flushed denormal is +-inf, of
+    // +-inf +-0 (rsq +0), sqrt/rsq/log of a negative NaN, log2(1) 0, exp2 underflow 0. Sin and cos
+    // keep their exact zeros and the NaN of an infinite operand (a NaN operand passes their fixups);
+    // the rounding ops need nothing. Fract stays emulated: its clamp below 1 would eat a NaN.
+    // APS5_NO_NATIVE_F32_SPECIALS=1 emulates them all as before.
+    static const bool nativeSpecials = std::getenv("APS5_NO_NATIVE_F32_SPECIALS") == nullptr;
+    if (nativeSpecials && nativeF32Nan && nativeF32Flush) {
+        switch (opcode) {
+            case IrOpcode::FPRecip32:
+            case IrOpcode::FPRecipIFlag32:
+            case IrOpcode::FPRecipSqrt32:
+            case IrOpcode::FPSqrt:
+            case IrOpcode::FPLog2:
+            case IrOpcode::FPExp2:
+            case IrOpcode::FPTrunc32:
+            case IrOpcode::FPCeil32:
+            case IrOpcode::FPRoundEven32:
+            case IrOpcode::FPFloor32:
+                writeOperand(inst.destination, &native.Value());
+                return true;
+            case IrOpcode::FPSin:
+            case IrOpcode::FPCos: {
+                const auto [result, invalid] = unaryFloatSpecials(opcode, argument, native);
+                writeOperand(inst.destination, &ir.BitCastF32(ir.Select(invalid.Value(), ir.Constant(0xffc00000u), ir.BitCastU32(result.Value()))));
+                return true;
+            }
+            default:
+                break;
+        }
+    }
+    const auto [result, invalid] = unaryFloatSpecials(opcode, argument, native);
     const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)));
     const IrU32 special(ir.Select(nan.Value(), quietNan32(bits).Value(), ir.Constant(0xffc00000u)));
     const IrF32 value(ir.Select(ir.LogicalOr(nan.Value(), invalid.Value()), ir.BitCastF32(special.Value()), result.Value()));
