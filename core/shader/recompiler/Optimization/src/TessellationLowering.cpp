@@ -456,6 +456,11 @@ public:
                 source = &both;
             }
             inst->ReplaceAllUsesWith(source);
+            // A branch condition is held by BlockInfo, not as a use: it follows the replacement too, or
+            // the dead-code pass below invalidates the lane bit under it.
+            for (auto& info : program.Metadata().blockInfo) {
+                if (info.condition != nullptr && info.condition->Resolve() == inst) info.condition = source;
+            }
         }
         collect();
         derive();

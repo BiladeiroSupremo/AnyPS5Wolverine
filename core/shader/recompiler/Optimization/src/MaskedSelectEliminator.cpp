@@ -23,6 +23,19 @@ bool isSelect(IrOpcode opcode) {
     return opcode == IrOpcode::SelectU1 || opcode == IrOpcode::SelectU32 || opcode == IrOpcode::SelectF32;
 }
 
+// A select removed here may be a block's branch condition, which BlockInfo holds by pointer rather
+// than as a use: the condition moves to the replacement with the uses, or it would name the
+// invalidated select (SPIR-V emission then fails: "branch condition Unreachable").
+void replaceSelect(IrProgram& program, IrValue& select) {
+    IrValue* replacement = select.Argument(1);
+    select.ReplaceAllUsesWith(replacement);
+    for (auto& info : program.Metadata().blockInfo) {
+        if (info.condition == &select) info.condition = replacement;
+    }
+    select.Invalidate();
+    select.SetParent(nullptr);
+}
+
 bool isLaneLocal(IrOpcode opcode) {
     if (IrOpcodeHasSideEffects(opcode)) return false;
     switch (opcode) {
@@ -950,9 +963,7 @@ private:
         const IrValue* mask = node < writes.size() ? writes[node] : nullptr;
         if (mask == nullptr || !select->HasUses() || select->Argument(0)->Resolve() != mask || !sets.Contains(unread[node], mask->Id())) return;
         halted = implied.Follows(*select) || std::any_of(owned.begin(), owned.end(), [&](const auto& reads) { return reads && reads->Follows(*select); });
-        select->ReplaceAllUsesWith(select->Argument(1));
-        select->Invalidate();
-        select->SetParent(nullptr);
+        replaceSelect(program, *select);
         ++removed;
     }
 
@@ -991,9 +1002,7 @@ std::uint32_t removeFullWaveSelects(IrProgram& program) {
             --it;
             IrValue* inst = *it;
             if (!isSelect(inst->Opcode()) || inst->ArgumentCount() != 3u || !inst->HasUses() || !alwaysTrue(inst->Argument(0), program.WaveSize())) continue;
-            inst->ReplaceAllUsesWith(inst->Argument(1));
-            inst->Invalidate();
-            inst->SetParent(nullptr);
+            replaceSelect(program, *inst);
             it = instructions.erase(it);
             ++removed;
         }
