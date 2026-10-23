@@ -1337,22 +1337,28 @@ public:
         }
         // Never destroyed: the helper may still run at process exit.
         static auto* release = new DeferredResultRelease;
+        bool wake = false;
         {
             std::lock_guard lock(release->mutex);
             release->pending.insert(release->pending.end(), std::make_move_iterator(results.begin()), std::make_move_iterator(results.end()));
+            wake = release->pending.size() >= WakeBatch;
         }
         results.clear();
-        release->wake.notify_one();
+        // A wake per release cost a kernel call each (~1.5% of the worker): the helper also wakes
+        // on its own every few milliseconds.
+        if (wake) release->wake.notify_one();
     }
 
 private:
+    static constexpr std::size_t WakeBatch = 256;
+
     DeferredResultRelease() {
         std::thread([this] {
             std::vector<std::shared_ptr<const RecompileResult>> batch;
             for (;;) {
                 {
                     std::unique_lock lock(mutex);
-                    wake.wait(lock, [&] { return !pending.empty(); });
+                    wake.wait_for(lock, std::chrono::milliseconds(5), [&] { return pending.size() >= WakeBatch; });
                     batch.swap(pending);
                 }
                 batch.clear();
