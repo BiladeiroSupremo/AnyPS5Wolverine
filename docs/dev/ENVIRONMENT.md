@@ -161,9 +161,11 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_GPU_WAIT_TIMEOUT_MS` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` | 1000 | milliseconds a GPU wait may run before a warning is printed |
 | `APS5_GROUP_CAPTURE_ALL_QUEUES` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/DispatchAhead.cpp` |  | resolves group-ahead capture on queue 0 as well |
 | `APS5_HANDOFF_SPIN_US` | integer | `core/libs/prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp` |  | microseconds a thread spins for a handed-off draw's work or for the GPU mutex before blocking, clamped to 0..10000; unset spins 150 us when the process has more than 8 usable processors and not at all otherwise |
+| `APS5_HANG_DUMP_S` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/WorkerSampler.cpp` | 20 | seconds without a present after which APS5_SAMPLE_HITCHES writes the current frame's stacks to <file>.hang.txt (once per frame) |
 | `APS5_HEAP_MIRROR_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 24576 | budget in MiB for the heap mirrors held for registered allocations |
 | `APS5_HEAP_REVALIDATE_US` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/BindlessHeapTable.cpp` | 600 | time limit in microseconds of one bindless heap revalidation pass (every 30 ms, under the GPU mutex) |
 | `APS5_HITCH_AFTER_S` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/WorkerSampler.cpp` | 0 | seconds after the sampler starts before APS5_SAMPLE_HITCHES keeps any frame |
+| `APS5_HITCH_INTERVAL_MS` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/WorkerSampler.cpp` | 2 | milliseconds between APS5_SAMPLE_HITCHES sampling rounds |
 | `APS5_HITCH_MS` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/WorkerSampler.cpp` | 250 | shortest frame (present to present) whose stacks APS5_SAMPLE_HITCHES keeps |
 | `APS5_HOOK_FLUSH_CPU_BLOCKS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | set to 0 flushes pending images whose every 64 KiB block the CPU wrote, instead of skipping them |
 | `APS5_HOOK_FULL_SYNC` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | makes the flush hook's recorded-store wait a full Sync under the GpuMutex |

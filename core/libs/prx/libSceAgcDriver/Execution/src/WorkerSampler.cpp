@@ -311,6 +311,14 @@ struct HitchSampler {
     std::chrono::steady_clock::time_point frameStart = std::chrono::steady_clock::now();
     // APS5_HITCH_AFTER_S: hitches before then (loading, menus) are not kept.
     std::chrono::steady_clock::time_point keepFrom = std::chrono::steady_clock::now();
+    // A frame that has not ended after APS5_HANG_DUMP_S (default 20) seconds is written as it stands
+    // to <file>.hang.txt, once per frame: a hang never reaches the present that keeps a hitch. A
+    // play session (2026-10-23) deadlocked going back to the cabin with the render thread on the
+    // title's lock (app.exe+0x143f47960) and the holder unknown.
+    std::chrono::seconds hangDump{20};
+    bool hangDumped = false;
+    // The newest samples of the current frame only: past this many the older half is dropped.
+    static constexpr std::size_t PendingCap = 150000;
 
     void enumerate() {
         const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -364,7 +372,17 @@ struct HitchSampler {
             }
             pending.clear();
             frameStart = now;
+            hangDumped = false;
         }
+        if (!hangDumped && now - frameStart >= hangDump && now >= keepFrom) {
+            hangDumped = true;
+            std::map<std::pair<DWORD, std::vector<std::uint64_t>>, std::uint64_t> hang;
+            for (const auto& item : pending) ++hang[{item.thread, std::vector<std::uint64_t>(item.frames.begin(), item.frames.begin() + item.count)}];
+            char header[128];
+            std::snprintf(header, sizeof(header), "# hang: no present for %.0f s, %zu samples\n", std::chrono::duration<double>(now - frameStart).count(), pending.size());
+            writeStacks(path + ".hang.txt", header, hang);
+        }
+        if (pending.size() >= PendingCap) pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(PendingCap / 2));
         if (threads.empty() || now - enumerated > std::chrono::seconds(5)) enumerate();
         for (auto& [id, thread] : threads) thread.depth = 32;
         std::array<std::uint64_t, Sampler::WorkerDepth> frames;
@@ -380,13 +398,19 @@ struct HitchSampler {
     }
 
     void write() {
-        const auto temporary = path + ".tmp";
+        char header[160];
+        std::snprintf(header, sizeof(header), "# hitches=%llu hitch_ms=%.0f threshold_ms=%lld\n", static_cast<unsigned long long>(hitches), hitchMs, static_cast<long long>(threshold.count()));
+        writeStacks(path, header, kept);
+    }
+
+    static void writeStacks(const std::string& target, const char* header, const std::map<std::pair<DWORD, std::vector<std::uint64_t>>, std::uint64_t>& stacks) {
+        const auto temporary = target + ".tmp";
         std::FILE* file = std::fopen(temporary.c_str(), "w");
         if (file == nullptr) return;
-        std::fprintf(file, "# hitches=%llu hitch_ms=%.0f threshold_ms=%lld\n", static_cast<unsigned long long>(hitches), hitchMs, static_cast<long long>(threshold.count()));
+        std::fputs(header, file);
         std::map<std::uint64_t, std::string> names;
         std::map<std::uint64_t, std::string> loaded;
-        for (const auto& [key, count] : kept) {
+        for (const auto& [key, count] : stacks) {
             std::string line = "T" + std::to_string(key.first);
             for (auto frame = key.second.rbegin(); frame != key.second.rend(); ++frame) {
                 auto found = names.find(*frame);
@@ -396,7 +420,7 @@ struct HitchSampler {
             std::fprintf(file, "%s %llu\n", line.c_str(), static_cast<unsigned long long>(count));
         }
         if (std::fclose(file) != 0) return;
-        MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+        MoveFileExA(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING);
     }
 };
 
@@ -409,9 +433,12 @@ void StartHitchSampler() {
         sampler->self = GetCurrentThreadId();
         if (const char* text = std::getenv("APS5_HITCH_MS")) sampler->threshold = std::chrono::milliseconds(std::atoi(text));
         if (const char* text = std::getenv("APS5_HITCH_AFTER_S")) sampler->keepFrom += std::chrono::seconds(std::atoi(text));
+        if (const char* text = std::getenv("APS5_HANG_DUMP_S")) sampler->hangDump = std::chrono::seconds(std::max(1, std::atoi(text)));
+        // APS5_HITCH_INTERVAL_MS: time between sampling rounds (default 2; a play session uses more).
+        const auto interval = std::chrono::milliseconds([] { const char* text = std::getenv("APS5_HITCH_INTERVAL_MS"); return text != nullptr ? std::max(1, std::atoi(text)) : 2; }());
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            std::this_thread::sleep_for(interval);
             sampler->sample();
             if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
                 sampler->write();
