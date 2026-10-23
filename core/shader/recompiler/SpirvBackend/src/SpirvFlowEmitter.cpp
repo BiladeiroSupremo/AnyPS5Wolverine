@@ -4,7 +4,10 @@
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "Optimization/MaskedSelectEliminator.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdio>
+#include <functional>
+#include <map>
 #include <cstdlib>
 #include <string>
 #include <spirv/unified1/spirv.hpp>
@@ -162,6 +165,8 @@ std::uint32_t EmitWaveMaskBranchCondition(SpirvValueEmitContext& ctx, const Bloc
 }
 
 std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
+    // An exec region made per-lane (PlanExecRegions): the lane's own exec bit decides.
+    if (ctx.state.laneBranchBlocks.contains(info.id)) return ctx.Def(info.condition);
     const auto condition = info.terminator.condition;
     if (ctx.otherHalf == nullptr && IsWaveMaskBranch(condition)) {
         return EmitWaveMaskBranchCondition(ctx, info);
@@ -878,6 +883,252 @@ void EmitLaneRegion(SpirvValueEmitContext& ctx, StructuredFunctionState& functio
     }
 }
 
+// Exec regions (APS5_EXEC_REGIONS=1): a guest s_cbranch_execz / execnz over a region whose skip edge
+// goes straight to the region's merge is a wave-uniform branch here, so every lane of the wave runs the
+// region and each vector write in it is "exec bit ? new : old" (a v_cndmask per write, with the old
+// value kept live). When every value the region hands its merge is such a masked write chain back to
+// the value the skip edge brings, the branch is made per-lane instead: lanes outside the region's exec
+// take the skip edge and keep their old values through the merge phis, and the region's masked writes
+// on its exec bit are their new values. A region keeps the uniform branch when it holds a barrier, a
+// cross-lane read of lanes that may be inactive, a derivative, a wave-level effect, an export, LDS
+// accesses ordered by wave LDS barriers, or a value leaving it that is not a masked write chain (a
+// scalar result every lane needs). Compute programs only, one guest lane per host invocation.
+bool ExecRegionsEnabled() {
+    static const bool enabled = std::getenv("APS5_EXEC_REGIONS") != nullptr;
+    return enabled;
+}
+
+bool IsSelectOpcode(IrOpcode opcode) {
+    return opcode == IrOpcode::Select || opcode == IrOpcode::SelectU1 || opcode == IrOpcode::SelectU32 || opcode == IrOpcode::SelectF32;
+}
+
+bool IsUndefinedValue(IrOpcode opcode) {
+    return opcode == IrOpcode::Void || opcode == IrOpcode::UndefU1 || opcode == IrOpcode::UndefU8 || opcode == IrOpcode::UndefU16 || opcode == IrOpcode::UndefU32 || opcode == IrOpcode::UndefU64;
+}
+
+bool ForbiddenInExecRegion(IrOpcode opcode, bool ldsBarriers) {
+    switch (opcode) {
+        case IrOpcode::Barrier:
+        case IrOpcode::EmitVertex:
+        case IrOpcode::Discard:
+        case IrOpcode::Sendmsg:
+        case IrOpcode::ReadLane:
+        case IrOpcode::WriteLane:
+        case IrOpcode::DppMoveU32:
+        case IrOpcode::DppUpdateU32:
+        case IrOpcode::Permlane16U32:
+        case IrOpcode::BpermuteU32:
+        case IrOpcode::PermuteU32:
+        case IrOpcode::SwizzleU32:
+        case IrOpcode::WqmU64:
+        case IrOpcode::ImageSampleImplicitLod:
+        case IrOpcode::ImageQueryLod:
+        case IrOpcode::DataAppend:
+        case IrOpcode::DataConsume:
+        case IrOpcode::MeshAllocate:
+        case IrOpcode::SetAttribute:
+        case IrOpcode::SetTessellationAttribute: return true;
+        default: return ldsBarriers && SharedAccessOf(opcode) != SharedAccess::None;
+    }
+}
+
+void PlanExecRegions(const IrProgram& program, SpirvEmitterState& state, StructuredFunctionState& functionState) {
+    const auto& blocks = program.BlockOrder();
+    const auto& infos = program.Metadata().blockInfo;
+    const auto& masked = program.Metadata().maskedVectorWrites;
+    if (blocks.size() != infos.size() || masked.empty()) return;
+    std::unordered_map<std::uint32_t, std::size_t> indexOf;
+    std::unordered_map<const IrBlock*, std::size_t> blockIndex;
+    for (std::size_t index = 0; index < infos.size(); ++index) {
+        indexOf.emplace(infos[index].id, index);
+        blockIndex.emplace(blocks[index], index);
+    }
+    constexpr std::size_t Exit = ~std::size_t{0};
+    const auto successors = [&](std::size_t index) {
+        std::vector<std::size_t> next;
+        const auto& term = infos[index].terminator;
+        const auto add = [&](std::uint32_t id) {
+            const auto found = indexOf.find(id);
+            next.push_back(found == indexOf.end() ? Exit : found->second);
+        };
+        if (term.kind == TerminatorKind::Branch) add(term.trueBlock);
+        else if (term.kind == TerminatorKind::ConditionalBranch) {
+            add(term.trueBlock);
+            add(term.falseBlock);
+        } else next.push_back(Exit);
+        return next;
+    };
+    std::vector<std::vector<std::size_t>> predecessors(infos.size());
+    for (std::size_t index = 0; index < infos.size(); ++index) {
+        for (const auto next : successors(index)) {
+            if (next != Exit) predecessors[next].push_back(index);
+        }
+    }
+    // Values something reads: an unread merge phi does not constrain its region.
+    std::unordered_set<const IrValue*> used;
+    for (const IrBlock* block : blocks) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (inst->IsIdentity()) continue;
+            for (std::size_t argument = 0; argument < inst->ArgumentCount(); ++argument) {
+                if (const IrValue* value = inst->Argument(argument); value != nullptr) used.insert(value->Resolve());
+            }
+        }
+    }
+    for (const auto& blockInfo : infos) {
+        if (blockInfo.condition != nullptr) used.insert(blockInfo.condition->Resolve());
+        if (blockInfo.indirectTarget != nullptr) used.insert(blockInfo.indirectTarget->Resolve());
+    }
+    static const bool trace = std::getenv("APS5_TRACE_EXEC_REGIONS") != nullptr;
+    std::size_t candidates = 0, converted = 0, aliases = 0;
+    std::array<std::size_t, 4> rejected{};  // shape, extent, instruction, merge value
+    // Trace: live masked writes in the program, and those inside rejected regions by reason.
+    std::size_t liveMasked = 0;
+    std::array<std::size_t, 4> rejectedWrites{};
+    std::map<std::string, std::size_t> leafOpcodes;
+    const auto maskedIn = [&](const std::unordered_set<std::size_t>& set) {
+        std::size_t count = 0;
+        for (const auto index : set) {
+            for (const IrValue* inst : blocks[index]->Instructions()) count += !inst->IsIdentity() && masked.contains(inst) && !inst->Argument(0)->Resolve()->HasImmediate();
+        }
+        return count;
+    };
+    if (trace) {
+        for (const IrBlock* block : blocks) {
+            for (const IrValue* inst : block->Instructions()) liveMasked += !inst->IsIdentity() && masked.contains(inst) && !inst->Argument(0)->Resolve()->HasImmediate();
+        }
+    }
+    constexpr std::size_t MaxRegionBlocks = 1024;
+    for (std::size_t branch = 0; branch < infos.size(); ++branch) {
+        const auto& info = infos[branch];
+        const auto& term = info.terminator;
+        if (term.kind != TerminatorKind::ConditionalBranch || term.loopHeader || info.condition == nullptr) continue;
+        if (term.condition != BranchCondition::ExecZero && term.condition != BranchCondition::ExecNonZero) continue;
+        ++candidates;
+        const IrValue* condition = info.condition->Resolve();
+        const IrValue* exec = condition;
+        if (term.condition == BranchCondition::ExecZero) {
+            if (condition->Opcode() != IrOpcode::LogicalNot || condition->ArgumentCount() != 1u) {
+                ++rejected[0];
+                continue;
+            }
+            exec = condition->Argument(0)->Resolve();
+        }
+        const auto regionId = term.condition == BranchCondition::ExecZero ? term.falseBlock : term.trueBlock;
+        const auto skipId = term.condition == BranchCondition::ExecZero ? term.trueBlock : term.falseBlock;
+        const auto mergeFound = indexOf.find(term.mergeBlock);
+        const auto entryFound = indexOf.find(regionId);
+        if (skipId != term.mergeBlock || regionId == term.mergeBlock || mergeFound == indexOf.end() || entryFound == indexOf.end()) {
+            ++rejected[0];
+            continue;
+        }
+        const auto merge = mergeFound->second;
+        // The region: everything reached from its entry before the merge, entered only from the
+        // branch and left only to the merge.
+        std::unordered_set<std::size_t> region;
+        std::vector<std::size_t> work{entryFound->second};
+        bool shaped = true;
+        while (!work.empty() && shaped) {
+            const auto index = work.back();
+            work.pop_back();
+            if (index == Exit || index == branch || region.size() > MaxRegionBlocks) {
+                shaped = false;
+                break;
+            }
+            if (index == merge || !region.insert(index).second) continue;
+            for (const auto next : successors(index)) work.push_back(next);
+        }
+        if (shaped) {
+            for (const auto index : region) {
+                for (const auto from : predecessors[index]) shaped = shaped && (from == branch || region.contains(from));
+            }
+            for (const auto from : predecessors[merge]) shaped = shaped && (from == branch || region.contains(from));
+        }
+        if (!shaped) {
+            ++rejected[1];
+            continue;
+        }
+        bool allowed = true;
+        for (const auto index : region) {
+            for (const IrValue* inst : blocks[index]->Instructions()) {
+                if (!inst->IsIdentity() && ForbiddenInExecRegion(inst->Opcode(), state.waveLdsScope != 0)) allowed = false;
+            }
+        }
+        if (!allowed) {
+            ++rejected[2];
+            if (trace) rejectedWrites[2] += maskedIn(region);
+            continue;
+        }
+        // Every merge phi: what the region hands it must reduce, for lanes outside the region's exec,
+        // to what the skip edge hands it (masked writes keep their old value; phis inside the region
+        // join such chains).
+        std::unordered_map<const IrValue*, int> state_;  // 1 in progress / true, 2 false
+        const auto inRegion = [&](const IrValue* value) {
+            const auto found = blockIndex.find(value->Parent());
+            return value->Parent() != nullptr && found != blockIndex.end() && region.contains(found->second);
+        };
+        std::function<bool(const IrValue*, const IrValue*)> keepsBase = [&](const IrValue* value, const IrValue* base) -> bool {
+            value = value->Resolve();
+            if (value == base || IsUndefinedValue(value->Opcode())) return true;
+            if (!inRegion(value)) {
+                if (trace) ++leafOpcodes[std::string("outside:") + std::string(IrOpcodeName(value->Opcode()))];
+                return false;
+            }
+            if (trace && !value->IsPhi() && !(IsSelectOpcode(value->Opcode()) && masked.contains(value))) ++leafOpcodes[std::string(IrOpcodeName(value->Opcode()))];
+            if (const auto found = state_.find(value); found != state_.end()) return found->second == 1;
+            state_[value] = 1;
+            bool keeps = false;
+            if (IsSelectOpcode(value->Opcode()) && masked.contains(value) && value->ArgumentCount() == 3u) keeps = keepsBase(value->Argument(2), base);
+            else if (value->IsPhi()) {
+                keeps = value->ArgumentCount() != 0;
+                for (std::size_t argument = 0; argument < value->ArgumentCount() && keeps; ++argument) keeps = keepsBase(value->Argument(argument), base);
+            }
+            state_[value] = keeps ? 1 : 2;
+            return keeps;
+        };
+        bool merges = true;
+        for (const IrValue* inst : blocks[merge]->Instructions()) {
+            if (inst->IsIdentity()) continue;
+            if (!inst->IsPhi()) break;
+            if (!used.contains(inst)) continue;
+            const IrValue* base = nullptr;
+            for (std::size_t argument = 0; argument < inst->ArgumentCount(); ++argument) {
+                if (inst->PhiBlock(argument) == blocks[branch]) base = inst->Argument(argument)->Resolve();
+            }
+            if (base == nullptr) {
+                merges = false;
+                break;
+            }
+            for (std::size_t argument = 0; argument < inst->ArgumentCount() && merges; ++argument) {
+                if (inst->PhiBlock(argument) == blocks[branch]) continue;
+                state_.clear();
+                merges = keepsBase(inst->Argument(argument), base);
+            }
+            if (!merges) break;
+        }
+        if (!merges) {
+            ++rejected[3];
+            if (trace) rejectedWrites[3] += maskedIn(region);
+            continue;
+        }
+        state.laneBranchBlocks.insert(info.id);
+        ++converted;
+        for (const auto index : region) {
+            for (const IrValue* inst : blocks[index]->Instructions()) {
+                if (inst->IsIdentity() || !IsSelectOpcode(inst->Opcode()) || inst->ArgumentCount() != 3u || !masked.contains(inst)) continue;
+                if (inst->Argument(0)->Resolve() != exec) continue;
+                functionState.execAliases.emplace(inst, inst->Argument(1));
+                ++aliases;
+            }
+        }
+    }
+    if (trace && candidates != 0) {
+        std::fprintf(stderr, "[exec-regions] %zu exec branches: %zu per-lane (%zu masked writes become plain), rejected: shape %zu, extent %zu, instruction %zu (%zu writes), merge value %zu (%zu writes); %zu live masked writes in the program\n", candidates, converted, aliases, rejected[0], rejected[1], rejected[2], rejectedWrites[2], rejected[3], rejectedWrites[3], liveMasked);
+        std::string leaves;
+        for (const auto& [name, count] : leafOpcodes) leaves += " " + name + " " + std::to_string(count);
+        if (!leaves.empty()) std::fprintf(stderr, "[exec-regions] values leaving rejected regions that are not masked writes:%s\n", leaves.c_str());
+    }
+}
+
 void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrBlock* block) {
     auto& state = ctx.state;
     state.currentBlock = block;
@@ -886,7 +1137,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
     // Compute only: in PPSA03671's pixel shaders the selects are mostly float special cases and the
     // regions raised VGPRs (0x11d1c86d00 93 -> 134), while its compute programs dropped (127 -> 94,
     // 177 -> 134 without the scratch spill).
-    if (LaneRegionsEnabled() && state.laneCount == 1u && !state.continueTarget && state.program.Resources().stage == IrShaderStage::Compute) {
+    if (LaneRegionsEnabled() && !ExecRegionsEnabled() && state.laneCount == 1u && !state.continueTarget && state.program.Resources().stage == IrShaderStage::Compute) {
         const BlockInfo* info = BlockInfoFor(state.program, block);
         if (info != nullptr && !info->terminator.loopHeader) lanes = PlanLaneRegions(state.program, functionState, block);
     }
@@ -918,6 +1169,10 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 ldsWritten |= writes;
                 ldsRead |= access != SharedAccess::Write;
             }
+        }
+        if (const auto alias = functionState.execAliases.find(inst); alias != functionState.execAliases.end()) {
+            ctx.Define(*inst, ctx.Def(alias->second));
+            continue;
         }
         if (const auto region = lanes.regionOf.find(inst); region != lanes.regionOf.end()) {
             const auto& planned = lanes.regions[region->second];
@@ -986,6 +1241,7 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         state.module.AddFunction(spv::OpStore, state.loopGuardPc, ConstantU32(state, 0u));
     }
     state.module.AddFunction(spv::OpBranch, context.Label(blocks.front()));
+    if (ExecRegionsEnabled() && state.laneCount == 1u && context.otherHalf == nullptr && program.Resources().stage == IrShaderStage::Compute) PlanExecRegions(program, state, functionState);
     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
     if (debug) {
         const auto& infos = program.Metadata().blockInfo;

@@ -8,6 +8,7 @@
 #include "IntermediateRepresentation/IrMetadata/ResourceInfo.hpp"
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -31,6 +32,10 @@ struct IrProgramMetadata {
     bool vectorWindowIndexedWrites = false;
     std::uint32_t tessellationControlStride = 0;
     std::uint32_t tessellationPatchStride = 0;
+    // The selects translation made for exec-masked vector register writes ("exec bit ? new : old"),
+    // so the SPIR-V backend can tell them from other selects (a scalar s_cselect) after SSA: a lane
+    // outside the exec keeps `old` through them (exec regions, SpirvFlowEmitter).
+    std::unordered_set<const IrValue*> maskedVectorWrites;
 };
 
 }

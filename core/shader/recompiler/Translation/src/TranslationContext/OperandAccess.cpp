@@ -543,6 +543,7 @@ void TranslationContext::writeRawU32(const RdnaOperand& operand, IrU32 value) {
                 value = IrU32(ir.Emit(IrOpcode::DppUpdateU32, IrType::U32, {&value.Value(), &old, &ir.GetExec()}, flags));
             } else {
                 value = IrU32(ir.Select(ir.GetExec(), value.Value(), old));
+                program.Metadata().maskedVectorWrites.insert(&value.Value());
             }
             ir.SetVectorReg(reg, value.Value());
             break;
