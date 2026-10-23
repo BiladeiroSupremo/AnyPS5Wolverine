@@ -189,6 +189,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_LDS_SLACK` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderInputState.cpp` | 0 | dwords added to every dispatch's LDS allocation |
 | `APS5_LOCKED_BUILD` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | builds the whole dispatch preparation under the GpuMutex, skipping the split path |
 | `APS5_LOCKED_DRAW_PREPARE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp` |  | takes the GpuMutex before preparing a draw |
+| `APS5_INLINE_INDIRECT_RECORDS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp` |  | records a CPU-read indirect draw's records on the queue worker, after waiting for every queued draw, instead of handing them to the draw pipeline's committer as one item |
 | `APS5_LOCKED_INDIRECT_RECORDS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp` |  | keeps the GPU mutex across the records of a CPU-read indirect draw, their materialization included, instead of releasing it after each record is recorded |
 | `APS5_LOG_STATS` | presence | `core/libs/prx/libSceAgcDriver/Execution/include/AsyncLog.hpp` |  | prints the AGC log's line, byte and coalescing statistics every window; 0 turns them off |
 | `APS5_LOG_SYNC` | presence | `core/libs/prx/libSceAgcDriver/Execution/include/AsyncLog.hpp` |  | writes AGC log lines on the calling thread instead of through the asynchronous sink thread |

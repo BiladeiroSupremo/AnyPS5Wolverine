@@ -367,8 +367,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
-        // The records are read here, after what queued draws write.
-        drainPipeline(DrawPipeline::DrainReason::Indirect);
+        // The records are read here, after what queued work writes: the queue is waited for when its
+        // write ranges cover the records or the count (captures order themselves the same way,
+        // queryPendingWrite). The previous CPU-read indirect draw's records go to the committer as one
+        // item, and waiting for it unconditionally put back most of what that saved (indirect drains
+        // 980 -> 4310 per 10 s, 0.1 -> 0.77 s). APS5_INLINE_INDIRECT_RECORDS=1 always waits.
+        const auto& args = *drawParameters.indirect;
+        static const bool alwaysDrain = std::getenv("APS5_INLINE_INDIRECT_RECORDS") != nullptr;
+        const bool overlapping = alwaysDrain || !pipelined || DrawPipeline::Queue0().Overlaps(args.arguments, static_cast<std::size_t>(args.RangeBytes())) || (args.countIndirect && DrawPipeline::Queue0().Overlaps(args.countAddress, 4));
+        if (overlapping) drainPipeline(DrawPipeline::DrainReason::Indirect);
         const auto indirect = *drawParameters.indirect;
         // The records patch the results below: each stage's (a cached variant's or a shared
         // materialized one) is copied into `results` first.
@@ -390,6 +397,36 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(indirect, record));
         Graphics::CountIndirectDraw(*indirectCpu, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
         std::vector<std::vector<Graphics::DecodeRead>> retiredDecodeReads;
+        // With the draw pipeline the records go to the committer as one item after the loop: each
+        // record keeps its own copies of the results it patched (the others stay in `results`, which
+        // the loop no longer changes) and its snapshots, and the item takes over what they point
+        // into. Recording each record here under the GPU mutex took ~25 us per record on the queue-0
+        // worker (~1.3 s per 10 s in PPSA03671) while the committer idled. APS5_INLINE_INDIRECT_RECORDS=1
+        // records them here as before.
+        struct BatchedRecord {
+            Pm4::DrawParameters direct;
+            std::vector<ShaderRecompiler::RecompileResult> results;
+            std::vector<Graphics::CompiledShader> stages;
+            std::vector<Graphics::GuestMemorySnapshot> snapshots;
+        };
+        static const bool inlineRecords = std::getenv("APS5_INLINE_INDIRECT_RECORDS") != nullptr;
+        const bool batchRecords = !inlineRecords && pipelined && ahead == nullptr && deferredLabels().labels.empty() && DrawWindowWrites() == nullptr;
+        std::vector<BatchedRecord> batched;
+        const auto flushBatch = [&] {
+            if (batched.empty()) return;
+            auto writes = drawWriteRanges(graphics, stages);
+            const auto commitQueue = submission.queue;
+            const auto commitPacket = (packet[0] >> 8u) & 0xffu;
+            const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+            auto commit = [this, localDevice, decode, entry, commitQueue, commitPacket, epoch, batched = std::move(batched), programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), retiredDecodeReads = std::move(retiredDecodeReads), shaderMemory = std::move(shaderMemory)] {
+                DrawPipeline::FollowEpoch(epoch);
+                Graphics::SetDrawTimingProgram(programs.empty() ? 0 : programs.back().binary.codeAddress);
+                for (const auto& record : batched) commitDraw(localDevice, commitQueue, commitPacket, decode->state, record.direct, record.stages, record.snapshots, nullptr, {}, 0);
+            };
+            auto held = std::make_shared<decltype(commit)>(std::move(commit));
+            DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+            timing.Mark("draw_enqueued");
+        };
         const auto baseVertexWord = locate(indirect.baseVertexLocation);
         const auto startInstanceWord = locate(indirect.startInstanceLocation);
         const auto drawIndexWord = indirect.drawIndexEnabled ? locate(indirect.drawIndexLocation) : std::nullopt;
@@ -429,15 +466,42 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 retiredDecodeReads.push_back(std::move(decodeReads[programIndex]));
                 decodeVertexInfo(programIndex);
                 result = *materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
-                if (!rejected.empty()) return DrawVerdict::Rejected;
+                if (!rejected.empty()) {
+                    flushBatch();
+                    return DrawVerdict::Rejected;
+                }
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
             }
             fold(*programResults[0], direct);
             if (graphics.rectList && patched.contains(0)) buildRectList();
             snapshot();
             if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
+                flushBatch();
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
+            }
+            if (batchRecords) {
+                // The results this record changed: its patched programs' and, with them, a rebuilt
+                // rect list's. The stages point at this record's copies of those.
+                std::vector<std::size_t> changed;
+                for (const auto programIndex : patched) changed.push_back(resultIndex[programIndex]);
+                if (graphics.rectList && patched.contains(0)) {
+                    changed.push_back(rectIndex);
+                    changed.push_back(rectIndex + 1);
+                }
+                auto& record = batched.emplace_back();
+                record.direct = direct;
+                record.snapshots = snapshots;
+                record.stages = stages;
+                record.results.reserve(changed.size());
+                for (const auto index : changed) {
+                    record.results.push_back(results[index]);
+                    for (auto& stage : record.stages) {
+                        if (stage.program == &results[index]) stage.program = &record.results.back();
+                    }
+                }
+                phaseTiming.Phase(DrawRowVectors);
+                continue;
             }
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
@@ -451,6 +515,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             static const bool lockedRecords = std::getenv("APS5_LOCKED_INDIRECT_RECORDS") != nullptr;
             if (!lockedRecords && !lockedPrepare && gpuLock.owns_lock()) gpuLock.unlock();
         }
+        flushBatch();
         timing.Mark("draw_and_resource_release");
         return drawn();
     }
