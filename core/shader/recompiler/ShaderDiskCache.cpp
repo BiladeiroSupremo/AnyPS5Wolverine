@@ -1356,6 +1356,9 @@ struct SharedSpirv::Evictable {
     Loader loader = nullptr;
     const void* context = nullptr;
     void (*release)(const void*) = nullptr;
+    // SharedSpirv::KeyHashes, under the mutex: set once, kept through evictions.
+    bool hashed = false;
+    std::pair<std::uint64_t, std::uint64_t> hashes{};
     ~Evictable() {
         if (release != nullptr) release(context);
     }
@@ -1466,6 +1469,23 @@ const std::vector<std::uint32_t>& SharedSpirv::EvictableWords(Evictable& module)
         state.reloads.fetch_add(1, std::memory_order_relaxed);
     }
     return *module.words;
+}
+
+std::pair<std::uint64_t, std::uint64_t> SharedSpirv::KeyHashes() const {
+    const auto compute = [](const std::vector<std::uint32_t>& words) {
+        const auto bytes = std::as_bytes(std::span(words));
+        return std::pair{ShaderDiskCache::ContentHash(bytes, 0x5eed0101ull), ShaderDiskCache::ContentHash(bytes, 0x5eed0102ull)};
+    };
+    if (evictable == nullptr) return compute(Words());
+    {
+        std::lock_guard lock(evictable->mutex);
+        if (evictable->hashed) return evictable->hashes;
+    }
+    const auto hashes = compute(Words());
+    std::lock_guard lock(evictable->mutex);
+    evictable->hashes = hashes;
+    evictable->hashed = true;
+    return hashes;
 }
 
 std::size_t SharedSpirv::EvictableSize(const Evictable& module) {

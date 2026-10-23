@@ -706,10 +706,11 @@ std::vector<std::byte> SpecializedKey(const CompiledShaderArtifact& artifact, st
         const auto bytes = std::as_bytes(std::span(&word, 1));
         key.insert(key.end(), bytes.begin(), bytes.end());
     };
-    const auto words = std::as_bytes(std::span(artifact.spirv.Words()));
-    value(words.size());
-    value(ShaderDiskCache::ContentHash(words, 0x5eed0101ull));
-    value(ShaderDiskCache::ContentHash(words, 0x5eed0102ull));
+    // The same key as hashing the words here, without reloading evicted words (KeyHashes).
+    const auto [first, second] = artifact.spirv.KeyHashes();
+    value(artifact.spirv.size() * sizeof(std::uint32_t));
+    value(first);
+    value(second);
     value(artifact.vertexInputPatches.size());
     for (const auto& patch : artifact.vertexInputPatches) {
         value(patch.location);

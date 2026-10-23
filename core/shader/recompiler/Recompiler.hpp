@@ -455,6 +455,10 @@ public:
     // `pinned`: kept resident until Unpin (a module whose reload source is not written yet).
     static SharedSpirv MakeEvictable(std::vector<std::uint32_t> words, Loader loader, const void* context, void (*release)(const void*), bool pinned = false);
     void Unpin() const;
+    // The two content hashes of the words that key a specialized module (SpecializedKey). An
+    // evictable module keeps them from the first call, so the key of a module whose words were
+    // evicted needs no reload from the disk cache (a synchronous read on the queue worker).
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> KeyHashes() const;
 
     [[nodiscard]] const std::vector<std::uint32_t>& Words() const {
         if (evictable) return EvictableWords(*evictable);
