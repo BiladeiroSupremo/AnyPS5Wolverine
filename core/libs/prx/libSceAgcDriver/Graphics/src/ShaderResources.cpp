@@ -119,6 +119,14 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    // An uncompressed snapshot's XXH3 hash per 64 KiB write-tracker block (block 0 holds `address`):
+    // a hit on a surface stamped since `generation` re-reads only the stamped blocks (empty: the whole
+    // surface is re-read and hashed, as before; APS5_NO_BLOCK_COMPARE=1 keeps it that way).
+    std::vector<std::uint64_t> blockHashes;
+    // The uncompressed snapshot's hash by committed runs (hashRuns), the whole-surface compare's
+    // measure when taken (APS5_NO_IN_PLACE_TEXTURE_HASH=1: the copy and snapshotHash, as before).
+    std::uint64_t runsHash = 0;
+    bool runsHashed = false;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -343,6 +351,12 @@ struct TextureCounters {
     // Storage images a Revalidate refreshed directly instead of through the lookups (T1, see
     // ShaderResources::refreshOwnObjects).
     std::atomic<std::uint64_t> ownRefreshes{0};
+    // Snapshot hits on a stamped surface: compared by blocks (blocks re-read / skipped as unstamped)
+    // or whole.
+    std::atomic<std::uint64_t> blockCompares{0};
+    std::atomic<std::uint64_t> blocksRead{0};
+    std::atomic<std::uint64_t> blocksSkipped{0};
+    std::atomic<std::uint64_t> wholeCompares{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -359,7 +373,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; stamped snapshot hits compared by blocks %llu (%llu blocks read, %llu skipped), whole %llu\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.blockCompares), count(counters.blocksRead), count(counters.blocksSkipped), count(counters.wholeCompares));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -543,6 +557,122 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     return budget;
 }
 
+bool inPlaceHashEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_IN_PLACE_TEXTURE_HASH") == nullptr;
+    return enabled;
+}
+
+// The XXH3 hash of [address, address + bytes) as ReadCommitted reads it (uncommitted pages as zeros),
+// taken in place: the same value as XXH3_64bits over that copy, without the copy (a stamped block of
+// a snapshot, see equalsByBlocks). The caller has checked the multisample read guard
+// (RequireNoMultisampleTarget); the flush hook runs here as the read's would.
+std::uint64_t hashCommitted(std::uint64_t address, std::size_t bytes) {
+    GuestMemory::FlushGpuWrites(address, bytes);
+    if (GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return XXH3_64bits(reinterpret_cast<const void*>(address), bytes);
+    static const std::array<std::byte, 65536> zeros{};
+    XXH3_state_t state;
+    XXH3_INITSTATE(&state);
+    XXH3_64bits_reset(&state);
+    const auto hashZeros = [&](std::uint64_t count) {
+        while (count != 0) {
+            const auto part = std::min<std::uint64_t>(count, zeros.size());
+            XXH3_64bits_update(&state, zeros.data(), static_cast<std::size_t>(part));
+            count -= part;
+        }
+    };
+    auto cursor = address;
+    for (const auto& [begin, end] : GuestMemory::CommittedRanges(address, bytes)) {
+        hashZeros(begin - cursor);
+        XXH3_64bits_update(&state, reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+        cursor = end;
+    }
+    hashZeros(address + bytes - cursor);
+    return XXH3_64bits_digest(&state);
+}
+
+// A partially resident surface (a streamed texture whose mapped views cover a few of its pages) is
+// compared by its committed runs alone: the XXH3 hash of each run's offset, length and bytes, so a
+// commit or decommit changes it as a write does, without hashing the zeros in between (megabytes per
+// compare). `data` is the snapshot ReadCommitted made (runs taken right after it) or null for the
+// live memory.
+using CommittedRuns = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+CommittedRuns committedRuns(std::uint64_t address, std::size_t bytes) {
+    if (GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return {{address, address + bytes}};
+    return GuestMemory::CommittedRanges(address, bytes);
+}
+
+std::uint64_t hashRuns(std::uint64_t address, const CommittedRuns& runs, const std::byte* data) {
+    XXH3_state_t state;
+    XXH3_INITSTATE(&state);
+    XXH3_64bits_reset(&state);
+    for (const auto& [begin, end] : runs) {
+        const std::uint64_t header[2] = {begin - address, end - begin};
+        XXH3_64bits_update(&state, header, sizeof(header));
+        XXH3_64bits_update(&state, data != nullptr ? static_cast<const void*>(data + (begin - address)) : reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+    }
+    return XXH3_64bits_digest(&state);
+}
+
+std::uint64_t liveRunsHash(std::uint64_t address, std::size_t bytes) {
+    GuestMemory::FlushGpuWrites(address, bytes);
+    return hashRuns(address, committedRuns(address, bytes), nullptr);
+}
+
+bool blockCompareEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_BLOCK_COMPARE") == nullptr;
+    return enabled;
+}
+
+// Write-tracker block k of the surface [address, address + bytes) as offsets into it (block 0 holds
+// `address`, as GuestMemory::ChangedBlocks numbers them).
+constexpr std::uint64_t TrackerBlockBytes = 65536;
+
+std::size_t trackerBlockCount(std::uint64_t address, std::size_t bytes) {
+    return static_cast<std::size_t>((address + bytes - 1) / TrackerBlockBytes - address / TrackerBlockBytes + 1);
+}
+
+std::pair<std::size_t, std::size_t> trackerBlockSlice(std::uint64_t address, std::size_t bytes, std::size_t block) {
+    const auto first = address / TrackerBlockBytes * TrackerBlockBytes + block * TrackerBlockBytes;
+    return {static_cast<std::size_t>(std::max(first, address) - address), static_cast<std::size_t>(std::min(first + TrackerBlockBytes, address + bytes) - address)};
+}
+
+std::vector<std::uint64_t> snapshotBlockHashes(std::uint64_t address, std::span<const std::byte> snapshot) {
+    std::vector<std::uint64_t> hashes(trackerBlockCount(address, snapshot.size()));
+    for (std::size_t block = 0; block < hashes.size(); ++block) {
+        const auto [begin, end] = trackerBlockSlice(address, snapshot.size(), block);
+        hashes[block] = XXH3_64bits(snapshot.data() + begin, end - begin);
+    }
+    return hashes;
+}
+
+// Whether the surface still holds the snapshot, comparing only the blocks the write tracker stamped
+// since `generation` (an unstamped block is taken as unchanged, the proof UnchangedSince makes for the
+// whole surface). Each stamped block is read through the flush hook, as the whole-surface compare
+// reads them. Empty: the blocks are not tracked, and the caller compares the whole surface.
+std::optional<bool> equalsByBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::span<const std::uint64_t> hashes) {
+    if (hashes.empty() || generation == 0 || hashes.size() != trackerBlockCount(address, bytes)) return std::nullopt;
+    thread_local std::vector<std::uint64_t> generations;
+    thread_local std::vector<std::uint8_t> changed;
+    generations.assign(hashes.size(), generation);
+    changed.assign(hashes.size(), GuestMemory::BlockWritten);
+    if (!GuestMemory::ChangedBlocks(address, bytes, generations, changed)) return std::nullopt;
+    auto& counters = TextureCounts();
+    counters.blockCompares.fetch_add(1, std::memory_order_relaxed);
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+    std::uint64_t read = 0;
+    bool same = true;
+    for (std::size_t block = 0; block < hashes.size() && same; ++block) {
+        if (changed[block] == GuestMemory::BlockUnchanged) continue;
+        const auto [begin, end] = trackerBlockSlice(address, bytes, block);
+        ++read;
+        same = hashCommitted(address + begin, end - begin) == hashes[block];
+    }
+    counters.blocksRead.fetch_add(read, std::memory_order_relaxed);
+    if (same) counters.blocksSkipped.fetch_add(hashes.size() - read, std::memory_order_relaxed);
+    return same;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, std::uint32_t skipLevels = 0) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
@@ -685,6 +815,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             const auto equalsCommitted = [&] {
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+                if (it->runsHashed && inPlaceHashEnabled()) return liveRunsHash(address, bytes) == it->runsHash;
                 thread_local std::vector<std::byte>* scratchSlot = nullptr;
                 auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
                 scratch.resize(bytes);
@@ -708,7 +839,14 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 }
                 return same;
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || GuestMemory::UnchangedSince(address, static_cast<std::size_t>(it->snapshotBytes), it->generation) || (traceCompare ? tracedCompare() : equalsCommitted())) {
+            const auto stampedCompare = [&] {
+                if (!traceCompare) {
+                    if (const auto same = equalsByBlocks(address, bytes, it->generation, it->blockHashes)) return *same;
+                }
+                counters.wholeCompares.fetch_add(1, std::memory_order_relaxed);
+                return traceCompare ? tracedCompare() : equalsCommitted();
+            };
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || GuestMemory::UnchangedSince(address, static_cast<std::size_t>(it->snapshotBytes), it->generation) || stampedCompare()) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
@@ -745,6 +883,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         entry.snapshotBytes = snapshot.size();
         entry.snapshotHash = XXH3_64bits(snapshot.data(), snapshot.size());
+        if (*keys == DccKeys::Uncompressed && blockCompareEnabled() && !snapshot.empty()) entry.blockHashes = snapshotBlockHashes(address, snapshot);
+        if (*keys == DccKeys::Uncompressed && inPlaceHashEnabled() && !snapshot.empty()) {
+            entry.runsHash = hashRuns(address, committedRuns(address, snapshot.size()), snapshot.data());
+            entry.runsHashed = true;
+        }
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare, skipLevels);
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);

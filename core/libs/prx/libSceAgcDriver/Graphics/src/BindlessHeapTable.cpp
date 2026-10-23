@@ -545,10 +545,12 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
     // APS5_NO_HEAP_REVALIDATE=1 keeps every entry as first resolved.
     static const bool revalidate = std::getenv("APS5_NO_HEAP_REVALIDATE") == nullptr;
     auto& entries = table->Entries();
-    // A pass also stops after APS5_HEAP_REVALIDATE_US (2000 by default): a revalidation reads and
-    // hashes the whole texture, and passes slower than the interval ran on every dispatch and
-    // stalled the queue for minutes (PPSA03671 load freezes, 2026-10-15).
-    static const auto passTime = std::chrono::microseconds([] { const char* text = std::getenv("APS5_HEAP_REVALIDATE_US"); return text ? std::atoi(text) : 2000; }());
+    // A pass also stops after APS5_HEAP_REVALIDATE_US (600 by default): a revalidation hashes the
+    // texture's committed bytes, and passes slower than the interval ran on every dispatch and
+    // stalled the queue for minutes (PPSA03671 load freezes, 2026-10-15). The pass runs under the
+    // GpuMutex; at 2000 us it took ~2 ms of every 30 ms on the committer, which the in-place
+    // committed-runs compare (~4x cheaper) brought to as many entries per pass at 600 us.
+    static const auto passTime = std::chrono::microseconds([] { const char* text = std::getenv("APS5_HEAP_REVALIDATE_US"); return text ? std::atoi(text) : 600; }());
     if (revalidate && !entries.empty() && table->RevalidateDue()) {
         auto& cursor = table->RevalidateCursor();
         // Entries whose texture the sampled texture cache evicted go back to Pending: kept alive by
