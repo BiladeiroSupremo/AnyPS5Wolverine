@@ -290,6 +290,7 @@ void StartProcessSampler() {
 namespace {
 
 std::jthread committerSamplerThread;
+std::jthread computeSamplerThread;
 
 // Samples the calling thread every millisecond into `path` (and its .collapsed.txt stacks).
 void StartThreadSampler(const char* path, std::jthread& samplerThread) {
@@ -330,17 +331,25 @@ void StartCommitterSampler() {
     if (const char* path = std::getenv("APS5_SAMPLE_COMMITTER")) StartThreadSampler(path, committerSamplerThread);
 }
 
+// Debug aid: APS5_SAMPLE_COMPUTE=<file> samples the queue 0x20 (async compute) worker like the worker.
+void StartComputeSampler() {
+    if (const char* path = std::getenv("APS5_SAMPLE_COMPUTE")) StartThreadSampler(path, computeSamplerThread);
+}
+
 void StopWorkerSampler() {
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
     committerSamplerThread.request_stop();
+    computeSamplerThread.request_stop();
     if (processSamplerThread.joinable()) processSamplerThread.join();
     if (workerSamplerThread.joinable()) workerSamplerThread.join();
     if (committerSamplerThread.joinable()) committerSamplerThread.join();
+    if (computeSamplerThread.joinable()) computeSamplerThread.join();
 }
 #else
 void StartWorkerSampler() {}
 void StartCommitterSampler() {}
+void StartComputeSampler() {}
 void StopWorkerSampler() {}
 #endif
 

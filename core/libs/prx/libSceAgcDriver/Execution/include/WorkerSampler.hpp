@@ -7,6 +7,8 @@ namespace AgcDriver {
 void StartWorkerSampler();
 // Starts sampling the calling thread (the draw committer) when APS5_SAMPLE_COMMITTER names a file.
 void StartCommitterSampler();
+// Starts sampling the calling thread (the queue 0x20 worker) when APS5_SAMPLE_COMPUTE names a file.
+void StartComputeSampler();
 void StopWorkerSampler();
 
 }
