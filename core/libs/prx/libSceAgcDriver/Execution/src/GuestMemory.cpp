@@ -1718,10 +1718,19 @@ bool GpuLockPriority() {
 }
 std::atomic<std::uint32_t> priorityWaiting{0};
 constexpr auto PriorityDeferLimit = std::chrono::microseconds(300);
+
+// With the draw pipeline the committer (untagged) records queue 0's draws, and queue 0 waits on
+// labels the async compute worker (tag 0x20) writes; that worker lost the mutex to the committer
+// ~14k times per 10 s. APS5_COMPUTE_LOCK_PRIORITY=1 gives it the graphics worker's priority.
+bool PriorityThread() {
+    static const bool compute = std::getenv("APS5_COMPUTE_LOCK_PRIORITY") != nullptr;
+    const auto tag = LockStats().tag;
+    return tag == 0 || (compute && tag == 0x20);
+}
 }
 
 bool GpuMutexType::try_lock() {
-    if (GpuLockPriority() && priorityWaiting.load(std::memory_order_acquire) != 0 && LockStats().tag != 0 && !HeldByThisThread()) return false;
+    if (GpuLockPriority() && priorityWaiting.load(std::memory_order_acquire) != 0 && !PriorityThread() && !HeldByThisThread()) return false;
     if (!GpuLockProfiled()) {
         if (!mutex.try_lock()) return false;
         acquired();
@@ -1792,7 +1801,7 @@ void GpuMutexType::lock() {
         }
     } priorityWait;
     if (GpuLockPriority() && !HeldByThisThread()) {
-        if (LockStats().tag == 0) {
+        if (PriorityThread()) {
             priorityWaiting.fetch_add(1, std::memory_order_acq_rel);
             priorityWait.counted = true;
         } else if (priorityWaiting.load(std::memory_order_acquire) != 0) {
