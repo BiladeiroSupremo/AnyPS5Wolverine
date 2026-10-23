@@ -1323,6 +1323,48 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     return hash;
 }
 
+// Results the memo drops are destroyed on a helper thread: a result owns many vectors, and freeing
+// them on eviction took ~2.4% of PPSA03671's queue-0 worker (under the source mutex; the memo hits
+// ~12%, so nearly every miss evicts). APS5_NO_DEFERRED_RESULT_FREE=1 frees them where they drop.
+class DeferredResultRelease {
+public:
+    static void Release(std::vector<std::shared_ptr<const RecompileResult>>& results) {
+        if (results.empty()) return;
+        static const bool inline_ = std::getenv("APS5_NO_DEFERRED_RESULT_FREE") != nullptr;
+        if (inline_) {
+            results.clear();
+            return;
+        }
+        // Never destroyed: the helper may still run at process exit.
+        static auto* release = new DeferredResultRelease;
+        {
+            std::lock_guard lock(release->mutex);
+            release->pending.insert(release->pending.end(), std::make_move_iterator(results.begin()), std::make_move_iterator(results.end()));
+        }
+        results.clear();
+        release->wake.notify_one();
+    }
+
+private:
+    DeferredResultRelease() {
+        std::thread([this] {
+            std::vector<std::shared_ptr<const RecompileResult>> batch;
+            for (;;) {
+                {
+                    std::unique_lock lock(mutex);
+                    wake.wait(lock, [&] { return !pending.empty(); });
+                    batch.swap(pending);
+                }
+                batch.clear();
+            }
+        }).detach();
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<std::shared_ptr<const RecompileResult>> pending;
+};
+
 // The memo'd result of `source`'s variant for the snapshot (design13 R5): a hit returns the shared
 // object, a miss materializes outside the source mutex and inserts (a concurrent miss's object is
 // as good). `memoHit` reports the hit.
@@ -1349,6 +1391,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     counters.misses.fetch_add(1, std::memory_order_relaxed);
     std::shared_ptr<const RecompileResult> shared = std::move(result);
+    thread_local std::vector<std::shared_ptr<const RecompileResult>> dropped;
     {
         std::lock_guard lock(source.mutex);
         const auto found = source.memoIndex.find(index);
@@ -1357,6 +1400,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 source.memo.splice(source.memo.begin(), source.memo, found->second);
                 shared = found->second->result;
             } else {
+                dropped.push_back(std::move(found->second->result));
                 source.memo.erase(found->second);
                 source.memoIndex.erase(found);
             }
@@ -1365,13 +1409,15 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             source.memo.push_front({variant->artifact.variantId, hash, shared});
             source.memoIndex.emplace(index, source.memo.begin());
             while (source.memo.size() > resultMemoEntries()) {
-                const auto& last = source.memo.back();
+                auto& last = source.memo.back();
                 source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
+                dropped.push_back(std::move(last.result));
                 source.memo.pop_back();
                 counters.evictions.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
+    DeferredResultRelease::Release(dropped);
     reportResultMemo();
     return shared;
 }
