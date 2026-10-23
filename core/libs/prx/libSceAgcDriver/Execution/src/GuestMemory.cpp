@@ -390,7 +390,21 @@ struct PageSpan {
         auto index = (address - base) / PageBytes;
         const auto stop = std::min<std::uintptr_t>((std::min(limit, base + size) - base + PageBytes - 1) / PageBytes, size / PageBytes);
         const std::uint64_t wide = 0x0101010101010101ull * value;
+        // 64 pages per step where aligned: a descriptor binding a whole GPU heap (gigabytes) walked
+        // hundreds of thousands of page bytes 8 at a time on every build (~2.5% of the committer). A
+        // page byte another thread stores meanwhile is read before or after the store, as the
+        // single-byte loads read it.
+        const __m128i lanes = _mm_set1_epi8(static_cast<char>(value));
         while (index < stop) {
+            if (index % 64 == 0 && index + 64 <= stop) {
+                const auto* block = reinterpret_cast<const __m128i*>(pages + index);
+                const auto low = _mm_and_si128(_mm_cmpeq_epi8(_mm_load_si128(block), lanes), _mm_cmpeq_epi8(_mm_load_si128(block + 1), lanes));
+                const auto high = _mm_and_si128(_mm_cmpeq_epi8(_mm_load_si128(block + 2), lanes), _mm_cmpeq_epi8(_mm_load_si128(block + 3), lanes));
+                if (_mm_movemask_epi8(_mm_and_si128(low, high)) == 0xffff) {
+                    index += 64;
+                    continue;
+                }
+            }
             if (index % 8 == 0 && index + 8 <= stop && std::atomic_ref<const std::uint64_t>(*reinterpret_cast<const std::uint64_t*>(pages + index)).load(std::memory_order_relaxed) == wide) {
                 index += 8;
                 continue;
