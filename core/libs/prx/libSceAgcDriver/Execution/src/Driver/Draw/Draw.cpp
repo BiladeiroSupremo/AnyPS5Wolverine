@@ -481,6 +481,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), entry = std::move(entry), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory)] {
             DrawPipeline::FollowEpoch(epoch);
+            // The committer records the draw: APS5_GPU_TIME_DRAW_PROGRAMS names its pass by this program.
+            Graphics::SetDrawTimingProgram(programs.empty() ? 0 : programs.back().binary.codeAddress);
             commitDraw(localDevice, commitQueue, commitPacket, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
