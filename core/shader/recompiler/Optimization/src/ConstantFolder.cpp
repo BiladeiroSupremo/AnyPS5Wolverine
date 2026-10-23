@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -121,8 +122,46 @@ bool holdsStartingLanes(const IrProgram& program, const IrValue& word, std::uint
     return (helper(lhs) && isImmediateU32(rhs, 0u)) || (helper(rhs) && isImmediateU32(lhs, 0u));
 }
 
+bool ownLaneSet(const IrProgram& program, const IrValue& word, std::uint32_t index, std::uint32_t depth = 0);
+
+// Whether the quad of the testing lane has a lane set in word `index` of a mask: its own bit, or the
+// pixel stage's starting lanes (each launched quad holds a covered fragment).
+bool ownQuadSet(const IrProgram& program, const IrValue& word, std::uint32_t index, std::uint32_t depth) {
+    return ownLaneSet(program, word, index, depth) || (program.Resources().stage == IrShaderStage::Pixel && holdsStartingLanes(program, word, index, depth));
+}
+
+// Whether word `index` of a lane mask has the bit of the lane that tests it set, for every lane that
+// can test it: a Ballot(true) the lane executed (its definition dominates the test) holds the lane,
+// an AND needs both sides and an OR either, and a whole-quad-mode word holds the lanes of every quad
+// with a lane set. Exec reads mask the words with Ballot(true), and exec restored from a saved copy
+// of the whole-quad mask is such a word, so the per-lane exec test of those (a select on every vector
+// write after them) is constant.
+bool ownLaneSet(const IrProgram& program, const IrValue& word, std::uint32_t index, std::uint32_t depth) {
+    if (depth > 8u) return false;
+    if (word.Opcode() == IrOpcode::BitwiseAnd32) {
+        return ownLaneSet(program, resolveArg(word, 0), index, depth + 1u) && ownLaneSet(program, resolveArg(word, 1), index, depth + 1u);
+    }
+    if (word.Opcode() == IrOpcode::BitwiseOr32) {
+        return ownLaneSet(program, resolveArg(word, 0), index, depth + 1u) || ownLaneSet(program, resolveArg(word, 1), index, depth + 1u);
+    }
+    if (word.Opcode() == IrOpcode::CompositeExtractU32x4 && isImmediateU32(resolveArg(word, 1), index)) {
+        const auto& ballot = resolveArg(word, 0);
+        if (ballot.Opcode() != IrOpcode::Ballot) return false;
+        const auto& condition = resolveArg(ballot, 0);
+        return isImmediate(condition, IrType::U1) && condition.ImmediateBool();
+    }
+    if (word.Opcode() == IrOpcode::CompositeExtractU64 && isImmediateU32(resolveArg(word, 1), index)) {
+        const auto& wqm = resolveArg(word, 0);
+        if (wqm.Opcode() != IrOpcode::WqmU64) return false;
+        const auto& lanes = resolveArg(wqm, 0);
+        return lanes.Opcode() == IrOpcode::CompositeConstructU64 && ownQuadSet(program, resolveArg(lanes, index), index, depth + 1u);
+    }
+    return false;
+}
+
 bool foldStartingQuadBitTest(const IrProgram& program, IrBuilder& builder, IrValue& inst) {
-    if (program.Resources().stage != IrShaderStage::Pixel) return false;
+    static const bool ownLanes = std::getenv("APS5_NO_OWN_LANE_FOLD") == nullptr;
+    if (!ownLanes && program.Resources().stage != IrShaderStage::Pixel) return false;
     auto& left = resolveArg(inst, 0);
     auto& right = resolveArg(inst, 1);
     if (!isImmediateU32(right, 0u) || left.Opcode() != IrOpcode::BitwiseAnd32) return false;
@@ -142,6 +181,11 @@ bool foldStartingQuadBitTest(const IrProgram& program, IrBuilder& builder, IrVal
         high = &resolveArg(word, 2);
     } else if (program.WaveSize() != 32u) {
         return false;
+    }
+    if (ownLanes) {
+        if (!ownLaneSet(program, *low, 0u) || (high != nullptr && !ownLaneSet(program, *high, 1u))) return false;
+        replaceWith(inst, builder.ConstantBool(true));
+        return true;
     }
     if (low->Opcode() != IrOpcode::CompositeExtractU64 || !isImmediateU32(resolveArg(*low, 1), 0u)) return false;
     const auto& wqm = resolveArg(*low, 0);
