@@ -11,10 +11,14 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
+#include <string>
+#include <vector>
 #include <exception>
 #include <mutex>
 #include <utility>
@@ -54,6 +58,57 @@ struct MapImports {
 MapImports& BackgroundMapImports() {
     static auto* state = new MapImports();
     return *state;
+}
+
+// Experiments on the title's own code (APS5_CODE_PATCHES="rva:expected:replacement;...", hex, rva
+// relative to the main executable): each patch is written only where the expected bytes are found,
+// before the title draws anything (the driver starts with its first graphics call). The process'
+// image is patched in memory; nothing on disk changes. First use (PPSA03671, 2026-10-23): the render
+// thread's frame wait (app.exe 0x143f113f0) waits for frame<<32 instead of frame<<32 | stage<<20 |
+// 0x7b, i.e. for the GPU to start the closed frame instead of finishing it: two frames in flight.
+void ApplyCodePatches() {
+    const char* text = std::getenv("APS5_CODE_PATCHES");
+    if (text == nullptr || *text == '\0') return;
+#ifdef _WIN32
+    const auto base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+    const auto hexBytes = [](const std::string& hex) {
+        std::vector<std::uint8_t> bytes;
+        for (std::size_t i = 0; i + 1 < hex.size(); i += 2) bytes.push_back(static_cast<std::uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+        return bytes;
+    };
+    std::string list(text);
+    std::size_t start = 0;
+    while (start < list.size()) {
+        const auto end = std::min(list.find(';', start), list.size());
+        const auto entry = list.substr(start, end - start);
+        start = end + 1;
+        const auto first = entry.find(':');
+        const auto second = first == std::string::npos ? std::string::npos : entry.find(':', first + 1);
+        if (second == std::string::npos) {
+            std::fprintf(stderr, "[code-patch] malformed entry '%s' (rva:expected:replacement)\n", entry.c_str());
+            continue;
+        }
+        const auto rva = std::stoull(entry.substr(0, first), nullptr, 16);
+        const auto expected = hexBytes(entry.substr(first + 1, second - first - 1));
+        const auto replacement = hexBytes(entry.substr(second + 1));
+        auto* target = base + rva;
+        if (expected.size() != replacement.size() || expected.empty() || std::memcmp(target, expected.data(), expected.size()) != 0) {
+            std::fprintf(stderr, "[code-patch] 0x%llx: expected bytes not found (or sizes differ), not patched\n", static_cast<unsigned long long>(rva));
+            continue;
+        }
+        DWORD previous = 0;
+        if (!VirtualProtect(target, replacement.size(), PAGE_EXECUTE_READWRITE, &previous)) {
+            std::fprintf(stderr, "[code-patch] 0x%llx: VirtualProtect failed (%lu)\n", static_cast<unsigned long long>(rva), GetLastError());
+            continue;
+        }
+        std::memcpy(target, replacement.data(), replacement.size());
+        VirtualProtect(target, replacement.size(), previous, &previous);
+        FlushInstructionCache(GetCurrentProcess(), target, replacement.size());
+        std::fprintf(stderr, "[code-patch] 0x%llx: patched %zu bytes\n", static_cast<unsigned long long>(rva), replacement.size());
+    }
+#else
+    std::fprintf(stderr, "[code-patch] APS5_CODE_PATCHES is Windows only\n");
+#endif
 }
 
 bool SyncMapImports() {
@@ -158,6 +213,7 @@ void Driver::stop() {
 }
 
 Driver::Driver() {
+    ApplyCodePatches();
     static_cast<void>(GuestMemory::TrackerGeneration());
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {

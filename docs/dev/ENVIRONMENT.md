@@ -101,6 +101,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_CAPTURE_INPUTS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | records each draw's inputs in the capture trace (requires APS5_CAPTURE_TRACE) |
 | `APS5_CAPTURE_TRACE` | presence | `core/libs/prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp` |  | writes capture events to capture-trace.log |
 | `APS5_CHECK_INDIRECT_ARGS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | reads GPU-side indirect draw records back on the CPU and prints the first ones |
+| `APS5_CODE_PATCHES` | string | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Lifecycle.cpp` |  | experiments on the title's code: "rva:expected:replacement;..." (hex, rva in the main executable), each written in memory at driver start only where the expected bytes are found (Windows only) |
 | `APS5_COMPLETION_STORE_SYNC` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | makes a store made by a completion action wait for later batches over its range |
 | `APS5_COPY_DESTINATION_STRICT` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | refuses a CPU copy whose destination has any pending writer, not only an unsettled one |
 | `APS5_COPY_HLE_CPU_MAX` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferCopy.cpp` | 262144 | largest copy in bytes the CPU side of the copy HLE handles |
