@@ -186,6 +186,20 @@ void Driver::execute(const Submission& submission) {
             cursor = nextCursor;
             continue;
         }
+        // An occlusion counter dump (EVENT_WRITE ZPASS_DONE) behind queued draws joins the queue the
+        // same way (commitSampleDump) instead of draining it: ~1750 drains per 10 s in PPSA03671
+        // gameplay (2026-10-23). With deferred labels pending it drains as before, since those must be
+        // recorded ahead of it. APS5_NO_PIPELINED_SAMPLE_DUMPS=1 always drains.
+        static const bool dumpItems = std::getenv("APS5_NO_PIPELINED_SAMPLE_DUMPS") == nullptr;
+        if (pipelined && dumpItems && opcode == 0x46 && packet.size() >= 4 && (packet[1] & 0x3fu) == 0x39u && !Pm4::Predicated(header) && DrawPipeline::Queue0().Busy() && DrawWindowWrites() == nullptr && deferredLabels().labels.empty()) {
+            constexpr std::uint64_t DumpBytes = 15 * 16 + 8;
+            const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+            std::vector<DrawPipeline::Range> writes{{address, address + DumpBytes}};
+            const auto dumpQueue = submission.queue;
+            DrawPipeline::Queue0().Enqueue([this, dumpQueue, address] { commitSampleDump(dumpQueue, address); }, std::move(writes));
+            cursor = nextCursor;
+            continue;
+        }
         if (pipelined && DrawPipeline::Queue0().Busy()) {
             // A predicated packet reads its predicate first: queued draws that may write it go first.
             const bool predicateQueued = Pm4::Predicated(header) && queue.predication.operation != 0 && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4);

@@ -208,6 +208,7 @@ private:
     static std::uint32_t takeFrameSkips();
     static bool labelCommitItem(std::span<const std::uint32_t> packet);
     void commitLabelPacket(std::uint32_t queue, std::span<const std::uint32_t> packet);
+    void commitSampleDump(std::uint32_t queue, std::uint64_t address);
     // A direct dispatch queued on the draw pipeline (Driver::dispatch) and what its recording reads.
     struct PipelinedDispatch {
         std::shared_ptr<VulkanDevice> device;

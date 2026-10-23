@@ -55,6 +55,20 @@ void Driver::commitLabelPacket(std::uint32_t queue, std::span<const std::uint32_
     if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(queue);
 }
 
+// An occlusion counter dump (EVENT_WRITE ZPASS_DONE) behind queued draws, on the committer after
+// them: recorded on the GPU, or written by the CPU as the worker does (dumpSampleCounters).
+void Driver::commitSampleDump(std::uint32_t queue, std::uint64_t address) {
+    GuestMemory::SetCurrentPacket(0x46, queue);
+    bool wroteOnGpu = false;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (const auto localDevice = device.Load()) wroteOnGpu = localDevice->DumpSamplesOnGpu(address);
+    }
+    if (wroteOnGpu) Graphics::Recorder::CountRecordedWork();
+    else dumpSampleCounters(address);
+}
+
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
