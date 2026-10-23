@@ -4,7 +4,9 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -287,6 +289,64 @@ void Trace(const char* format, ...) {
     std::fputc('\n', stderr);
     va_end(args);
 }
+
+// APS5_PROFILE_MEMORY=1: calls, total and longest time of the guest memory calls by kind, printed
+// every 10 s as a [memory-ops] line. PPSA03671's 300-700 ms gameplay hitches (APS5_SAMPLE_HITCHES,
+// 2026-10-23) had a title thread inside these calls (host-import retirement and re-creation) while
+// the render thread spun on a title lock.
+enum class MemoryOp : std::size_t { MapDirect, MapAnon, MapZero, Mprotect, Munmap, Reserve, UnmapViews, Count };
+constexpr const char* MemoryOpNames[] = {"map-direct", "map-anon", "map-zero", "mprotect", "munmap", "reserve", "unmap-views"};
+
+struct MemoryOpStats {
+    std::atomic<std::uint64_t> calls{0}, totalUs{0}, maxUs{0}, slow{0};
+};
+MemoryOpStats g_memoryOps[static_cast<std::size_t>(MemoryOp::Count)];
+// Fixed remaps of direct memory onto a range already mapping the same physical pages.
+std::atomic<std::uint64_t> g_sameRemaps{0}, g_sameRemapBytes{0}, g_remaps{0}, g_remapBytes{0};
+
+bool MemoryOpsProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_MEMORY") != nullptr;
+    return enabled;
+}
+
+struct MemoryOpTimer {
+    MemoryOp op;
+    std::chrono::steady_clock::time_point start;
+    explicit MemoryOpTimer(MemoryOp op) : op(op), start(MemoryOpsProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    MemoryOpTimer(const MemoryOpTimer&) = delete;
+    MemoryOpTimer& operator=(const MemoryOpTimer&) = delete;
+    ~MemoryOpTimer() {
+        if (!MemoryOpsProfiled()) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
+        auto& stats = g_memoryOps[static_cast<std::size_t>(op)];
+        stats.calls.fetch_add(1, std::memory_order_relaxed);
+        stats.totalUs.fetch_add(us, std::memory_order_relaxed);
+        if (us >= 10'000) stats.slow.fetch_add(1, std::memory_order_relaxed);
+        for (auto seen = stats.maxUs.load(std::memory_order_relaxed); us > seen && !stats.maxUs.compare_exchange_weak(seen, us, std::memory_order_relaxed);) {}
+        static std::mutex reportMutex;
+        static auto reported = now;
+        std::unique_lock lock(reportMutex, std::try_to_lock);
+        if (!lock.owns_lock() || now - reported < std::chrono::seconds(10)) return;
+        reported = now;
+        std::string line = "[memory-ops] (10 s)";
+        for (std::size_t index = 0; index < static_cast<std::size_t>(MemoryOp::Count); ++index) {
+            auto& each = g_memoryOps[index];
+            const auto calls = each.calls.exchange(0, std::memory_order_relaxed);
+            const auto total = each.totalUs.exchange(0, std::memory_order_relaxed);
+            const auto longest = each.maxUs.exchange(0, std::memory_order_relaxed);
+            const auto slowCalls = each.slow.exchange(0, std::memory_order_relaxed);
+            if (calls == 0) continue;
+            char text[160];
+            std::snprintf(text, sizeof(text), " %s %llu in %.1f ms (max %.1f ms, %llu >= 10 ms);", MemoryOpNames[index], static_cast<unsigned long long>(calls), static_cast<double>(total) / 1000.0, static_cast<double>(longest) / 1000.0, static_cast<unsigned long long>(slowCalls));
+            line += text;
+        }
+        char text[200];
+        std::snprintf(text, sizeof(text), " fixed direct remaps %llu (%llu MiB), onto the same pages %llu (%llu MiB)\n", static_cast<unsigned long long>(g_remaps.exchange(0)), static_cast<unsigned long long>(g_remapBytes.exchange(0) >> 20), static_cast<unsigned long long>(g_sameRemaps.exchange(0)), static_cast<unsigned long long>(g_sameRemapBytes.exchange(0) >> 20));
+        line += text;
+        std::fputs(line.c_str(), stderr);
+    }
+};
 
 #if defined(__linux__)
 int PhysicalFile() {
@@ -681,6 +741,26 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
     constexpr int GuestMapNoOverwrite = 0x80;
     if (addr == nullptr || (flags & GuestMapFixed) == 0 || (flags & GuestMapNoOverwrite) != 0 || !mutation.Covers(addr, len)) return false;
     ValidateRange(addr, len, PS5_PAGE_SIZE);
+    if (MemoryOpsProfiled() && physStart >= 0) {
+        const auto start = reinterpret_cast<std::uintptr_t>(addr);
+        bool same = true;
+        {
+            std::lock_guard lock(g_directLock);
+            auto it = g_directMappings.upper_bound(start);
+            if (it == g_directMappings.begin()) same = false;
+            else --it;
+            for (auto cursor = start; same && cursor < start + len; ++it) {
+                if (it == g_directMappings.end() || it->first > cursor || cursor >= it->second.end || it->second.phys + (cursor - it->first) != static_cast<std::uint64_t>(physStart) + (cursor - start)) same = false;
+                else cursor = it->second.end;
+            }
+        }
+        g_remaps.fetch_add(1, std::memory_order_relaxed);
+        g_remapBytes.fetch_add(len, std::memory_order_relaxed);
+        if (same) {
+            g_sameRemaps.fetch_add(1, std::memory_order_relaxed);
+            g_sameRemapBytes.fetch_add(len, std::memory_order_relaxed);
+        }
+    }
     RequireResidentUnpinned(mutation, reinterpret_cast<std::uintptr_t>(addr), len);
     if (physStart >= 0) RequireAliasesUnpinned(mutation, static_cast<std::uint64_t>(physStart), len);
     Trace("remap fixed %p+0x%zx prot=0x%x phys=0x%llx", addr, len, prot, static_cast<long long>(physStart));
@@ -958,6 +1038,7 @@ int PlaceHintInReservation(void* addr, size_t len, int flags) {
 }
 
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
+    const MemoryOpTimer memoryOpTimer(MemoryOp::MapDirect);
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
@@ -993,6 +1074,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
 }
 
 int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive, [[maybe_unused]] bool allowStackReplacement) {
+    const MemoryOpTimer memoryOpTimer(MemoryOp::MapAnon);
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
 #ifdef _WIN32
@@ -1070,6 +1152,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bo
 // Wolverine stack (fork ce3be64b4): read-only fixed pages that read as zeros share one host page
 // (GuestArenaMapZero) instead of taking a private page each; anything else is DoMapAnon.
 int DoMapZero(void** addr, size_t len, int prot, int flags) {
+    const MemoryOpTimer memoryOpTimer(MemoryOp::MapZero);
 #ifdef _WIN32
     const bool zero = (flags & GuestMapFixedFlag) != 0 && (LinuxProtFromSce(prot) & PROT_WRITE) == 0 && *addr != nullptr && GuestArena::GuestArenaContains_nid_postfix(*addr, len);
 #else
@@ -1268,6 +1351,7 @@ static int FindImageContaining(dl_phdr_info* image, std::size_t, void* data) {
 #endif
 
 int DoMprotect(const void* addr, size_t len, int prot) {
+    const MemoryOpTimer memoryOpTimer(MemoryOp::Mprotect);
     Trace("protect %p+0x%zx prot=0x%x", addr, len, prot);
     const auto address = reinterpret_cast<std::uintptr_t>(addr);
     constexpr auto pageMask = static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1);
@@ -1386,6 +1470,7 @@ int DoMtypeprotect(const void* addr, size_t len, int type, int prot) {
 }
 
 int DoMunmap(void* addr, size_t len) {
+    const MemoryOpTimer memoryOpTimer(MemoryOp::Munmap);
     Trace("unmap %p+0x%zx", addr, len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || !addr) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
@@ -1395,6 +1480,7 @@ int DoMunmap(void* addr, size_t len) {
 }
 
 int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
+    const MemoryOpTimer memoryOpTimer(MemoryOp::Reserve);
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
@@ -1550,6 +1636,7 @@ std::vector<DirectMemoryView> DirectMemoryViews(int64_t start, size_t len) {
 }
 
 void UnmapDirectMemoryViews(const std::vector<DirectMemoryView>& views) {
+    const MemoryOpTimer memoryOpTimer(MemoryOp::UnmapViews);
     if (views.empty()) return;
     GuestAllocations::Mutation mutation;
     for (const auto& view : views) {

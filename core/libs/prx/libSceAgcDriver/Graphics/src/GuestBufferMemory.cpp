@@ -248,6 +248,66 @@ struct RetiredImport {
     ImportNode node;
 };
 
+// Retired imports the pin waiter lets go of on a guest thread (a title's unmap or remap over an
+// imported range) are destroyed on this thread instead: vkDestroyBuffer + vkFreeMemory of a host
+// import and its alias unmap. PPSA03671's streaming thread made hundreds of them per burst through
+// sceAmpr while its render thread spun on a lock that thread held (APS5_SAMPLE_HITCHES, 2026-10-23).
+// Nothing records with them any more (the waiter synced, or the recorder keeps the ones it may still
+// use). ClearHostImports drains the queue before its device goes. APS5_SYNC_IMPORT_RELEASE=1
+// destroys them where they are dropped, as before.
+struct ImportReaper {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<std::shared_ptr<RetiredImport>> pending;
+    // Held while a taken batch is destroyed, so a drain can wait for it.
+    std::mutex destroying;
+    bool started = false;
+};
+
+ImportReaper& Reaper() {
+    static auto* reaper = new ImportReaper();
+    return *reaper;
+}
+
+void releaseLater(std::vector<std::shared_ptr<RetiredImport>> retired) {
+    static const bool inPlace = std::getenv("APS5_SYNC_IMPORT_RELEASE") != nullptr;
+    if (retired.empty() || inPlace) return;
+    auto& reaper = Reaper();
+    std::lock_guard lock(reaper.mutex);
+    if (!reaper.started) {
+        try {
+            std::thread([] {
+                auto& state = Reaper();
+                for (;;) {
+                    std::unique_lock lock(state.mutex);
+                    state.wake.wait(lock, [&] { return !state.pending.empty(); });
+                    std::lock_guard destroying(state.destroying);
+                    auto taken = std::move(state.pending);
+                    state.pending.clear();
+                    lock.unlock();
+                    taken.clear();
+                }
+            }).detach();
+            reaper.started = true;
+        } catch (const std::system_error&) {
+            return;
+        }
+    }
+    for (auto& holder : retired) reaper.pending.push_back(std::move(holder));
+    reaper.wake.notify_one();
+}
+
+void drainReaper() {
+    auto& reaper = Reaper();
+    std::vector<std::shared_ptr<RetiredImport>> taken;
+    {
+        std::lock_guard lock(reaper.mutex);
+        taken.swap(reaper.pending);
+    }
+    taken.clear();
+    std::lock_guard destroying(reaper.destroying);
+}
+
 const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
@@ -264,6 +324,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     if (recorder == nullptr) return;
     if (hold) recorder->KeepThroughHold(std::move(holder));
     else if (!recorder->Idle()) recorder->Keep(std::move(holder));
+    else releaseLater({std::move(holder)});
 }
 
 bool releaseParkedImports(HostImports& state, std::uint64_t begin, std::uint64_t end) {
@@ -283,7 +344,9 @@ bool releaseParkedImports(HostImports& state, std::uint64_t begin, std::uint64_t
             device = list.empty() ? state.parked.erase(device) : std::next(device);
         }
     }
-    return !released.empty();
+    const bool any = !released.empty();
+    releaseLater(std::move(released));
+    return any;
 }
 
 const char* bindImport(const Context& context, HostImport& entry, VkExternalMemoryHandleTypeFlagBits handleType, const void* import, std::uint32_t importTypes, bool& allocated, VkResult& failure) {
@@ -2039,6 +2102,7 @@ void ClearImageMirrors(VkDevice device) {
 }
 
 void ClearHostImports(VkDevice device) {
+    drainReaper();
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     state.parked.erase(device);

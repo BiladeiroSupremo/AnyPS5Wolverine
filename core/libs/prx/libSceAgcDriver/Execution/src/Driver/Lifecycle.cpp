@@ -10,9 +10,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <deque>
 #include <exception>
+#include <mutex>
+#include <utility>
 #include <system_error>
 #include <thread>
 #ifdef _WIN32
@@ -31,6 +36,30 @@ namespace {
 constexpr std::uintptr_t InlineImportStackBytes = 256 * 1024;
 
 std::atomic<std::uint64_t> gpuMapImportThreads{0};
+
+// Imports of GPU-mapped ranges (the registry's map observer, see Driver::Driver) run on one
+// background thread: the mapping call returns at once instead of creating the imports first. In
+// PPSA03671 the title's streaming thread maps through sceAmpr while holding a lock its render
+// thread then spins on, and those imports were ~16% of that thread during 200+ ms hitches
+// (APS5_SAMPLE_HITCHES, 2026-10-23). A range unmapped before its turn is skipped (the ranges are
+// held weakly); one the queue needs first is imported at that use, as before the map-time import.
+// APS5_SYNC_MAP_IMPORT=1 imports on a thread the mapping call joins, as before.
+struct MapImports {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<std::pair<GuestAllocations::Mapped, std::uint64_t>> pending;
+    bool started = false;
+};
+
+MapImports& BackgroundMapImports() {
+    static auto* state = new MapImports();
+    return *state;
+}
+
+bool SyncMapImports() {
+    static const bool sync = std::getenv("APS5_SYNC_MAP_IMPORT") != nullptr;
+    return sync;
+}
 
 void PrintFailure(std::exception_ptr error) {
     try {
@@ -148,8 +177,42 @@ Driver::Driver() {
                 std::fprintf(stderr, "[gpu] import of GPU memory at its mapping failed: %s\n", error.what());
             }
         };
-        if (GuestMemory::GpuMutex().HeldByThisThread() || StackHoldsImport()) {
+        if (GuestMemory::GpuMutex().HeldByThisThread() || (SyncMapImports() && StackHoldsImport())) {
             import();
+            return;
+        }
+        if (!SyncMapImports()) {
+            auto& background = BackgroundMapImports();
+            std::lock_guard lock(background.mutex);
+            background.pending.emplace_back(ranges, generation);
+            if (!background.started) {
+                try {
+                    std::thread([] {
+                        auto& state = BackgroundMapImports();
+                        for (;;) {
+                            std::unique_lock lock(state.mutex);
+                            state.wake.wait(lock, [&] { return !state.pending.empty(); });
+                            auto [mapped, mappedGeneration] = std::move(state.pending.front());
+                            state.pending.pop_front();
+                            lock.unlock();
+                            try {
+                                const auto current = Driver::Get().device.Load();
+                                if (current == nullptr || current->ImportGuestMemory(mapped, mappedGeneration, false)) continue;
+                                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                                if (Driver::Get().device.Load() == current) current->ImportGuestMemory(mapped, mappedGeneration, true);
+                            } catch (const std::exception& error) {
+                                std::fprintf(stderr, "[gpu] import of GPU memory after its mapping failed: %s\n", error.what());
+                            }
+                        }
+                    }).detach();
+                    background.started = true;
+                } catch (const std::system_error& error) {
+                    std::fprintf(stderr, "[gpu] import of GPU memory at its mapping failed: no background thread: %s\n", error.what());
+                    background.pending.clear();
+                    return;
+                }
+            }
+            background.wake.notify_one();
             return;
         }
         std::thread host;

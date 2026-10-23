@@ -4,6 +4,7 @@
 #include <cstring>
 #ifdef _WIN32
 #include "prx/libSceAgcDriver/Execution/include/StackWalk.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <algorithm>
@@ -125,23 +126,43 @@ struct Sampler {
         modules.emplace(at, base, base + nt->OptionalHeader.SizeOfImage, frames, framesEnd);
     }
 
-    void sample() {
-        CONTEXT context{};
+    // Suspends the thread and walks its stack into `frames` (leaf first); -1 when it could not be
+    // suspended.
+    int capture(std::array<std::uint64_t, WorkerDepth>& frames, CONTEXT& context) {
+        context = CONTEXT{};
         context.ContextFlags = CONTEXT_FULL;
-        std::array<std::uint64_t, WorkerDepth> frames;
         int count = 0;
         LARGE_INTEGER suspended{};
         LARGE_INTEGER resumed{};
         QueryPerformanceCounter(&suspended);
-        if (SuspendThread(target) == static_cast<DWORD>(-1)) return;
-        if (GetThreadContext(target, &context) != 0) count = walk(context, frames);
+        if (SuspendThread(target) == static_cast<DWORD>(-1)) return -1;
+        if (GetThreadContext(target, &context) != 0) {
+            // A guest thread runs on a stack its libkernel allocated, not the one in its TEB: the
+            // committed region holding RSP bounds the walk then (kept while RSP stays inside it).
+            if (stackHigh != 0 && (context.Rsp < stackLow || context.Rsp >= stackHigh)) {
+                MEMORY_BASIC_INFORMATION region{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(context.Rsp), &region, sizeof(region)) != 0 && region.State == MEM_COMMIT) {
+                    stackLow = reinterpret_cast<std::uint64_t>(region.AllocationBase);
+                    stackHigh = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
+                }
+            }
+            count = walk(context, frames);
+        }
         ResumeThread(target);
         QueryPerformanceCounter(&resumed);
         if (pendingModule != 0) indexModule();
         std::lock_guard lock(mutex);
-        ++samples;
         suspendedTicks += resumed.QuadPart - suspended.QuadPart;
         longestSuspendedTicks = std::max(longestSuspendedTicks, resumed.QuadPart - suspended.QuadPart);
+        return count;
+    }
+
+    void sample() {
+        CONTEXT context{};
+        std::array<std::uint64_t, WorkerDepth> frames;
+        const int count = capture(frames, context);
+        if (count < 0) return;
+        ++samples;
         for (int i = 0; i < count; ++i) {
             auto& entry = counts[frames[i]];
             if (i == 0) ++entry.first;
@@ -265,7 +286,147 @@ struct ProcessSampler {
     }
 };
 
+// Debug aid: APS5_SAMPLE_HITCHES=<file> samples every thread every 2 ms like APS5_SAMPLE_THREADS,
+// but keeps the stacks of a frame only when that frame took at least APS5_HITCH_MS (default 250)
+// from one present to the next, and writes them every 20 s as collapsed stacks, root first, with the
+// thread id as the root frame ("T<id>;module+offset;... count"). A trace (2026-10-23, pipe_now4) had
+// 300-700 ms frames with the GPU and every driver worker idle: the title itself was stalled.
+struct HitchSampler {
+    std::string path;
+    DWORD self = 0;
+    std::map<DWORD, Sampler> threads;
+    std::chrono::steady_clock::time_point enumerated{};
+    std::chrono::milliseconds threshold{250};
+    // The current frame's samples: thread id and its frames, leaf first.
+    struct Pending {
+        DWORD thread;
+        std::uint8_t count;
+        std::array<std::uint64_t, 32> frames;
+    };
+    std::vector<Pending> pending;
+    std::map<std::pair<DWORD, std::vector<std::uint64_t>>, std::uint64_t> kept;
+    std::uint64_t hitches = 0;
+    double hitchMs = 0;
+    std::uint64_t lastPresents = 0;
+    std::chrono::steady_clock::time_point frameStart = std::chrono::steady_clock::now();
+    // APS5_HITCH_AFTER_S: hitches before then (loading, menus) are not kept.
+    std::chrono::steady_clock::time_point keepFrom = std::chrono::steady_clock::now();
+
+    void enumerate() {
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) return;
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        const DWORD process = GetCurrentProcessId();
+        for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
+            auto& thread = threads[entry.th32ThreadID];
+            if (thread.target != nullptr) continue;
+            thread.target = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+            if (thread.target != nullptr) stackBounds(thread);
+        }
+        CloseHandle(snapshot);
+        enumerated = std::chrono::steady_clock::now();
+    }
+
+    // The thread's stack range from its TEB, so frames of modules without OS-registered unwind
+    // data (the prx modules, unwound through their .eh_frame) can be walked past.
+    static void stackBounds(Sampler& thread) {
+        struct BasicInformation {
+            LONG exitStatus;
+            PVOID teb;
+            PVOID process;
+            PVOID thread;
+            ULONG_PTR affinity;
+            LONG priority;
+            LONG basePriority;
+        };
+        using Query = LONG(WINAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+        static const auto query = reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+        BasicInformation information{};
+        if (query == nullptr || query(thread.target, 0, &information, sizeof(information), nullptr) < 0 || information.teb == nullptr) return;
+        const auto* block = static_cast<const NT_TIB*>(information.teb);
+        MEMORY_BASIC_INFORMATION stack{};
+        if (VirtualQuery(block->StackLimit, &stack, sizeof(stack)) == 0) return;
+        thread.stackLow = reinterpret_cast<std::uint64_t>(stack.AllocationBase);
+        thread.stackHigh = reinterpret_cast<std::uint64_t>(block->StackBase);
+    }
+
+    void sample() {
+        const auto now = std::chrono::steady_clock::now();
+        const auto presents = Graphics::Recorder::Presents();
+        if (presents != lastPresents) {
+            lastPresents = presents;
+            if (now - frameStart >= threshold && now >= keepFrom) {
+                ++hitches;
+                hitchMs += std::chrono::duration<double, std::milli>(now - frameStart).count();
+                for (const auto& item : pending) ++kept[{item.thread, std::vector<std::uint64_t>(item.frames.begin(), item.frames.begin() + item.count)}];
+            }
+            pending.clear();
+            frameStart = now;
+        }
+        if (threads.empty() || now - enumerated > std::chrono::seconds(5)) enumerate();
+        for (auto& [id, thread] : threads) thread.depth = 32;
+        std::array<std::uint64_t, Sampler::WorkerDepth> frames;
+        CONTEXT context{};
+        for (auto& [id, thread] : threads) {
+            if (thread.target == nullptr) continue;
+            const int count = thread.capture(frames, context);
+            if (count <= 0) continue;
+            Pending item{id, static_cast<std::uint8_t>(count), {}};
+            std::copy(frames.begin(), frames.begin() + count, item.frames.begin());
+            pending.push_back(item);
+        }
+    }
+
+    void write() {
+        const auto temporary = path + ".tmp";
+        std::FILE* file = std::fopen(temporary.c_str(), "w");
+        if (file == nullptr) return;
+        std::fprintf(file, "# hitches=%llu hitch_ms=%.0f threshold_ms=%lld\n", static_cast<unsigned long long>(hitches), hitchMs, static_cast<long long>(threshold.count()));
+        std::map<std::uint64_t, std::string> names;
+        std::map<std::uint64_t, std::string> loaded;
+        for (const auto& [key, count] : kept) {
+            std::string line = "T" + std::to_string(key.first);
+            for (auto frame = key.second.rbegin(); frame != key.second.rend(); ++frame) {
+                auto found = names.find(*frame);
+                if (found == names.end()) found = names.emplace(*frame, Sampler::frameName(*frame, loaded)).first;
+                line += ";" + found->second;
+            }
+            std::fprintf(file, "%s %llu\n", line.c_str(), static_cast<unsigned long long>(count));
+        }
+        if (std::fclose(file) != 0) return;
+        MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+};
+
+void StartHitchSampler() {
+    const char* path = std::getenv("APS5_SAMPLE_HITCHES");
+    if (path == nullptr) return;
+    processSamplerThread = std::jthread([path = std::string(path)](std::stop_token token) {
+        auto sampler = std::make_unique<HitchSampler>();
+        sampler->path = path;
+        sampler->self = GetCurrentThreadId();
+        if (const char* text = std::getenv("APS5_HITCH_MS")) sampler->threshold = std::chrono::milliseconds(std::atoi(text));
+        if (const char* text = std::getenv("APS5_HITCH_AFTER_S")) sampler->keepFrom += std::chrono::seconds(std::atoi(text));
+        auto flushed = std::chrono::steady_clock::now();
+        while (!token.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            sampler->sample();
+            if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
+                sampler->write();
+                flushed = std::chrono::steady_clock::now();
+            }
+        }
+        sampler->write();
+    });
+}
+
 void StartProcessSampler() {
+    if (std::getenv("APS5_SAMPLE_HITCHES") != nullptr) {
+        StartHitchSampler();
+        return;
+    }
     const char* path = std::getenv("APS5_SAMPLE_THREADS");
     if (path == nullptr) return;
     processSamplerThread = std::jthread([path = std::string(path)](std::stop_token token) {

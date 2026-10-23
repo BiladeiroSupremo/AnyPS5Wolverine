@@ -106,8 +106,11 @@ int main() {
     try {
 #ifdef _WIN32
         _putenv_s("APS5_PIN_WAIT_MS", "2000");
+        // The checks below look for an import right after the mapping call returns.
+        _putenv_s("APS5_SYNC_MAP_IMPORT", "1");
 #else
         setenv("APS5_PIN_WAIT_MS", "2000", 1);
+        setenv("APS5_SYNC_MAP_IMPORT", "1", 1);
 #endif
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
