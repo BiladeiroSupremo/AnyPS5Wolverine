@@ -439,6 +439,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             phaseTiming.Phase(DrawRowVectors);
             localDevice->Draw(graphics, direct, stages, snapshots);
             phaseTiming.Phase(DrawRowGraphics);
+            // The next record's materialization runs without the GPU mutex: held across the loop, it
+            // kept the other queues and the committer waiting (~200 us per hold, 1.7 s per 10 s in
+            // PPSA03671). Each record is recorded under the mutex, as separate draws are.
+            // APS5_LOCKED_INDIRECT_RECORDS=1 keeps the mutex across the records as before.
+            static const bool lockedRecords = std::getenv("APS5_LOCKED_INDIRECT_RECORDS") != nullptr;
+            if (!lockedRecords && !lockedPrepare && gpuLock.owns_lock()) gpuLock.unlock();
         }
         timing.Mark("draw_and_resource_release");
         return drawn();
