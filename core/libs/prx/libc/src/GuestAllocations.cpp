@@ -154,6 +154,9 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
+        // A range unpinned on its own (RequireUnpinned without a protect, unmap or removal) got new
+        // Range objects (renewBacking): caches keyed by them, such as host imports, see it as changed.
+        for (const auto& [address, bytes] : state->unpinned) callback(address, bytes);
     }
     if (!state->gpuMapped.empty()) gpuMapObserverCalls.fetch_add(1);
     const auto observer = state->gpuMapped.empty() ? nullptr : gpuMapObserver.load();

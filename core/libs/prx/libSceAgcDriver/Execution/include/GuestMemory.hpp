@@ -26,6 +26,13 @@ struct Commitment {
     bool whole = false;
 };
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable = false);
+// The guest allocation registry's changed ranges (added, removed, reprotected, unmapped or renewed)
+// logged since position `from` (a `to` an earlier call returned), for caches keyed by registered ranges
+// to recheck only those. `to` receives the position after the last one. False when they are not all
+// known (the first call starts the log; entries this old were dropped): the caller rechecks everything.
+// A change is logged before the mutation releases the registry lock, so after reading the registry
+// generation and taking that lock once (GuestAllocationsLookup), every change up to it is logged.
+bool RegistryChangesSince(std::uint64_t from, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changes, std::uint64_t& to);
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment = 1);
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.

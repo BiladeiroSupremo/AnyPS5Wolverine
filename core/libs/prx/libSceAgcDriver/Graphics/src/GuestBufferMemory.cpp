@@ -166,8 +166,10 @@ struct HostImports {
     std::map<std::uint64_t, ImportFailure> failed;
     std::map<std::uint64_t, ImportFailure> failedJoins;
     std::set<std::uint64_t> unaliasedSpans;
-    // Registry generation the imports were last reconciled with.
+    // Registry generation the imports were last reconciled with, and the registry change log position
+    // that reconciliation took in (GuestMemory::RegistryChangesSince).
     std::uint64_t refreshedGeneration = 0;
+    std::uint64_t changePosition = 0;
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
     // reused while it is unchanged.
     std::uint64_t epoch = 1;
@@ -179,6 +181,40 @@ struct HostImports {
 HostImports& Imports() {
     static HostImports imports;
     return imports;
+}
+
+// APS5_PROFILE_DRAW: host import churn, on an [imports] line every 10 s: imports made (and the time
+// in the driver's import calls), imports retired by why, and the registry-change walks over them.
+struct ImportStats {
+    std::atomic<std::uint64_t> created{0}, createUs{0}, overlapped{0}, refreshed{0}, leased{0}, walks{0}, walkUs{0}, walked{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+ImportStats& ImportCounts() {
+    static ImportStats stats;
+    return stats;
+}
+
+bool importsProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+void reportImports(const HostImports& state) {
+    auto& stats = ImportCounts();
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = stats.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10000 || !stats.lastReport.compare_exchange_strong(last, now)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto created = take(stats.created);
+    const auto createUs = take(stats.createUs);
+    const auto overlapped = take(stats.overlapped);
+    const auto refreshed = take(stats.refreshed);
+    const auto leased = take(stats.leased);
+    const auto walks = take(stats.walks);
+    const auto walkUs = take(stats.walkUs);
+    const auto walked = take(stats.walked);
+    AgcDriver::ProfilePrint_nid_no_patch("[imports] (10 s) %llu made in %.1f ms; retired: overlapping a new run %llu, registry changed %llu, lease %llu; %llu registry walks in %.1f ms over %llu imports; %zu live (%.0f MiB)\n", created, createUs / 1000.0, overlapped, refreshed, leased, walks, walkUs / 1000.0, walked, state.imports.size(), state.liveBytes / 1048576.0);
 }
 
 void destroyImport(const Context& context, const HostImport& entry) {
@@ -758,16 +794,22 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(run.ranges.begin(), run.ranges.end())});
         return nullptr;
     }
+    const bool profile = importsProfiled();
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
         if (sameRun(found->second, run)) return &found->second;
         retireImport(context.device, state, found, lease);
+        if (profile) ImportCounts().overlapped.fetch_add(1, std::memory_order_relaxed);
     }
     for (auto it = state.imports.lower_bound(base); it != state.imports.end() && it->first < base + bytes;) {
         const auto next = std::next(it);
         retireImport(context.device, state, it, lease);
+        if (profile) ImportCounts().overlapped.fetch_add(1, std::memory_order_relaxed);
         it = next;
     }
-    if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) retireImport(context.device, state, std::prev(it), lease);
+    if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) {
+        retireImport(context.device, state, std::prev(it), lease);
+        if (profile) ImportCounts().overlapped.fetch_add(1, std::memory_order_relaxed);
+    }
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
     if (const auto failed = failures.find(base); failed != failures.end()) {
         if (sameRun(failed->second, run)) return nullptr;
@@ -891,10 +933,16 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     const bool watchedHostPointer = !state.unwatchImports;
     const bool watchedDmaBuf = !state.unwatchDmaBufImports;
 #endif
+    const auto createStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     GuestMemory::ImportWatched(base, bytes, [&] {
         step = watchedDmaBuf == watchedHostPointer ? createImport(context, entry, result) : createHostPointerImport(context, entry, result);
         return step == nullptr;
     }, watchedHostPointer);
+    if (profile) {
+        ImportCounts().created.fetch_add(1, std::memory_order_relaxed);
+        ImportCounts().createUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - createStart).count()), std::memory_order_relaxed);
+        reportImports(state);
+    }
 #ifndef _WIN32
     if (BackingFile backing; step != nullptr && watchedDmaBuf != watchedHostPointer && sharedBacking(context, entry, backing)) {
         GuestMemory::ImportWatched(base, bytes, [&] {
@@ -984,19 +1032,61 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (state.freeMemory == nullptr) state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
+    // Only the imports over ranges the registry changed since the last reconciliation are rechecked
+    // (each walk over every import took ~2.3 ms for ~8000 imports, up to 260 times per 10 s in
+    // PPSA03671): the change log holds every change up to `generation` once the registry lock was
+    // taken after reading it. Without a known log position everything is rechecked.
+    // APS5_FULL_IMPORT_WALK=1 always rechecks everything.
+    static const bool fullWalk = std::getenv("APS5_FULL_IMPORT_WALK") != nullptr;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> changes;
+    std::uint64_t position = 0;
+    const bool known = !fullWalk && GuestMemory::RegistryChangesSince(state.changePosition, changes, position) && state.refreshedGeneration != 0;
+    static_cast<void>(GuestAllocations::GuestAllocationsLookup_nid_postfix(0, false));
+    if (known) {
+        // Changes logged between the first read and the lock: taken in now (rechecking one twice is harmless).
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> late;
+        if (GuestMemory::RegistryChangesSince(position, late, position)) changes.insert(changes.end(), late.begin(), late.end());
+    }
     state.refreshedGeneration = generation;
-    for (auto it = state.imports.begin(); it != state.imports.end();) {
+    state.changePosition = position;
+    const bool profile = importsProfiled();
+    const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::size_t walked = 0;
+    const auto recheck = [&](std::map<std::uint64_t, HostImport>::iterator it) {
+        ++walked;
         const auto* range = leasedRangeAt(lease, it->first);
         if (range != nullptr && sameRange(it->second, lease)) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
-            ++it;
-            continue;
+            return std::next(it);
         }
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
         if (trace && range != nullptr && range->bytes == it->second.bytes) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
         const auto next = std::next(it);
         retireImport(context.device, state, it, lease);
-        it = next;
+        if (profile) ImportCounts().refreshed.fetch_add(1, std::memory_order_relaxed);
+        return next;
+    };
+    if (known) {
+        // Imports do not overlap (a new run retires those it overlaps): one may begin before a changed
+        // range, the rest begin inside it.
+        for (const auto& [address, bytes] : changes) {
+            const auto end = address + bytes;
+            auto it = state.imports.lower_bound(address);
+            if (it != state.imports.begin()) {
+                const auto previous = std::prev(it);
+                if (previous->second.base + previous->second.bytes > address) it = previous;
+            }
+            while (it != state.imports.end() && it->first < end) it = recheck(it);
+        }
+    } else {
+        for (auto it = state.imports.begin(); it != state.imports.end();) it = recheck(it);
+    }
+    if (profile) {
+        auto& stats = ImportCounts();
+        stats.walks.fetch_add(1, std::memory_order_relaxed);
+        stats.walked.fetch_add(walked, std::memory_order_relaxed);
+        stats.walkUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
+        reportImports(state);
     }
     for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRun(it->second, importRun(lease, it->first)) ? std::next(it) : state.failed.erase(it);
     for (auto it = state.failedJoins.begin(); it != state.failedJoins.end();) it = sameRun(it->second, joinedRun(lease, it->second.base, it->second.base + it->second.bytes)) ? std::next(it) : state.failedJoins.erase(it);
@@ -1745,6 +1835,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                     }
                     const auto next = std::next(it);
                     retireImport(imports.device, imports, it, lease, false);
+                    if (importsProfiled()) ImportCounts().leased.fetch_add(1, std::memory_order_relaxed);
                     it = next;
                     retiredImport = true;
                 }
@@ -1828,6 +1919,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                         }
                         const auto next = std::next(it);
                         retireImport(imports.device, imports, it, lease, false);
+                        if (importsProfiled()) ImportCounts().leased.fetch_add(1, std::memory_order_relaxed);
                         it = next;
                         retiredImport = true;
                     }

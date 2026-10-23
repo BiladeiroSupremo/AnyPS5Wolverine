@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -459,7 +460,38 @@ std::size_t ImagePagesSize() {
     return Pages().image.size;
 }
 
+// The ranges the registry reported changed (added, removed, reprotected, unmapped or renewed), in
+// order, for caches keyed by registered ranges (host imports) to recheck only what changed. Logged by
+// the registry's invalidator, inside the mutation's registry lock and before the lock is released,
+// once a reader asked for it (RegistryChangesSince); up to RegistryLogCapacity entries are kept.
+struct RegistryChangeLog {
+    std::mutex mutex;
+    std::deque<std::pair<std::uint64_t, std::uint64_t>> entries;
+    // The position of entries.front() (positions count every entry ever logged).
+    std::uint64_t first = 0;
+    bool started = false;
+};
+
+constexpr std::size_t RegistryLogCapacity = std::size_t{1} << 16u;
+
+RegistryChangeLog& RegistryChanges() {
+    static auto* log = new RegistryChangeLog;
+    return *log;
+}
+
+void logRegistryChange(std::uintptr_t address, std::size_t bytes) {
+    auto& log = RegistryChanges();
+    std::lock_guard lock(log.mutex);
+    if (!log.started) return;
+    log.entries.emplace_back(address, bytes);
+    if (log.entries.size() > RegistryLogCapacity) {
+        log.entries.pop_front();
+        ++log.first;
+    }
+}
+
 void ForgetPages(std::uintptr_t address, std::size_t bytes) {
+    logRegistryChange(address, bytes);
     forgetCalls.fetch_add(1, std::memory_order_relaxed);
     forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
     forgetSerial.fetch_add(1, std::memory_order_release);
@@ -697,6 +729,27 @@ bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
 
 std::uint64_t ForgetSerial() {
     return forgetSerial.load(std::memory_order_acquire);
+}
+
+bool RegistryChangesSince(std::uint64_t from, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changes, std::uint64_t& to) {
+    changes.clear();
+    auto& log = RegistryChanges();
+    {
+        std::lock_guard lock(log.mutex);
+        if (log.started) {
+            to = log.first + log.entries.size();
+            if (from < log.first || from > to) return false;
+            changes.assign(log.entries.begin() + static_cast<std::ptrdiff_t>(from - log.first), log.entries.end());
+            return true;
+        }
+        log.started = true;
+        to = log.first + log.entries.size();
+    }
+    // The first reader starts the log; what changed before is unknown to it. The invalidator is the
+    // page cache's (installed unconditionally here: forgetting pages it never cached is harmless).
+    Pages().initialize();
+    GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
+    return false;
 }
 
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
