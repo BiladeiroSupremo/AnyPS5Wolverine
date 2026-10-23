@@ -425,6 +425,9 @@ struct PageSpan {
 
 struct PageStates {
     std::once_flag once;
+    // Set once initialize ran: every page lookup asks, and call_once goes through winpthread's
+    // once-control on every call (~0.5% of the queue-0 worker in PPSA03671).
+    std::atomic<bool> ready{false};
     PageSpan arena;
     PageSpan image;
 
@@ -514,6 +517,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 }
 
 void PageStates::initialize() {
+    if (ready.load(std::memory_order_acquire)) return;
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
         const bool arenaCached = arena.allocate();
@@ -537,6 +541,7 @@ void PageStates::initialize() {
 #endif
         if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
     });
+    ready.store(true, std::memory_order_release);
 }
 
 struct PageRun {
@@ -667,6 +672,16 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
 }
 
 bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
+#ifdef _WIN32
+    // The thread's (or running fiber's) stack from its TIB: one segment load, where a thread_local
+    // went through MinGW's emulated TLS (pthread_getspecific) on every guest memory check.
+    const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const auto low = reinterpret_cast<std::uintptr_t>(tib->StackLimit);
+    const auto high = reinterpret_cast<std::uintptr_t>(tib->StackBase);
+    const volatile unsigned char here = 0;
+    const auto current = reinterpret_cast<std::uintptr_t>(&here);
+    return high != 0 && current >= low && current < high && address >= current && address < high && bytes <= high - address;
+#else
     struct Bounds {
         std::uintptr_t low = 0;
         std::uintptr_t high = 0;
@@ -694,6 +709,7 @@ bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
     const volatile unsigned char marker = 0;
     const auto frame = reinterpret_cast<std::uintptr_t>(&marker);
     return bounds.high != 0 && frame >= bounds.low && frame < bounds.high && address >= frame && address < bounds.high && bytes <= bounds.high - address;
+#endif
 }
 
 // Checks that [address, address + bytes) is mapped with read (and, if asked, write) access. Returns
