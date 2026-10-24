@@ -36,6 +36,9 @@ struct ShadowState {
     // length (one side longer), different; the record had no user data for it.
     std::uint64_t dataEqual = 0, dataPrefix = 0, dataDiffer = 0, dataNone = 0;
     std::array<std::uint64_t, 33> dataOffsets{};
+    // Bound descriptors by role (buffer, image, sampler): found among the record's placed ones, not.
+    std::array<std::uint64_t, 3> descriptorsFound{}, descriptorsMissed{};
+    int descriptorExamples = 0;
     int dataExamples = 0;
     // Record slots holding the decoded shaders (which stage records the title uses).
     std::array<std::uint64_t, 16> slotUse{};
@@ -58,6 +61,33 @@ void DumpNativeDraw(const NativeDrawRecord& record, std::span<const std::uint64_
     for (const auto& [slot, bytes] : record.raw) {
         std::snprintf(item, sizeof(item), "\n  record %u:", static_cast<unsigned>(slot));
         text += item;
+        // The Shader's resource layout (ShaderUserData): direct resources (u16 user-data positions)
+        // and the four sharp tables (ShaderSharp {offset_dw:15, size:1}).
+        const auto shader = bytes[0];
+        if (shader >= 0x10000 && AgcDriver::GuestMemory::Accessible(reinterpret_cast<const void*>(shader), sizeof(Shader))) {
+            const auto* userData = reinterpret_cast<const Shader*>(shader)->user_data;
+            if (userData != nullptr && AgcDriver::GuestMemory::Accessible(userData, sizeof(ShaderUserData))) {
+                std::snprintf(item, sizeof(item), "\n    layout: eud %u srt %u direct %u:", userData->eud_size_dw, userData->srt_size_dw, userData->direct_resource_count);
+                text += item;
+                if (userData->direct_resource_offset != nullptr && AgcDriver::GuestMemory::Accessible(userData->direct_resource_offset, userData->direct_resource_count * 2u)) {
+                    for (std::uint32_t i = 0; i < userData->direct_resource_count && i < 32; ++i) {
+                        std::snprintf(item, sizeof(item), " %x", userData->direct_resource_offset[i]);
+                        text += item;
+                    }
+                }
+                for (std::uint32_t table = 0; table < 4; ++table) {
+                    const auto count = userData->sharp_resource_count[table];
+                    std::snprintf(item, sizeof(item), "; sharp[%u] %u:", table, count);
+                    text += item;
+                    const auto* sharps = userData->sharp_resource_offset[table];
+                    if (sharps == nullptr || count == 0 || !AgcDriver::GuestMemory::Accessible(sharps, count * 2u)) continue;
+                    for (std::uint32_t i = 0; i < count && i < 24; ++i) {
+                        std::snprintf(item, sizeof(item), " %u/%u", sharps[i].offset_dw, sharps[i].size);
+                        text += item;
+                    }
+                }
+            }
+        }
         for (const auto word : bytes) {
             std::snprintf(item, sizeof(item), " %016llx", static_cast<unsigned long long>(word));
             text += item;
@@ -133,6 +163,74 @@ void CompareNativeUserData(const NativeDrawRecord& record, std::span<const std::
     }
 }
 
+void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const DecodedDescriptor> decoded) {
+    // The descriptors the record's Shaders place: first four words of each sharp entry.
+    std::vector<std::array<std::uint32_t, 4>> placed;
+    for (std::size_t slot = 0; slot < record.shaders.size(); ++slot) {
+        const auto shader = record.shaders[slot];
+        if (shader == 0) continue;
+        const auto* layout = reinterpret_cast<const Shader*>(shader)->user_data;
+        if (layout == nullptr || !AgcDriver::GuestMemory::Accessible(layout, sizeof(ShaderUserData))) continue;
+        const auto& words = record.userData[slot];
+        const auto& extended = record.eud[slot];
+        for (std::uint32_t table = 0; table < 4; ++table) {
+            const auto count = layout->sharp_resource_count[table];
+            const auto* sharps = layout->sharp_resource_offset[table];
+            if (sharps == nullptr || count == 0 || !AgcDriver::GuestMemory::Accessible(sharps, count * 2u)) continue;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const std::uint32_t offset = sharps[i].offset_dw;
+                if (offset == 0x7fffu) continue;
+                const auto& source = offset < 32 ? words : extended;
+                const auto at = offset < 32 ? offset : offset - 32;
+                if (at + 4 > source.size()) continue;
+                placed.push_back({source[at], source[at + 1], source[at + 2], source[at + 3]});
+            }
+        }
+    }
+    auto& state = Shadow();
+    std::lock_guard lock(state.mutex);
+    for (const auto& descriptor : decoded) {
+        if (descriptor.role > 2) continue;
+        if (std::find(placed.begin(), placed.end(), descriptor.words) != placed.end()) {
+            ++state.descriptorsFound[descriptor.role];
+            continue;
+        }
+        ++state.descriptorsMissed[descriptor.role];
+        if (state.descriptorExamples < 40) {
+            ++state.descriptorExamples;
+            // Where the descriptor lives: searched in the memory each user-data word pair points at
+            // (as a raw pointer, or as a V#'s base with its size), up to 1 MiB.
+            std::string found;
+            for (std::size_t slot = 0; slot < record.shaders.size() && found.empty(); ++slot) {
+                for (const auto* source : {&record.userData[slot], &record.eud[slot]}) {
+                    for (std::size_t k = 0; k + 1 < source->size() && found.empty(); ++k) {
+                        const auto low = (*source)[k];
+                        const auto high = (*source)[k + 1];
+                        std::array<std::pair<std::uint64_t, std::uint64_t>, 2> targets{{
+                            {static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u), 0x10000},
+                            {static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high & 0xffffu) << 32u), k + 2 < source->size() ? std::min<std::uint64_t>(static_cast<std::uint64_t>((*source)[k + 2]) * 16u, 0x100000) : 0}}};
+                        for (const auto& [base, bytes] : targets) {
+                            if (base < 0x100000 || bytes < 16 || (base & 3u) != 0 || !AgcDriver::GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes))) continue;
+                            const auto* words = reinterpret_cast<const std::uint32_t*>(base);
+                            for (std::uint64_t i = 0; i + 4 <= bytes / 4; ++i) {
+                                if (words[i] == descriptor.words[0] && words[i + 1] == descriptor.words[1] && words[i + 2] == descriptor.words[2] && words[i + 3] == descriptor.words[3]) {
+                                    char text[160];
+                                    std::snprintf(text, sizeof(text), "found via record %zu %s word %zu (%s 0x%llx) at +0x%llx", slot, source == &record.userData[slot] ? "user data" : "eud", k, bytes == 0x10000 ? "pointer" : "V# base", static_cast<unsigned long long>(base), static_cast<unsigned long long>(i * 4));
+                                    found = text;
+                                    break;
+                                }
+                            }
+                            if (!found.empty()) break;
+                        }
+                    }
+                    if (!found.empty()) break;
+                }
+            }
+            std::fprintf(stderr, "[native-shadow] bound %s %08x %08x %08x %08x not placed by the layouts (%zu placed): %s\n", descriptor.role == 0 ? "buffer" : descriptor.role == 1 ? "image" : "sampler", descriptor.words[0], descriptor.words[1], descriptor.words[2], descriptor.words[3], placed.size(), found.empty() ? "not found behind any user-data pointer" : found.c_str());
+        }
+    }
+}
+
 bool NativeShadowActive() {
     static const bool active = std::getenv("APS5_NATIVE_SHADOW") != nullptr;
     return active;
@@ -200,9 +298,12 @@ void CompareNativeDraw(const NativeDrawRecord* record, std::span<const std::uint
         offsets += item;
     }
     std::fprintf(stderr, "[native-shadow] 10 s: %llu draw packets noted; decoded draws: every shader in the record %llu, not %llu, no record %llu; decoded stages without a registered header %llu; record slots used:%s; user data per program: equal %llu, equal at a word offset %llu (by offset:%s), different %llu, none in the record %llu\n", static_cast<unsigned long long>(state.noted), static_cast<unsigned long long>(state.covered), static_cast<unsigned long long>(state.uncovered), static_cast<unsigned long long>(state.missing), static_cast<unsigned long long>(state.unregistered), slots.c_str(), static_cast<unsigned long long>(state.dataEqual), static_cast<unsigned long long>(state.dataPrefix), offsets.c_str(), static_cast<unsigned long long>(state.dataDiffer), static_cast<unsigned long long>(state.dataNone));
+    std::fprintf(stderr, "[native-shadow] bound descriptors placed by the title's Shader layouts: buffers %llu of %llu, images %llu of %llu, samplers %llu of %llu\n", static_cast<unsigned long long>(state.descriptorsFound[0]), static_cast<unsigned long long>(state.descriptorsFound[0] + state.descriptorsMissed[0]), static_cast<unsigned long long>(state.descriptorsFound[1]), static_cast<unsigned long long>(state.descriptorsFound[1] + state.descriptorsMissed[1]), static_cast<unsigned long long>(state.descriptorsFound[2]), static_cast<unsigned long long>(state.descriptorsFound[2] + state.descriptorsMissed[2]));
     state.covered = state.uncovered = state.unregistered = state.missing = state.noted = 0;
     state.dataEqual = state.dataPrefix = state.dataDiffer = state.dataNone = 0;
     state.dataOffsets = {};
+    state.descriptorsFound = {};
+    state.descriptorsMissed = {};
     state.slotUse = {};
 }
 
@@ -225,6 +326,12 @@ extern "C" void AgcDriverNoteEngineDraw_nid_postfix(const CommandBuffer* buffer,
             const auto count = *reinterpret_cast<const std::uint32_t*>(at + 0x38);
             if (words >= 0x10000 && count != 0 && count <= 64 && AgcDriver::GuestMemory::Accessible(reinterpret_cast<const void*>(words), count * 4u)) {
                 record.userData[stage].assign(reinterpret_cast<const std::uint32_t*>(words), reinterpret_cast<const std::uint32_t*>(words) + count);
+            }
+            const auto extended = *reinterpret_cast<const std::uint64_t*>(at + 0x18);
+            const auto* layout = reinterpret_cast<const Shader*>(shader)->user_data;
+            if (extended >= 0x10000 && layout != nullptr && AgcDriver::GuestMemory::Accessible(layout, sizeof(ShaderUserData))) {
+                const auto size = std::min<std::uint32_t>(layout->eud_size_dw, 256);
+                if (size != 0 && AgcDriver::GuestMemory::Accessible(reinterpret_cast<const void*>(extended), size * 4u)) record.eud[stage].assign(reinterpret_cast<const std::uint32_t*>(extended), reinterpret_cast<const std::uint32_t*>(extended) + size);
             }
         }
         static const bool study = [] { const char* text = std::getenv("APS5_NATIVE_SHADOW"); return text != nullptr && std::strtol(text, nullptr, 10) >= 2; }();

@@ -325,12 +325,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // A cached decode holds the user words of the draw that made it; the key left these out.
     if (relocation != nullptr) refreshRelocatedUserWords(queue, *relocation, programs);
     // APS5_NATIVE_SHADOW: the title's own view of this draw's shaders against the decoded programs.
+    const NativeDrawRecord* nativeRecord = nullptr;
     if (NativeShadowActive() && packet.data() >= submission.commands.data() && packet.data() < submission.commands.data() + submission.commands.size()) {
         std::vector<std::uint64_t> decodedShaders;
         for (const auto& program : programs) decodedShaders.push_back(program.snapshot != nullptr ? program.snapshot->headerAddress : 0);
         const auto found = submission.nativeDraws.find(static_cast<std::size_t>(packet.data() - submission.commands.data()));
         CompareNativeDraw(found != submission.nativeDraws.end() ? &found->second : nullptr, decodedShaders);
         if (found != submission.nativeDraws.end()) {
+            nativeRecord = &found->second;
             std::vector<std::vector<std::uint32_t>> userData;
             for (const auto& program : programs) userData.push_back(program.userData);
             CompareNativeUserData(found->second, decodedShaders, userData);
@@ -772,6 +774,26 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
         }
+    }
+    // APS5_NATIVE_SHADOW: the descriptors the recompiler bound, against the ones the title's Shader
+    // layouts place in this draw's user data.
+    if (nativeRecord != nullptr) {
+        std::vector<DecodedDescriptor> decoded;
+        for (const auto& stage : stages) {
+            if (stage.program == nullptr) continue;
+            for (const auto& binding : stage.program->bindings) {
+                const auto role = binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers ? 0 : binding.role == ShaderRecompiler::DescriptorRole::GuestImages ? 1 : binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers ? 2 : 3;
+                if (role == 3 || binding.count == 0) continue;
+                const auto elementWords = binding.guestDescriptor.size() / binding.count;
+                if (elementWords < 4) continue;
+                for (std::uint32_t element = 0; element < binding.count; ++element) {
+                    const auto* words = binding.guestDescriptor.data() + element * elementWords;
+                    if (words[0] == 0 && words[1] == 0 && words[2] == 0 && words[3] == 0) continue;
+                    decoded.push_back({static_cast<std::uint8_t>(role), {words[0], words[1], words[2], words[3]}});
+                }
+            }
+        }
+        CompareNativeDescriptors(*nativeRecord, decoded);
     }
     // A pipelined direct draw: the committer records it (commitDraw) after the draws queued before it.
     // The commit owns everything the recording reads: the stages' results, the snapshots and the
