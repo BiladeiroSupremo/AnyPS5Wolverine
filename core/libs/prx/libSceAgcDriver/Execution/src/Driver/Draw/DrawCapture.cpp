@@ -39,6 +39,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }();
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
+    if (capture != nullptr) {
+        stageCapture.userWordsAsBase = capture->userDataUse.asBase;
+        stageCapture.userWordsAsValue = capture->userDataUse.asValue;
+        stageCapture.captured = true;
+    }
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
@@ -94,8 +99,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     return stageCapture.compiled;
 }
 
-void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming) {
-    if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admitDrawKey(drawKey))) {
+void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const DrawRelocationPlan* relocation) {
+    // A relocated insert (DrawRelocation.cpp) goes under its own key at once: that key recurs.
+    if (relocation != nullptr && !relocation->insert) return;
+    const bool admitted = relocation != nullptr && relocation->admit;
+    if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admitted || admitDrawKey(drawKey))) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -121,7 +129,12 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 variant->words.resize(offset + count);
                 std::memcpy(variant->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
             }
-            if (verifyHit && matched[i] != nullptr && (matched[i]->runs != variant->runs || matched[i]->words != variant->words)) {
+            if (relocation != nullptr && i < relocation->stages.size() && relocation->stages[i] && !relocateVariant(*variant, programs[i].userData)) return;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> matchedRuns;
+            if (verifyHit && matched[i] != nullptr) {
+                if (matched[i]->runPointerWords.empty() || !relocatedRuns(*matched[i], programs[i].userData, matchedRuns)) matchedRuns = matched[i]->runs;
+            }
+            if (verifyHit && matched[i] != nullptr && (matchedRuns != variant->runs || matched[i]->words != variant->words)) {
                 ++mismatches;
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());

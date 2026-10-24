@@ -2,8 +2,15 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
 
@@ -33,7 +40,62 @@ const auto& registerMasks() {
 
 }
 
-std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental) {
+// Which keyed registers (user words aside) change between draws of the same programs
+// (APS5_PROFILE_KEY_REGISTERS): every 10 s, for the program sets drawn most, the registers that took
+// more than one value, as bank:offset(distinct values, capped at 8).
+void ProfileKeyRegisters(const QueueState& queue) {
+    static const bool on = std::getenv("APS5_PROFILE_KEY_REGISTERS") != nullptr;
+    if (!on) return;
+    struct Set {
+        std::uint64_t draws = 0;
+        std::map<std::pair<int, std::uint32_t>, std::set<std::uint32_t>> values;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Set> sets;
+    static auto windowStart = std::chrono::steady_clock::now();
+    std::uint64_t programs = 0xcbf29ce484222325ull;
+    for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+        for (const auto offset : {base, base + 1}) {
+            const auto found = queue.shader.find(offset);
+            programs = (programs ^ (found == queue.shader.end() ? 0u : found->second)) * 0x100000001b3ull;
+        }
+    }
+    const auto& masks = registerMasks();
+    std::lock_guard lock(mutex);
+    auto& set = sets[programs];
+    ++set.draws;
+    const auto note = [&](const Registers& registers, Graphics::RegisterBank bank) {
+        const auto& mask = *masks[static_cast<std::size_t>(bank)];
+        for (const auto& [offset, value] : registers) {
+            if (!mask.Contains(offset)) continue;
+            auto& values = set.values[{static_cast<int>(bank), offset}];
+            if (values.size() < 8) values.insert(value);
+        }
+    };
+    note(queue.context, Graphics::RegisterBank::Context);
+    note(queue.shader, Graphics::RegisterBank::Shader);
+    note(queue.userConfig, Graphics::RegisterBank::UserConfig);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - windowStart < std::chrono::seconds(10)) return;
+    windowStart = now;
+    std::vector<std::pair<std::uint64_t, const Set*>> top;
+    for (const auto& [key, entry] : sets) top.emplace_back(key, &entry);
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second->draws > b.second->draws; });
+    std::fprintf(stderr, "[key-registers] %zu program sets (10 s); changing keyed registers of the top sets:\n", top.size());
+    for (std::size_t i = 0; i < top.size() && i < 6; ++i) {
+        std::string text;
+        for (const auto& [where, values] : top[i].second->values) {
+            if (values.size() < 2) continue;
+            char item[48];
+            std::snprintf(item, sizeof(item), " %d:%x(%zu)", where.first, where.second, values.size());
+            text += item;
+        }
+        std::fprintf(stderr, "[key-registers]   set %016llx x%llu:%s\n", static_cast<unsigned long long>(top[i].first), static_cast<unsigned long long>(top[i].second->draws), text.c_str());
+    }
+    sets.clear();
+}
+
+std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, const std::vector<std::uint32_t>* skipUserWords, bool noUserWords) {
     const auto& masks = registerMasks();
     const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {
         const auto& mask = masks[static_cast<std::size_t>(bank)];
@@ -44,7 +106,9 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
     shape = (shape ^ fingerprint(queue.userConfig, Graphics::RegisterBank::UserConfig)) * 0x100000001b3ull;
     auto exact = shape;
     const auto words = [&](std::uint32_t base, std::uint32_t count) {
+        if (noUserWords) return;
         for (auto it = queue.shader.lower_bound(base); it != queue.shader.end() && it->first < base + count; ++it) {
+            if (skipUserWords != nullptr && std::binary_search(skipUserWords->begin(), skipUserWords->end(), it->first)) continue;
             exact = (exact ^ it->first) * 0x100000001b3ull;
             exact = (exact ^ it->second) * 0x100000001b3ull;
         }
@@ -60,11 +124,12 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
 }
 
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, const std::vector<std::uint32_t>* skipUserWords, bool noUserWords) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEYS") != nullptr;
-    auto key = RegisterStateKey(queue, allUserWords);
-    if (verify && key != RegisterStateKey(queue, allUserWords, false)) throw std::runtime_error("incremental register fingerprint disagrees with full state");
+    if (!noUserWords) ProfileKeyRegisters(queue);
+    auto key = RegisterStateKey(queue, allUserWords, true, skipUserWords, noUserWords);
+    if (verify && key != RegisterStateKey(queue, allUserWords, false, skipUserWords, noUserWords)) throw std::runtime_error("incremental register fingerprint disagrees with full state");
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
         key *= 0x100000001b3ull;

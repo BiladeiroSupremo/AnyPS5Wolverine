@@ -79,7 +79,12 @@ struct CaptureDiffProfile {
     std::mutex mutex;
     struct Program {
         std::vector<std::vector<std::uint32_t>> last;
+        // Per region: the user-data word pair whose pointer it lies within 4 KiB after, and the
+        // offset (or -1, -1), compared with the previous draw.
+        std::vector<std::pair<int, std::uint64_t>> lastRelative;
+        std::vector<std::uint64_t> lastAddresses;
         std::uint64_t draws = 0, compared = 0, words = 0, differing = 0, shapeChanged = 0;
+        std::uint64_t regions = 0, relative = 0, relativeStable = 0, absoluteStable = 0, absoluteMoved = 0;
         std::array<std::uint64_t, 8> positions{};
     };
     std::unordered_map<std::uint64_t, Program> programs;
@@ -96,11 +101,36 @@ void ProfileCaptureDiff(const std::vector<DrawProgram>& programs, const std::vec
         auto& entry = state->programs[programs[i].binary.codeAddress];
         ++entry.draws;
         std::vector<std::vector<std::uint32_t>> now;
+        std::vector<std::pair<int, std::uint64_t>> relative;
+        std::vector<std::uint64_t> addresses;
+        const auto& user = programs[i].userData;
         for (const auto& region : captures[i].regions) {
             std::vector<std::uint32_t> words(region.bytes.size() / 4);
             std::memcpy(words.data(), region.bytes.data(), words.size() * 4);
             now.push_back(std::move(words));
+            std::pair<int, std::uint64_t> found{-1, 0};
+            for (std::size_t w = 0; w + 1 < user.size(); w += 2) {
+                const auto pointer = static_cast<std::uint64_t>(user[w]) | (static_cast<std::uint64_t>(user[w + 1] & 0xffffu) << 32u);
+                if (pointer != 0 && region.guestAddress >= pointer && region.guestAddress - pointer < 0x1000 && (found.first < 0 || region.guestAddress - pointer < found.second)) found = {static_cast<int>(w), region.guestAddress - pointer};
+            }
+            relative.push_back(found);
+            addresses.push_back(region.guestAddress);
         }
+        if (entry.lastRelative.size() == relative.size()) {
+            for (std::size_t r = 0; r < relative.size(); ++r) {
+                ++entry.regions;
+                if (relative[r].first >= 0) {
+                    ++entry.relative;
+                    if (relative[r] == entry.lastRelative[r]) ++entry.relativeStable;
+                } else if (addresses[r] == entry.lastAddresses[r]) {
+                    ++entry.absoluteStable;
+                } else {
+                    ++entry.absoluteMoved;
+                }
+            }
+        }
+        entry.lastRelative = std::move(relative);
+        entry.lastAddresses = std::move(addresses);
         if (!entry.last.empty()) {
             bool sameShape = entry.last.size() == now.size();
             for (std::size_t r = 0; sameShape && r < now.size(); ++r) sameShape = entry.last[r].size() == now[r].size();
@@ -131,14 +161,17 @@ void ProfileCaptureDiff(const std::vector<DrawProgram>& programs, const std::vec
         const auto& entry = *top[i].second;
         std::string positions;
         for (const auto count : entry.positions) positions += " " + std::to_string(count);
-        std::fprintf(stderr, "[capture-diff]   0x%llx x%llu: %zu regions %zu words, compared %llu (shape changed %llu), %.1f%% of words differed, by word mod 8:%s\n",
+        std::fprintf(stderr, "[capture-diff]   0x%llx x%llu: %zu regions %zu words, compared %llu (shape changed %llu), %.1f%% of words differed, by word mod 8:%s; regions %llu: pointer-relative %llu (same pointer and offset %llu), absolute same %llu, absolute moved %llu\n",
                      static_cast<unsigned long long>(top[i].first), static_cast<unsigned long long>(entry.draws), entry.last.size(),
                      [&] { std::size_t n = 0; for (const auto& r : entry.last) n += r.size(); return n; }(),
                      static_cast<unsigned long long>(entry.compared), static_cast<unsigned long long>(entry.shapeChanged),
-                     entry.words != 0 ? 100.0 * static_cast<double>(entry.differing) / static_cast<double>(entry.words) : 0.0, positions.c_str());
+                     entry.words != 0 ? 100.0 * static_cast<double>(entry.differing) / static_cast<double>(entry.words) : 0.0, positions.c_str(),
+                     static_cast<unsigned long long>(entry.regions), static_cast<unsigned long long>(entry.relative), static_cast<unsigned long long>(entry.relativeStable),
+                     static_cast<unsigned long long>(entry.absoluteStable), static_cast<unsigned long long>(entry.absoluteMoved));
     }
     for (auto& [address, entry] : state->programs) {
         entry.draws = entry.compared = entry.words = entry.differing = entry.shapeChanged = 0;
+        entry.regions = entry.relative = entry.relativeStable = entry.absoluteStable = entry.absoluteMoved = 0;
         entry.positions = {};
     }
 }
@@ -232,9 +265,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
+    // APS5_RELOCATED_DRAW_KEYS (DrawRelocation.cpp): the shape's relocated pointer words, left out of the key.
+    std::uint64_t shapeKey = 0;
+    std::shared_ptr<const std::vector<std::uint32_t>> relocation;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+        if (relocatedDrawKeys()) {
+            shapeKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, true);
+            std::lock_guard cacheLock(drawCacheMutex);
+            if (const auto found = drawRelocations.find(shapeKey); found != drawRelocations.end()) relocation = found->second;
+        }
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), relocation.get());
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -260,6 +301,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;
+    // A cached decode holds the user words of the draw that made it; the key left these out.
+    if (relocation != nullptr) refreshRelocatedUserWords(queue, *relocation, programs);
     // Debug aid: draws of APS5_TRACE_DRAW_PROGRAMS print their resources ([draw-io]) and skip recipes.
     const bool tracedPrograms = std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return Graphics::TraceDrawProgram(program.binary.codeAddress); });
     if (tracedPrograms) {
@@ -374,7 +417,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool drawHit = false;
     bool verifyHit = false;
     ProfileUserWords(programs);
-    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
+    // The key's inputs as looked up: the miss path below may change pixel.
+    const auto lookupPixel = pixel;
+    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, shapeKey, relocation);
 
     if (registerKey) {
 
@@ -433,7 +478,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     ProfileCaptureDiff(programs, stageCaptures);
-    cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
+    std::optional<DrawRelocationPlan> relocationPlan;
+    if (useDrawEntries && relocatedDrawKeys() && !drawHit) {
+        const auto keyFor = [&](const std::vector<std::uint32_t>* mask) {
+            return registerKey ? drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), mask) : drawProgramKey(localDevice->Serial(), graphics, lookupPixel, programs, roles, vertexInfos, mask);
+        };
+        relocationPlan = planDrawRelocation(keyFor, programs, stageCaptures, decodeReads, shapeKey, relocation, drawKey);
+    }
+    const bool relocatedDraw = relocation != nullptr || (relocationPlan && std::any_of(relocationPlan->stages.begin(), relocationPlan->stages.end(), [](bool stage) { return stage; }));
+    cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, relocationPlan ? relocationPlan->insertKey : drawKey, registerKey, decode, phaseTiming, relocationPlan ? &*relocationPlan : nullptr);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -650,7 +703,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
+    // Recipes hold resources found at the recording draw's addresses: not for relocated draws.
+    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes() && !relocatedDraw) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();

@@ -95,9 +95,18 @@ struct StageCapture {
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
+    // The user words the capture's walk read through (asBase) and specialized on (asValue), for
+    // APS5_RELOCATED_DRAW_KEYS; captured is set when this draw ran the walk.
+    std::uint64_t userWordsAsBase = 0;
+    std::uint64_t userWordsAsValue = 0;
+    bool captured = false;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
+
+// The shader register a draw program's user word comes from, or 0 for a merged stage's driver
+// words (DrawRelocation.cpp).
+std::uint32_t DrawUserWordRegister(const DrawProgram& program, std::uint32_t word);
 
 }
 

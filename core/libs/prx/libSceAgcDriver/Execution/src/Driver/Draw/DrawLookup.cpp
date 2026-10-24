@@ -5,16 +5,18 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs) {
-    using Role = ShaderRecompiler::ProgramRole;
-    if (useDrawEntries) {
-        if (!registerKey) {
-            drawKey = 0xcbf29ce484222325ull;
-            const auto mix = [&](std::uint64_t value) {
-                drawKey ^= value;
-                drawKey *= 0x100000001b3ull;
-            };
-            mix(localDevice->Serial());
+// The draw key without the register state (APS5_NO_DRAW_KEY): the stages, programs, user words,
+// vertex and pixel stage info. skipUserWords leaves out the user words of those registers
+// (APS5_RELOCATED_DRAW_KEYS), noUserWords all of them (the draw's shape).
+std::uint64_t Driver::drawProgramKey(std::uint64_t deviceSerial, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::uint32_t>* skipUserWords, bool noUserWords) {
+    std::uint64_t drawKey = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) {
+        drawKey ^= value;
+        drawKey *= 0x100000001b3ull;
+    };
+    {
+        {
+            mix(deviceSerial);
             mix(static_cast<std::uint64_t>(graphics.stages.path));
             mix(graphics.stages.registerValue);
             mix(graphics.stages.vertexWaveSize);
@@ -40,7 +42,14 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(program.userDataBase);
                 mix(program.firstUserSgpr);
                 mix(program.userData.size());
-                for (const auto word : program.userData) mix(word);
+                for (std::uint32_t word = 0; word < program.userData.size(); ++word) {
+                    if (noUserWords) continue;
+                    if (skipUserWords != nullptr) {
+                        const auto offset = DrawUserWordRegister(program, word);
+                        if (offset != 0 && std::binary_search(skipUserWords->begin(), skipUserWords->end(), offset)) continue;
+                    }
+                    mix(program.userData[word]);
+                }
                 mix(vertexInfos[i].has_value());
                 if (!vertexInfos[i]) continue;
                 const auto& vertex = *vertexInfos[i];
@@ -73,6 +82,21 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.dualSourceBlend);
             mix(pixel.alphaToCoverage);
             mix(static_cast<std::uint64_t>(pixel.rasterPrimitive));
+        }
+    }
+    return drawKey;
+}
+
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::uint64_t& shapeKey, std::shared_ptr<const std::vector<std::uint32_t>>& relocation) {
+    using Role = ShaderRecompiler::ProgramRole;
+    if (useDrawEntries) {
+        if (!registerKey) {
+            if (relocatedDrawKeys()) {
+                shapeKey = drawProgramKey(localDevice->Serial(), graphics, pixel, programs, roles, vertexInfos, nullptr, true);
+                std::lock_guard cacheLock(drawCacheMutex);
+                if (const auto found = drawRelocations.find(shapeKey); found != drawRelocations.end()) relocation = found->second;
+            }
+            drawKey = drawProgramKey(localDevice->Serial(), graphics, pixel, programs, roles, vertexInfos, relocation.get());
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);
@@ -87,6 +111,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
             std::uint32_t cursor = 0;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> relocatedRunsScratch;
             {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
 
@@ -108,10 +133,18 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         }
                         auto& regions = matchedRegions[i];
                         regions.clear();
-                        appendEntryRegions(*variant, regions);
+                        // A relocated stage (DrawRelocation.cpp) is compared at this draw's pointers.
+                        const bool relocated = !variant->runPointerWords.empty();
+                        if (relocated) {
+                            if (!relocatedRuns(*variant, programs[i].userData, relocatedRunsScratch)) continue;
+                            appendEntryRegionsAt(*variant, relocatedRunsScratch, regions);
+                        } else {
+                            appendEntryRegions(*variant, regions);
+                        }
                         ++compared;
-                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                        const auto* runs = relocated ? &relocatedRunsScratch : nullptr;
+                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, nullptr, runs);
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, nullptr, runs);
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal) continue;

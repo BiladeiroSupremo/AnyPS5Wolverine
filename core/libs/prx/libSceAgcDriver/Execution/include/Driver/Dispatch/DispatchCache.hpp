@@ -26,6 +26,11 @@ struct DispatchVariant {
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
     std::vector<std::uint32_t> words;
+    // APS5_RELOCATED_DRAW_KEYS: a draw stage whose every run lies within 4 KiB after one of its
+    // user-data pointers keeps, per run, the user word of that pointer and the pointer's value when
+    // captured; a later draw compares the runs at its own pointers plus the same offsets.
+    std::vector<std::int16_t> runPointerWords;
+    std::vector<std::uint64_t> runPointerValues;
     std::uint64_t forgetSerial = 0;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
     std::array<std::uint32_t, 4> meshIndexDescriptor{};
