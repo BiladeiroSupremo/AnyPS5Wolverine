@@ -95,6 +95,10 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
             continue;
         }
         if (opcode == 0x22u && count == 5) guarded.emplace_back(cursor + count + Pm4::ConditionalWords(std::span(guest + cursor, count)), submission.commands.size());
+        // APS5_GUEST_HOOKS: a draw packet is charged to the hooked engine call that wrote it here, at
+        // the submit, while the engine's cursors still describe this command buffer (by the time the
+        // queue worker decodes it, the title may be recording the next frame at the same addresses).
+        if (GuestHooksActive() && Pm4::DrawOpcode(opcode)) NoteGuestHookDrawPacket(reinterpret_cast<std::uint64_t>(guest + cursor), opcode);
         submission.commands.insert(submission.commands.end(), guest + cursor, guest + cursor + count);
         cursor += count;
         if (opcode == 0x59u) {

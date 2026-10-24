@@ -48,6 +48,11 @@ struct DispatchShaderRejected : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// APS5_GUEST_HOOKS (Lifecycle.cpp): a draw packet copied at its submit (copySegment), by its guest
+// address, charged to the hooked engine call whose command buffer cursor it follows.
+bool GuestHooksActive();
+void NoteGuestHookDrawPacket(std::uint64_t guestAddress, std::uint32_t opcode);
+
 class Driver {
 public:
     static Driver& Get();

@@ -14,7 +14,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -125,12 +127,29 @@ void ApplyCodePatches() {
 // whose first field points at the stage's shader (stages 2..7 are used); the six pointers stand in for
 // the pipeline state. Every 5 s the hooks print calls per second, distinct this pointers and shader
 // sets, and how many of the window's shader sets the previous window used too.
+// The draw-call census (native port milestone M1, C:\wolvie\work\native_port_plan.md) adds, per hook
+// and window: how many distinct values each SysV argument register took (rsi rdx rcx r8 r9) with two
+// example calls; and, for 'p' hooks, the libSceAgc command buffer's write cursor at entry
+// (CommandBuffer::cursor_up, +0x10 of this+0x78): the PM4 bytes from one hooked call to the next on
+// the thread, and the draw packets the queue worker decodes (NoteGuestHookDrawPacket), charged by
+// opcode to the hooked call whose cursor is the nearest at or below the packet (within 64 KiB; the
+// rest are counted unmatched).
 struct GuestHook {
     std::uint64_t rva = 0;
     bool readsPipeline = false;
     std::uint64_t calls = 0;
     std::unordered_set<std::uint64_t> objects;
     std::unordered_set<std::uint64_t> pipelines;
+    std::array<std::unordered_set<std::uint64_t>, 5> argValues;
+    std::vector<std::array<std::uint64_t, 6>> examples;
+    std::uint64_t pm4Calls = 0;
+    std::uint64_t pm4Bytes = 0;
+    std::map<std::uint32_t, std::uint64_t> drawOpcodes;
+};
+
+struct GuestHookCursor {
+    std::uint64_t serial;
+    std::size_t index;
 };
 
 struct GuestHooks {
@@ -138,11 +157,29 @@ struct GuestHooks {
     std::vector<GuestHook> hooks;
     std::unordered_set<std::uint64_t> previousPipelines;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+    // Recent entry cursors by address, oldest evicted first (an address reused by a later call
+    // keeps that call's entry).
+    std::map<std::uint64_t, GuestHookCursor> cursors;
+    std::deque<std::pair<std::uint64_t, std::uint64_t>> cursorOrder;
+    std::uint64_t serial = 0;
+    std::map<std::uint32_t, std::uint64_t> unmatchedDraws;
 };
+
+std::atomic<bool> guestHooksActive{false};
 
 GuestHooks& GuestHookState() {
     static auto* state = new GuestHooks();
     return *state;
+}
+
+std::string GuestHookOpcodes(const std::map<std::uint32_t, std::uint64_t>& opcodes) {
+    std::string text;
+    for (const auto& [opcode, count] : opcodes) {
+        char item[32];
+        std::snprintf(item, sizeof(item), " 0x%02x x%llu", opcode, static_cast<unsigned long long>(count));
+        text += item;
+    }
+    return text.empty() ? " none" : text;
 }
 
 void ReportGuestHooks(GuestHooks& state, double seconds) {
@@ -153,23 +190,42 @@ void ReportGuestHooks(GuestHooks& state, double seconds) {
         for (const auto pipeline : hook.pipelines) reused += state.previousPipelines.contains(pipeline) ? 1 : 0;
         std::fprintf(stderr, "[guest-hook] 0x%llx: %.0f calls/s, %zu objects, %zu shader sets (%zu also in the last window)\n",
                      static_cast<unsigned long long>(hook.rva), static_cast<double>(hook.calls) / seconds, hook.objects.size(), hook.pipelines.size(), reused);
+        std::string examples;
+        for (const auto& args : hook.examples) {
+            char item[160];
+            std::snprintf(item, sizeof(item), " (%llx %llx %llx %llx %llx %llx)", static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]), static_cast<unsigned long long>(args[2]), static_cast<unsigned long long>(args[3]), static_cast<unsigned long long>(args[4]), static_cast<unsigned long long>(args[5]));
+            examples += item;
+        }
+        std::fprintf(stderr, "[guest-hook-census] 0x%llx: args distinct rsi %zu rdx %zu rcx %zu r8 %zu r9 %zu; e.g. (rdi rsi rdx rcx r8 r9)%s; PM4 to the next hooked call %.0f bytes avg over %llu; draw packets decoded:%s\n",
+                     static_cast<unsigned long long>(hook.rva), hook.argValues[0].size(), hook.argValues[1].size(), hook.argValues[2].size(), hook.argValues[3].size(), hook.argValues[4].size(), examples.c_str(),
+                     hook.pm4Calls == 0 ? 0.0 : static_cast<double>(hook.pm4Bytes) / static_cast<double>(hook.pm4Calls), static_cast<unsigned long long>(hook.pm4Calls), GuestHookOpcodes(hook.drawOpcodes).c_str());
         pipelines.insert(hook.pipelines.begin(), hook.pipelines.end());
         hook.calls = 0;
         hook.objects.clear();
         hook.pipelines.clear();
+        for (auto& values : hook.argValues) values.clear();
+        hook.examples.clear();
+        hook.pm4Calls = hook.pm4Bytes = 0;
+        hook.drawOpcodes.clear();
     }
     std::size_t reused = 0;
     for (const auto pipeline : pipelines) reused += state.previousPipelines.contains(pipeline) ? 1 : 0;
-    std::fprintf(stderr, "[guest-hook] window %.1f s: %zu shader sets, %zu also in the last window\n", seconds, pipelines.size(), reused);
+    std::fprintf(stderr, "[guest-hook] window %.1f s: %zu shader sets, %zu also in the last window; draw packets matched to no hooked call:%s\n", seconds, pipelines.size(), reused, GuestHookOpcodes(state.unmatchedDraws).c_str());
     state.previousPipelines = std::move(pipelines);
+    state.unmatchedDraws.clear();
 }
 
-APS5_VABI void GuestHookCall(std::uint64_t self, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t index) {
+APS5_VABI void GuestHookCall(std::uint64_t self, std::uint64_t rsi, std::uint64_t rdx, std::uint64_t rcx, std::uint64_t r8, std::uint64_t r9, std::uint64_t index) {
     auto& state = GuestHookState();
     std::lock_guard lock(state.mutex);
     auto& hook = state.hooks[index];
     ++hook.calls;
     hook.objects.insert(self);
+    const std::array<std::uint64_t, 6> args{self, rsi, rdx, rcx, r8, r9};
+    for (std::size_t i = 0; i < hook.argValues.size(); ++i) {
+        if (hook.argValues[i].size() < 4096) hook.argValues[i].insert(args[i + 1]);
+    }
+    if (hook.examples.size() < 2 && hook.calls % 97 == 1) hook.examples.push_back(args);
     if (hook.readsPipeline && self >= 0x10000) {
         const auto buffer = *reinterpret_cast<const std::uint64_t*>(self + 0x78);
         std::uint64_t shaders = 0xcbf29ce484222325ull;
@@ -177,6 +233,29 @@ APS5_VABI void GuestHookCall(std::uint64_t self, std::uint64_t, std::uint64_t, s
             shaders = (shaders ^ *reinterpret_cast<const std::uint64_t*>(buffer + 0x38 + stage * 0x70)) * 0x100000001b3ull;
         }
         hook.pipelines.insert(shaders);
+        if (buffer >= 0x10000) {
+            const auto cursor = *reinterpret_cast<const std::uint64_t*>(buffer + 0x10);
+            thread_local std::uint64_t lastCursor = 0;
+            thread_local std::size_t lastIndex = 0;
+            if (lastCursor != 0 && cursor > lastCursor && cursor - lastCursor < 0x100000) {
+                auto& previous = state.hooks[lastIndex];
+                ++previous.pm4Calls;
+                previous.pm4Bytes += cursor - lastCursor;
+            }
+            lastCursor = cursor;
+            lastIndex = index;
+            const auto serial = ++state.serial;
+            // Entries ahead of the cursor are from earlier recordings of this buffer (the title has
+            // not written there yet): they would take the packets this call and the next ones write.
+            state.cursors.erase(state.cursors.upper_bound(cursor), state.cursors.upper_bound(cursor + 0x10000));
+            state.cursors[cursor] = {serial, index};
+            state.cursorOrder.emplace_back(cursor, serial);
+            while (state.cursorOrder.size() > (std::size_t{1} << 18)) {
+                const auto [address, oldest] = state.cursorOrder.front();
+                state.cursorOrder.pop_front();
+                if (const auto found = state.cursors.find(address); found != state.cursors.end() && found->second.serial == oldest) state.cursors.erase(found);
+            }
+        }
     }
     const auto now = std::chrono::steady_clock::now();
     const auto seconds = std::chrono::duration<double>(now - state.windowStart).count();
@@ -184,6 +263,18 @@ APS5_VABI void GuestHookCall(std::uint64_t self, std::uint64_t, std::uint64_t, s
         ReportGuestHooks(state, seconds);
         state.windowStart = now;
     }
+}
+
+void noteGuestHookDrawPacket(std::uint64_t address, std::uint32_t opcode) {
+    if (!guestHooksActive.load(std::memory_order_relaxed) || address == 0) return;
+    auto& state = GuestHookState();
+    std::lock_guard lock(state.mutex);
+    auto found = state.cursors.upper_bound(address);
+    if (found == state.cursors.begin() || address - std::prev(found)->first >= 0x10000) {
+        ++state.unmatchedDraws[opcode];
+        return;
+    }
+    ++state.hooks[std::prev(found)->second.index].drawOpcodes[opcode];
 }
 
 void InstallGuestHooks() {
@@ -254,6 +345,7 @@ void InstallGuestHooks() {
         VirtualProtect(target, jump.size(), previous, &previous);
         FlushInstructionCache(GetCurrentProcess(), target, jump.size());
         std::fprintf(stderr, "[guest-hook] 0x%llx: hooked (%zu bytes moved)\n", static_cast<unsigned long long>(rva), stolen.size());
+        guestHooksActive.store(true, std::memory_order_relaxed);
     }
     FlushInstructionCache(GetCurrentProcess(), stubs, used);
 #else
@@ -360,6 +452,14 @@ void Driver::stop() {
     PerformanceTrace::StopOutput();
     StopProfileOutput_nid_no_patch();
     stopped = true;
+}
+
+bool GuestHooksActive() {
+    return guestHooksActive.load(std::memory_order_relaxed);
+}
+
+void NoteGuestHookDrawPacket(std::uint64_t guestAddress, std::uint32_t opcode) {
+    noteGuestHookDrawPacket(guestAddress, opcode);
 }
 
 Driver::Driver() {
