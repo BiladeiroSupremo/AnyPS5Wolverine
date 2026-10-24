@@ -25,8 +25,101 @@ constexpr std::uint32_t ShaderFileHeader = 0x34333231u;
 constexpr std::uint64_t StageRecords = 0x38;
 constexpr std::uint64_t StageRecordBytes = 0x70;
 
+// Step 1a: where each bound descriptor of a draw comes from, for draws of one Shader tuple (the
+// record's Shaders plus the bound descriptors' count and roles): words of a stage's user data, of
+// its extended user data, or of the buffer a user-data V# addresses, at a fixed offset. Built on
+// the first draw of the tuple by locating each descriptor, then checked on every later draw by
+// gathering through it.
+struct DescriptorSource {
+    // Pointer: a raw 64-bit pointer in user-data words [word, word+1] (the per-draw ring tables).
+    enum Kind : std::uint8_t { Unknown, UserData, Extended, Buffer, Pointer };
+    Kind kind = Unknown;
+    std::uint8_t slot = 0;
+    // The user-data (or extended) word of the descriptor, or of the buffer's V#.
+    std::uint16_t word = 0;
+    std::uint32_t byteOffset = 0;
+};
+
+struct SourcePlan {
+    std::vector<DescriptorSource> sources;
+};
+
+// The buffer a V# at words[k..k+3] addresses, as [base, bytes) clamped to 1 MiB; 0 bytes when the
+// words do not look like one.
+std::pair<std::uint64_t, std::uint64_t> BufferOf(const std::vector<std::uint32_t>& words, std::size_t k) {
+    if (k + 3 >= words.size()) return {0, 0};
+    const auto base = static_cast<std::uint64_t>(words[k]) | (static_cast<std::uint64_t>(words[k + 1] & 0xffffu) << 32u);
+    const auto stride = (words[k + 1] >> 16u) & 0x3fffu;
+    const auto records = static_cast<std::uint64_t>(words[k + 2]);
+    const auto bytes = std::min<std::uint64_t>(records * std::max<std::uint32_t>(stride, 1u), 0x100000);
+    if (base < 0x100000 || (base & 3u) != 0 || bytes < 16) return {0, 0};
+    return {base, bytes};
+}
+
+// The memory a raw pointer at words[k..k+1] addresses, 4 KiB from it; 0 bytes when not a pointer.
+std::pair<std::uint64_t, std::uint64_t> PointerOf(const std::vector<std::uint32_t>& words, std::size_t k) {
+    if (k + 1 >= words.size()) return {0, 0};
+    const auto base = static_cast<std::uint64_t>(words[k]) | (static_cast<std::uint64_t>(words[k + 1]) << 32u);
+    if (base < 0x100000 || base >= (std::uint64_t{1} << 40u) || (base & 3u) != 0) return {0, 0};
+    return {base, 0x1000};
+}
+
+DescriptorSource LocateDescriptor(const NativeDrawRecord& record, const std::array<std::uint32_t, 4>& words) {
+    const auto equalAt = [&](const std::uint32_t* at) { return at[0] == words[0] && at[1] == words[1] && at[2] == words[2] && at[3] == words[3]; };
+    for (std::size_t slot = 0; slot < record.shaders.size(); ++slot) {
+        if (record.shaders[slot] == 0) continue;
+        const auto& userData = record.userData[slot];
+        const auto& extended = record.eud[slot];
+        for (std::size_t k = 0; k + 4 <= userData.size(); ++k) {
+            if (equalAt(userData.data() + k)) return {DescriptorSource::UserData, static_cast<std::uint8_t>(slot), static_cast<std::uint16_t>(k), 0};
+        }
+        for (std::size_t k = 0; k + 4 <= extended.size(); ++k) {
+            if (equalAt(extended.data() + k)) return {DescriptorSource::Extended, static_cast<std::uint8_t>(slot), static_cast<std::uint16_t>(k), 0};
+        }
+        for (const auto kind : {DescriptorSource::Pointer, DescriptorSource::Buffer}) {
+            for (std::size_t k = 0; k + 2 <= userData.size(); ++k) {
+                const auto [base, bytes] = kind == DescriptorSource::Buffer ? BufferOf(userData, k) : PointerOf(userData, k);
+                if (bytes == 0 || !AgcDriver::GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes))) continue;
+                const auto* buffer = reinterpret_cast<const std::uint32_t*>(base);
+                for (std::uint64_t i = 0; i + 4 <= bytes / 4; ++i) {
+                    if (equalAt(buffer + i)) return {kind, static_cast<std::uint8_t>(slot), static_cast<std::uint16_t>(k), static_cast<std::uint32_t>(i * 4)};
+                }
+            }
+        }
+    }
+    return {};
+}
+
+// The descriptor words a source gives in this draw; nullopt when they cannot be read.
+std::optional<std::array<std::uint32_t, 4>> GatherDescriptor(const NativeDrawRecord& record, const DescriptorSource& source) {
+    const auto& userData = record.userData[source.slot];
+    const auto& extended = record.eud[source.slot];
+    switch (source.kind) {
+        case DescriptorSource::UserData:
+            if (source.word + 4u > userData.size()) return std::nullopt;
+            return std::array<std::uint32_t, 4>{userData[source.word], userData[source.word + 1u], userData[source.word + 2u], userData[source.word + 3u]};
+        case DescriptorSource::Extended:
+            if (source.word + 4u > extended.size()) return std::nullopt;
+            return std::array<std::uint32_t, 4>{extended[source.word], extended[source.word + 1u], extended[source.word + 2u], extended[source.word + 3u]};
+        case DescriptorSource::Buffer:
+        case DescriptorSource::Pointer: {
+            const auto [base, bytes] = source.kind == DescriptorSource::Buffer ? BufferOf(userData, source.word) : PointerOf(userData, source.word);
+            if (bytes == 0 || source.byteOffset + 16u > bytes || !AgcDriver::GuestMemory::Accessible(reinterpret_cast<const void*>(base + source.byteOffset), 16)) return std::nullopt;
+            const auto* at = reinterpret_cast<const std::uint32_t*>(base + source.byteOffset);
+            return std::array<std::uint32_t, 4>{at[0], at[1], at[2], at[3]};
+        }
+        default:
+            return std::nullopt;
+    }
+}
+
 struct ShadowState {
     std::mutex mutex;
+    // Step 1a plans by Shader tuple, and how they fared: draws whose every descriptor the plan
+    // reproduced, draws with some wrong; descriptors gathered right / wrong / with no source.
+    std::unordered_map<std::uint64_t, SourcePlan> plans;
+    std::uint64_t plansBuilt = 0, planDrawsRight = 0, planDrawsWrong = 0, planRight = 0, planWrong = 0, planUnknown = 0, relocations = 0;
+    int planExamples = 0;
     std::unordered_map<std::uint64_t, NativeDrawRecord> records;
     std::deque<std::uint64_t> order;
     // Decoded draws: every decoded Shader among the record's; some missing (by count of decoded
@@ -195,8 +288,60 @@ void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const De
             }
         }
     }
+    // Step 1a: the plan of this Shader tuple (built outside the lock on the first draw).
+    std::uint64_t tuple = 0xcbf29ce484222325ull;
+    for (const auto shader : record.shaders) tuple = (tuple ^ shader) * 0x100000001b3ull;
+    tuple = (tuple ^ decoded.size()) * 0x100000001b3ull;
+    for (const auto& descriptor : decoded) tuple = (tuple ^ descriptor.role) * 0x100000001b3ull;
+    std::optional<SourcePlan> built;
+    {
+        auto& shadow = Shadow();
+        std::unique_lock lock(shadow.mutex);
+        const bool known = shadow.plans.contains(tuple);
+        lock.unlock();
+        if (!known && shadow.plans.size() < 8192) {
+            built.emplace();
+            built->sources.reserve(decoded.size());
+            for (const auto& descriptor : decoded) built->sources.push_back(LocateDescriptor(record, descriptor.words));
+        }
+    }
     auto& state = Shadow();
     std::lock_guard lock(state.mutex);
+    if (built) {
+        if (state.plans.try_emplace(tuple, std::move(*built)).second) ++state.plansBuilt;
+    } else if (const auto found = state.plans.find(tuple); found != state.plans.end() && found->second.sources.size() == decoded.size()) {
+        bool right = true;
+        for (std::size_t i = 0; i < decoded.size(); ++i) {
+            auto& source = found->second.sources[i];
+            if (source.kind == DescriptorSource::Unknown) {
+                ++state.planUnknown;
+                right = false;
+                // Unknown sources are retried (a few per window): the first draw may not have shown it.
+                if (state.relocations < 4000) {
+                    ++state.relocations;
+                    source = LocateDescriptor(record, decoded[i].words);
+                }
+                continue;
+            }
+            const auto words = GatherDescriptor(record, source);
+            if (words && *words == decoded[i].words) {
+                ++state.planRight;
+                continue;
+            }
+            ++state.planWrong;
+            right = false;
+            // An ambiguous first location (the words were in two places): located again.
+            if (state.relocations < 4000) {
+                ++state.relocations;
+                source = LocateDescriptor(record, decoded[i].words);
+            }
+            if (state.planExamples < 12) {
+                ++state.planExamples;
+                std::fprintf(stderr, "[native-shadow] plan source %u (record %u word %u +0x%x) gave %s, bound %08x %08x %08x %08x\n", static_cast<unsigned>(source.kind), static_cast<unsigned>(source.slot), static_cast<unsigned>(source.word), source.byteOffset, words ? "other words" : "nothing", decoded[i].words[0], decoded[i].words[1], decoded[i].words[2], decoded[i].words[3]);
+            }
+        }
+        ++(right ? state.planDrawsRight : state.planDrawsWrong);
+    }
     {
         std::uint64_t key = 0xcbf29ce484222325ull;
         const auto mix = [&](std::uint64_t value) { key = (key ^ value) * 0x100000001b3ull; };
@@ -347,6 +492,8 @@ void CompareNativeDraw(const NativeDrawRecord* record, std::span<const std::uint
     std::uint64_t repeats = 0;
     for (const auto& [key, draws] : state.nativeKeys) repeats += draws - 1;
     std::fprintf(stderr, "[native-shadow] native keys: %zu distinct over %llu draws (10 s; a cache keyed so would hit %.1f%%), %zu distinct in the run so far\n", state.nativeKeys.size(), static_cast<unsigned long long>(state.keyedDraws), state.keyedDraws != 0 ? 100.0 * static_cast<double>(repeats) / static_cast<double>(state.keyedDraws) : 0.0, state.runKeys.size());
+    std::fprintf(stderr, "[native-shadow] source plans: %zu (built %llu this window); draws gathered right %llu, not %llu; descriptors right %llu, wrong %llu, without a source %llu; sources located again %llu\n", state.plans.size(), static_cast<unsigned long long>(state.plansBuilt), static_cast<unsigned long long>(state.planDrawsRight), static_cast<unsigned long long>(state.planDrawsWrong), static_cast<unsigned long long>(state.planRight), static_cast<unsigned long long>(state.planWrong), static_cast<unsigned long long>(state.planUnknown), static_cast<unsigned long long>(state.relocations));
+    state.plansBuilt = state.planDrawsRight = state.planDrawsWrong = state.planRight = state.planWrong = state.planUnknown = state.relocations = 0;
     std::fprintf(stderr, "[native-shadow] repeated native keys: compiled structure same %llu / other %llu, push constants same %llu / other %llu\n", static_cast<unsigned long long>(state.sameStructure), static_cast<unsigned long long>(state.otherStructure), static_cast<unsigned long long>(state.samePushes), static_cast<unsigned long long>(state.otherPushes));
     state.sameStructure = state.otherStructure = state.samePushes = state.otherPushes = 0;
     state.nativeKeys.clear();
