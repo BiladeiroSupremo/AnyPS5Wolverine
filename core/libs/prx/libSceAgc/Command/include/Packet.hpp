@@ -14,6 +14,9 @@ std::uint32_t Header(std::uint32_t opcode, std::uint32_t count, std::uint32_t fl
 void Reserve(CommandBuffer* buffer, std::uint32_t count, const char* function);
 std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* function);
 std::uint32_t* Emit(CommandBuffer* buffer, std::uint32_t opcode, std::initializer_list<std::uint32_t> payload, const char* function);
+// A draw packet just written into `buffer` (Emit reports its own; packets built by hand report here),
+// for the driver's native-port shadow (AgcDriverNoteEngineDraw).
+void NoteDraw(const CommandBuffer* buffer, const std::uint32_t* packet);
 void ValidatePacket(const std::uint32_t* packet, std::uint32_t opcode, std::uint32_t count, const char* function);
 std::uint32_t* WriteNop(CommandBuffer* buffer, std::uint32_t count, const char* function);
 std::uint32_t* WriteRegisterRange(CommandBuffer* buffer, std::uint32_t opcode, std::uint32_t offset, const std::uint32_t* values, std::uint32_t count, const char* function);

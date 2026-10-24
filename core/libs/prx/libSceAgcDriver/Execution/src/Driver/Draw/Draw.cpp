@@ -324,6 +324,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<DrawProgram> programs = decode->programs;
     // A cached decode holds the user words of the draw that made it; the key left these out.
     if (relocation != nullptr) refreshRelocatedUserWords(queue, *relocation, programs);
+    // APS5_NATIVE_SHADOW: the title's own view of this draw's shaders against the decoded programs.
+    if (NativeShadowActive() && packet.data() >= submission.commands.data() && packet.data() < submission.commands.data() + submission.commands.size()) {
+        std::vector<std::uint64_t> decodedShaders;
+        for (const auto& program : programs) decodedShaders.push_back(program.snapshot != nullptr ? program.snapshot->headerAddress : 0);
+        const auto found = submission.nativeDraws.find(static_cast<std::size_t>(packet.data() - submission.commands.data()));
+        CompareNativeDraw(found != submission.nativeDraws.end() ? &found->second : nullptr, decodedShaders);
+    }
     // Debug aid: draws of APS5_TRACE_DRAW_PROGRAMS print their resources ([draw-io]) and skip recipes.
     const bool tracedPrograms = std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return Graphics::TraceDrawProgram(program.binary.codeAddress); });
     if (tracedPrograms) {

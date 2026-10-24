@@ -78,6 +78,7 @@ uint32_t* APS5_VABI sceAgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_
     packet[5] = static_cast<std::uint32_t>(static_cast<std::uint64_t>(geometry) >> 32u);
     packet[6] = index_count;
     packet[7] = initiator;
+    Agc::Command::NoteDraw(buf, packet + 2);
     return packet;
 }
 

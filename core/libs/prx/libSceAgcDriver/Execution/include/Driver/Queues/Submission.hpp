@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_SUBMISSION_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_SUBMISSION_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Driver/NativeShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include <atomic>
@@ -21,6 +22,9 @@ struct Submission {
     std::uint64_t serial;
     std::uint32_t queue;
     std::vector<std::uint32_t> commands;
+    // APS5_NATIVE_SHADOW: the title's own state of each draw packet, by the packet's first DWORD in
+    // `commands` (taken at the copy, see NativeShadow.hpp).
+    std::unordered_map<std::size_t, NativeDrawRecord> nativeDraws;
 
     std::shared_ptr<const ShaderRegistry> shaders;
     std::map<std::size_t, std::shared_ptr<IFlipRequest>> flips;

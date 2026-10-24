@@ -1,4 +1,5 @@
 #include "prx/libSceAgc/Command/include/Packet.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -78,7 +79,12 @@ std::uint32_t* Emit(CommandBuffer* buffer, std::uint32_t opcode, std::initialize
     auto* packet = Allocate(buffer, count, function);
     packet[0] = header;
     std::copy(payload.begin(), payload.end(), packet + 1);
+    if (opcode == 0x24u || opcode == 0x25u || opcode == 0x27u || opcode == 0x2cu || opcode == 0x2du || opcode == 0x35u || opcode == 0x38u) NoteDraw(buffer, packet);
     return packet;
+}
+
+void NoteDraw(const CommandBuffer* buffer, const std::uint32_t* packet) {
+    AgcDriverNoteEngineDraw_nid_postfix(buffer, packet);
 }
 
 void ValidatePacket(const std::uint32_t* packet, std::uint32_t opcode, std::uint32_t count, const char* function) {

@@ -17,6 +17,7 @@ namespace AgcDriver::DriverDetail {
 
 void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words) {
     submission.commands.clear();
+    submission.nativeDraws.clear();
     submission.conditionalEnds.clear();
     std::size_t budget = std::size_t{1} << 26u;
     copySegment(submission, guest, words, budget);
@@ -99,6 +100,9 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
         // the submit, while the engine's cursors still describe this command buffer (by the time the
         // queue worker decodes it, the title may be recording the next frame at the same addresses).
         if (GuestHooksActive() && Pm4::DrawOpcode(opcode)) NoteGuestHookDrawPacket(reinterpret_cast<std::uint64_t>(guest + cursor), opcode);
+        if (NativeShadowActive() && Pm4::DrawOpcode(opcode)) {
+            if (auto record = TakeNativeDraw(reinterpret_cast<std::uint64_t>(guest + cursor))) submission.nativeDraws.emplace(submission.commands.size(), *record);
+        }
         submission.commands.insert(submission.commands.end(), guest + cursor, guest + cursor + count);
         cursor += count;
         if (opcode == 0x59u) {

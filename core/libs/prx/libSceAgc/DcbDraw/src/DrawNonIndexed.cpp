@@ -49,6 +49,7 @@ std::uint32_t* APS5_VABI sceAgcDcbDrawIndirectMulti(CommandBuffer* buf, std::uin
     packet[13] = Agc::Command::Header(0x79u, 3, 1);
     packet[14] = 0x342u;
     packet[15] = 0xc6000000u;
+    Agc::Command::NoteDraw(buf, packet + 3);
     return packet;
 }
 
