@@ -1268,13 +1268,43 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    // Profiling (APS5_PROFILE_DRAW): the lookup phase split into key, cache probe, Revalidate and
+    // moved buffers, on a [lookup-split] line every 10 s - which part could run before the GPU mutex
+    // (the key and the probe, as VulkanDevice::PrepareDispatch does for dispatches).
+    static std::array<std::atomic<std::uint64_t>, 4> splitNs{};
+    static std::atomic<std::uint64_t> splitCount{0};
+    static std::atomic<std::int64_t> splitReported{0};
+    const auto splitAt = [&] { return timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
+    const auto splitAdd = [&](std::size_t part, std::chrono::steady_clock::time_point from) {
+        if (timer.profile) splitNs[part].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count()), std::memory_order_relaxed);
+    };
     if (resolved.cacheable) {
+        auto at = splitAt();
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        splitAdd(0, at);
+        at = splitAt();
+        auto found = SharedResourceCache().Find(resolved.contentKey);
+        splitAdd(1, at);
+        if (timer.profile) {
+            const auto count = splitCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            auto last = splitReported.load(std::memory_order_relaxed);
+            if (last == 0) splitReported.compare_exchange_strong(last, now);
+            else if (now - last >= 10'000'000'000ll && splitReported.compare_exchange_strong(last, now)) {
+                const auto per = [&](std::size_t part) { return static_cast<double>(splitNs[part].exchange(0)) / 1000.0 / static_cast<double>(count); };
+                std::fprintf(stderr, "[lookup-split] %llu cacheable draws (10 s), us per draw: key %.2f probe %.2f revalidate %.2f moved %.2f\n", static_cast<unsigned long long>(count), per(0), per(1), per(2), per(3));
+                splitCount.store(0, std::memory_order_relaxed);
+            }
+        }
+        if (auto cached = std::move(found)) {
+            at = splitAt();
             const bool valid = cached->Revalidate(shaders);
+            splitAdd(2, at);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
+            at = splitAt();
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            splitAdd(3, at);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
