@@ -1253,21 +1253,32 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
-    ResolvedResources resolved;
-    APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
-    // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
-    // descriptor set when it is still valid (see ResourceCache; the dispatch path does the same).
-    // Only recordable draws take part: a synchronous draw writes its resources back, which a shared
-    // object must never do. Revalidate proves a hit by texture identity, which needs the texture
-    // caches. Push constants still come from this draw's stages. APS5_NO_DRAW_RESOURCE_CACHE=1
-    // builds every draw's resources as before.
+// A recordable draw whose stages' compiled content repeats an earlier one binds that build's
+// descriptor set when it is still valid (see ResourceCache; the dispatch path does the same).
+// Only recordable draws take part: a synchronous draw writes its resources back, which a shared
+// object must never do. Revalidate proves a hit by texture identity, which needs the texture
+// caches. Push constants still come from this draw's stages. APS5_NO_DRAW_RESOURCE_CACHE=1
+// builds every draw's resources as before. This is the stages' part of the condition.
+bool cacheableDrawStages(std::span<const CompiledShader> shaders) {
     static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
     static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
-    // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
-    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    return !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+}
+
+// The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
+// the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
+bool trimDrawKey() {
+    static const bool trim = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    return trim;
+}
+
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawResourceProbe* probe, DrawOutcome& outcome, DrawTimer& timer) {
+    ResolvedResources resolved;
+    APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
+    const bool trimKey = trimDrawKey();
+    resolved.cacheable = recordable && cacheableDrawStages(shaders);
+    // The committer's probe, made before the lock for this device (an empty key: none made).
+    const bool probed = probe != nullptr && !probe->key.empty() && probe->device == static_cast<const void*>(context.device);
     // Profiling (APS5_PROFILE_DRAW): the lookup phase split into key, cache probe, Revalidate and
     // moved buffers, on a [lookup-split] line every 10 s - which part could run before the GPU mutex
     // (the key and the probe, as VulkanDevice::PrepareDispatch does for dispatches).
@@ -1280,10 +1291,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     };
     if (resolved.cacheable) {
         auto at = splitAt();
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        resolved.contentKey = probed ? std::move(probe->key) : DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         splitAdd(0, at);
         at = splitAt();
-        auto found = SharedResourceCache().Find(resolved.contentKey);
+        auto found = probed ? std::move(probe->found) : SharedResourceCache().Find(resolved.contentKey);
         splitAdd(1, at);
         if (timer.profile) {
             const auto count = splitCount.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1314,7 +1325,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
             } else {
-                SharedResourceCache().Remove(resolved.contentKey);
+                // Only while the entry still holds it: a probed object may have been replaced since.
+                SharedResourceCache().Remove(resolved.contentKey, cached.get());
                 countCache(&DrawProfile::cacheInvalidated);
             }
         }
@@ -2057,7 +2069,23 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+DrawResourceProbe ProbeDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool find) {
+    static const bool probes = std::getenv("APS5_DRAW_PROBE") != nullptr;
+    DrawResourceProbe probe;
+    if (!probes || !cacheableDrawStages(shaders)) return probe;
+    probe.device = context.device;
+    // indexBytes as prepareDrawInputs makes it.
+    const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+    probe.key = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimDrawKey());
+    if (find) FindDrawResources(probe);
+    return probe;
+}
+
+void FindDrawResources(DrawResourceProbe& probe) {
+    if (!probe.key.empty()) probe.found = SharedResourceCache().Find(probe.key);
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, DrawResourceProbe* probe) {
     ThrowIfShaderPartsPending(shaders);
     const auto drawStart = std::chrono::steady_clock::now();
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
@@ -2203,7 +2231,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, probe, outcome, timer);
     auto& resources = resolved.resources;
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;

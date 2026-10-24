@@ -14,10 +14,27 @@ namespace AgcDriver::Graphics {
 
 struct HostImport;
 
+// A draw's resource-cache key and probe (ResourceCache::Find, which locks itself) made before
+// GuestMemory::GpuMutex, as VulkanDevice::PrepareDispatch does for dispatches: the queue-0 worker
+// makes the key when it queues a pipelined draw (`find` false: an entry inserted by a draw still
+// queued ahead would be missed), the committer the probe (FindDrawResources) ahead of its lock
+// (Driver::commitDraw), and Draw takes the key and the object found instead of making them under
+// the lock when the probe's device is still the context's. The hit is revalidated under the lock as
+// any. Empty when the stages cannot use the cache, and unless APS5_DRAW_PROBE=1: in PPSA03671 it
+// took ~3 us per draw out of the lock but no frame time (A/B 2026-10-24: 7.75 and 7.61 FPS against
+// 8.01 and 7.85 without), since the committer's whole time per draw, not its hold, limits q0.
+struct DrawResourceProbe {
+    const void* device = nullptr;
+    std::vector<std::uint32_t> key;
+    std::shared_ptr<ShaderResources> found;
+};
+DrawResourceProbe ProbeDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool find = true);
+void FindDrawResources(DrawResourceProbe& probe);
+
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
-// APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+// APS5_NO_DRAW_RECIPE=1). `probe`, when given, is the draw's ProbeDrawResources (consumed).
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, DrawResourceProbe* probe = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 

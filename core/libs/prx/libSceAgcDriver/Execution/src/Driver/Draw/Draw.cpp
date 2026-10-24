@@ -778,11 +778,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), entry = std::move(entry), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory)] {
+        // The draw's resource-cache key, made here beside the committer's work (see commitDraw).
+        auto probe = recipe == nullptr ? localDevice->ProbeDraw(graphics, drawParameters, stages, false) : Graphics::DrawResourceProbe{};
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), probe = std::move(probe), entry = std::move(entry), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
             // The committer records the draw: APS5_GPU_TIME_DRAW_PROGRAMS names its pass by this program.
             Graphics::SetDrawTimingProgram(programs.empty() ? 0 : programs.back().binary.codeAddress);
-            commitDraw(localDevice, commitQueue, commitPacket, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
+            commitDraw(localDevice, commitQueue, commitPacket, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, std::move(probe));
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         if (ahead != nullptr) {
@@ -820,9 +822,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 // A pipelined draw's recording, on the committer. A draw that cannot be recorded is reported and
 // skipped as an inline one is (PacketExecution); APS5_STRICT_DRAWS=1 makes it fatal, which stops
 // the pipeline.
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, std::uint32_t packetOpcode, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, std::uint32_t packetOpcode, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::DrawResourceProbe probe) {
     GuestMemory::SetCurrentPacket(packetOpcode, queue);
     try {
+        // The resource-cache probe before the lock, of the key the worker made when it queued the
+        // draw (Graphics::DrawResourceProbe). A device swapped meanwhile makes Draw ignore it.
+        Graphics::FindDrawResources(probe);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
@@ -833,7 +838,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
         }
         std::shared_ptr<const DrawRecipe> built;
-        localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+        localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, &probe);
         if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
         // The batch cap's submit, which the worker leaves to the committer while draws are queued.
         if (batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap()) localDevice->SubmitRecorded(queue == 0);
