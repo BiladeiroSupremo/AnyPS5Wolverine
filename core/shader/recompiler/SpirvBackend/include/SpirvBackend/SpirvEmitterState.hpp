@@ -142,6 +142,9 @@ struct SpirvEmitterState {
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
     // host invocations (see WaveLdsScope); 0 when none are emitted.
     std::uint32_t waveLdsScope = 0;
+    // Exec regions (SpirvFlowEmitter, APS5_EXEC_REGIONS): the blocks whose exec branch is a per-lane
+    // branch instead of a wave-uniform one.
+    std::unordered_set<std::uint32_t> laneBranchBlocks;
     // Debug aid (APS5_LOOP_GUARD=<exits>): after that many evaluated loop exits an invocation leaves its
     // loops, and the first loop that ran out is reported as a LoopLimit fault instead of hanging the GPU.
     std::uint32_t loopGuardLimit = 0;
@@ -245,6 +248,8 @@ struct StructuredFunctionState {
     // at, built from the argument lists on first use.
     std::unordered_map<const IrValue*, std::vector<std::pair<const IrValue*, std::size_t>>> users;
     bool usersBuilt = false;
+    // Exec regions: a masked vector write on its region's exec bit, emitted as its new value.
+    std::unordered_map<const IrValue*, const IrValue*> execAliases;
 };
 
 enum class SpirvFormatComponentType {
