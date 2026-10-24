@@ -21,7 +21,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <exception>
@@ -152,6 +154,18 @@ struct GuestHook {
     std::uint64_t bindings = 0;
     std::unordered_set<std::uint64_t> boundObjects;
     std::string sample;
+    // Register-block emitters ('r': ShaderRegister {offset, value} entries in rsi, count in edx, as
+    // 0x145e7e840): entries per register offset and distinct values per offset.
+    bool registerEntries = false;
+    // 'o' (rsi) / 'd' (rdx): each distinct argument object once per run (first 0x100 bytes; up to
+    // 200 per hook).
+    char dumpsArgument = 0;
+    std::unordered_set<std::uint64_t> dumpedArguments;
+    std::map<std::uint32_t, std::pair<std::uint64_t, std::unordered_set<std::uint32_t>>> registers;
+    // Which register offsets each caller emits.
+    std::unordered_map<std::uint64_t, std::set<std::uint32_t>> callerRegisters;
+    // Return addresses (callers) of the hooked function.
+    std::unordered_map<std::uint64_t, std::uint64_t> callers;
 };
 
 struct GuestHookCursor {
@@ -170,6 +184,8 @@ struct GuestHooks {
     std::deque<std::pair<std::uint64_t, std::uint64_t>> cursorOrder;
     std::uint64_t serial = 0;
     std::map<std::uint32_t, std::uint64_t> unmatchedDraws;
+    // The title's load address: guest code addresses print as Ghidra's (address - base + 0x140000000).
+    std::uint64_t imageBase = 0;
 };
 
 std::atomic<bool> guestHooksActive{false};
@@ -206,6 +222,43 @@ void ReportGuestHooks(GuestHooks& state, double seconds) {
         std::fprintf(stderr, "[guest-hook-census] 0x%llx: args distinct rsi %zu rdx %zu rcx %zu r8 %zu r9 %zu; e.g. (rdi rsi rdx rcx r8 r9)%s; PM4 to the next hooked call %.0f bytes avg over %llu; draw packets decoded:%s\n",
                      static_cast<unsigned long long>(hook.rva), hook.argValues[0].size(), hook.argValues[1].size(), hook.argValues[2].size(), hook.argValues[3].size(), hook.argValues[4].size(), examples.c_str(),
                      hook.pm4Calls == 0 ? 0.0 : static_cast<double>(hook.pm4Bytes) / static_cast<double>(hook.pm4Calls), static_cast<unsigned long long>(hook.pm4Calls), GuestHookOpcodes(hook.drawOpcodes).c_str());
+        if (!hook.callers.empty()) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> top(hook.callers.begin(), hook.callers.end());
+            std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::string text;
+            for (std::size_t i = 0; i < top.size() && i < 8; ++i) {
+                char item[48];
+                std::snprintf(item, sizeof(item), " 0x%llx x%llu", static_cast<unsigned long long>(top[i].first - state.imageBase + 0x140000000ull), static_cast<unsigned long long>(top[i].second));
+                text += item;
+            }
+            std::fprintf(stderr, "[guest-hook-callers] 0x%llx: %zu return addresses:%s\n", static_cast<unsigned long long>(hook.rva), hook.callers.size(), text.c_str());
+            hook.callers.clear();
+        }
+        if (hook.registerEntries) {
+            std::string text;
+            for (const auto& [offset, entry] : hook.registers) {
+                char item[48];
+                std::snprintf(item, sizeof(item), " %x:%llu/%zu", offset, static_cast<unsigned long long>(entry.first), entry.second.size());
+                text += item;
+            }
+            std::fprintf(stderr, "[guest-hook-regs] 0x%llx: offset:entries/distinct values%s\n", static_cast<unsigned long long>(hook.rva), text.c_str());
+            hook.registers.clear();
+            for (const auto& [caller, offsets] : hook.callerRegisters) {
+                // Offsets as ranges (first-last) of consecutive values.
+                std::string ranges;
+                for (auto it = offsets.begin(); it != offsets.end();) {
+                    auto last = it;
+                    while (std::next(last) != offsets.end() && *std::next(last) == *last + 1) ++last;
+                    char item[32];
+                    if (last == it) std::snprintf(item, sizeof(item), " %x", *it);
+                    else std::snprintf(item, sizeof(item), " %x-%x", *it, *last);
+                    ranges += item;
+                    it = std::next(last);
+                }
+                std::fprintf(stderr, "[guest-hook-regs] 0x%llx caller 0x%llx:%s\n", static_cast<unsigned long long>(hook.rva), static_cast<unsigned long long>(caller - state.imageBase + 0x140000000ull), ranges.c_str());
+            }
+            hook.callerRegisters.clear();
+        }
         if (hook.bindArgs != 0) {
             std::fprintf(stderr, "[guest-hook-bind] 0x%llx: %llu objects bound, %zu distinct; sample %s\n", static_cast<unsigned long long>(hook.rva), static_cast<unsigned long long>(hook.bindings), hook.boundObjects.size(), hook.sample.empty() ? "none" : hook.sample.c_str());
             hook.bindings = 0;
@@ -228,12 +281,36 @@ void ReportGuestHooks(GuestHooks& state, double seconds) {
     state.unmatchedDraws.clear();
 }
 
-APS5_VABI void GuestHookCall(std::uint64_t self, std::uint64_t rsi, std::uint64_t rdx, std::uint64_t rcx, std::uint64_t r8, std::uint64_t r9, std::uint64_t index) {
+APS5_VABI void GuestHookCall(std::uint64_t self, std::uint64_t rsi, std::uint64_t rdx, std::uint64_t rcx, std::uint64_t r8, std::uint64_t r9, std::uint64_t index, std::uint64_t returnAddress) {
     auto& state = GuestHookState();
     std::lock_guard lock(state.mutex);
     auto& hook = state.hooks[index];
     ++hook.calls;
     hook.objects.insert(self);
+    if (hook.callers.size() < 4096) ++hook.callers[returnAddress];
+    const auto dumped = hook.dumpsArgument == 'd' ? rdx : rsi;
+    if (hook.dumpsArgument != 0 && dumped >= 0x10000 && hook.dumpedArguments.size() < 200 && hook.dumpedArguments.insert(dumped).second && GuestMemory::Accessible(reinterpret_cast<const void*>(dumped), 0x100)) {
+        std::string line;
+        char text[40];
+        for (std::size_t word = 0; word < 0x20; ++word) {
+            std::snprintf(text, sizeof(text), " %016llx", static_cast<unsigned long long>(reinterpret_cast<const std::uint64_t*>(dumped)[word]));
+            line += text;
+        }
+        std::fprintf(stderr, "[guest-hook-arg] 0x%llx %s %llx (rsi %llx rdx %llx rcx %llx r8 %llx, caller 0x%llx):%s\n", static_cast<unsigned long long>(hook.rva), hook.dumpsArgument == 'd' ? "rdx" : "rsi", static_cast<unsigned long long>(dumped), static_cast<unsigned long long>(rsi), static_cast<unsigned long long>(rdx), static_cast<unsigned long long>(rcx), static_cast<unsigned long long>(r8), static_cast<unsigned long long>(returnAddress - state.imageBase + 0x140000000ull), line.c_str());
+    }
+    if (hook.registerEntries) {
+        const auto count = static_cast<std::uint32_t>(rdx);
+        if (rsi >= 0x10000 && count <= 4096 && GuestMemory::Accessible(reinterpret_cast<const void*>(rsi), count * 8u)) {
+            const auto* entries = reinterpret_cast<const std::uint32_t*>(rsi);
+            auto& offsets = hook.callerRegisters[returnAddress];
+            for (std::uint32_t i = 0; i < count; ++i) {
+                auto& entry = hook.registers[entries[i * 2]];
+                ++entry.first;
+                if (entry.second.size() < 256) entry.second.insert(entries[i * 2 + 1]);
+                offsets.insert(entries[i * 2]);
+            }
+        }
+    }
     const std::array<std::uint64_t, 6> args{self, rsi, rdx, rcx, r8, r9};
     for (std::size_t i = 0; i < hook.argValues.size(); ++i) {
         if (hook.argValues[i].size() < 4096) hook.argValues[i].insert(args[i + 1]);
@@ -247,13 +324,14 @@ APS5_VABI void GuestHookCall(std::uint64_t self, std::uint64_t rsi, std::uint64_
                 const auto object = reinterpret_cast<const std::uint64_t*>(array)[i];
                 ++hook.bindings;
                 if (hook.boundObjects.size() < 65536) hook.boundObjects.insert(object);
-                // Every distinct object once per run (up to 600): its first 0x80 bytes, to sort the
-                // objects into classes by their first word (GUESS: a vtable pointer).
+                // Every distinct object once per run (up to 600): its first 0x100 bytes, to sort the
+                // objects into classes by their first word (a vtable pointer) and read the register
+                // lists some classes carry (depth targets from +0x48).
                 static std::unordered_set<std::uint64_t> logged;
-                if (object >= 0x10000 && logged.size() < 600 && logged.insert(object).second && GuestMemory::Accessible(reinterpret_cast<const void*>(object), 0x80)) {
+                if (object >= 0x10000 && logged.size() < 600 && logged.insert(object).second && GuestMemory::Accessible(reinterpret_cast<const void*>(object), 0x100)) {
                     std::string line;
                     char text[40];
-                    for (std::size_t word = 0; word < 0x10; ++word) {
+                    for (std::size_t word = 0; word < 0x20; ++word) {
                         std::snprintf(text, sizeof(text), " %016llx", static_cast<unsigned long long>(reinterpret_cast<const std::uint64_t*>(object)[word]));
                         line += text;
                     }
@@ -349,6 +427,7 @@ void InstallGuestHooks() {
     auto& state = GuestHookState();
     // Guest code pointers seen by the hooks convert to Ghidra addresses as pointer - base + 0x140000000.
     std::fprintf(stderr, "[guest-hook] image base 0x%llx\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(base)));
+    state.imageBase = reinterpret_cast<std::uintptr_t>(base);
     std::size_t used = 0;
     std::string list(text);
     std::size_t start = 0;
@@ -372,12 +451,16 @@ void InstallGuestHooks() {
         const auto flags = second != std::string::npos ? entry.substr(second + 1) : std::string{};
         state.hooks.push_back({rva, flags.find('p') != std::string::npos});
         state.hooks.back().bindArgs = flags.find('b') != std::string::npos ? 'b' : flags.find('t') != std::string::npos ? 't' : 0;
+        state.hooks.back().registerEntries = flags.find('r') != std::string::npos;
+        state.hooks.back().dumpsArgument = flags.find('o') != std::string::npos ? 'o' : flags.find('d') != std::string::npos ? 'd' : 0;
         std::vector<std::uint8_t> code = {
             0x57, 0x56, 0x52, 0x51, 0x41, 0x50, 0x41, 0x51, 0x50, 0x41, 0x52, 0x41, 0x53, // push rdi rsi rdx rcx r8 r9 rax r10 r11
             0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00,                                     // sub rsp, 0x80
         };
         for (std::uint8_t reg = 0; reg < 8; ++reg) code.insert(code.end(), {0xf3, 0x0f, 0x7f, static_cast<std::uint8_t>(0x44 | reg << 3), 0x24, static_cast<std::uint8_t>(reg * 0x10)});
-        code.insert(code.end(), {0x48, 0x83, 0xec, 0x08, 0x68}); // sub rsp, 8; push index (7th argument)
+        // push the return address (8th argument: at entry it was [rsp], now 0x48 of pushes and 0x80
+        // of xmm saves above), then push index (7th argument).
+        code.insert(code.end(), {0xff, 0xb4, 0x24, 0xc8, 0x00, 0x00, 0x00, 0x68});
         for (int i = 0; i < 4; ++i) code.push_back(static_cast<std::uint8_t>(index >> (i * 8)));
         code.insert(code.end(), {0x48, 0xb8}); // mov rax, GuestHookCall
         const auto call = reinterpret_cast<std::uint64_t>(&GuestHookCall);
