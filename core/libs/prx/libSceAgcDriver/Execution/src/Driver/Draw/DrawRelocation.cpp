@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -72,6 +74,11 @@ bool Driver::relocatedRuns(const DispatchVariant& variant, std::span<const std::
     runs.clear();
     runs.reserve(variant.runs.size());
     for (std::size_t i = 0; i < variant.runs.size(); ++i) {
+        // A run no pointer covers stays where it was (learning checked it does not move).
+        if (variant.runPointerWords[i] < 0) {
+            runs.push_back(variant.runs[i]);
+            continue;
+        }
         const auto word = static_cast<std::size_t>(variant.runPointerWords[i]);
         if (word + 1 >= userData.size()) return false;
         const auto pointer = PointerAt(userData, word);
@@ -101,26 +108,115 @@ void Driver::refreshRelocatedUserWords(const QueueState& queue, const std::vecto
     }
 }
 
+namespace {
+
+std::atomic<std::uint64_t> patchConfirmed{0}, patchRefused{0}, patchHits{0}, patchVerifyMismatches{0};
+std::atomic<std::uint64_t> planNs{0}, patchNs{0};
+std::array<std::atomic<std::uint64_t>, 64> uncoveredDistance{};
+
+std::uint64_t NowNs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+}
+
+std::vector<DispatchVariant::UserWordPatch> Driver::userWordPatchesFor(const ShaderRecompiler::RecompileResult& result, std::span<const std::uint32_t> userData) {
+    std::vector<DispatchVariant::UserWordPatch> patches;
+    const auto scan = [&](std::span<const std::uint32_t> words, std::uint32_t binding) {
+        for (std::size_t word = 0; word + 1 < words.size(); ++word) {
+            for (std::size_t user = 0; user + 1 < userData.size(); user += 2) {
+                if (PointerAt(userData, user) < 0x10000 || words[word] != userData[user] || words[word + 1] != userData[user + 1]) continue;
+                patches.push_back({binding, static_cast<std::uint32_t>(word), static_cast<std::uint32_t>(user)});
+                patches.push_back({binding, static_cast<std::uint32_t>(word + 1), static_cast<std::uint32_t>(user + 1)});
+                break;
+            }
+        }
+    };
+    for (std::size_t binding = 0; binding < result.bindings.size(); ++binding) scan(result.bindings[binding].guestDescriptor, static_cast<std::uint32_t>(binding));
+    std::vector<std::uint32_t> push(result.pushConstants.size() / sizeof(std::uint32_t));
+    std::memcpy(push.data(), result.pushConstants.data(), push.size() * sizeof(std::uint32_t));
+    scan(push, DispatchVariant::UserWordPatch::NoBinding);
+    return patches;
+}
+
+// The shader data's leading words are the stage's user words (ShaderDataDwordsFor), in push data
+// or in a ShaderData binding: a patched copy always carries the draw's own.
+std::vector<DispatchVariant::UserWordPatch> Driver::shaderDataPatchesFor(const ShaderRecompiler::RecompileResult& result) {
+    std::vector<DispatchVariant::UserWordPatch> patches;
+    for (std::size_t i = 0; i < result.shaderDataUserWords.size(); ++i) {
+        const auto user = result.shaderDataUserWords[i];
+        if ((i + 1) * sizeof(std::uint32_t) <= result.pushConstants.size()) patches.push_back({DispatchVariant::UserWordPatch::NoBinding, static_cast<std::uint32_t>(i), user});
+        for (std::size_t binding = 0; binding < result.bindings.size(); ++binding) {
+            if (result.bindings[binding].role == ShaderRecompiler::DescriptorRole::ShaderData && i < result.bindings[binding].guestDescriptor.size()) patches.push_back({static_cast<std::uint32_t>(binding), static_cast<std::uint32_t>(i), user});
+        }
+    }
+    return patches;
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchedResult(const DispatchVariant& variant, std::span<const std::uint32_t> userData) {
+    const auto started = NowNs();
+    struct Timed {
+        std::uint64_t started;
+        ~Timed() { patchNs += NowNs() - started; }
+    } timed{started};
+    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    for (const auto& patch : variant.userWordPatches) {
+        if (patch.userWord >= userData.size()) return nullptr;
+        const auto value = userData[patch.userWord];
+        if (patch.binding == DispatchVariant::UserWordPatch::NoBinding) {
+            if ((patch.word + 1) * sizeof(std::uint32_t) > patched->pushConstants.size()) return nullptr;
+            std::memcpy(patched->pushConstants.data() + patch.word * sizeof(std::uint32_t), &value, sizeof(value));
+        } else {
+            if (patch.binding >= patched->bindings.size() || patch.word >= patched->bindings[patch.binding].guestDescriptor.size()) return nullptr;
+            patched->bindings[patch.binding].guestDescriptor[patch.word] = value;
+        }
+    }
+    return patched;
+}
+
+bool Driver::sameCompiledResult(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b) {
+    if (a.spirv.KeyHashes() != b.spirv.KeyHashes()) return false;
+    if (a.specializationId != b.specializationId || a.variantId != b.variantId || a.pushConstants != b.pushConstants || a.shaderDataUserWords != b.shaderDataUserWords || a.bindings.size() != b.bindings.size()) return false;
+    for (std::size_t i = 0; i < a.bindings.size(); ++i) {
+        const auto& x = a.bindings[i];
+        const auto& y = b.bindings[i];
+        if (x.kind != y.kind || x.role != y.role || x.descriptorSet != y.descriptorSet || x.binding != y.binding || x.count != y.count || x.readOnly != y.readOnly || x.guestDescriptor != y.guestDescriptor || x.imageShape != y.imageShape) return false;
+    }
+    return true;
+}
+
+void Driver::notePatchOutcome(int outcome) {
+    switch (outcome) {
+        case 1: ++patchConfirmed; break;
+        case -1: ++patchRefused; break;
+        case 2: ++patchHits; break;
+        case 3: ++patchVerifyMismatches; break;
+        default: break;
+    }
+}
+
 bool Driver::relocateVariant(DispatchVariant& variant, std::span<const std::uint32_t> userData) {
     variant.runPointerWords.clear();
     variant.runPointerValues.clear();
+    // Runs no pointer covers stay absolute (-1): a stage's static tables, reached through pointers
+    // its captured words hold. The learning draw checks they did not move.
     for (const auto& run : variant.runs) {
         const auto word = PointerFor(userData, run.first);
-        if (word < 0) {
-            variant.runPointerWords.clear();
-            variant.runPointerValues.clear();
-            return false;
-        }
         variant.runPointerWords.push_back(static_cast<std::int16_t>(word));
-        variant.runPointerValues.push_back(PointerAt(userData, static_cast<std::size_t>(word)));
+        variant.runPointerValues.push_back(word < 0 ? 0 : PointerAt(userData, static_cast<std::size_t>(word)));
     }
     return !variant.runs.empty();
 }
 
 Driver::DrawRelocationPlan Driver::planDrawRelocation(const std::function<std::uint64_t(const std::vector<std::uint32_t>*)>& keyFor, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, std::uint64_t shapeKey, const std::shared_ptr<const std::vector<std::uint32_t>>& relocation, std::uint64_t drawKey) {
+    struct Timed {
+        std::uint64_t started = NowNs();
+        ~Timed() { planNs += NowNs() - started; }
+    } timed;
     DrawRelocationPlan plan;
     plan.insertKey = drawKey;
     plan.stages.assign(programs.size(), false);
+    plan.patches.assign(programs.size(), {});
     std::vector<std::uint32_t> mask;
     // Per stage, when this draw ran its capture walk: every captured address must lie after one of
     // its pointers (the runs move with them), and the key keeps only the user words the walk
@@ -157,16 +253,40 @@ Driver::DrawRelocationPlan Driver::planDrawRelocation(const std::function<std::u
             for (const auto& read : decodeReads[i]) addresses.push_back(read.address);
         }
         const bool all = std::all_of(addresses.begin(), addresses.end(), [&](std::uint64_t address) { return PointerFor(program.userData, address) >= 0; });
-        if (!all) {
+        static const bool mixed = std::getenv("APS5_NO_MIXED_RELOCATION") == nullptr;
+        if (!all && !mixed) {
+            // Where the runs no pointer covers lie: log2 of the distance above the nearest pointer
+            // below them (bucket 63: no pointer below), printed with the [draw-relocation] line.
+            for (const auto address : addresses) {
+                if (PointerFor(program.userData, address) >= 0) continue;
+                std::uint64_t nearest = ~std::uint64_t{0};
+                for (std::size_t word = 0; word + 1 < program.userData.size(); word += 2) {
+                    const auto pointer = PointerAt(program.userData, word);
+                    if (pointer >= 0x10000 && address >= pointer) nearest = std::min(nearest, address - pointer);
+                }
+                ++uncoveredDistance[nearest == ~std::uint64_t{0} ? 63 : std::bit_width(nearest)];
+            }
             keepAbsolute(program, 3);
             continue;
         }
         plan.stages[i] = !addresses.empty();
         ++(addresses.empty() ? maskedStages : relocatedStages);
+        // A value-used pointer the compiled result holds verbatim (a buffer descriptor in user
+        // SGPRs) leaves the key too: a hit gets a copy with its own pointer there, once confirmed.
+        std::vector<DispatchVariant::UserWordPatch> patches;
+        if (capture.compiled != nullptr) patches = userWordPatchesFor(*capture.compiled, program.userData);
+        std::uint64_t patchedWords = 0;
+        for (const auto& patch : patches) patchedWords |= std::uint64_t{1} << patch.userWord;
         for (std::uint32_t word = 0; word < size; ++word) {
             const auto offset = RegisterOf(program, word);
-            if (offset != 0 && ((capture.userWordsAsValue >> word) & 1u) == 0) mask.push_back(offset);
+            if (offset != 0 && (((capture.userWordsAsValue >> word) & 1u) == 0 || ((patchedWords >> word) & 1u) != 0)) mask.push_back(offset);
         }
+        // Words in the shader data are patched too, but stay keyed when value-used.
+        if (capture.compiled != nullptr) {
+            const auto data = shaderDataPatchesFor(*capture.compiled);
+            patches.insert(patches.end(), data.begin(), data.end());
+        }
+        plan.patches[i] = std::move(patches);
     }
     {
         static std::atomic<std::uint64_t> plans{0}, relocated{0}, masked{0}, otherSgpr{0}, uncaptured{0}, untracked{0}, unrelated{0};
@@ -183,7 +303,12 @@ Driver::DrawRelocationPlan Driver::planDrawRelocation(const std::function<std::u
         if (last == 0) reportedAt.compare_exchange_strong(last, now);
         else if (now - last >= 10'000'000'000ll && reportedAt.compare_exchange_strong(last, now)) {
             const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0)); };
-            std::fprintf(stderr, "[draw-relocation] (10 s) %llu plans: stages relocated %llu, masked without runs %llu; kept absolute: user SGPRs not at 0/8 %llu, not captured this draw %llu, untracked words %llu, runs not after a pointer %llu; %zu shapes\n", take(plans), take(relocated), take(masked), take(otherSgpr), take(uncaptured), take(untracked), take(unrelated), [&] { std::lock_guard cacheLock(drawCacheMutex); return drawRelocations.size(); }());
+            std::string distances;
+            for (std::size_t bucket = 0; bucket < uncoveredDistance.size(); ++bucket) {
+                if (const auto count = uncoveredDistance[bucket].exchange(0); count != 0) distances += " 2^" + std::to_string(bucket) + ":" + std::to_string(count);
+            }
+            std::fprintf(stderr, "[draw-relocation] uncovered runs by distance above the nearest pointer (2^63 = none):%s\n", distances.c_str());
+            std::fprintf(stderr, "[draw-relocation] (10 s) %llu plans: stages relocated %llu, masked without runs %llu; kept absolute: user SGPRs not at 0/8 %llu, not captured this draw %llu, untracked words %llu, runs not after a pointer %llu; %zu shapes; pointer patches: %llu confirmed, %llu refused, %llu patched stage hits, %llu verify mismatches; plans %.1f ms, patched copies %.1f ms\n", take(plans), take(relocated), take(masked), take(otherSgpr), take(uncaptured), take(untracked), take(unrelated), [&] { std::lock_guard cacheLock(drawCacheMutex); return drawRelocations.size(); }(), take(patchConfirmed), take(patchRefused), take(patchHits), take(patchVerifyMismatches), static_cast<double>(planNs.exchange(0)) / 1e6, static_cast<double>(patchNs.exchange(0)) / 1e6);
         }
     }
     std::sort(mask.begin(), mask.end());
@@ -238,9 +363,10 @@ Driver::DrawRelocationPlan Driver::planDrawRelocation(const std::function<std::u
         if (std::binary_search(effective.begin(), effective.end(), offset)) plan.insert = false;
     }
     if (relocation != nullptr) {
-        // The shape's key already leaves its words out (drawKey): only the same relocation inserts.
+        // The shape's key already leaves its words out (drawKey): only the same relocation inserts,
+        // and like any key only once seen before (Driver::admitDrawKey): most misses of a known
+        // shape are keys that do not come back, and inserting each cost ~12 us per draw (tr226).
         if (*relocation != mask) plan.insert = false;
-        plan.admit = plan.insert;
         return plan;
     }
     if (mask.empty() || !plan.insert) {

@@ -83,6 +83,8 @@ struct CaptureDiffProfile {
         // offset (or -1, -1), compared with the previous draw.
         std::vector<std::pair<int, std::uint64_t>> lastRelative;
         std::vector<std::uint64_t> lastAddresses;
+        std::vector<std::vector<std::uint32_t>> lastDescriptors;
+        std::uint64_t bindings = 0, bindingsChanged = 0, bindingsChangedFromUser = 0;
         std::uint64_t draws = 0, compared = 0, words = 0, differing = 0, shapeChanged = 0;
         std::uint64_t regions = 0, relative = 0, relativeStable = 0, absoluteStable = 0, absoluteMoved = 0;
         std::array<std::uint64_t, 8> positions{};
@@ -131,6 +133,23 @@ void ProfileCaptureDiff(const std::vector<DrawProgram>& programs, const std::vec
         }
         entry.lastRelative = std::move(relative);
         entry.lastAddresses = std::move(addresses);
+        // The compiled stage's binding descriptors: how many changed since the program's previous
+        // draw, and how many of the changed ones are user words of this draw (a V# in user SGPRs).
+        if (captures[i].compiled != nullptr) {
+            std::vector<std::vector<std::uint32_t>> descriptors;
+            for (const auto& binding : captures[i].compiled->bindings) descriptors.push_back(binding.guestDescriptor);
+            if (entry.lastDescriptors.size() == descriptors.size()) {
+                for (std::size_t b = 0; b < descriptors.size(); ++b) {
+                    ++entry.bindings;
+                    if (descriptors[b] == entry.lastDescriptors[b]) continue;
+                    ++entry.bindingsChanged;
+                    const auto& words = descriptors[b];
+                    const bool fromUser = !words.empty() && std::search(user.begin(), user.end(), words.begin(), words.begin() + std::min<std::size_t>(words.size(), 2)) != user.end();
+                    if (fromUser) ++entry.bindingsChangedFromUser;
+                }
+            }
+            entry.lastDescriptors = std::move(descriptors);
+        }
         if (!entry.last.empty()) {
             bool sameShape = entry.last.size() == now.size();
             for (std::size_t r = 0; sameShape && r < now.size(); ++r) sameShape = entry.last[r].size() == now[r].size();
@@ -161,6 +180,7 @@ void ProfileCaptureDiff(const std::vector<DrawProgram>& programs, const std::vec
         const auto& entry = *top[i].second;
         std::string positions;
         for (const auto count : entry.positions) positions += " " + std::to_string(count);
+        std::fprintf(stderr, "[capture-diff]   0x%llx bindings %llu, changed %llu (from user words %llu)\n", static_cast<unsigned long long>(top[i].first), static_cast<unsigned long long>(entry.bindings), static_cast<unsigned long long>(entry.bindingsChanged), static_cast<unsigned long long>(entry.bindingsChangedFromUser));
         std::fprintf(stderr, "[capture-diff]   0x%llx x%llu: %zu regions %zu words, compared %llu (shape changed %llu), %.1f%% of words differed, by word mod 8:%s; regions %llu: pointer-relative %llu (same pointer and offset %llu), absolute same %llu, absolute moved %llu\n",
                      static_cast<unsigned long long>(top[i].first), static_cast<unsigned long long>(entry.draws), entry.last.size(),
                      [&] { std::size_t n = 0; for (const auto& r : entry.last) n += r.size(); return n; }(),
@@ -172,6 +192,7 @@ void ProfileCaptureDiff(const std::vector<DrawProgram>& programs, const std::vec
     for (auto& [address, entry] : state->programs) {
         entry.draws = entry.compared = entry.words = entry.differing = entry.shapeChanged = 0;
         entry.regions = entry.relative = entry.relativeStable = entry.absoluteStable = entry.absoluteMoved = 0;
+        entry.bindings = entry.bindingsChanged = entry.bindingsChangedFromUser = 0;
         entry.positions = {};
     }
 }
@@ -419,7 +440,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     ProfileUserWords(programs);
     // The key's inputs as looked up: the miss path below may change pixel.
     const auto lookupPixel = pixel;
-    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, shapeKey, relocation);
+    bool learnHit = false;
+    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, shapeKey, relocation, learnHit);
 
     if (registerKey) {
 
@@ -452,6 +474,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (drawHit) {
 
             programResults[i] = matched[i]->compiled.get();
+            // A confirmed pointer-patched stage (DrawRelocation.cpp): a copy with this draw's pointers.
+            if (!matched[i]->userWordPatches.empty()) {
+                auto patched = patchedResult(*matched[i], programs[i].userData);
+                require(patched != nullptr, "pointer patch outside the cached stage result");
+                heldResults.push_back(std::move(patched));
+                programResults[i] = heldResults.back().get();
+                notePatchOutcome(2);
+            }
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
@@ -480,10 +510,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     ProfileCaptureDiff(programs, stageCaptures);
     std::optional<DrawRelocationPlan> relocationPlan;
     if (useDrawEntries && relocatedDrawKeys() && !drawHit) {
-        const auto keyFor = [&](const std::vector<std::uint32_t>* mask) {
-            return registerKey ? drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), mask) : drawProgramKey(localDevice->Serial(), graphics, lookupPixel, programs, roles, vertexInfos, mask);
-        };
-        relocationPlan = planDrawRelocation(keyFor, programs, stageCaptures, decodeReads, shapeKey, relocation, drawKey);
+        // A known shape's miss is planned (~8 us) only when it may be inserted: its key seen before
+        // (Driver::admitDrawKey, as cacheDrawStages asks) and not a learning draw.
+        if (relocation == nullptr || (!learnHit && admitDrawKey(drawKey))) {
+            const auto keyFor = [&](const std::vector<std::uint32_t>* mask) {
+                return registerKey ? drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), mask) : drawProgramKey(localDevice->Serial(), graphics, lookupPixel, programs, roles, vertexInfos, mask);
+            };
+            relocationPlan = planDrawRelocation(keyFor, programs, stageCaptures, decodeReads, shapeKey, relocation, drawKey);
+            relocationPlan->learning = learnHit;
+            if (relocation != nullptr) relocationPlan->admit = true;
+        } else {
+            relocationPlan.emplace();
+            relocationPlan->insert = false;
+            relocationPlan->learning = learnHit;
+        }
     }
     const bool relocatedDraw = relocation != nullptr || (relocationPlan && std::any_of(relocationPlan->stages.begin(), relocationPlan->stages.end(), [](bool stage) { return stage; }));
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, relocationPlan ? relocationPlan->insertKey : drawKey, registerKey, decode, phaseTiming, relocationPlan ? &*relocationPlan : nullptr);

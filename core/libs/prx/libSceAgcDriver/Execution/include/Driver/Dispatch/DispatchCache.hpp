@@ -31,6 +31,18 @@ struct DispatchVariant {
     // captured; a later draw compares the runs at its own pointers plus the same offsets.
     std::vector<std::int16_t> runPointerWords;
     std::vector<std::uint64_t> runPointerValues;
+    // Words of the compiled result that hold the capturing draw's user-word pointers (binding
+    // descriptors, or push data when binding is NoBinding): a later draw of the same content uses
+    // a copy with its own user words there. Confirmed (1) once a draw's full compile matched the
+    // patched copy, refused (-1) when one did not; unconfirmed (0) entries are compiled in full.
+    struct UserWordPatch {
+        static constexpr std::uint32_t NoBinding = 0xffffffffu;
+        std::uint32_t binding;
+        std::uint32_t word;
+        std::uint32_t userWord;
+    };
+    std::vector<UserWordPatch> userWordPatches;
+    std::atomic<int> patchState{0};
     std::uint64_t forgetSerial = 0;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
     std::array<std::uint32_t, 4> meshIndexDescriptor{};

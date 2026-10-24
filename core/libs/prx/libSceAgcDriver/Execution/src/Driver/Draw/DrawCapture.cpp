@@ -100,8 +100,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 }
 
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const DrawRelocationPlan* relocation) {
-    // A relocated insert (DrawRelocation.cpp) goes under its own key at once: that key recurs.
-    if (relocation != nullptr && !relocation->insert) return;
+    // A relocated insert (DrawRelocation.cpp) of a new shape goes under its own key at once: that
+    // key recurs. A plan that may not insert still lets a learning or verified hit compare below.
+    const bool insertable = relocation == nullptr || (relocation->insert && !relocation->learning);
+    if (!insertable && !verifyHit) return;
     const bool admitted = relocation != nullptr && relocation->admit;
     if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admitted || admitDrawKey(drawKey))) {
         phaseTiming.Phase(DrawRowVectors);
@@ -129,10 +131,22 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 variant->words.resize(offset + count);
                 std::memcpy(variant->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
             }
-            if (relocation != nullptr && i < relocation->stages.size() && relocation->stages[i] && !relocateVariant(*variant, programs[i].userData)) return;
+            if (insertable && relocation != nullptr && i < relocation->stages.size() && relocation->stages[i] && !relocateVariant(*variant, programs[i].userData)) return;
+            if (insertable && relocation != nullptr && i < relocation->patches.size()) variant->userWordPatches = relocation->patches[i];
             std::vector<std::pair<std::uint64_t, std::uint64_t>> matchedRuns;
             if (verifyHit && matched[i] != nullptr) {
                 if (matched[i]->runPointerWords.empty() || !relocatedRuns(*matched[i], programs[i].userData, matchedRuns)) matchedRuns = matched[i]->runs;
+            }
+            // A relocated or pointer-patched stage (DrawRelocation.cpp): this draw's full compile
+            // confirms or refuses it once - the same runs at this draw's pointers (absolute ones
+            // unmoved), the same words, and a patched copy equal to this compile - and checks it
+            // again under APS5_VERIFY_DRAW_ENTRIES.
+            if (verifyHit && matched[i] != nullptr && (!matched[i]->userWordPatches.empty() || !matched[i]->runPointerWords.empty()) && stageCapture.compiled != nullptr) {
+                const auto patched = patchedResult(*matched[i], programs[i].userData);
+                const bool same = patched != nullptr && sameCompiledResult(*patched, *stageCapture.compiled) && matchedRuns == variant->runs && matched[i]->words == variant->words;
+                auto state = matched[i]->patchState.load();
+                if (state == 0 && matched[i]->patchState.compare_exchange_strong(state, same ? 1 : -1)) notePatchOutcome(same ? 1 : -1);
+                else if (state == 1 && !same) notePatchOutcome(3);
             }
             if (verifyHit && matched[i] != nullptr && (matchedRuns != variant->runs || matched[i]->words != variant->words)) {
                 ++mismatches;
@@ -148,6 +162,8 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             }
             fresh[i] = std::move(variant);
         }
+        // A learning draw keeps the entry it confirmed or refused.
+        if (!insertable) return;
         insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr);
         if (unstable != 0 || mismatches != 0) {
             std::lock_guard cacheLock(drawCacheMutex);

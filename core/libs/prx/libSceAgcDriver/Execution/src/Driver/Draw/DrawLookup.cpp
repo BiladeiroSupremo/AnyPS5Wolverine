@@ -87,7 +87,7 @@ std::uint64_t Driver::drawProgramKey(std::uint64_t deviceSerial, const Graphics:
     return drawKey;
 }
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::uint64_t& shapeKey, std::shared_ptr<const std::vector<std::uint32_t>>& relocation) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::uint64_t& shapeKey, std::shared_ptr<const std::vector<std::uint32_t>>& relocation, bool& learnHit) {
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (!registerKey) {
@@ -111,6 +111,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
             std::uint32_t cursor = 0;
+            bool learning = false;
             std::vector<std::pair<std::uint64_t, std::uint64_t>> relocatedRunsScratch;
             {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
@@ -148,6 +149,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal) continue;
+                        // A stage whose compiled result holds the pointers it was captured with
+                        // (DrawRelocation.cpp): refused ones never hit, unconfirmed ones are learnt.
+                        if (!variant->userWordPatches.empty() || !variant->runPointerWords.empty()) {
+                            const auto state = variant->patchState.load(std::memory_order_relaxed);
+                            if (state < 0) continue;
+                            if (state == 0) learning = true;
+                        }
                         matched[i] = variant;
                         ranks[i] = rank;
                         ++stageEqual;
@@ -204,6 +212,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     ++counters.verifyHits;
                     verifyHit = true;
                     drawHit = false;
+                }
+                if (drawHit && learning) {
+                    verifyHit = true;
+                    drawHit = false;
+                    learnHit = true;
                 }
             } else {
                 ++counters.misses[static_cast<std::size_t>(*miss)];
