@@ -560,8 +560,10 @@ private:
 // building one (import lookups, sampler and descriptor objects, guest buffer uploads). Only reusable
 // objects (nothing to complete, every buffer read in place) are kept, and an entry serves a later
 // use only after ShaderResources::Revalidate brought it up to date. Entries hold their object alive;
-// the recorder keeps it as well while its batch runs. One LRU bound covers dispatch and draw entries
-// together (APS5_RESOURCE_CACHE_ENTRIES, default 1024); the map has its own mutex and locks itself:
+// the recorder keeps it as well while its batch runs. Dispatch and draw entries age in LRU lists of
+// their own (APS5_RESOURCE_CACHE_ENTRIES, default 1024, and APS5_DRAW_RESOURCE_CACHE_ENTRIES, default
+// 4096): in PPSA03671 ~1.3M dispatch misses per run pushed draw templates out of one shared 1024
+// bound, ~7k draw builds per 10 s on the committer; the map has its own mutex and locks itself:
 // VulkanDevice::PrepareDispatch probes it without GuestMemory::GpuMutex (a hit there is revalidated
 // under the lock by the dispatch; inserts and Revalidate stay under it). Compute keys start with the
 // stage, draw keys with a marker word, so the two never meet, and both name the device handle: the driver replaces
@@ -601,9 +603,13 @@ private:
             return static_cast<std::size_t>(hash);
         }
     };
+    using Entries = std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>;
+    // The LRU list a key belongs to: draw keys (DrawResourceKey's marker) apart from dispatch keys.
+    Entries& listFor(const Key& key) { return !key.empty() && key[0] == 0xffffffffu ? drawEntries : entries; }
     mutable std::mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    Entries entries;
+    Entries drawEntries;
+    std::unordered_map<Key, Entries::iterator, KeyHash> index;
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears

@@ -2799,7 +2799,8 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
         noteMiss(key);
         return nullptr;
     }
-    entries.splice(entries.begin(), entries, found->second);
+    auto& list = listFor(key);
+    list.splice(list.begin(), list, found->second);
     return found->second->second;
 }
 
@@ -2877,22 +2878,25 @@ void ResourceCache::noteMiss(const Key& key) {
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     if (!resources->HasCachedStorageImages()) return;
+    auto& list = listFor(key);
     if (const auto found = index.find(key); found != index.end()) {
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
-        entries.erase(found->second);
+        list.erase(found->second);
         index.erase(found);
     }
-    entries.emplace_front(key, std::move(resources));
-    index.emplace(key, entries.begin());
-    static const std::size_t capacity = [] {
-        const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
-        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 1024ull;
-        return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
-    }();
-    while (entries.size() > capacity) {
-        if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
-        index.erase(entries.back().first);
-        entries.pop_back();
+    list.emplace_front(key, std::move(resources));
+    index.emplace(key, list.begin());
+    const auto bound = [](const char* name, std::size_t fallback) {
+        const char* value = std::getenv(name);
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
+        return static_cast<std::size_t>(parsed != 0 ? parsed : fallback);
+    };
+    static const std::size_t capacity = bound("APS5_RESOURCE_CACHE_ENTRIES", 1024);
+    static const std::size_t drawCapacity = bound("APS5_DRAW_RESOURCE_CACHE_ENTRIES", 4096);
+    while (list.size() > (&list == &drawEntries ? drawCapacity : capacity)) {
+        if (evicted != nullptr) evicted->push_back(std::move(list.back().second));
+        index.erase(list.back().first);
+        list.pop_back();
     }
 }
 
@@ -2907,14 +2911,16 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
 
 void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
-    for (auto it = entries.begin(); it != entries.end();) {
-        if (!it->second->ReadsImage(image)) {
-            ++it;
-            continue;
+    for (auto* list : {&entries, &drawEntries}) {
+        for (auto it = list->begin(); it != list->end();) {
+            if (!it->second->ReadsImage(image)) {
+                ++it;
+                continue;
+            }
+            if (evicted != nullptr) evicted->push_back(std::move(it->second));
+            index.erase(it->first);
+            it = list->erase(it);
         }
-        if (evicted != nullptr) evicted->push_back(std::move(it->second));
-        index.erase(it->first);
-        it = entries.erase(it);
     }
 }
 
@@ -2923,7 +2929,8 @@ bool ResourceCache::Touch(const Key& key) {
     std::lock_guard lock(mutex);
     const auto found = index.find(key);
     if (found == index.end()) return false;
-    entries.splice(entries.begin(), entries, found->second);
+    auto& list = listFor(key);
+    list.splice(list.begin(), list, found->second);
     return true;
 }
 
@@ -2939,17 +2946,18 @@ void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
     index.clear();
     entries.clear();
+    drawEntries.clear();
 }
 
 std::size_t ResourceCache::Size() const {
     std::lock_guard lock(mutex);
-    return entries.size();
+    return entries.size() + drawEntries.size();
 }
 
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
-    entries.erase(found->second);
+    listFor(key).erase(found->second);
     index.erase(found);
 }
 
