@@ -39,6 +39,12 @@ struct ShadowState {
     // Bound descriptors by role (buffer, image, sampler): found among the record's placed ones, not.
     std::array<std::uint64_t, 3> descriptorsFound{}, descriptorsMissed{};
     int descriptorExamples = 0;
+    // Step 1 payoff: distinct "native keys" (the record's Shaders plus every bound descriptor with
+    // its base address masked: what a draw cache keyed on engine objects would see) per window,
+    // and the draws they covered; also the distinct keys over the whole run.
+    std::unordered_map<std::uint64_t, std::uint64_t> nativeKeys;
+    std::unordered_map<std::uint64_t, std::uint64_t> runKeys;
+    std::uint64_t keyedDraws = 0;
     int dataExamples = 0;
     // Record slots holding the decoded shaders (which stage records the title uses).
     std::array<std::uint64_t, 16> slotUse{};
@@ -189,6 +195,28 @@ void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const De
     }
     auto& state = Shadow();
     std::lock_guard lock(state.mutex);
+    {
+        std::uint64_t key = 0xcbf29ce484222325ull;
+        const auto mix = [&](std::uint64_t value) { key = (key ^ value) * 0x100000001b3ull; };
+        for (const auto shader : record.shaders) mix(shader);
+        for (const auto& descriptor : decoded) {
+            auto words = descriptor.words;
+            // Base addresses out: a V#'s word 0 and the low 16 bits of word 1, a T#'s word 0 and the
+            // low 8 bits of word 1; samplers whole.
+            if (descriptor.role == 0) {
+                words[0] = 0;
+                words[1] &= 0xffff0000u;
+            } else if (descriptor.role == 1) {
+                words[0] = 0;
+                words[1] &= ~0xffu;
+            }
+            mix(descriptor.role);
+            for (const auto word : words) mix(word);
+        }
+        ++state.keyedDraws;
+        if (state.nativeKeys.size() < 1u << 20) ++state.nativeKeys[key];
+        if (state.runKeys.size() < 1u << 20) ++state.runKeys[key];
+    }
     for (const auto& descriptor : decoded) {
         if (descriptor.role > 2) continue;
         if (std::find(placed.begin(), placed.end(), descriptor.words) != placed.end()) {
@@ -304,6 +332,11 @@ void CompareNativeDraw(const NativeDrawRecord* record, std::span<const std::uint
     state.dataOffsets = {};
     state.descriptorsFound = {};
     state.descriptorsMissed = {};
+    std::uint64_t repeats = 0;
+    for (const auto& [key, draws] : state.nativeKeys) repeats += draws - 1;
+    std::fprintf(stderr, "[native-shadow] native keys: %zu distinct over %llu draws (10 s; a cache keyed so would hit %.1f%%), %zu distinct in the run so far\n", state.nativeKeys.size(), static_cast<unsigned long long>(state.keyedDraws), state.keyedDraws != 0 ? 100.0 * static_cast<double>(repeats) / static_cast<double>(state.keyedDraws) : 0.0, state.runKeys.size());
+    state.nativeKeys.clear();
+    state.keyedDraws = 0;
     state.slotUse = {};
 }
 
