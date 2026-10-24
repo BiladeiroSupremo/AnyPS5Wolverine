@@ -7,16 +7,143 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <array>
+#include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Which user-data words vary from draw to draw, per program (APS5_PROFILE_USER_WORDS): every 10 s,
+// for the programs drawn most, the distinct values each word took (capped at 64). The draw keys
+// hash every user word, so a word that changes per draw (a per-draw constant pointer, say) makes
+// each draw a new key; this shows which words those are.
+struct UserWordProfile {
+    std::mutex mutex;
+    struct Program {
+        std::uint64_t draws = 0;
+        std::vector<std::set<std::uint32_t>> words;
+    };
+    std::unordered_map<std::uint64_t, Program> programs;
+    std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+};
+
+void ProfileUserWords(const std::vector<DrawProgram>& programs) {
+    static const bool on = std::getenv("APS5_PROFILE_USER_WORDS") != nullptr;
+    if (!on) return;
+    static auto* state = new UserWordProfile();
+    std::lock_guard lock(state->mutex);
+    for (const auto& program : programs) {
+        auto& entry = state->programs[program.binary.codeAddress];
+        ++entry.draws;
+        if (entry.words.size() < program.userData.size()) entry.words.resize(program.userData.size());
+        for (std::size_t i = 0; i < program.userData.size(); ++i) {
+            if (entry.words[i].size() < 64) entry.words[i].insert(program.userData[i]);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state->windowStart < std::chrono::seconds(10)) return;
+    state->windowStart = now;
+    std::vector<std::pair<std::uint64_t, const UserWordProfile::Program*>> top;
+    std::uint64_t draws = 0;
+    for (const auto& [address, entry] : state->programs) {
+        top.emplace_back(address, &entry);
+        draws += entry.draws;
+    }
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second->draws > b.second->draws; });
+    std::fprintf(stderr, "[user-words] %zu programs, %llu program draws (10 s); distinct values per word of the top programs:\n", top.size(), static_cast<unsigned long long>(draws));
+    for (std::size_t i = 0; i < top.size() && i < 16; ++i) {
+        std::string text;
+        for (const auto& values : top[i].second->words) text += " " + std::to_string(values.size());
+        std::fprintf(stderr, "[user-words]   0x%llx x%llu:%s\n", static_cast<unsigned long long>(top[i].first), static_cast<unsigned long long>(top[i].second->draws), text.c_str());
+    }
+    state->programs.clear();
+}
+
+// How a program's captured memory changes between its draws (APS5_PROFILE_CAPTURE_DIFF): each
+// draw's captured regions are compared, region by region and word by word, with the program's
+// previous draw. Every 10 s, for the programs drawn most: regions and words per draw, the share of
+// words that differed, and where the differing words sit in their region (word index mod 8: a
+// buffer descriptor's base address is word 0 and the low bits of word 1 of its 4 words).
+struct CaptureDiffProfile {
+    std::mutex mutex;
+    struct Program {
+        std::vector<std::vector<std::uint32_t>> last;
+        std::uint64_t draws = 0, compared = 0, words = 0, differing = 0, shapeChanged = 0;
+        std::array<std::uint64_t, 8> positions{};
+    };
+    std::unordered_map<std::uint64_t, Program> programs;
+    std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+};
+
+void ProfileCaptureDiff(const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures) {
+    static const bool on = std::getenv("APS5_PROFILE_CAPTURE_DIFF") != nullptr;
+    if (!on) return;
+    static auto* state = new CaptureDiffProfile();
+    std::lock_guard lock(state->mutex);
+    for (std::size_t i = 0; i < programs.size() && i < captures.size(); ++i) {
+        if (captures[i].regions.empty()) continue;
+        auto& entry = state->programs[programs[i].binary.codeAddress];
+        ++entry.draws;
+        std::vector<std::vector<std::uint32_t>> now;
+        for (const auto& region : captures[i].regions) {
+            std::vector<std::uint32_t> words(region.bytes.size() / 4);
+            std::memcpy(words.data(), region.bytes.data(), words.size() * 4);
+            now.push_back(std::move(words));
+        }
+        if (!entry.last.empty()) {
+            bool sameShape = entry.last.size() == now.size();
+            for (std::size_t r = 0; sameShape && r < now.size(); ++r) sameShape = entry.last[r].size() == now[r].size();
+            if (!sameShape) {
+                ++entry.shapeChanged;
+            } else {
+                ++entry.compared;
+                for (std::size_t r = 0; r < now.size(); ++r) {
+                    for (std::size_t w = 0; w < now[r].size(); ++w) {
+                        ++entry.words;
+                        if (now[r][w] == entry.last[r][w]) continue;
+                        ++entry.differing;
+                        ++entry.positions[w % 8];
+                    }
+                }
+            }
+        }
+        entry.last = std::move(now);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state->windowStart < std::chrono::seconds(10)) return;
+    state->windowStart = now;
+    std::vector<std::pair<std::uint64_t, CaptureDiffProfile::Program*>> top;
+    for (auto& [address, entry] : state->programs) top.emplace_back(address, &entry);
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second->draws > b.second->draws; });
+    std::fprintf(stderr, "[capture-diff] %zu programs with captures (10 s):\n", top.size());
+    for (std::size_t i = 0; i < top.size() && i < 16; ++i) {
+        const auto& entry = *top[i].second;
+        std::string positions;
+        for (const auto count : entry.positions) positions += " " + std::to_string(count);
+        std::fprintf(stderr, "[capture-diff]   0x%llx x%llu: %zu regions %zu words, compared %llu (shape changed %llu), %.1f%% of words differed, by word mod 8:%s\n",
+                     static_cast<unsigned long long>(top[i].first), static_cast<unsigned long long>(entry.draws), entry.last.size(),
+                     [&] { std::size_t n = 0; for (const auto& r : entry.last) n += r.size(); return n; }(),
+                     static_cast<unsigned long long>(entry.compared), static_cast<unsigned long long>(entry.shapeChanged),
+                     entry.words != 0 ? 100.0 * static_cast<double>(entry.differing) / static_cast<double>(entry.words) : 0.0, positions.c_str());
+    }
+    for (auto& [address, entry] : state->programs) {
+        entry.draws = entry.compared = entry.words = entry.differing = entry.shapeChanged = 0;
+        entry.positions = {};
+    }
+}
+
+}
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
@@ -246,6 +373,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<bool> recompiled(programs.size(), false);
     bool drawHit = false;
     bool verifyHit = false;
+    ProfileUserWords(programs);
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
 
     if (registerKey) {
@@ -304,6 +432,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
+    ProfileCaptureDiff(programs, stageCaptures);
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
     timing.Mark("shader_compile_and_link");
 

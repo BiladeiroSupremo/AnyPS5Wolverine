@@ -9,7 +9,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/general/VabiMacros.hpp"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <algorithm>
 #include <cstdint>
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <exception>
 #include <mutex>
@@ -108,6 +111,153 @@ void ApplyCodePatches() {
     }
 #else
     std::fprintf(stderr, "[code-patch] APS5_CODE_PATCHES is Windows only\n");
+#endif
+}
+
+// Hooks on the title's own functions, to measure its engine layer before replacing it
+// (APS5_GUEST_HOOKS="rva:stolen[:p];...", hex, Windows only). The stolen bytes (whole, position
+// independent instructions, at least 5, checked against the image) move into a stub next to the
+// image; the function starts with a jump to it. The stub saves the SysV argument registers, calls
+// GuestHookCall with the arguments and the hook's index, restores them, runs the moved bytes and
+// jumps back. 'p' also reads the draw's shader set: in PPSA03671 the recorder's draws (app.exe
+// 0x143f7b9a0 and its siblings, all starting 55 48 89 e5 41 57 41 56) pass this+0x78 as the command
+// buffer to every libSceAgc call, and that buffer keeps per-stage records of 0x70 bytes from +0x38
+// whose first field points at the stage's shader (stages 2..7 are used); the six pointers stand in for
+// the pipeline state. Every 5 s the hooks print calls per second, distinct this pointers and shader
+// sets, and how many of the window's shader sets the previous window used too.
+struct GuestHook {
+    std::uint64_t rva = 0;
+    bool readsPipeline = false;
+    std::uint64_t calls = 0;
+    std::unordered_set<std::uint64_t> objects;
+    std::unordered_set<std::uint64_t> pipelines;
+};
+
+struct GuestHooks {
+    std::mutex mutex;
+    std::vector<GuestHook> hooks;
+    std::unordered_set<std::uint64_t> previousPipelines;
+    std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+};
+
+GuestHooks& GuestHookState() {
+    static auto* state = new GuestHooks();
+    return *state;
+}
+
+void ReportGuestHooks(GuestHooks& state, double seconds) {
+    std::unordered_set<std::uint64_t> pipelines;
+    for (auto& hook : state.hooks) {
+        if (hook.calls == 0) continue;
+        std::size_t reused = 0;
+        for (const auto pipeline : hook.pipelines) reused += state.previousPipelines.contains(pipeline) ? 1 : 0;
+        std::fprintf(stderr, "[guest-hook] 0x%llx: %.0f calls/s, %zu objects, %zu shader sets (%zu also in the last window)\n",
+                     static_cast<unsigned long long>(hook.rva), static_cast<double>(hook.calls) / seconds, hook.objects.size(), hook.pipelines.size(), reused);
+        pipelines.insert(hook.pipelines.begin(), hook.pipelines.end());
+        hook.calls = 0;
+        hook.objects.clear();
+        hook.pipelines.clear();
+    }
+    std::size_t reused = 0;
+    for (const auto pipeline : pipelines) reused += state.previousPipelines.contains(pipeline) ? 1 : 0;
+    std::fprintf(stderr, "[guest-hook] window %.1f s: %zu shader sets, %zu also in the last window\n", seconds, pipelines.size(), reused);
+    state.previousPipelines = std::move(pipelines);
+}
+
+APS5_VABI void GuestHookCall(std::uint64_t self, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t index) {
+    auto& state = GuestHookState();
+    std::lock_guard lock(state.mutex);
+    auto& hook = state.hooks[index];
+    ++hook.calls;
+    hook.objects.insert(self);
+    if (hook.readsPipeline && self >= 0x10000) {
+        const auto buffer = *reinterpret_cast<const std::uint64_t*>(self + 0x78);
+        std::uint64_t shaders = 0xcbf29ce484222325ull;
+        for (std::uint64_t stage = 2; buffer >= 0x10000 && stage < 8; ++stage) {
+            shaders = (shaders ^ *reinterpret_cast<const std::uint64_t*>(buffer + 0x38 + stage * 0x70)) * 0x100000001b3ull;
+        }
+        hook.pipelines.insert(shaders);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto seconds = std::chrono::duration<double>(now - state.windowStart).count();
+    if (seconds >= 5.0) {
+        ReportGuestHooks(state, seconds);
+        state.windowStart = now;
+    }
+}
+
+void InstallGuestHooks() {
+    const char* text = std::getenv("APS5_GUEST_HOOKS");
+    if (text == nullptr || *text == '\0') return;
+#ifdef _WIN32
+    const auto base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+    // Stubs must be within a rel32 jump of the image: try 64 KiB steps below it.
+    std::uint8_t* stubs = nullptr;
+    for (std::uintptr_t step = 1; step < 0x7000 && stubs == nullptr; ++step) {
+        const auto address = reinterpret_cast<std::uintptr_t>(base) - step * 0x10000;
+        stubs = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(address), 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    }
+    if (stubs == nullptr) {
+        std::fprintf(stderr, "[guest-hook] no stub memory near the image\n");
+        return;
+    }
+    auto& state = GuestHookState();
+    std::size_t used = 0;
+    std::string list(text);
+    std::size_t start = 0;
+    while (start < list.size() && used + 256 <= 0x10000) {
+        const auto end = std::min(list.find(';', start), list.size());
+        const auto entry = list.substr(start, end - start);
+        start = end + 1;
+        const auto first = entry.find(':');
+        if (first == std::string::npos) continue;
+        const auto second = entry.find(':', first + 1);
+        const auto rva = std::stoull(entry.substr(0, first), nullptr, 16);
+        const auto stolenHex = entry.substr(first + 1, (second == std::string::npos ? entry.size() : second) - first - 1);
+        std::vector<std::uint8_t> stolen;
+        for (std::size_t i = 0; i + 1 < stolenHex.size(); i += 2) stolen.push_back(static_cast<std::uint8_t>(std::stoul(stolenHex.substr(i, 2), nullptr, 16)));
+        auto* target = base + rva;
+        if (stolen.size() < 5 || std::memcmp(target, stolen.data(), stolen.size()) != 0) {
+            std::fprintf(stderr, "[guest-hook] 0x%llx: stolen bytes not found, not hooked\n", static_cast<unsigned long long>(rva));
+            continue;
+        }
+        const auto index = state.hooks.size();
+        state.hooks.push_back({rva, second != std::string::npos && entry.substr(second + 1).find('p') != std::string::npos});
+        std::vector<std::uint8_t> code = {
+            0x57, 0x56, 0x52, 0x51, 0x41, 0x50, 0x41, 0x51, 0x50, 0x41, 0x52, 0x41, 0x53, // push rdi rsi rdx rcx r8 r9 rax r10 r11
+            0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00,                                     // sub rsp, 0x80
+        };
+        for (std::uint8_t reg = 0; reg < 8; ++reg) code.insert(code.end(), {0xf3, 0x0f, 0x7f, static_cast<std::uint8_t>(0x44 | reg << 3), 0x24, static_cast<std::uint8_t>(reg * 0x10)});
+        code.insert(code.end(), {0x48, 0x83, 0xec, 0x08, 0x68}); // sub rsp, 8; push index (7th argument)
+        for (int i = 0; i < 4; ++i) code.push_back(static_cast<std::uint8_t>(index >> (i * 8)));
+        code.insert(code.end(), {0x48, 0xb8}); // mov rax, GuestHookCall
+        const auto call = reinterpret_cast<std::uint64_t>(&GuestHookCall);
+        for (int i = 0; i < 8; ++i) code.push_back(static_cast<std::uint8_t>(call >> (i * 8)));
+        code.insert(code.end(), {0xff, 0xd0, 0x48, 0x83, 0xc4, 0x10}); // call rax; add rsp, 16
+        for (std::uint8_t reg = 0; reg < 8; ++reg) code.insert(code.end(), {0xf3, 0x0f, 0x6f, static_cast<std::uint8_t>(0x44 | reg << 3), 0x24, static_cast<std::uint8_t>(reg * 0x10)});
+        code.insert(code.end(), {0x48, 0x81, 0xc4, 0x80, 0x00, 0x00, 0x00,                 // add rsp, 0x80
+                                 0x41, 0x5b, 0x41, 0x5a, 0x58, 0x41, 0x59, 0x41, 0x58, 0x59, 0x5a, 0x5e, 0x5f}); // pop in reverse
+        code.insert(code.end(), stolen.begin(), stolen.end());
+        code.insert(code.end(), {0xff, 0x25, 0x00, 0x00, 0x00, 0x00}); // jmp [rip]: back after the stolen bytes
+        const auto back = reinterpret_cast<std::uint64_t>(target + stolen.size());
+        for (int i = 0; i < 8; ++i) code.push_back(static_cast<std::uint8_t>(back >> (i * 8)));
+        auto* stub = stubs + used;
+        std::memcpy(stub, code.data(), code.size());
+        used += (code.size() + 15) & ~std::size_t{15};
+        std::vector<std::uint8_t> jump(stolen.size(), 0x90);
+        jump[0] = 0xe9;
+        const auto rel = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(stub) - reinterpret_cast<std::intptr_t>(target + 5));
+        std::memcpy(jump.data() + 1, &rel, 4);
+        DWORD previous = 0;
+        VirtualProtect(target, jump.size(), PAGE_EXECUTE_READWRITE, &previous);
+        std::memcpy(target, jump.data(), jump.size());
+        VirtualProtect(target, jump.size(), previous, &previous);
+        FlushInstructionCache(GetCurrentProcess(), target, jump.size());
+        std::fprintf(stderr, "[guest-hook] 0x%llx: hooked (%zu bytes moved)\n", static_cast<unsigned long long>(rva), stolen.size());
+    }
+    FlushInstructionCache(GetCurrentProcess(), stubs, used);
+#else
+    std::fprintf(stderr, "[guest-hook] APS5_GUEST_HOOKS is Windows only\n");
 #endif
 }
 
@@ -214,6 +364,7 @@ void Driver::stop() {
 
 Driver::Driver() {
     ApplyCodePatches();
+    InstallGuestHooks();
     static_cast<void>(GuestMemory::TrackerGeneration());
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {
