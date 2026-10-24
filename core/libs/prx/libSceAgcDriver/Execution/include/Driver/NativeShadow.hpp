@@ -48,7 +48,7 @@ struct DecodedDescriptor {
 // Whether each bound descriptor is one the record's Shaders place in their user data or extended
 // user data (ShaderUserData sharp tables: size 1 = 4 dwords, size 0 = 8 dwords; offsets from 32 in
 // the extended user data), by role.
-void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const DecodedDescriptor> decoded);
+void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const DecodedDescriptor> decoded, std::uint64_t structure = 0, std::uint64_t pushes = 0);
 // Compares each decoded program's user data words with the record's for the same Shader.
 void CompareNativeUserData(const NativeDrawRecord& record, std::span<const std::uint64_t> decodedShaders, std::span<const std::vector<std::uint32_t>> decodedUserData);
 // APS5_NATIVE_SHADOW=2: prints the raw records of a few draws next to each decoded program's user

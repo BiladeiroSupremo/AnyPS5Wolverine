@@ -779,9 +779,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // layouts place in this draw's user data.
     if (nativeRecord != nullptr) {
         std::vector<DecodedDescriptor> decoded;
+        std::uint64_t structure = 0xcbf29ce484222325ull;
+        std::uint64_t pushes = 0xcbf29ce484222325ull;
+        const auto mix = [](std::uint64_t& hash, std::uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; };
         for (const auto& stage : stages) {
             if (stage.program == nullptr) continue;
+            const auto [first, second] = stage.program->spirv.KeyHashes();
+            mix(structure, first);
+            mix(structure, second);
+            mix(structure, stage.program->PipelineVariantId());
+            for (const auto byte : stage.program->pushConstants) mix(pushes, static_cast<std::uint64_t>(byte));
+            for (const auto word : stage.program->shaderDataUserWords) mix(structure, word);
             for (const auto& binding : stage.program->bindings) {
+                mix(structure, static_cast<std::uint64_t>(binding.kind) << 32u | static_cast<std::uint64_t>(binding.role));
+                mix(structure, static_cast<std::uint64_t>(binding.binding) << 32u | binding.count);
                 const auto role = binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers ? 0 : binding.role == ShaderRecompiler::DescriptorRole::GuestImages ? 1 : binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers ? 2 : 3;
                 if (role == 3 || binding.count == 0) continue;
                 const auto elementWords = binding.guestDescriptor.size() / binding.count;
@@ -793,7 +804,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
         }
-        CompareNativeDescriptors(*nativeRecord, decoded);
+        CompareNativeDescriptors(*nativeRecord, decoded, structure, pushes);
     }
     // A pipelined direct draw: the committer records it (commitDraw) after the draws queued before it.
     // The commit owns everything the recording reads: the stages' results, the snapshots and the

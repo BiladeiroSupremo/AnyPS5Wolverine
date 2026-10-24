@@ -45,6 +45,8 @@ struct ShadowState {
     std::unordered_map<std::uint64_t, std::uint64_t> nativeKeys;
     std::unordered_map<std::uint64_t, std::uint64_t> runKeys;
     std::uint64_t keyedDraws = 0;
+    std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> keyFingerprints;
+    std::uint64_t sameStructure = 0, otherStructure = 0, samePushes = 0, otherPushes = 0;
     int dataExamples = 0;
     // Record slots holding the decoded shaders (which stage records the title uses).
     std::array<std::uint64_t, 16> slotUse{};
@@ -169,7 +171,7 @@ void CompareNativeUserData(const NativeDrawRecord& record, std::span<const std::
     }
 }
 
-void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const DecodedDescriptor> decoded) {
+void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const DecodedDescriptor> decoded, std::uint64_t structure, std::uint64_t pushes) {
     // The descriptors the record's Shaders place: first four words of each sharp entry.
     std::vector<std::array<std::uint32_t, 4>> placed;
     for (std::size_t slot = 0; slot < record.shaders.size(); ++slot) {
@@ -216,6 +218,16 @@ void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const De
         ++state.keyedDraws;
         if (state.nativeKeys.size() < 1u << 20) ++state.nativeKeys[key];
         if (state.runKeys.size() < 1u << 20) ++state.runKeys[key];
+        // Whether the key decides the compiled stages: the first draw's fingerprints per key against
+        // later draws' (structure = SPIR-V, variant, binding layout; pushes = push constant bytes).
+        if (structure != 0) {
+            const auto [entry, inserted] = state.keyFingerprints.try_emplace(key, std::pair{structure, pushes});
+            if (!inserted) {
+                ++(entry->second.first == structure ? state.sameStructure : state.otherStructure);
+                ++(entry->second.second == pushes ? state.samePushes : state.otherPushes);
+            }
+            if (state.keyFingerprints.size() > 1u << 20) state.keyFingerprints.clear();
+        }
     }
     for (const auto& descriptor : decoded) {
         if (descriptor.role > 2) continue;
@@ -335,6 +347,8 @@ void CompareNativeDraw(const NativeDrawRecord* record, std::span<const std::uint
     std::uint64_t repeats = 0;
     for (const auto& [key, draws] : state.nativeKeys) repeats += draws - 1;
     std::fprintf(stderr, "[native-shadow] native keys: %zu distinct over %llu draws (10 s; a cache keyed so would hit %.1f%%), %zu distinct in the run so far\n", state.nativeKeys.size(), static_cast<unsigned long long>(state.keyedDraws), state.keyedDraws != 0 ? 100.0 * static_cast<double>(repeats) / static_cast<double>(state.keyedDraws) : 0.0, state.runKeys.size());
+    std::fprintf(stderr, "[native-shadow] repeated native keys: compiled structure same %llu / other %llu, push constants same %llu / other %llu\n", static_cast<unsigned long long>(state.sameStructure), static_cast<unsigned long long>(state.otherStructure), static_cast<unsigned long long>(state.samePushes), static_cast<unsigned long long>(state.otherPushes));
+    state.sameStructure = state.otherStructure = state.samePushes = state.otherPushes = 0;
     state.nativeKeys.clear();
     state.keyedDraws = 0;
     state.slotUse = {};
