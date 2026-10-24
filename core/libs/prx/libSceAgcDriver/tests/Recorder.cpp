@@ -6739,6 +6739,15 @@ void Run(Context context) {
 
 int main(int argc, char** argv) {
     try {
+        // The draw snapshot tests exercise snapshots, which are off by default since 2026-10-24
+        // (ShaderResources::MaxDrawSnapshotBytes): they run with the former 1 MiB cap.
+        if (std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB") == nullptr) {
+#ifdef _WIN32
+            _putenv_s("APS5_DRAW_SNAPSHOT_MAX_MIB", "1");
+#else
+            setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "1", 1);
+#endif
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
             queuedWriteGroupTests();
             std::cout << "queued write group tests passed\n";

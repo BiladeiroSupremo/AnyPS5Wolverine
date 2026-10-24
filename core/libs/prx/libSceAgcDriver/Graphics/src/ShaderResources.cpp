@@ -3772,9 +3772,12 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     // draw refreshed one (~55 refreshes of ~52 us per frame, all under the GPU mutex); larger
     // buffers are now read in place, as the title's own label waits order them on the PS5 too.
     // A/B (2026-10-16): bindings 32 -> 13.6 us per draw, picture unchanged. =64 restores.
+    // Default 0 since 2026-10-24: no draw input is snapshotted, all are read in place (PPSA03671
+    // A/B, three runs each: 7.47 -> 7.94 FPS, 1% lows 1.86 -> 1.95, median frame 132 -> 125 ms,
+    // pictures unchanged; ~10 us per draw less on the committer). =1 restores the 1 MiB limit.
     static const std::size_t bytes = [] {
         const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
-        const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 1ull;
+        const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
         return static_cast<std::size_t>(mib * 1024ull * 1024ull);
     }();
     return bytes;
@@ -3832,9 +3835,11 @@ struct BindingSplit {
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    const auto maxSnapshotBytes = MaxDrawSnapshotBytes();
+    // Nothing is snapshotted (the default): only moved buffers need bindings of their own.
+    if (maxSnapshotBytes == 0 && moved.empty()) return {};
     BindingSplit split;
     const auto reads = guestMemory.InPlaceReads();
-    const auto maxSnapshotBytes = MaxDrawSnapshotBytes();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
     std::vector<std::size_t> selected;
