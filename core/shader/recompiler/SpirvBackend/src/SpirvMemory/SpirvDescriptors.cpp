@@ -287,6 +287,21 @@ std::uint32_t LoadSampledImageDescriptor(SpirvEmitterState& state, std::uint32_t
 
 std::uint32_t LoadSamplerDescriptor(SpirvEmitterState& state, std::uint32_t sampler) {
     const bool point = state.runtimeImage != nullptr && (state.runtimeImage->numericClass == IrTextureNumericClass::Sint || state.runtimeImage->conversionFormat != IrBufferFormat::Invalid || state.runtimeImage->depthBits);
+    // A GPU-resolved S#: element 2 * slot (+ 1 point filtered) of the heap set's sampler array.
+    if (state.hashedSamplerSlot != 0u && sampler < state.program.Info().samplers.size() && state.program.Info().samplers[sampler].hashed) {
+        const auto samplerType = state.module.Type(spv::OpTypeSampler);
+        auto& variable = state.bindlessHeapSamplerVariable;
+        if (variable == 0u) {
+            RequireBindlessHeapCapabilities(state);
+            variable = DefineBindlessHeapVariable(state, state.module.Type(spv::OpTypeRuntimeArray, samplerType), spv::StorageClassUniformConstant, BindlessHeaps::SamplerBinding, "bindless_heap_samplers");
+        }
+        const auto element = Binary(state, spv::OpIAdd, TypeU32(state), Binary(state, spv::OpShiftLeftLogical, TypeU32(state), state.hashedSamplerSlot, ConstantU32(state, 1u)), ConstantU32(state, point ? 1u : 0u));
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, state.module.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, samplerType), pointer, variable, element);
+        const auto loaded = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, samplerType, loaded, pointer);
+        return loaded;
+    }
     const auto arrayIndex = ResourceForDescriptor(state, DescriptorBindingKind::Samplers, sampler) + (point ? 1u : 0u);
     const auto samplerType = state.module.Type(spv::OpTypeSampler);
     const auto pointerType = state.module.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, samplerType);

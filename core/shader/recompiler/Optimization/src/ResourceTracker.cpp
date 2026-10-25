@@ -276,7 +276,7 @@ private:
     std::uint32_t InternSource(const DescriptorSource& descriptor) {
         for (std::uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
             const auto& current = m_sources[candidate];
-            if (current.dwordCount != descriptor.dwordCount || current.indirectImage != descriptor.indirectImage || current.hashedImage != descriptor.hashedImage || current.hashedOffset != descriptor.hashedOffset) {
+            if (current.dwordCount != descriptor.dwordCount || current.indirectImage != descriptor.indirectImage || current.hashedImage != descriptor.hashedImage || current.hashedSampler != descriptor.hashedSampler || current.hashedOffset != descriptor.hashedOffset) {
                 continue;
             }
             bool same = true;
@@ -475,6 +475,28 @@ private:
         image.hashedImage = true;
         image.hashedOffset = offset;
         source = InternSource(image);
+        return true;
+    }
+
+    // A GPU-resolved S# (Detail::HashedSamplerCandidate): its source is the V# of the buffer it is
+    // read from, like a GPU-resolved T#.
+    bool MakeHashedSamplerSource(const IrValue& handle, std::uint32_t& source) {
+        std::array<IrValue*, 8> reads{};
+        std::uint32_t offset = 0;
+        if (!Detail::HashedSamplerCandidate(m_program.Resources(), handle, &reads, &offset)) {
+            return false;
+        }
+        DescriptorSource buffer;
+        std::uint32_t bufferSource = 0;
+        if (!MakeRuntimeBufferSource(*reads[0]->Argument(0)->Resolve(), bufferSource, buffer)) {
+            return false;
+        }
+        DescriptorSource sampler;
+        sampler.dwordCount = 4u;
+        std::copy(buffer.dwords.begin(), buffer.dwords.begin() + 4u, sampler.dwords.begin());
+        sampler.hashedSampler = true;
+        sampler.hashedOffset = offset;
+        source = InternSource(sampler);
         return true;
     }
 
@@ -1524,6 +1546,7 @@ private:
             return std::numeric_limits<std::uint32_t>::max();
         }
         m_info.samplers.push_back({source, pc});
+        m_info.samplers.back().hashed = source < m_sources.size() && m_sources[source].hashedSampler;
         return static_cast<std::uint32_t>(m_info.samplers.size() - 1);
     }
 
@@ -1655,7 +1678,10 @@ private:
             IrValue* samplerHandle = nullptr;
             std::uint32_t samplerSource = 0;
             const bool sampleAdjust = (memory.imageSampleFlags & RdnaImageSampleFlagAdjust) != 0;
-            GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, true, sampleAdjust);
+            samplerHandle = inst.Argument(1)->Resolve();
+            if (!MakeHashedSamplerSource(*samplerHandle, samplerSource)) {
+                GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, true, sampleAdjust);
+            }
             sampler = AddSampler(samplerSource, flags.pc);
             if (sampler == std::numeric_limits<std::uint32_t>::max()) {
                 fail("sampler resource limit exceeded");

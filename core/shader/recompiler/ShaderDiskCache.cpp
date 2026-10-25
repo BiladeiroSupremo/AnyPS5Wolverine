@@ -542,6 +542,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(sampler.depthCompare);
         out.Value(sampler.uses);
         out.Value(sampler.foldTexelOffsetsOnly);
+        out.Value(sampler.hashed);
     });
     writer.List(info.sampledPairs, [](Writer& out, const SampledResourcePair& pair) {
         out.Value(pair.image);
@@ -654,6 +655,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(sampler.depthCompare);
         in.Value(sampler.uses);
         in.Value(sampler.foldTexelOffsetsOnly);
+        in.Value(sampler.hashed);
     });
     reader.List(info.sampledPairs, 12, [](Reader& in, SampledResourcePair& pair) {
         in.Value(pair.image);

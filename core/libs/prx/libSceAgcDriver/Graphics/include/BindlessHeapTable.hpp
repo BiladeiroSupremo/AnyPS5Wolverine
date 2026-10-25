@@ -16,6 +16,7 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 class Recorder;
+class Sampler;
 class Texture;
 
 // The device's bindless heap set (see Optimization/BindlessHeaps.hpp): its layout, pool and set,
@@ -43,6 +44,9 @@ public:
     // Puts the texture's view in the next free slot of `kind` (a BindlessHeaps::ImageBinding*) and
     // keeps the texture alive; the translation word for it, or Unusable when the kind is full.
     std::uint32_t Publish(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout imageLayout);
+    // Puts a GPU-resolved S#'s filtered and point-filtered samplers in the next free pair of the
+    // sampler array and keeps them alive; the translation word for it, or Unusable when it is full.
+    std::uint32_t PublishSampler(const std::shared_ptr<Sampler>& filtered, const std::shared_ptr<Sampler>& point);
     // Gives back the slot of a translation word that was replaced: its texture stays alive and the
     // slot unused until the recorder's open batch (the last work that may read it) completes.
     void Retire(std::uint32_t word, Recorder& recorder);
@@ -93,6 +97,10 @@ private:
     std::unique_ptr<Buffer> keys;
     // The T# each key buffer bucket holds (all zero: free), as the driver wrote them.
     std::vector<std::array<std::uint32_t, 8>> bucketWords;
+    // The samplers each published sampler pair holds (pair 0: the placeholder).
+    std::vector<std::shared_ptr<Sampler>> pairSamplers;
+    std::uint32_t nextSamplerPair = 1;
+    void createSamplerPlaceholder();
     std::array<std::uint32_t, ShaderRecompiler::BindlessHeaps::KindCount> nextSlot{};
     struct Placeholder {
         VkImage image = VK_NULL_HANDLE;

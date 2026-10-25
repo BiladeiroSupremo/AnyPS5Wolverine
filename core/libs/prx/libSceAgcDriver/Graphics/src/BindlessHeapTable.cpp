@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -34,8 +35,8 @@ constexpr std::size_t RevalidateBudget = 128u;
 
 BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) {
     try {
-        std::array<VkDescriptorSetLayoutBinding, Heaps::KindCount + 3u> bindings{};
-        std::array<VkDescriptorBindingFlags, Heaps::KindCount + 3u> flags{};
+        std::array<VkDescriptorSetLayoutBinding, Heaps::KindCount + 4u> bindings{};
+        std::array<VkDescriptorBindingFlags, Heaps::KindCount + 4u> flags{};
         for (std::uint32_t kind = 0; kind < Heaps::KindCount; kind++) {
             bindings[kind] = {kind, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Heaps::SlotsPerKind, VK_SHADER_STAGE_ALL, nullptr};
             flags[kind] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
@@ -43,6 +44,8 @@ BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) 
         bindings[Heaps::KindCount] = {Heaps::TranslationBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
         bindings[Heaps::KindCount + 1u] = {Heaps::FeedbackBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
         bindings[Heaps::KindCount + 2u] = {Heaps::KeyBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
+        bindings[Heaps::KindCount + 3u] = {Heaps::SamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, Heaps::SamplerPairs * 2u, VK_SHADER_STAGE_ALL, nullptr};
+        flags[Heaps::KindCount + 3u] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
         VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
         bindingFlags.bindingCount = static_cast<std::uint32_t>(flags.size());
         bindingFlags.pBindingFlags = flags.data();
@@ -54,7 +57,7 @@ BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) 
         const VkDescriptorSetLayoutCreateInfo emptyInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &emptyInfo, nullptr, &emptyLayout), "vkCreateDescriptorSetLayout bindless empty set");
 
-        const std::array<VkDescriptorPoolSize, 2> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Heaps::SlotsPerKind * Heaps::KindCount}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}}};
+        const std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Heaps::SlotsPerKind * Heaps::KindCount}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}, {VK_DESCRIPTOR_TYPE_SAMPLER, Heaps::SamplerPairs * 2u}}};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
         poolInfo.maxSets = 1;
@@ -115,6 +118,7 @@ BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) 
         }
         context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
         createPlaceholders();
+        createSamplerPlaceholder();
     } catch (...) {
         release();
         throw;
@@ -127,6 +131,7 @@ BindlessHeapTable::~BindlessHeapTable() {
 
 void BindlessHeapTable::release() noexcept {
     for (auto& textures : slotTextures) textures.clear();
+    pairSamplers.clear();
     translation.reset();
     feedback.reset();
     keys.reset();
@@ -209,6 +214,54 @@ void BindlessHeapTable::createPlaceholders() {
     }
     batch.SubmitAndWait();
     context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+namespace {
+
+// The S# with point filtering (ShaderRecompiler's PointFilteredSamplerWord: the element a shader
+// takes for sint, converted or depth-bits images); a min/max reduction sampler keeps its filter.
+std::array<std::uint32_t, 4> pointFilteredWords(std::span<const std::uint32_t> words) {
+    std::array<std::uint32_t, 4> point{words[0], words[1], words[2], words[3]};
+    const bool reduced = ((words[0] >> 29u) & 3u) != 0u;
+    if (!reduced) {
+        const bool mipmapped = ((words[2] >> 26u) & 3u) != 0u;
+        point[2] = (words[2] & ~(0xffu << 20u)) | (1u << 24u) | (mipmapped ? 1u << 26u : 0u);
+    }
+    return point;
+}
+
+// The filtered and point-filtered samplers of an S#, as the per-draw binding makes them.
+std::pair<std::shared_ptr<Sampler>, std::shared_ptr<Sampler>> samplerPair(const Context& context, std::span<const std::uint32_t> words) {
+    const auto point = pointFilteredWords(words);
+    if (context.samplerCache != nullptr) return {context.samplerCache->Get(context, words, false, false, true, false), context.samplerCache->Get(context, point, false, false, true, false)};
+    return {std::make_shared<Sampler>(context, DecodeSamplerResource(words, false, true, false)), std::make_shared<Sampler>(context, DecodeSamplerResource(point, false, true, false))};
+}
+
+}
+
+// Pair 0: the default S# GetHandle substitutes (trilinear, wrap), for keys not resolved yet.
+void BindlessHeapTable::createSamplerPlaceholder() {
+    constexpr std::array<std::uint32_t, 4> defaultSampler{0u, 0x00fff000u, 0x08500000u, 0u};
+    auto [filtered, point] = samplerPair(context, defaultSampler);
+    nextSamplerPair = 0;
+    if (PublishSampler(filtered, point) == Heaps::Unusable) throw std::runtime_error("bindless heap sampler placeholder");
+}
+
+std::uint32_t BindlessHeapTable::PublishSampler(const std::shared_ptr<Sampler>& filtered, const std::shared_ptr<Sampler>& point) {
+    if (nextSamplerPair >= Heaps::SamplerPairs) return Heaps::Unusable;
+    const auto pair = nextSamplerPair++;
+    const std::array<VkDescriptorImageInfo, 2> infos{{{filtered->Handle(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED}, {point->Handle(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED}}};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.dstBinding = Heaps::SamplerBinding;
+    write.dstArrayElement = pair * 2u;
+    write.descriptorCount = 2;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    write.pImageInfo = infos.data();
+    context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &write, 0, nullptr);
+    pairSamplers.push_back(filtered);
+    pairSamplers.push_back(point);
+    return (Heaps::SamplerKind << Heaps::KindShift) | pair;
 }
 
 VkBuffer BindlessHeapTable::TranslationBuffer() const {
@@ -629,7 +682,15 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             std::uint32_t word = Heaps::Unusable;
             const auto entryStart = std::chrono::steady_clock::now();
             try {
-                word = resolveHeapEntry(context, *table, recorder, index, 0u, nullptr, &words);
+                if (words[4] == Heaps::SamplerMarker) {
+                    // An unnormalized S# is unusable: shaders specialize their sampling as normalized.
+                    if (((words[0] >> 15u) & 1u) == 0u) {
+                        const auto [filtered, point] = samplerPair(context, std::span(words).first(4));
+                        word = table->PublishSampler(filtered, point);
+                    }
+                } else {
+                    word = resolveHeapEntry(context, *table, recorder, index, 0u, nullptr, &words);
+                }
             } catch (const std::exception& error) {
                 static std::atomic<int> reported{0};
                 if (reported.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[gpu-images] T# %08x %08x is unusable: %s\n", words[0], words[1], error.what());

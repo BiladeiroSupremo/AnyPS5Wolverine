@@ -6,11 +6,14 @@
 
 namespace ShaderRecompiler::Detail {
 
-bool HashedImageCandidate(const IrResourcePlan& program, const IrValue& handle, std::array<IrValue*, 8>* reads, std::uint32_t* offset) {
-    if (!BindlessHeaps::HashedImagesEnabled() || handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u) return false;
+namespace {
+
+// The handle's `count` dwords are constant-offset reads of one scalar buffer, one dword apart.
+bool ConstantOffsetReads(const IrResourcePlan& program, const IrValue& handle, std::uint32_t count, std::array<IrValue*, 8>* reads, std::uint32_t* offset) {
+    if (handle.ArgumentCount() != count) return false;
     const IrValue* buffer = nullptr;
     std::uint32_t first = 0;
-    for (std::uint32_t dword = 0; dword < 8u; ++dword) {
+    for (std::uint32_t dword = 0; dword < count; ++dword) {
         IrValue* read = handle.Argument(dword)->Resolve();
         if (read->Opcode() != IrOpcode::ReadConstBuffer || read->ArgumentCount() != 2u || !IsRawRead(program, *read)) return false;
         const auto& memory = program.memoryInfo[read->Flags<MemoryFlags>().index];
@@ -24,6 +27,31 @@ bool HashedImageCandidate(const IrResourcePlan& program, const IrValue& handle, 
         }
         if (reads != nullptr) (*reads)[dword] = read;
     }
+    if (offset != nullptr) *offset = first;
+    return true;
+}
+
+}
+
+bool HashedSamplerCandidate(const IrResourcePlan& program, const IrValue& handle, std::array<IrValue*, 8>* reads, std::uint32_t* offset) {
+    if (!BindlessHeaps::HashedImagesEnabled() || handle.Opcode() != IrOpcode::GetSamplerResource || !ConstantOffsetReads(program, handle, 4u, reads, offset)) return false;
+    if (handle.Uses().empty()) return false;
+    for (const IrValue* user : handle.Uses()) {
+        const auto info = ImageOpcodeInfoOf(user->Opcode());
+        if (!info.needsSampler || user->ArgumentCount() < 2u || user->Argument(1)->Resolve() != &handle) return false;
+        const auto index = user->Flags<MemoryFlags>().index;
+        if (index >= program.memoryInfo.size()) return false;
+        const auto& memory = program.memoryInfo[index];
+        // A depth comparison or an LOD adjustment makes the sampler depend on the image or the op.
+        if ((memory.imageSampleFlags & (RdnaImageSampleFlagCompare | RdnaImageSampleFlagAdjust)) != 0u) return false;
+        if (!BindlessHeaps::HeapEligible(program.stage, static_cast<std::uint32_t>(memory.imageDimension), true, false, memory.imageR128)) return false;
+    }
+    return true;
+}
+
+bool HashedImageCandidate(const IrResourcePlan& program, const IrValue& handle, std::array<IrValue*, 8>* reads, std::uint32_t* offset) {
+    std::uint32_t first = 0;
+    if (!BindlessHeaps::HashedImagesEnabled() || handle.Opcode() != IrOpcode::GetImageResource || !ConstantOffsetReads(program, handle, 8u, reads, &first)) return false;
     if (handle.Uses().empty()) return false;
     for (const IrValue* user : handle.Uses()) {
         const auto info = ImageOpcodeInfoOf(user->Opcode());

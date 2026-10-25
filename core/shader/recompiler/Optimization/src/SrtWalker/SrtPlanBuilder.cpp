@@ -27,9 +27,9 @@ void PlanBuilder::Run() {
                 }
             }
             if (IsDescriptorHandle(inst->Opcode())) {
-                // A GPU-resolved T#: only the V# of the buffer it is read from is planned.
+                // A GPU-resolved T# or S#: only the V# of the buffer it is read from is planned.
                 std::array<IrValue*, 8> reads{};
-                if (HashedImageCandidate(_program.Resources(), *inst, &reads)) {
+                if (HashedImageCandidate(_program.Resources(), *inst, &reads) || HashedSamplerCandidate(_program.Resources(), *inst, &reads)) {
                     Collect(reads[0]->Argument(0), 0);
                     continue;
                 }

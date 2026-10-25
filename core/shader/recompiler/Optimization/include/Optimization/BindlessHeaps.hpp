@@ -70,6 +70,15 @@ inline constexpr std::uint32_t ClassShift = 20u;
 inline constexpr std::uint32_t ClassMask = 0x3u;
 inline constexpr std::uint32_t CubeBit = 1u << 22u;
 
+// GPU-resolved S#s share the key buffer and ring: a sampler's key is its four words, SamplerMarker,
+// then three zeros (never a T#'s eight words, never an empty bucket). Its word is SamplerKind <<
+// KindShift | pair index; pair k sits at elements 2k (as the S# says) and 2k + 1 (point filtered) of
+// the sampler array binding SamplerBinding. Pair 0 is the placeholder.
+inline constexpr std::uint32_t SamplerBinding = 7u;
+inline constexpr std::uint32_t SamplerPairs = 2048u;
+inline constexpr std::uint32_t SamplerKind = 0x40u;
+inline constexpr std::uint32_t SamplerMarker = 0x53414d50u;
+
 // The bucket hash of a T#; the SPIR-V emits the same arithmetic.
 [[nodiscard]] constexpr std::uint32_t HashWords(const std::uint32_t* words) {
     std::uint32_t hash = 0x9e3779b9u;

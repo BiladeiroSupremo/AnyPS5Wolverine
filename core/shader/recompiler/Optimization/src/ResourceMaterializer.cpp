@@ -553,10 +553,18 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         snapshot.images[i] = descriptor;
     }
 
-    if (values.size() < cursor + plan.info.samplers.size()) {
-        throw std::runtime_error("materialization sources are missing sampler descriptors");
+    // A GPU-resolved S# keeps a null descriptor in the snapshot.
+    snapshot.samplers.resize(plan.info.samplers.size());
+    for (std::size_t i = 0; i < plan.info.samplers.size(); ++i) {
+        if (plan.info.samplers[i].hashed) {
+            snapshot.samplers[i].dwordCount = 4u;
+            continue;
+        }
+        if (cursor >= values.size()) {
+            throw std::runtime_error("materialization sources are missing sampler descriptors");
+        }
+        snapshot.samplers[i] = values[cursor++];
     }
-    snapshot.samplers.assign(values.begin() + cursor, values.begin() + cursor + plan.info.samplers.size());
 }
 
 std::uint32_t colorCompareReference(IrBufferFormat format) {
@@ -1220,7 +1228,9 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
             addSource(image.source);
         }
     }
-    for (const auto& sampler : plan.info.samplers) addSource(sampler.source);
+    for (const auto& sampler : plan.info.samplers) {
+        if (!sampler.hashed) addSource(sampler.source);
+    }
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     buildCompactPlan(plan);

@@ -162,13 +162,15 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
         }
     }
 
-    if (!info.samplers.empty()) {
-        if (info.samplers.size() > RuntimeAbi::SamplerHeapCapacity / 2u) fail("shader sampler pairs exceed runtime heap capacity");
-        std::vector<std::uint32_t> resources(info.samplers.size() * 2u);
-        for (std::uint32_t i = 0; i < resources.size(); i++) {
-            resources[i] = i / 2u;
-        }
-        addBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
+    // A GPU-resolved S# is loaded from the heap set's sampler array only.
+    std::vector<std::uint32_t> samplerResources;
+    for (std::uint32_t i = 0; i < info.samplers.size(); i++) {
+        if (info.samplers[i].hashed) continue;
+        samplerResources.insert(samplerResources.end(), {i, i});
+    }
+    if (!samplerResources.empty()) {
+        if (samplerResources.size() > RuntimeAbi::SamplerHeapCapacity) fail("shader sampler pairs exceed runtime heap capacity");
+        addBinding(next, DescriptorBindingKind::Samplers, std::move(samplerResources));
     }
     if (usesGds(program)) {
         addBinding(next, DescriptorBindingKind::Gds);

@@ -43,6 +43,8 @@ struct DescriptorSource {
     // whose V# the first four dwords hold, at byte `hashedOffset`; the CPU never evaluates it.
     bool hashedImage = false;
     std::uint32_t hashedOffset = 0;
+    // The same for an S# (dwordCount 4 then holds the buffer's V#).
+    bool hashedSampler = false;
 
     bool operator==(const DescriptorSource& other) const = default;
 };

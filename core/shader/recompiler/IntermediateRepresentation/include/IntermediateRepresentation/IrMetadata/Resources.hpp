@@ -130,6 +130,9 @@ struct SamplerResource {
     bool depthCompare = false;
     std::uint16_t uses = 0;
     bool foldTexelOffsetsOnly = false;
+    // Loaded from the heap set's sampler array through a GPU-resolved S# (DescriptorSource::
+    // hashedSampler): no binding of its own.
+    bool hashed = false;
 
     bool operator==(const SamplerResource& other) const = default;
 };

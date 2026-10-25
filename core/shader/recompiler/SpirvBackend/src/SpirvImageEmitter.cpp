@@ -1865,24 +1865,13 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     }
 }
 
-// A GPU-resolved T# (BindlessHeaps.hpp): the eight words the handle reads are hashed and looked up
-// in the key buffer. A matching bucket's translation word names the heap slot and the mode (numeric
-// class, cube); an unknown or pending T# is requested through the ring once per subgroup and samples
-// zeros meanwhile. The words are one buffer's constant-offset reads, so the slot is uniform.
-void EmitHashedImage(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageResource& image) {
+// The translation word of a GPU-resolved key (BindlessHeaps.hpp): the eight key words are hashed and
+// looked up in the key buffer; a matching bucket's translation word, else Pending (`unusable`, a bool
+// id or 0: Unusable instead). A Pending word is requested through the ring once per subgroup.
+std::uint32_t EmitHashedWord(SpirvValueEmitContext& ctx, const std::array<std::uint32_t, 8>& words, std::uint32_t unusable) {
     auto& state = ctx.state;
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
-    const auto* handle = inst.Argument(0)->Resolve();
-    if (handle->ArgumentCount() != 8u) ctx.Fail(inst, "has a GPU-resolved T# without eight words");
-    std::array<std::uint32_t, 8> words{};
-    for (std::uint32_t dword = 0; dword < 8u; ++dword) words[dword] = ctx.Def(handle->Argument(dword));
-    static std::mutex tracedMutex;
-    static std::set<std::pair<std::uint64_t, bool>> traced;
-    {
-        std::unique_lock tracedLock(tracedMutex);
-        if (traced.insert({state.program.Resources().shaderHash, state.registrationModules}).second) std::fprintf(stderr, "[gpu-images] hashed T# path emitted: shader %llx%s\n", static_cast<unsigned long long>(state.program.Resources().shaderHash), state.registrationModules ? " (registration module)" : "");
-    }
     const auto loadWord = [&](std::uint32_t variable, std::uint32_t index) {
         const auto pointer = state.module.AllocateId();
         state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, variable, ConstantU32(state, 0), index);
@@ -1909,9 +1898,8 @@ void EmitHashedImage(SpirvValueEmitContext& ctx, const IrValue& inst, const Imag
         found = Binary(state, spv::OpLogicalOr, boolean, found, match);
     }
     const auto translated = loadWord(BindlessHeapBuffer(state, false), Binary(state, spv::OpIAdd, u32, ConstantU32(state, BindlessHeaps::HashBase), foundBucket));
-    // A null T# samples zeros, as a null descriptor does, and is never requested.
-    const auto null = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpIEqual, boolean, words[0], ConstantU32(state, 0u)), Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, words[1], ConstantU32(state, 0xffu)), ConstantU32(state, 0u)));
-    const auto word = Select(state, u32, null, ConstantU32(state, BindlessHeaps::Unusable), Select(state, u32, found, translated, ConstantU32(state, BindlessHeaps::Pending)));
+    auto word = Select(state, u32, found, translated, ConstantU32(state, BindlessHeaps::Pending));
+    if (unusable != 0u) word = Select(state, u32, unusable, ConstantU32(state, BindlessHeaps::Unusable), word);
     EmitIfCondition(state, Binary(state, spv::OpIEqual, boolean, word, ConstantU32(state, BindlessHeaps::Pending)), [&]() {
         state.module.EmitCapability(spv::CapabilityGroupNonUniform);
         const auto elected = state.module.AllocateId();
@@ -1932,6 +1920,50 @@ void EmitHashedImage(SpirvValueEmitContext& ctx, const IrValue& inst, const Imag
             });
         });
     });
+    return word;
+}
+
+// A GPU-resolved S# (BindlessHeaps.hpp): its four words plus the sampler marker are looked up like
+// a T#; the word's slot names a filtered/point pair of the heap set's sampler array (slot 0 holds
+// the placeholder pair). The words are one buffer's constant-offset reads, so the slot is uniform.
+void EmitHashedSampler(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto* handle = inst.Argument(1)->Resolve();
+    if (handle->ArgumentCount() != 4u) ctx.Fail(inst, "has a GPU-resolved S# without four words");
+    std::array<std::uint32_t, 8> words{};
+    for (std::uint32_t dword = 0; dword < 4u; ++dword) words[dword] = ctx.Def(handle->Argument(dword));
+    words[4] = ConstantU32(state, BindlessHeaps::SamplerMarker);
+    for (std::uint32_t dword = 5; dword < 8u; ++dword) words[dword] = ConstantU32(state, 0u);
+    const auto word = EmitHashedWord(ctx, words, 0u);
+    const auto mapped = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::KindShift)), ConstantU32(state, BindlessHeaps::SamplerKind));
+    state.hashedSamplerSlot = Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, BindlessHeaps::IndexMask)), ConstantU32(state, 0u));
+    EmitImage(ctx, inst);
+    state.hashedSamplerSlot = 0u;
+}
+
+// A GPU-resolved T# (BindlessHeaps.hpp): the eight words the handle reads are hashed and looked up
+// in the key buffer. A matching bucket's translation word names the heap slot and the mode (numeric
+// class, cube); an unknown or pending T# is requested through the ring once per subgroup and samples
+// zeros meanwhile. The words are one buffer's constant-offset reads, so the slot is uniform.
+void EmitHashedImage(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageResource& image) {
+    auto& state = ctx.state;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto* handle = inst.Argument(0)->Resolve();
+    if (handle->ArgumentCount() != 8u) ctx.Fail(inst, "has a GPU-resolved T# without eight words");
+    std::array<std::uint32_t, 8> words{};
+    for (std::uint32_t dword = 0; dword < 8u; ++dword) words[dword] = ctx.Def(handle->Argument(dword));
+    static std::mutex tracedMutex;
+    static std::set<std::pair<std::uint64_t, bool>> traced;
+    {
+        std::unique_lock tracedLock(tracedMutex);
+        if (traced.insert({state.program.Resources().shaderHash, state.registrationModules}).second) std::fprintf(stderr, "[gpu-images] hashed T# path emitted: shader %llx%s\n", static_cast<unsigned long long>(state.program.Resources().shaderHash), state.registrationModules ? " (registration module)" : "");
+    }
+    // A null T# samples zeros, as a null descriptor does, and is never requested.
+    const auto null = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpIEqual, boolean, words[0], ConstantU32(state, 0u)), Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, words[1], ConstantU32(state, 0xffu)), ConstantU32(state, 0u)));
+    const auto word = EmitHashedWord(ctx, words, null);
     const auto kind = Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::KindShift));
     const auto expectedKind = BindlessHeapKind(image);
     const bool flatKind = expectedKind == BindlessHeaps::ImageBinding2D || expectedKind == BindlessHeaps::ImageBinding2DArray;
@@ -1964,6 +1996,11 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto& memory = ctx.Memory(inst);
     const auto& base = ImageResourceOf(state, memory);
+    // The sampler is resolved first (its slot is in state for LoadSamplerDescriptor), then the image.
+    if (state.hashedSamplerSlot == 0u && ImageOpcodeInfoOf(inst.Opcode()).needsSampler && memory.sampler < state.program.Info().samplers.size() && state.program.Info().samplers[memory.sampler].hashed) {
+        EmitHashedSampler(ctx, inst);
+        return;
+    }
     if (!state.bindlessHeapBranch && base.hashed) {
         EmitHashedImage(ctx, inst, base);
         return;
