@@ -2,28 +2,47 @@
 #include "Optimization/BindlessHeaps.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
 
 namespace {
 
-// The handle's `count` dwords are constant-offset reads of one scalar buffer, one dword apart.
+// Diagnostic: APS5_TRACE_HASH_CANDIDATES=1 prints why a T#/S# handle is not GPU-resolved.
+bool rejected(const IrResourcePlan& program, const char* reason, std::uint32_t detail = 0u) {
+    static const bool trace = std::getenv("APS5_TRACE_HASH_CANDIDATES") != nullptr;
+    if (trace) std::fprintf(stderr, "[hash-reject] shader %llx: %s (%u)\n", static_cast<unsigned long long>(program.shaderHash), reason, detail);
+    return false;
+}
+
+// The handle's `count` dwords are reads of one scalar buffer at one offset (immediate, or one scalar
+// value every read shares: a scalar load's offset is wave-uniform, as the heap path's slot), one
+// dword apart.
 bool ConstantOffsetReads(const IrResourcePlan& program, const IrValue& handle, std::uint32_t count, std::array<IrValue*, 8>* reads, std::uint32_t* offset) {
-    if (handle.ArgumentCount() != count) return false;
+    if (handle.ArgumentCount() != count) return rejected(program, "dword count", handle.ArgumentCount());
     const IrValue* buffer = nullptr;
+    const IrValue* sharedOffset = nullptr;
     std::uint32_t first = 0;
     for (std::uint32_t dword = 0; dword < count; ++dword) {
         IrValue* read = handle.Argument(dword)->Resolve();
-        if (read->Opcode() != IrOpcode::ReadConstBuffer || read->ArgumentCount() != 2u || !IsRawRead(program, *read)) return false;
+        if (read->Opcode() == IrOpcode::LoadAddressU32) return rejected(program, "address load", dword);
+        if (read->Opcode() != IrOpcode::ReadConstBuffer) return rejected(program, IrOpcodeName(read->Opcode()).data(), dword);
+        if (read->ArgumentCount() != 2u || !IsRawRead(program, *read)) return rejected(program, "not a raw read", dword);
         const auto& memory = program.memoryInfo[read->Flags<MemoryFlags>().index];
         const IrValue* dynamic = read->Argument(1)->Resolve();
-        if (memory.dataBits != 32u || memory.dataDwords != 1u || !dynamic->HasImmediate() || dynamic->ImmediateU32() != 0u) return false;
+        if (memory.dataBits != 32u || memory.dataDwords != 1u) return rejected(program, "read width", memory.dataDwords);
         if (dword == 0u) {
             buffer = read->Argument(0)->Resolve();
+            sharedOffset = dynamic;
             first = memory.offset;
-        } else if (read->Argument(0)->Resolve() != buffer || memory.offset != first + dword * 4u) {
-            return false;
+        } else if (dynamic != sharedOffset && !(dynamic->HasImmediate() && sharedOffset->HasImmediate() && dynamic->ImmediateU32() == sharedOffset->ImmediateU32())) {
+            return rejected(program, "different offsets", dword);
+        } else if (read->Argument(0)->Resolve() != buffer) {
+            return rejected(program, "two buffers", dword);
+        } else if (memory.offset != first + dword * 4u) {
+            return rejected(program, "not consecutive", dword);
         }
         if (reads != nullptr) (*reads)[dword] = read;
     }
@@ -55,12 +74,14 @@ bool HashedImageCandidate(const IrResourcePlan& program, const IrValue& handle, 
     if (handle.Uses().empty()) return false;
     for (const IrValue* user : handle.Uses()) {
         const auto info = ImageOpcodeInfoOf(user->Opcode());
-        if (info.resourceClass != ImageResourceClass::Sampled || user->ArgumentCount() == 0u || user->Argument(0)->Resolve() != &handle) return false;
+        if (info.resourceClass != ImageResourceClass::Sampled || user->ArgumentCount() == 0u || user->Argument(0)->Resolve() != &handle) return rejected(program, "user not a sampled access", static_cast<std::uint32_t>(user->Opcode()));
         const auto index = user->Flags<MemoryFlags>().index;
         if (index >= program.memoryInfo.size()) return false;
         const auto& memory = program.memoryInfo[index];
         const bool compare = (memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u;
-        if (memory.imagePacked || memory.imageByElements != 0u || !BindlessHeaps::HeapEligible(program.stage, static_cast<std::uint32_t>(memory.imageDimension), true, compare, memory.imageR128)) return false;
+        if (compare) return rejected(program, "depth compare");
+        if (memory.imagePacked || memory.imageByElements != 0u) return rejected(program, "packed access");
+        if (!BindlessHeaps::HeapEligible(program.stage, static_cast<std::uint32_t>(memory.imageDimension), true, compare, memory.imageR128)) return rejected(program, "heap ineligible dimension", static_cast<std::uint32_t>(memory.imageDimension));
     }
     if (offset != nullptr) *offset = first;
     return true;

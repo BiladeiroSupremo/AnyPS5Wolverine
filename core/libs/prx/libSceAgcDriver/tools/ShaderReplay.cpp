@@ -102,7 +102,7 @@ void PrintReads(const ShaderRecompiler::RecompileRequest& request) {
         } catch (const std::exception&) {
             ok = false;
         }
-        std::printf("  slot %u = 0x%08x%s (used by%s) reads:", slot, result, ok ? "" : " (failed)", users[slot].c_str());
+        std::printf("  slot %u = 0x%08x%s (used by%s) %s reads:", slot, result, ok ? "" : " (failed)", users[slot].c_str(), value != nullptr ? std::string(ShaderRecompiler::IrOpcodeName(value->Resolve()->Opcode())).c_str() : "?");
         printLog();
     }
     g_readLog = nullptr;
