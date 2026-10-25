@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -119,6 +120,8 @@ struct ShadowState {
     // reproduced, draws with some wrong; descriptors gathered right / wrong / with no source.
     std::unordered_map<std::uint64_t, SourcePlan> plans;
     std::uint64_t plansBuilt = 0, planDrawsRight = 0, planDrawsWrong = 0, planRight = 0, planWrong = 0, planUnknown = 0, relocations = 0;
+    std::array<std::unordered_set<std::uint64_t>, 3> distinct;
+    std::unordered_set<std::uint64_t> imageBases;
     int planExamples = 0;
     std::unordered_map<std::uint64_t, NativeDrawRecord> records;
     std::deque<std::uint64_t> order;
@@ -294,7 +297,9 @@ void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const De
     tuple = (tuple ^ decoded.size()) * 0x100000001b3ull;
     for (const auto& descriptor : decoded) tuple = (tuple ^ descriptor.role) * 0x100000001b3ull;
     std::optional<SourcePlan> built;
-    {
+    // The source plans (memory searches) only at APS5_NATIVE_SHADOW=3: they cost frames.
+    static const bool plansOn = [] { const char* text = std::getenv("APS5_NATIVE_SHADOW"); return text != nullptr && std::strtol(text, nullptr, 10) >= 3; }();
+    if (plansOn) {
         auto& shadow = Shadow();
         std::unique_lock lock(shadow.mutex);
         const bool known = shadow.plans.contains(tuple);
@@ -307,9 +312,19 @@ void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const De
     }
     auto& state = Shadow();
     std::lock_guard lock(state.mutex);
+    // B2 sizing: distinct bound descriptors over the run by role (first four words; images and
+    // samplers would need GPU-side translation entries).
+    for (const auto& descriptor : decoded) {
+        if (descriptor.role > 2 || state.distinct[descriptor.role].size() >= (1u << 20)) continue;
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        for (const auto word : descriptor.words) hash = (hash ^ word) * 0x100000001b3ull;
+        state.distinct[descriptor.role].insert(hash);
+        // Images by base address alone (T# word 0 and the low byte of word 1).
+        if (descriptor.role == 1) state.imageBases.insert(static_cast<std::uint64_t>(descriptor.words[0]) | (static_cast<std::uint64_t>(descriptor.words[1] & 0xffu) << 32u));
+    }
     if (built) {
         if (state.plans.try_emplace(tuple, std::move(*built)).second) ++state.plansBuilt;
-    } else if (const auto found = state.plans.find(tuple); found != state.plans.end() && found->second.sources.size() == decoded.size()) {
+    } else if (const auto found = state.plans.find(tuple); plansOn && found != state.plans.end() && found->second.sources.size() == decoded.size()) {
         bool right = true;
         for (std::size_t i = 0; i < decoded.size(); ++i) {
             auto& source = found->second.sources[i];
@@ -492,6 +507,7 @@ void CompareNativeDraw(const NativeDrawRecord* record, std::span<const std::uint
     std::uint64_t repeats = 0;
     for (const auto& [key, draws] : state.nativeKeys) repeats += draws - 1;
     std::fprintf(stderr, "[native-shadow] native keys: %zu distinct over %llu draws (10 s; a cache keyed so would hit %.1f%%), %zu distinct in the run so far\n", state.nativeKeys.size(), static_cast<unsigned long long>(state.keyedDraws), state.keyedDraws != 0 ? 100.0 * static_cast<double>(repeats) / static_cast<double>(state.keyedDraws) : 0.0, state.runKeys.size());
+    std::fprintf(stderr, "[native-shadow] distinct bound descriptors in the run: buffers %zu, images %zu (%zu image base addresses), samplers %zu\n", state.distinct[0].size(), state.distinct[1].size(), state.imageBases.size(), state.distinct[2].size());
     std::fprintf(stderr, "[native-shadow] source plans: %zu (built %llu this window); draws gathered right %llu, not %llu; descriptors right %llu, wrong %llu, without a source %llu; sources located again %llu\n", state.plans.size(), static_cast<unsigned long long>(state.plansBuilt), static_cast<unsigned long long>(state.planDrawsRight), static_cast<unsigned long long>(state.planDrawsWrong), static_cast<unsigned long long>(state.planRight), static_cast<unsigned long long>(state.planWrong), static_cast<unsigned long long>(state.planUnknown), static_cast<unsigned long long>(state.relocations));
     state.plansBuilt = state.planDrawsRight = state.planDrawsWrong = state.planRight = state.planWrong = state.planUnknown = state.relocations = 0;
     std::fprintf(stderr, "[native-shadow] repeated native keys: compiled structure same %llu / other %llu, push constants same %llu / other %llu\n", static_cast<unsigned long long>(state.sameStructure), static_cast<unsigned long long>(state.otherStructure), static_cast<unsigned long long>(state.samePushes), static_cast<unsigned long long>(state.otherPushes));
