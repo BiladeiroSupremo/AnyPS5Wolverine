@@ -6,7 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -331,8 +333,68 @@ void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::v
 
 }
 
+namespace {
+
+// Profiling (APS5_PROFILE_SRT_TAPE): how runtime source evaluations went, on an [srt-tape] line every
+// 10 s: by the tape, refused by the tape and interpreted, interpreted without a tape (no tape, or not
+// the plan's own inputs), with the time each path took per call and the descriptor sources and flat
+// slots evaluated.
+struct TapeProfile {
+    enum Path : std::size_t { Tape, Refused, NoTape, Partial, Count };
+    std::array<std::atomic<std::uint64_t>, Count> calls{};
+    std::array<std::atomic<std::uint64_t>, Count> nanoseconds{};
+    std::atomic<std::uint64_t> sources{0};
+    std::atomic<std::uint64_t> flatSlots{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+TapeProfile& TapeProfiling() {
+    static TapeProfile profile;
+    return profile;
+}
+
+bool TapeProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_SRT_TAPE") != nullptr;
+    return enabled;
+}
+
+void NoteTapePath(TapeProfile::Path path, std::chrono::steady_clock::time_point start, const IrResourcePlan& program) {
+    auto& profile = TapeProfiling();
+    const auto now = std::chrono::steady_clock::now();
+    profile.calls[path].fetch_add(1, std::memory_order_relaxed);
+    profile.nanoseconds[path].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
+    profile.sources.fetch_add(program.materializationSources.size(), std::memory_order_relaxed);
+    profile.flatSlots.fetch_add(program.srtReads.size(), std::memory_order_relaxed);
+    const auto ticks = now.time_since_epoch().count();
+    auto last = profile.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        profile.lastReport.compare_exchange_strong(last, ticks);
+        return;
+    }
+    if (ticks - last < 10'000'000'000ll || !profile.lastReport.compare_exchange_strong(last, ticks)) return;
+    std::string text;
+    constexpr std::array<const char*, TapeProfile::Count> names{"tape", "refused then interpreted", "interpreted (no tape)", "interpreted (partial inputs)"};
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < TapeProfile::Count; ++i) {
+        const auto calls = profile.calls[i].exchange(0);
+        const auto ns = profile.nanoseconds[i].exchange(0);
+        total += calls;
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %llu (%.2f us)", names[i], static_cast<unsigned long long>(calls), calls != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(calls) : 0.0);
+        text += item;
+    }
+    const auto sources = profile.sources.exchange(0);
+    const auto flat = profile.flatSlots.exchange(0);
+    std::fprintf(stderr, "[srt-tape] 10 s:%s; per call %.1f descriptor sources, %.1f flat slots\n", text.c_str(), total != 0 ? static_cast<double>(sources) / static_cast<double>(total) : 0.0, total != 0 ? static_cast<double>(flat) / static_cast<double>(total) : 0.0);
+}
+
+}
+
 bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads) {
+    const bool profiled = TapeProfiled();
+    const auto start = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool planInputs = evaluateFlat && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && cleanFlatSlots.data() == program.cleanFlatSlots.data() && cleanFlatSlots.size() == program.cleanFlatSlots.size();
+    bool refused = false;
     if (planInputs) {
         if (const auto* tape = SrtTape::For(program); tape != nullptr) {
             const auto leavesBefore = runtime.readTrace != nullptr ? runtime.readTrace->leaves.size() : 0;
@@ -343,11 +405,15 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
                 if (poison != nullptr) poison->clear();
                 if (nullRootReads != nullptr) *nullRootReads = 0;
                 if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, poison, nullRootReads, leavesBefore, readsBefore, useBefore ? &*useBefore : nullptr);
+                if (profiled) NoteTapePath(TapeProfile::Tape, start, program);
                 return true;
             }
+            refused = true;
         }
     }
-    return interpretRuntimeSources(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources, poison, nullRootReads);
+    const bool ok = interpretRuntimeSources(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources, poison, nullRootReads);
+    if (profiled) NoteTapePath(refused ? TapeProfile::Refused : planInputs ? TapeProfile::NoTape : TapeProfile::Partial, start, program);
+    return ok;
 }
 
 const std::string& RuntimeSourceFailureReason() {

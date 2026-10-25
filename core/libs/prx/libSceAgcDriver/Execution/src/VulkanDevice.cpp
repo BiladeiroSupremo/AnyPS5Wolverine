@@ -1362,6 +1362,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &driverProperties);
             state->pipelineLinkTimeOptimization = PipelineLinkTimeOptimizationUsable(driver.driverID);
         }
+        std::fprintf(stderr, "[vulkan] graphics pipeline libraries (VK_EXT_graphics_pipeline_library, fast link): %s; background link-time optimization: %s\n", state->graphicsPipelineLibrary ? "on" : "off (missing feature, fast linking, extended dynamic state, dynamic rendering or push constant room)", state->graphicsPipelineLibrary && state->pipelineLinkTimeOptimization ? "on" : "off");
     }
     renderingFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR, nullptr, VK_TRUE};
     libraryFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, &dynamicStateFeatures, VK_TRUE};
