@@ -15,8 +15,12 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace AgcDriver {
 namespace {
@@ -308,7 +312,22 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 }
                 static const bool traceSlow = std::getenv("APS5_TRACE_WORD_SYNC") != nullptr;
                 static std::atomic<int> traced{0};
-                if (traceSlow && nanoseconds >= 1000000u && traced.fetch_add(1, std::memory_order_relaxed) < 2000) std::fprintf(stderr, "[wordsync] 0x%llx waited %.2f ms: before 0x%08x after 0x%08x%s, program 0x%llx\n", static_cast<unsigned long long>(address), nanoseconds / 1e6, before, word, observed ? "" : " (before not read)", static_cast<unsigned long long>(captureProgram));
+                if (traceSlow && nanoseconds >= 1000000u && traced.fetch_add(1, std::memory_order_relaxed) < 2000) {
+                    // The callers (offsets in this module), to tell which walk read the word.
+                    std::string frames;
+#ifdef _WIN32
+                    void* stack[10] = {};
+                    const auto count = RtlCaptureStackBackTrace(1, 10, stack, nullptr);
+                    HMODULE module = nullptr;
+                    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&ShaderMemory::NoteCaptureProgram), &module);
+                    for (unsigned short i = 0; i < count; ++i) {
+                        char text[32];
+                        std::snprintf(text, sizeof(text), " +0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(stack[i]) - reinterpret_cast<std::uintptr_t>(module)));
+                        frames += text;
+                    }
+#endif
+                    std::fprintf(stderr, "[wordsync] 0x%llx waited %.2f ms: before 0x%08x after 0x%08x%s, program 0x%llx, callers%s\n", static_cast<unsigned long long>(address), nanoseconds / 1e6, before, word, observed ? "" : " (before not read)", static_cast<unsigned long long>(captureProgram), frames.c_str());
+                }
             }
             if (observed) report(waitsBefore, before == word);
         }
