@@ -83,6 +83,40 @@ bool HashedImagesEnabled() {
     return requested && Enabled();
 }
 
+std::uint32_t HashedWordBits(const std::uint32_t* words, std::uint32_t srgbDecodeFormats, const char** reason) {
+    const auto fail = [&](const char* why) {
+        if (reason != nullptr) *reason = why;
+        return Unusable;
+    };
+    ImageResource image;
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.srgbDecodeFormats = srgbDecodeFormats;
+    switch (words[3] >> 28u) {
+    case 8u: image.dimension = RdnaImageDimension::Dim1D; break;
+    case 9u: image.dimension = RdnaImageDimension::Dim2D; break;
+    case 10u: image.dimension = RdnaImageDimension::Dim3D; break;
+    case 11u: case 13u: image.dimension = RdnaImageDimension::Dim2DArray; break;
+    default: return fail("image type");
+    }
+    DescriptorValue descriptor;
+    descriptor.dwordCount = 8u;
+    std::copy(words, words + 8u, descriptor.dwords.begin());
+    const auto modes = ResourceMaterializer::RuntimeImageModes(image);
+    std::uint32_t index = 0;
+    try {
+        index = ResourceMaterializer::RuntimeImageMode(image, descriptor, modes);
+    } catch (const std::exception&) {
+        return fail("no runtime mode");
+    }
+    const auto& mode = modes.at(index);
+    if (mode.conversionFormat != IrBufferFormat::Invalid) return fail("format conversion");
+    if (mode.packedFormat != IrBufferFormat::Invalid) return fail("packed format");
+    if (mode.depthBits) return fail("depth bits");
+    if (mode.srgbDecode) return fail("sRGB decode");
+    const std::uint32_t numeric = mode.numericClass == IrTextureNumericClass::Uint ? 1u : mode.numericClass == IrTextureNumericClass::Sint ? 2u : 0u;
+    return numeric << ClassShift | (mode.cube ? CubeBit : 0u);
+}
+
 std::uint32_t RegionBase(std::uint64_t heapBase, std::uint32_t entryOffset, std::uint32_t entries) {
     auto& state = registry();
     std::lock_guard lock(state.mutex);

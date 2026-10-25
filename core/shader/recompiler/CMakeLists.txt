@@ -222,6 +222,10 @@ function(add_shader_recompiler target runtimeTarget)
     endif()
     set(shaderCacheReviewedNames
             BindlessHeaps::Enabled
+            # Driver-side resolution of GPU-resolved T#s: reads the switch and decodes a T# with the
+            # recompiler's own mode choice; neither changes what a recompile produces.
+            BindlessHeaps::HashedImagesEnabled
+            BindlessHeaps::HashedWordBits
             BindlessHeaps::HeapEligible
             BindlessHeaps::RegionBase
             BindlessHeaps::Regions

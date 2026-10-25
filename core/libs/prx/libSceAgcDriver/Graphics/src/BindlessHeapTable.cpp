@@ -219,6 +219,10 @@ VkBuffer BindlessHeapTable::KeyBuffer() const {
     return keys->Handle();
 }
 
+std::span<std::byte> BindlessHeapTable::KeyBytes() {
+    return keys->Bytes();
+}
+
 bool BindlessHeapTable::HashedBucket(const std::array<std::uint32_t, 8>& words, std::uint32_t& bucket, bool& inserted) {
     const auto hash = Heaps::HashWords(words.data());
     constexpr std::array<std::uint32_t, 8> free{};
@@ -385,20 +389,6 @@ bool integerViewFormat(VkFormat format) {
     }
 }
 
-// The numeric class a hashed entry's word carries for its view (BindlessHeaps::ClassShift).
-std::uint32_t viewNumericClass(VkFormat format) {
-    switch (format) {
-    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT:
-    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
-        return 1u;
-    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_SINT:
-    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32A32_SINT:
-        return 2u;
-    default:
-        return 0u;
-    }
-}
-
 bool readHeapWords(std::uint64_t address, std::array<std::uint32_t, 8>& words) {
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(words))) return false;
     GuestMemory::Read(address, std::as_writable_bytes(std::span(words)));
@@ -461,17 +451,24 @@ std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table,
     // image-backed view in place).
     if (existing != nullptr && existing->words == words && existing->texture == texture) return Heaps::Pending;
     if (texture == nullptr || (hashed == nullptr && integerViewFormat(texture->ViewFormat()))) return Heaps::Unusable;
+    // A GPU-resolved T#'s mode is the one the recompiler picks for it (class, cube); modes a hashed
+    // access does not emit leave it unusable.
+    std::uint32_t modeBits = 0u;
+    if (hashed != nullptr) {
+        const char* reason = "";
+        modeBits = Heaps::HashedWordBits(words.data(), context.srgbDecodeFormats, &reason);
+        if (modeBits == Heaps::Unusable) {
+            static std::atomic<int> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[gpu-images] T# %08x %08x %08x %08x unusable: %s\n", words[0], words[1], words[2], words[3], reason);
+            return Heaps::Unusable;
+        }
+    }
     const auto range = texture->SampledViewRange(false);
     std::uint32_t kind = Heaps::KindCount;
-    bool cube = false;
     if (range.type == VK_IMAGE_VIEW_TYPE_2D) kind = Heaps::ImageBinding2D;
     else if (range.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY) kind = Heaps::ImageBinding2DArray;
     else if (range.type == VK_IMAGE_VIEW_TYPE_3D) kind = Heaps::ImageBinding3D;
     else if (range.type == VK_IMAGE_VIEW_TYPE_1D) kind = Heaps::ImageBinding1D;
-    else if (range.type == VK_IMAGE_VIEW_TYPE_CUBE && hashed != nullptr) {
-        kind = Heaps::ImageBinding2DArray;
-        cube = true;
-    }
     // Diagnostic: APS5_TRACE_HEAP_ENTRIES=1 prints every published entry.
     static const bool traceEntries = std::getenv("APS5_TRACE_HEAP_ENTRIES") != nullptr;
     if (kind == Heaps::KindCount) {
@@ -482,7 +479,7 @@ std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table,
     // The slot word says how many guest levels the texture left out (a storage image's view: 0).
     auto word = table.Publish(kind, texture, texture->View(), texture->Layout());
     if (word != Heaps::Unusable) word |= texture->SkippedLevels() << Heaps::LevelShift;
-    if (word != Heaps::Unusable && hashed != nullptr) word |= viewNumericClass(texture->ViewFormat()) << Heaps::ClassShift | (cube ? Heaps::CubeBit : 0u);
+    if (word != Heaps::Unusable && hashed != nullptr) word |= modeBits;
     if (word != Heaps::Unusable) {
         if (existing != nullptr) {
             // The replaced slot (and its texture) is released once the work that may read it ends.
@@ -617,6 +614,16 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
                 continue;
             }
             const auto index = Heaps::HashBase + bucket;
+            // Diagnostic: APS5_TRACE_GPU_IMAGES=1 prints new keys and the first requests of keys
+            // already held, with the key buffer and translation word as the device memory holds them.
+            static const bool trace = std::getenv("APS5_TRACE_GPU_IMAGES") != nullptr;
+            if (trace && !inserted) {
+                static std::atomic<int> traced{0};
+                if (traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+                    const auto* held = reinterpret_cast<const std::uint32_t*>(table->KeyBytes().data()) + static_cast<std::size_t>(bucket) * 8u;
+                    std::fprintf(stderr, "[gpu-images] re-request: bucket %u hash %08x word %08x, requested %08x %08x %08x %08x %08x %08x %08x %08x, key buffer %08x %08x %08x %08x %08x %08x %08x %08x\n", bucket, Heaps::HashWords(words.data()), table->Translation()[index], words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], held[0], held[1], held[2], held[3], held[4], held[5], held[6], held[7]);
+                }
+            }
             if (!table->Claim(index)) continue;
             if (inserted) keyWrites.emplace_back(bucket, words);
             std::uint32_t word = Heaps::Unusable;
@@ -629,6 +636,7 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             }
             slowestEntry = std::max(slowestEntry, std::chrono::steady_clock::now() - entryStart);
             published.emplace_back(index, word);
+            if (trace) std::fprintf(stderr, "[gpu-images] %s key: bucket %u hash %08x -> word %08x, T# %08x %08x %08x %08x %08x %08x %08x %08x\n", inserted ? "new" : "again", bucket, Heaps::HashWords(words.data()), word, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
             (word != Heaps::Unusable ? hashedResolved : hashedUnusable).fetch_add(1, std::memory_order_relaxed);
             if (inserted) hashedKeys.fetch_add(1, std::memory_order_relaxed);
         }

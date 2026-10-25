@@ -34,6 +34,7 @@ public:
     VkDescriptorSet Set() const { return set; }
     VkBuffer TranslationBuffer() const;
     VkBuffer KeyBuffer() const;
+    std::span<std::byte> KeyBytes();
     std::span<std::uint32_t> Translation();
     std::span<std::uint32_t> Feedback();
     // The key buffer bucket of a GPU-resolved T# (BindlessHeaps::HashWords, HashProbes buckets from

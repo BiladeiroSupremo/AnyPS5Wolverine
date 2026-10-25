@@ -80,6 +80,12 @@ inline constexpr std::uint32_t CubeBit = 1u << 22u;
 // Whether shaders take GPU-resolved T#s (APS5_GPU_IMAGES=1 and the heap set exists).
 [[nodiscard]] bool HashedImagesEnabled();
 
+// The class and cube bits (ClassShift, CubeBit) of a GPU-resolved T#'s word: the runtime mode the
+// recompiler picks for the T# (ResourceMaterializer::RuntimeImageMode, as a direct image of its own
+// dimension would) when that mode is one a hashed access emits (float, uint or sint, a cube); else
+// Unusable, with `reason` naming the mode.
+[[nodiscard]] std::uint32_t HashedWordBits(const std::uint32_t* words, std::uint32_t srgbDecodeFormats, const char** reason);
+
 struct Region {
     std::uint64_t heapBase = 0;
     std::uint32_t entryOffset = 0;
