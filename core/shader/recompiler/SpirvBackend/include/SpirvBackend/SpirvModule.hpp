@@ -138,6 +138,9 @@ public:
         appendInstruction(functionInstructions, opcode, operands...);
     }
 
+    // The words of function code emitted so far (both function sections).
+    [[nodiscard]] std::size_t FunctionWords() const { return functionInstructions.size() + helperFunctionInstructions.size(); }
+
 private:
     static constexpr std::size_t DeclarationCacheSize = 512;
     static constexpr std::size_t MaxCachedDeclarationWords = 4;

@@ -22,6 +22,32 @@
 namespace ShaderRecompiler {
 namespace {
 
+// Profiling (APS5_EMIT_STATS=1): SPIR-V function words emitted per IR opcode over the process,
+// printed at exit (with the instruction count), to show which operations the backend expands most.
+struct EmitStats {
+    std::array<std::uint64_t, 1u << 16u> words{};
+    std::array<std::uint64_t, 1u << 16u> count{};
+    ~EmitStats() {
+        std::vector<std::pair<std::uint64_t, std::size_t>> order;
+        std::uint64_t total = 0;
+        for (std::size_t opcode = 0; opcode < words.size(); ++opcode) {
+            if (count[opcode] == 0) continue;
+            order.emplace_back(words[opcode], opcode);
+            total += words[opcode];
+        }
+        std::sort(order.rbegin(), order.rend());
+        std::fprintf(stderr, "[emit-stats] %llu function words\n", static_cast<unsigned long long>(total));
+        for (const auto& [emitted, opcode] : order) std::fprintf(stderr, "[emit-stats] %8llu words %6llu insts %7.1f/inst %s\n", static_cast<unsigned long long>(emitted), static_cast<unsigned long long>(count[opcode]), static_cast<double>(emitted) / static_cast<double>(count[opcode]), std::string(IrOpcodeName(static_cast<IrOpcode>(opcode))).c_str());
+    }
+};
+
+EmitStats* EmitStatistics() {
+    static EmitStats* stats = std::getenv("APS5_EMIT_STATS") != nullptr ? new EmitStats : nullptr;
+    static const bool registered = stats != nullptr && std::atexit([] { delete EmitStatistics(); }) == 0;
+    static_cast<void>(registered);
+    return stats;
+}
+
 void EmitKillIfBoolFalse(SpirvEmitterState& state, std::uint32_t active) {
     const auto killLabel = state.module.AllocateId();
     const auto mergeLabel = state.module.AllocateId();
@@ -1193,7 +1219,13 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
+                auto* stats = EmitStatistics();
+                const auto before = stats != nullptr ? state.module.FunctionWords() : 0u;
                 EmitStructuredInstruction(lane, functionState, *inst);
+                if (stats != nullptr) {
+                    stats->words[static_cast<std::size_t>(inst->Opcode())] += state.module.FunctionWords() - before;
+                    ++stats->count[static_cast<std::size_t>(inst->Opcode())];
+                }
             }
         }
         state.laneHalf = 0;

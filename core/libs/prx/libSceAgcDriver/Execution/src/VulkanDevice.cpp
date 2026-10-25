@@ -1670,6 +1670,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         robustness2.nullDescriptor = nullDescriptor ? VK_TRUE : VK_FALSE;
         robustness2.robustBufferAccess2 = robustBufferAccess2 ? VK_TRUE : VK_FALSE;
         state->robustBufferAccess2 = robustBufferAccess2;
+        std::fprintf(stderr, "[vulkan] robustBufferAccess2 (VK_EXT_robustness2): %s; nullDescriptor: %s\n", robustBufferAccess2 ? "on" : "off", nullDescriptor ? "on" : "off");
         robustness2.pNext = bdaFeatures.pNext;
         bdaFeatures.pNext = &robustness2;
         deviceExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);

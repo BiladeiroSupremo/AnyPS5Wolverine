@@ -119,6 +119,7 @@ bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_robust = false;
 bool g_code = false;
+bool g_specialized = false;
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -220,12 +221,17 @@ bool Replay(const char* path) {
     try {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         if (g_robust) request.request.target.robustBufferAccess2 = true;
+        if (g_specialized) request.request.target.registrationModules = false;
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
         if (g_spirv) {
             std::string name(path);
             name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
             std::ofstream(name, std::ios::binary).write(reinterpret_cast<const char*>(result.spirv.data()), static_cast<std::streamsize>(result.spirv.size() * sizeof(result.spirv[0])));
+            // The specialization the driver would create this capture's pipeline with, as
+            // spirv-opt --set-spec-const-default-value pairs (offline compilers see the defaults).
+            std::ofstream spec(name + ".spec");
+            for (const auto& constant : result.specialization) spec << constant.id << ':' << constant.value << ' ';
         }
         if (g_memory) {
             for (const auto& binding : result.bindings) {
@@ -281,6 +287,12 @@ int main(int argc, char** argv) {
         // --robust: as on a device with robustBufferAccess2 (binding-range checks left to it).
         if (std::string(argv[i]) == "--robust") {
             g_robust = true;
+            continue;
+        }
+        // --specialized: a graphics request saved under VK_EXT_graphics_pipeline_library compiles as
+        // the per-pipeline specialized module instead of the registration module.
+        if (std::string(argv[i]) == "--specialized") {
+            g_specialized = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {

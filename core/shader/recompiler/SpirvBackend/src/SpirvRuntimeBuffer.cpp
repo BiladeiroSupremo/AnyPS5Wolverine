@@ -658,7 +658,10 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     const auto byte = EmitAndConstant(state, address, ~3u);
     const auto offset = Unary(state, spv::OpUConvert, u64, byte);
     const auto inBounds = both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThanEqual, TypeBool(state), Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size)));
-    if (!context.Memory(instruction).gpuDescriptor) return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, byte, 32u); });
+    // Under robustBufferAccess2 the word is read whatever the V#'s bounds and a select keeps or
+    // drops it (readOrZero): a branch around every constant load split the shader's scalar loads
+    // into one memory round trip each (an s_wait_kmcnt per load in the ISA).
+    if (!context.Memory(instruction).gpuDescriptor) return readOrZero(context, instruction, inBounds, [&] { return readBuffer(context, instruction, byte, 32u); });
     return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
 }
 
