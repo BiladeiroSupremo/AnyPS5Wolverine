@@ -244,9 +244,11 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             // Experiment (unsafe, values may be a frame stale): APS5_RAW_GPU_READS=<hex program,...>
             // reads the GPU-written words of those programs' captures raw instead of waiting for the
             // writer, to measure what the wait costs (only for programs whose words are data).
+            // "all": every capture (the ceiling of removing every such wait).
+            static const bool rawAll = [] { const char* text = std::getenv("APS5_RAW_GPU_READS"); return text != nullptr && std::string_view(text) == "all"; }();
             static const std::vector<std::uint64_t> rawPrograms = [] {
                 std::vector<std::uint64_t> list;
-                if (const char* text = std::getenv("APS5_RAW_GPU_READS")) {
+                if (const char* text = std::getenv("APS5_RAW_GPU_READS"); text != nullptr && !rawAll) {
                     for (const char* cursor = text; *cursor != '\0';) {
                         char* end = nullptr;
                         const auto value = std::strtoull(cursor, &end, 16);
@@ -257,7 +259,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 }
                 return list;
             }();
-            if (policy == PendingWrite::Sync && !rawPrograms.empty() && std::find(rawPrograms.begin(), rawPrograms.end(), captureProgram & ~(1ull << 63u)) != rawPrograms.end() && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) policy = PendingWrite::Raw;
+            if (policy == PendingWrite::Sync && (rawAll || (!rawPrograms.empty() && std::find(rawPrograms.begin(), rawPrograms.end(), captureProgram & ~(1ull << 63u)) != rawPrograms.end())) && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) policy = PendingWrite::Raw;
         }
         // A read is evidence only when the hook waited for unfinished GPU work across it.
         const auto hookWaits = [&] { return self.hookWaits != nullptr ? self.hookWaits() : 0; };

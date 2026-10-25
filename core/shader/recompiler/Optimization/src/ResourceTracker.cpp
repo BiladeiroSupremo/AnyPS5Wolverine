@@ -1413,7 +1413,13 @@ private:
         std::uint32_t badDword = 0;
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
-        if (ValidateSource(descriptor, badDword)) {
+        // An address-SRT program (Detail::AddressSrtProgram) binds only V#s held in user data; any
+        // other V# is read by the shader itself.
+        const bool userDataOnly = std::ranges::all_of(std::span(descriptor.dwords).first(4), [](IrValue* dword) {
+            const auto* value = dword->Resolve();
+            return value->Opcode() == IrOpcode::GetUserData || value->HasImmediate();
+        });
+        if ((!Detail::AddressSrtProgram(m_program.Resources()) || userDataOnly) && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");

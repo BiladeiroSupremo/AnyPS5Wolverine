@@ -14,6 +14,10 @@ bool HashedImageCandidate(const IrResourcePlan& program, const IrValue& handle, 
 // The same for an S# (four dwords) used only by sampling ops without depth comparison or LOD
 // adjustment: the GPU resolves it to a slot of the heap set's sampler array.
 bool HashedSamplerCandidate(const IrResourcePlan& program, const IrValue& handle, std::array<IrValue*, 8>* reads = nullptr, std::uint32_t* offset = nullptr);
+// APS5_ADDRESS_SRT=<hex code address,...>: compute programs whose SRT is left entirely to the shader
+// (no flat slots, buffers whose V# is not user data go through the address-based path), for
+// programs that read words an earlier GPU pass writes, so the CPU never waits for that pass.
+bool AddressSrtProgram(const IrResourcePlan& program);
 bool IsRawRead(const IrResourcePlan& program, const IrValue& inst);
 bool IsRawRead(const IrResourcePlan& program, IrOpcode op, std::uint32_t memoryIndex);
 bool LoadedFromMemory(const IrValue& handle);

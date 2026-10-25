@@ -68,6 +68,23 @@ bool HashedSamplerCandidate(const IrResourcePlan& program, const IrValue& handle
     return true;
 }
 
+bool AddressSrtProgram(const IrResourcePlan& program) {
+    static const std::vector<std::uint64_t> list = [] {
+        std::vector<std::uint64_t> programs;
+        if (const char* text = std::getenv("APS5_ADDRESS_SRT")) {
+            for (const char* cursor = text; *cursor != '\0';) {
+                char* end = nullptr;
+                const auto value = std::strtoull(cursor, &end, 16);
+                if (end == cursor) break;
+                programs.push_back(value);
+                cursor = *end == ',' ? end + 1 : end;
+            }
+        }
+        return programs;
+    }();
+    return program.stage == IrShaderStage::Compute && !list.empty() && std::find(list.begin(), list.end(), program.shaderHash) != list.end();
+}
+
 bool HashedImageCandidate(const IrResourcePlan& program, const IrValue& handle, std::array<IrValue*, 8>* reads, std::uint32_t* offset) {
     std::uint32_t first = 0;
     if (!BindlessHeaps::HashedImagesEnabled() || handle.Opcode() != IrOpcode::GetImageResource || !ConstantOffsetReads(program, handle, 8u, reads, &first)) return false;

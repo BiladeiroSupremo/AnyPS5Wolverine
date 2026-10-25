@@ -6,13 +6,16 @@
 #include "IntermediateRepresentation/IrBuilder.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
+#include <vector>
 
 namespace ShaderRecompiler::Detail {
 
 void PlanBuilder::Run() {
     _program.Resources().srtReads.clear();
     _program.Metadata().dynamicReads.clear();
+    if (AddressSrtProgram(_program.Resources())) return;
     for (auto& block : _program.Blocks()) {
         for (IrValue* inst : block->Instructions()) {
             const auto op = inst->Opcode();
