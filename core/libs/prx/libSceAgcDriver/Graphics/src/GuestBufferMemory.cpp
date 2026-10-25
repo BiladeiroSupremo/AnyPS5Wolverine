@@ -3746,6 +3746,29 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
+    // APS5_PROFILE_DRAW: the copied regions by 256 MiB guest granule, writability and size class,
+    // per 10 s on a [staging] line (what the native layer must keep resident instead).
+    if (profile) {
+        static std::mutex stagingMutex;
+        static std::map<std::tuple<std::uint64_t, bool, int>, std::pair<std::uint64_t, std::uint64_t>> histogram;
+        static auto lastReport = std::chrono::steady_clock::now();
+        std::lock_guard lock(stagingMutex);
+        for (const auto* region : copies) {
+            const auto bytes = region->end - region->begin;
+            const int sizeClass = bytes <= 256u ? 0 : bytes <= 4096u ? 1 : bytes <= 65536u ? 2 : bytes <= 1048576u ? 3 : 4;
+            auto& bucket = histogram[{region->begin >> 28u, region->writable, sizeClass}];
+            ++bucket.first;
+            bucket.second += bytes;
+        }
+        if (std::chrono::steady_clock::now() - lastReport >= std::chrono::seconds(10)) {
+            lastReport = std::chrono::steady_clock::now();
+            static constexpr const char* sizeNames[] = {"<=256B", "<=4K", "<=64K", "<=1M", ">1M"};
+            AgcDriver::ProfilePrint_nid_no_patch("[staging] (10 s) GPU-copied regions by granule/access/size:");
+            for (const auto& [key, counts] : histogram) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx0000000 %s %s: %llu/%.1fMiB;", static_cast<unsigned long long>(std::get<0>(key)), std::get<1>(key) ? "rw" : "ro", sizeNames[std::get<2>(key)], static_cast<unsigned long long>(counts.first), counts.second / 1048576.0);
+            AgcDriver::ProfilePrint_nid_no_patch("\n");
+            histogram.clear();
+        }
+    }
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
