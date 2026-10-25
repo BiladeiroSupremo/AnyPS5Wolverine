@@ -5,6 +5,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -44,6 +47,23 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         stageCapture.userWordsAsBase = capture->userDataUse.asBase;
         stageCapture.userWordsAsValue = capture->userDataUse.asValue;
         stageCapture.captured = true;
+        // APS5_PROFILE_DRAW: native coverage, the stages whose resources need no CPU read of guest
+        // memory (user data alone; everything else resolved on the GPU), on a [walk-free] line.
+        if (profile) {
+            static std::atomic<std::uint64_t> stages{0}, walkFree{0}, words{0};
+            static std::atomic<long long> lastReport{0};
+            ++stages;
+            words += capture->userDataUse.reads.size();
+            if (capture->userDataUse.reads.empty()) ++walkFree;
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto last = lastReport.load(std::memory_order_relaxed);
+            if (last == 0) lastReport.compare_exchange_strong(last, now);
+            else if (now - last >= 10 && lastReport.compare_exchange_strong(last, now)) {
+                const auto total = stages.exchange(0);
+                const auto free = walkFree.exchange(0);
+                std::fprintf(stderr, "[walk-free] (10 s): %llu of %llu captured draw stages read no guest memory (%.1f%%), %.1f guest words read per stage\n", static_cast<unsigned long long>(free), static_cast<unsigned long long>(total), total != 0 ? 100.0 * static_cast<double>(free) / static_cast<double>(total) : 0.0, total != 0 ? static_cast<double>(words.exchange(0)) / static_cast<double>(total) : 0.0);
+            }
+        }
     }
     recompiled[i] = true;
     memory = shaderMemory.Regions();
