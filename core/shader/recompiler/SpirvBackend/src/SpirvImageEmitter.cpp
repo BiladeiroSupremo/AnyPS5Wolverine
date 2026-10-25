@@ -1566,6 +1566,10 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
 // a direct image.
 TableSelection TableSlot(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, const ImageResource& image) {
     auto& state = ctx.state;
+    // A GPU-resolved T# (EmitHashedImage): the heap slot, zeros unmapped.
+    if (image.hashed) {
+        return state.bindlessHeapSlot != 0u ? TableSelection{0u, state.bindlessHeapMapped} : TableSelection{};
+    }
     if (image.indirectRoot != mem.resource) {
         return {};
     }
@@ -1861,10 +1865,109 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     }
 }
 
+// A GPU-resolved T# (BindlessHeaps.hpp): the eight words the handle reads are hashed and looked up
+// in the key buffer. A matching bucket's translation word names the heap slot and the mode (numeric
+// class, cube); an unknown or pending T# is requested through the ring once per subgroup and samples
+// zeros meanwhile. The words are one buffer's constant-offset reads, so the slot is uniform.
+void EmitHashedImage(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageResource& image) {
+    auto& state = ctx.state;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto* handle = inst.Argument(0)->Resolve();
+    if (handle->ArgumentCount() != 8u) ctx.Fail(inst, "has a GPU-resolved T# without eight words");
+    std::array<std::uint32_t, 8> words{};
+    for (std::uint32_t dword = 0; dword < 8u; ++dword) words[dword] = ctx.Def(handle->Argument(dword));
+    static std::mutex tracedMutex;
+    static std::set<std::pair<std::uint64_t, bool>> traced;
+    {
+        std::unique_lock tracedLock(tracedMutex);
+        if (traced.insert({state.program.Resources().shaderHash, state.registrationModules}).second) std::fprintf(stderr, "[gpu-images] hashed T# path emitted: shader %llx%s\n", static_cast<unsigned long long>(state.program.Resources().shaderHash), state.registrationModules ? " (registration module)" : "");
+    }
+    const auto loadWord = [&](std::uint32_t variable, std::uint32_t index) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, variable, ConstantU32(state, 0), index);
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, pointer);
+        return value;
+    };
+    // BindlessHeaps::HashWords.
+    auto hash = ConstantU32(state, 0x9e3779b9u);
+    for (const auto word : words) hash = Binary(state, spv::OpIMul, u32, Binary(state, spv::OpBitwiseXor, u32, hash, word), ConstantU32(state, 0x01000193u));
+    hash = Binary(state, spv::OpBitwiseXor, u32, hash, Binary(state, spv::OpShiftRightLogical, u32, hash, ConstantU32(state, 16u)));
+    const auto keys = BindlessHeapKeyBuffer(state);
+    auto found = ConstantBool(state, false);
+    auto foundBucket = ConstantU32(state, 0u);
+    for (std::uint32_t probe = 0; probe < BindlessHeaps::HashProbes; ++probe) {
+        const auto bucket = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, hash, ConstantU32(state, probe)), ConstantU32(state, BindlessHeaps::HashEntries - 1u));
+        const auto first = Binary(state, spv::OpShiftLeftLogical, u32, bucket, ConstantU32(state, 3u));
+        auto match = ConstantBool(state, true);
+        for (std::uint32_t dword = 0; dword < 8u; ++dword) {
+            const auto key = loadWord(keys, dword == 0u ? first : Binary(state, spv::OpIAdd, u32, first, ConstantU32(state, dword)));
+            match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, key, words[dword]));
+        }
+        foundBucket = Select(state, u32, Binary(state, spv::OpLogicalAnd, boolean, match, Unary(state, spv::OpLogicalNot, boolean, found)), bucket, foundBucket);
+        found = Binary(state, spv::OpLogicalOr, boolean, found, match);
+    }
+    const auto translated = loadWord(BindlessHeapBuffer(state, false), Binary(state, spv::OpIAdd, u32, ConstantU32(state, BindlessHeaps::HashBase), foundBucket));
+    // A null T# samples zeros, as a null descriptor does, and is never requested.
+    const auto null = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpIEqual, boolean, words[0], ConstantU32(state, 0u)), Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, words[1], ConstantU32(state, 0xffu)), ConstantU32(state, 0u)));
+    const auto word = Select(state, u32, null, ConstantU32(state, BindlessHeaps::Unusable), Select(state, u32, found, translated, ConstantU32(state, BindlessHeaps::Pending)));
+    EmitIfCondition(state, Binary(state, spv::OpIEqual, boolean, word, ConstantU32(state, BindlessHeaps::Pending)), [&]() {
+        state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+        const auto elected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformElect, boolean, elected, ConstantU32(state, spv::ScopeSubgroup));
+        EmitIfCondition(state, elected, [&]() {
+            const auto feedback = BindlessHeapBuffer(state, true);
+            const auto counter = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), counter, feedback, ConstantU32(state, 0), ConstantU32(state, BindlessHeaps::RingBase));
+            const auto request = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicIAdd, u32, request, counter, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1u));
+            EmitIfCondition(state, Binary(state, spv::OpULessThan, boolean, request, ConstantU32(state, BindlessHeaps::RingCapacity)), [&]() {
+                const auto entry = Binary(state, spv::OpIAdd, u32, ConstantU32(state, BindlessHeaps::RingBase + 1u), Binary(state, spv::OpIMul, u32, request, ConstantU32(state, BindlessHeaps::RingStride)));
+                for (std::uint32_t dword = 0; dword <= 8u; ++dword) {
+                    const auto pointer = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, feedback, ConstantU32(state, 0), Binary(state, spv::OpIAdd, u32, entry, ConstantU32(state, dword)));
+                    state.module.AddFunction(spv::OpStore, pointer, dword < 8u ? words[dword] : ConstantU32(state, 1u));
+                }
+            });
+        });
+    });
+    const auto kind = Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::KindShift));
+    const auto expectedKind = BindlessHeapKind(image);
+    const bool flatKind = expectedKind == BindlessHeaps::ImageBinding2D || expectedKind == BindlessHeaps::ImageBinding2DArray;
+    auto mapped = flatKind ? Binary(state, spv::OpULessThan, boolean, kind, ConstantU32(state, 2u)) : Binary(state, spv::OpIEqual, boolean, kind, ConstantU32(state, expectedKind));
+    const auto numeric = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::ClassShift)), ConstantU32(state, BindlessHeaps::ClassMask));
+    const auto cube = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, BindlessHeaps::CubeBit)), ConstantU32(state, 0u));
+    // The mode order of ResourceMaterializer::RuntimeImageModes for a hashed image: float, uint,
+    // sint, then the float cube of a 2D array access. A cube view another access meets is unmapped.
+    const bool cubeMode = image.dimension == RdnaImageDimension::Dim2DArray;
+    auto selector = numeric;
+    if (cubeMode) selector = Select(state, u32, cube, ConstantU32(state, 3u), numeric);
+    else mapped = Binary(state, spv::OpLogicalAnd, boolean, mapped, Unary(state, spv::OpLogicalNot, boolean, cube));
+    mapped = Binary(state, spv::OpLogicalAnd, boolean, mapped, Binary(state, spv::OpULessThan, boolean, numeric, ConstantU32(state, 3u)));
+    state.hashedImageSelector = Select(state, u32, mapped, selector, ConstantU32(state, 0u));
+    state.bindlessHeapSlot = Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, BindlessHeaps::IndexMask)), ConstantU32(state, 0u));
+    state.bindlessHeapMapped = mapped;
+    state.bindlessHeapLevels = Select(state, u32, mapped, Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, BindlessHeaps::LevelShift)), ConstantU32(state, BindlessHeaps::LevelMask)), ConstantU32(state, 0u));
+    state.bindlessHeapUniformSlot = true;
+    state.bindlessHeapBranch = true;
+    EmitImage(ctx, inst);
+    state.bindlessHeapBranch = false;
+    state.bindlessHeapUniformSlot = false;
+    state.bindlessHeapSlot = 0u;
+    state.bindlessHeapMapped = 0u;
+    state.bindlessHeapLevels = 0u;
+    state.hashedImageSelector = 0u;
+}
+
 void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto& memory = ctx.Memory(inst);
     const auto& base = ImageResourceOf(state, memory);
+    if (!state.bindlessHeapBranch && base.hashed) {
+        EmitHashedImage(ctx, inst, base);
+        return;
+    }
     if (!state.bindlessHeapBranch && HeapBranched(state, memory, base)) {
         EmitHeapBranchedImage(ctx, inst, base);
         return;
@@ -1900,7 +2003,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         state.runtimeImageMetadata = 0u;
         return;
     }
-    const auto selector = base.indirectRoot == ImageResource::NoIndirectImage && !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u) : RuntimeImageMode(state, memory.resource);
+    const auto selector = state.hashedImageSelector != 0u ? state.hashedImageSelector : base.indirectRoot == ImageResource::NoIndirectImage && !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u) : RuntimeImageMode(state, memory.resource);
     const bool returnsValue = inst.Opcode() != IrOpcode::ImageWrite;
     const auto resultId = returnsValue ? ctx.Result(inst) : 0u;
     ctx.definitions.erase(&inst);

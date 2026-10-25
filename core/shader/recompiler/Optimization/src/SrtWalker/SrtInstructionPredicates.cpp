@@ -1,9 +1,42 @@
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
+#include "Optimization/BindlessHeaps.hpp"
 
 #include <algorithm>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
+
+bool HashedImageCandidate(const IrResourcePlan& program, const IrValue& handle, std::array<IrValue*, 8>* reads, std::uint32_t* offset) {
+    if (!BindlessHeaps::HashedImagesEnabled() || handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u) return false;
+    const IrValue* buffer = nullptr;
+    std::uint32_t first = 0;
+    for (std::uint32_t dword = 0; dword < 8u; ++dword) {
+        IrValue* read = handle.Argument(dword)->Resolve();
+        if (read->Opcode() != IrOpcode::ReadConstBuffer || read->ArgumentCount() != 2u || !IsRawRead(program, *read)) return false;
+        const auto& memory = program.memoryInfo[read->Flags<MemoryFlags>().index];
+        const IrValue* dynamic = read->Argument(1)->Resolve();
+        if (memory.dataBits != 32u || memory.dataDwords != 1u || !dynamic->HasImmediate() || dynamic->ImmediateU32() != 0u) return false;
+        if (dword == 0u) {
+            buffer = read->Argument(0)->Resolve();
+            first = memory.offset;
+        } else if (read->Argument(0)->Resolve() != buffer || memory.offset != first + dword * 4u) {
+            return false;
+        }
+        if (reads != nullptr) (*reads)[dword] = read;
+    }
+    if (handle.Uses().empty()) return false;
+    for (const IrValue* user : handle.Uses()) {
+        const auto info = ImageOpcodeInfoOf(user->Opcode());
+        if (info.resourceClass != ImageResourceClass::Sampled || user->ArgumentCount() == 0u || user->Argument(0)->Resolve() != &handle) return false;
+        const auto index = user->Flags<MemoryFlags>().index;
+        if (index >= program.memoryInfo.size()) return false;
+        const auto& memory = program.memoryInfo[index];
+        const bool compare = (memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u;
+        if (memory.imagePacked || memory.imageByElements != 0u || !BindlessHeaps::HeapEligible(program.stage, static_cast<std::uint32_t>(memory.imageDimension), true, compare, memory.imageR128)) return false;
+    }
+    if (offset != nullptr) *offset = first;
+    return true;
+}
 
 bool IsRawRead(const IrResourcePlan& program, const IrValue& inst) {
     return IsRawRead(program, inst.Opcode(), inst.Flags<MemoryFlags>().index);

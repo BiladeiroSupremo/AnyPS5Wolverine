@@ -19,6 +19,8 @@ std::uint32_t ImageViewSizeType(SpirvEmitterState& state, RdnaImageDimension dim
 std::uint32_t LoadSampledImageDescriptor(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t slotId);
 // The bindless heap translation (`feedback` false) or feedback buffer variable, defined on first use.
 std::uint32_t BindlessHeapBuffer(SpirvEmitterState& state, bool feedback);
+// The key buffer of GPU-resolved T#s (read-only), defined on first use.
+std::uint32_t BindlessHeapKeyBuffer(SpirvEmitterState& state);
 // The heap image kind (BindlessHeaps::ImageBinding*) of a table root's dimension.
 std::uint32_t BindlessHeapKind(const ImageResource& image);
 std::uint32_t LoadSamplerDescriptor(SpirvEmitterState& state, std::uint32_t sampler);

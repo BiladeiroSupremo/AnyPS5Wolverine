@@ -33,8 +33,12 @@ public:
     VkDescriptorSetLayout EmptyLayout() const { return emptyLayout; }
     VkDescriptorSet Set() const { return set; }
     VkBuffer TranslationBuffer() const;
+    VkBuffer KeyBuffer() const;
     std::span<std::uint32_t> Translation();
     std::span<std::uint32_t> Feedback();
+    // The key buffer bucket of a GPU-resolved T# (BindlessHeaps::HashWords, HashProbes buckets from
+    // its hash), taken on first use (`inserted`); false when every probed bucket holds another T#.
+    bool HashedBucket(const std::array<std::uint32_t, 8>& words, std::uint32_t& bucket, bool& inserted);
     // Puts the texture's view in the next free slot of `kind` (a BindlessHeaps::ImageBinding*) and
     // keeps the texture alive; the translation word for it, or Unusable when the kind is full.
     std::uint32_t Publish(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout imageLayout);
@@ -85,6 +89,9 @@ private:
     VkDescriptorSet set = VK_NULL_HANDLE;
     std::unique_ptr<Buffer> translation;
     std::unique_ptr<Buffer> feedback;
+    std::unique_ptr<Buffer> keys;
+    // The T# each key buffer bucket holds (all zero: free), as the driver wrote them.
+    std::vector<std::array<std::uint32_t, 8>> bucketWords;
     std::array<std::uint32_t, ShaderRecompiler::BindlessHeaps::KindCount> nextSlot{};
     struct Placeholder {
         VkImage image = VK_NULL_HANDLE;

@@ -528,6 +528,12 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
             resolveTableImage(plan, i, *source.indirectImage, runtime, walker, snapshot.images[i], tables[i]);
             continue;
         }
+        // The GPU resolves the T#: the snapshot holds a null descriptor (its modes and binding are
+        // not taken from it).
+        if (source.hashedImage) {
+            snapshot.images[i].dwordCount = 8u;
+            continue;
+        }
         if (cursor >= values.size()) {
             throw std::runtime_error("materialization sources are missing image descriptors");
         }
@@ -710,6 +716,28 @@ void materializeSrtGuards(const IrResourcePlan& plan, ResourceSnapshot& snapshot
 std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageResource& image) {
     std::vector<ImageResource> modes;
     const bool storage = image.resourceClass == ImageResourceClass::Storage;
+    // A GPU-resolved T# takes the mode its slot word names (HashedModeIndex): float, uint, sint at
+    // the image's own dimension, and a float cube for a 2D array access.
+    if (image.hashed) {
+        for (const auto numeric : {IrTextureNumericClass::Float, IrTextureNumericClass::Uint, IrTextureNumericClass::Sint}) {
+            auto mode = image;
+            mode.numericClass = numeric;
+            mode.conversionFormat = IrBufferFormat::Invalid;
+            mode.packedFormat = IrBufferFormat::Invalid;
+            mode.depthBits = false;
+            mode.depthUnorm16 = false;
+            mode.cube = false;
+            mode.mipCount = 1u;
+            mode.shaderSwizzle = ShaderImageIdentitySwizzle;
+            modes.push_back(mode);
+        }
+        if (image.dimension == RdnaImageDimension::Dim2DArray) {
+            auto cube = modes.front();
+            cube.cube = true;
+            modes.push_back(cube);
+        }
+        return modes;
+    }
     const auto append = [&](IrTextureNumericClass numeric, IrBufferFormat conversion, IrBufferFormat packed, bool depth, bool unorm16) {
         auto mode = image;
         mode.numericClass = numeric;
@@ -1188,7 +1216,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
         }
         if (plan.descriptorSources[image.source].indirectImage.has_value()) {
             plan.requiresSpecializationMemory = true;
-        } else {
+        } else if (!plan.descriptorSources[image.source].hashedImage) {
             addSource(image.source);
         }
     }

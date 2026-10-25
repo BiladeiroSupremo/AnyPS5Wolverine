@@ -271,6 +271,16 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     }
     std::vector<std::uint32_t> imageModes(info.images.size());
     for (std::size_t index = 0; index < info.images.size(); ++index) imageModes[index] = ResourceMaterializer::RuntimeImageMode(info.images[index], snapshot.images.at(index), info.runtimeImageModes.at(index));
+    // Diagnostic: APS5_TRACE_IMAGE_MODES=1 prints the mode each direct sampled image takes (how many
+    // a GPU-resolved T# limited to the plain float mode would serve).
+    static const bool traceModes = std::getenv("APS5_TRACE_IMAGE_MODES") != nullptr;
+    for (std::size_t index = 0; traceModes && index < info.images.size(); ++index) {
+        const auto& image = info.images[index];
+        const auto& descriptor = snapshot.images.at(index);
+        if (image.indirectRoot != ImageResource::NoIndirectImage || image.hashed || image.resourceClass != ImageResourceClass::Sampled || (descriptor.dwords[0] == 0u && (descriptor.dwords[1] & 0xffu) == 0u)) continue;
+        const auto& mode = info.runtimeImageModes.at(index).at(imageModes[index]);
+        std::fprintf(stderr, "[image-mode] stage %d image %zu dim %d compare %d r128 %d -> class %d dim %d conversion %d packed %d cube %d depthBits %d srgb %d constant %d emulated %d swizzle %03o\n", static_cast<int>(stage), index, static_cast<int>(image.dimension), image.depthCompare ? 1 : 0, image.r128 ? 1 : 0, static_cast<int>(mode.numericClass), static_cast<int>(mode.dimension), static_cast<int>(mode.conversionFormat), static_cast<int>(mode.packedFormat), mode.cube ? 1 : 0, mode.depthBits ? 1 : 0, mode.srgbDecode ? 1 : 0, mode.constantSwizzle ? 1 : 0, (mode.emulatedCompare & EmulatedCompare::Enabled) != 0u ? 1 : 0, (descriptor.dwords[3] & 07777u));
+    }
     for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
         if (descriptor.dwordCount != 4u) fail("buffer specialization requires four descriptor words");
@@ -320,7 +330,9 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     };
     for (const auto& pair : info.sampledPairs) {
         const auto& image = info.images.at(pair.image);
-        if (image.indirectRoot == ImageResource::NoIndirectImage) pairSampler(pair.sampler, info.runtimeImageModes.at(pair.image).at(imageModes[pair.image]));
+        // A GPU-resolved T# may take any of its modes at an access.
+        if (image.hashed) for (const auto& mode : info.runtimeImageModes.at(pair.image)) pairSampler(pair.sampler, mode);
+        else if (image.indirectRoot == ImageResource::NoIndirectImage) pairSampler(pair.sampler, info.runtimeImageModes.at(pair.image).at(imageModes[pair.image]));
         else {
             const auto& root = info.images.at(image.indirectRoot);
             for (const auto slot : root.indirectResources) pairSampler(pair.sampler, info.runtimeImageModes.at(slot).at(imageModes[slot]));

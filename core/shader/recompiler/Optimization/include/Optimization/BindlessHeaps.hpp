@@ -49,6 +49,37 @@ inline constexpr std::uint32_t Unusable = 0xfffffffeu;
 // First word of a table root's mapping block when its table went through the heap.
 inline constexpr std::uint32_t HeapMarker = 0xffffffffu;
 
+// GPU-resolved T#s (APS5_GPU_IMAGES=1): a sampled image whose eight dwords are constant-offset
+// reads of one uniform buffer is not evaluated on the CPU at each draw. The shader loads the words,
+// hashes them (HashWords) and probes HashProbes buckets of the key buffer (binding KeyBinding,
+// eight words per bucket, written only by the driver). A matching bucket's word sits in the
+// translation buffer at HashBase + bucket. No match, or a Pending word, appends the words to the
+// request ring in the feedback buffer (feedback[RingBase] counts, then RingStride words per request:
+// the T#, then a nonzero completion word); the driver resolves it like a heap entry and stores the
+// key and the word. The ring reuses the feedback words of the hash range, which regions never take.
+inline constexpr std::uint32_t KeyBinding = 6u;
+inline constexpr std::uint32_t HashEntries = 1u << 16u;
+inline constexpr std::uint32_t HashProbes = 4u;
+inline constexpr std::uint32_t HashBase = TranslationEntries - 1u - HashEntries;
+inline constexpr std::uint32_t RingBase = HashBase;
+inline constexpr std::uint32_t RingStride = 9u;
+inline constexpr std::uint32_t RingCapacity = (HashEntries - 1u) / RingStride;
+// Bits 20-22 of a hashed entry's word: the view's numeric class (0 float, 1 uint, 2 sint) and
+// whether it is a cube view (stored in the 2D array binding). Table entries never set them.
+inline constexpr std::uint32_t ClassShift = 20u;
+inline constexpr std::uint32_t ClassMask = 0x3u;
+inline constexpr std::uint32_t CubeBit = 1u << 22u;
+
+// The bucket hash of a T#; the SPIR-V emits the same arithmetic.
+[[nodiscard]] constexpr std::uint32_t HashWords(const std::uint32_t* words) {
+    std::uint32_t hash = 0x9e3779b9u;
+    for (std::uint32_t i = 0; i < 8u; ++i) hash = (hash ^ words[i]) * 0x01000193u;
+    return hash ^ (hash >> 16u);
+}
+
+// Whether shaders take GPU-resolved T#s (APS5_GPU_IMAGES=1 and the heap set exists).
+[[nodiscard]] bool HashedImagesEnabled();
+
 struct Region {
     std::uint64_t heapBase = 0;
     std::uint32_t entryOffset = 0;

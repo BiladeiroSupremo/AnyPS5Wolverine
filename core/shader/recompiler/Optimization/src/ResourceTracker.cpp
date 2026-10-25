@@ -276,7 +276,7 @@ private:
     std::uint32_t InternSource(const DescriptorSource& descriptor) {
         for (std::uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
             const auto& current = m_sources[candidate];
-            if (current.dwordCount != descriptor.dwordCount || current.indirectImage != descriptor.indirectImage) {
+            if (current.dwordCount != descriptor.dwordCount || current.indirectImage != descriptor.indirectImage || current.hashedImage != descriptor.hashedImage || current.hashedOffset != descriptor.hashedOffset) {
                 continue;
             }
             bool same = true;
@@ -452,6 +452,29 @@ private:
             return false;
         }
         source = InternSource(descriptor);
+        return true;
+    }
+
+    // A T# the GPU resolves (Detail::HashedImageCandidate): its source is the V# of the buffer the
+    // words are read from, so only that V# is evaluated per draw (and bound for the reads).
+    bool MakeHashedImageSource(const IrValue& handle, std::uint32_t& source) {
+        std::array<IrValue*, 8> reads{};
+        std::uint32_t offset = 0;
+        if (!Detail::HashedImageCandidate(m_program.Resources(), handle, &reads, &offset)) {
+            return false;
+        }
+        DescriptorSource buffer;
+        std::uint32_t bufferSource = 0;
+        if (!MakeRuntimeBufferSource(*reads[0]->Argument(0)->Resolve(), bufferSource, buffer)) {
+            return false;
+        }
+        DescriptorSource image;
+        image.dwordCount = 8u;
+        std::copy(buffer.dwords.begin(), buffer.dwords.begin() + 4u, image.dwords.begin());
+        std::copy(buffer.dwords.begin(), buffer.dwords.begin() + 4u, image.dwords.begin() + 4u);
+        image.hashedImage = true;
+        image.hashedOffset = offset;
+        source = InternSource(image);
         return true;
     }
 
@@ -1444,6 +1467,7 @@ private:
         }
         ImageResource image;
         image.source = source;
+        image.hashed = source < m_sources.size() && m_sources[source].hashedImage;
         image.firstUsePc = pc;
         image.resourceClass = resourceClass;
         image.dimension = memory.imageDimension;
@@ -1614,7 +1638,7 @@ private:
         const IndirectImagePlan* indirect = FindIndirectImage(*handle);
         if (indirect != nullptr) {
             source = indirect->source;
-        } else {
+        } else if (!MakeHashedImageSource(*handle, source)) {
             GetHandle(inst.Argument(0), IrOpcode::GetImageResource, 8, handle, source);
         }
         resource = AddImage(source, memory, op, flags.pc);
@@ -1654,7 +1678,7 @@ private:
             }
             for (std::uint32_t image = 0; image < m_info.images.size(); image++) {
                 const DescriptorSource* imageSource = Source(m_info.images[image].source);
-                if (imageSource == nullptr || imageSource->dwordCount != 8 || imageSource->indirectImage.has_value()) {
+                if (imageSource == nullptr || imageSource->dwordCount != 8 || imageSource->indirectImage.has_value() || imageSource->hashedImage) {
                     continue;
                 }
                 bool alias = true;

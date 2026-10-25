@@ -39,6 +39,10 @@ struct DescriptorSource {
     std::array<IrValue*, 8> dwords {};
     std::uint32_t dwordCount = 0;
     std::optional<IndirectImage> indirectImage;
+    // A T# the GPU resolves (BindlessHeaps.hpp): its words are read at run time from the buffer
+    // whose V# the first four dwords hold, at byte `hashedOffset`; the CPU never evaluates it.
+    bool hashedImage = false;
+    std::uint32_t hashedOffset = 0;
 
     bool operator==(const DescriptorSource& other) const = default;
 };

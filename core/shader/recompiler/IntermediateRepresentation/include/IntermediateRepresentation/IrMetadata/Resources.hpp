@@ -97,6 +97,9 @@ struct ImageResource {
     std::uint32_t indirectMappingOffset = 0;
     std::uint32_t indirectSearchIterations = 0;
     std::vector<std::uint32_t> indirectResources;
+    // Sampled through the heap set from a GPU-resolved T# (DescriptorSource::hashedImage): no
+    // binding of its own, its modes chosen per access from the slot word.
+    bool hashed = false;
 
     bool operator==(const ImageResource& other) const = default;
 };

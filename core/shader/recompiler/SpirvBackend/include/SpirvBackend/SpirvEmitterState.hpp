@@ -169,6 +169,10 @@ struct SpirvEmitterState {
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> bindlessHeapImageVariables;
     std::uint32_t bindlessHeapTranslationVariable = 0;
     std::uint32_t bindlessHeapFeedbackVariable = 0;
+    // The key buffer of GPU-resolved T#s (BindlessHeaps::KeyBinding).
+    std::uint32_t bindlessHeapKeyVariable = 0;
+    // Inside a GPU-resolved T#'s access: the u32 id of the mode index its slot word selects.
+    std::uint32_t hashedImageSelector = 0;
     // Inside the heap branch of a table root (EmitImage): the heap slot id the root's image loads
     // from, and the selection TableSlot returns for the root instead of searching its mapping.
     std::uint32_t bindlessHeapSlot = 0;

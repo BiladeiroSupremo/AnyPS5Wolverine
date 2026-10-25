@@ -140,7 +140,8 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     // binding with element(root) + slot.
     for (std::uint32_t i = 0; i < info.images.size(); i++) {
         const auto root = info.images[i].indirectRoot;
-        if (root != ImageResource::NoIndirectImage && root != i) {
+        // A GPU-resolved T# is sampled from the heap set only.
+        if ((root != ImageResource::NoIndirectImage && root != i) || info.images[i].hashed) {
             continue;
         }
         place(i);

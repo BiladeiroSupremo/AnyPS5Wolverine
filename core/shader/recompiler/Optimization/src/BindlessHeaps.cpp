@@ -78,6 +78,11 @@ bool HeapEligible(IrShaderStage stage, std::uint32_t dimension, bool sampled, bo
     return Enabled() && (compute || graphicsStageHeaps(stage)) && kind && sampled && !depthCompare && !r128;
 }
 
+bool HashedImagesEnabled() {
+    static const bool requested = [] { const char* text = std::getenv("APS5_GPU_IMAGES"); return text != nullptr && text[0] == '1'; }();
+    return requested && Enabled();
+}
+
 std::uint32_t RegionBase(std::uint64_t heapBase, std::uint32_t entryOffset, std::uint32_t entries) {
     auto& state = registry();
     std::lock_guard lock(state.mutex);
@@ -90,7 +95,8 @@ std::uint32_t RegionBase(std::uint64_t heapBase, std::uint32_t entryOffset, std:
         return found->base;
     }
     const auto capacity = std::max(MinimumCapacity, entries > TranslationEntries / 2u ? entries : entries * 2u);
-    if (capacity > TranslationEntries - state.next) {
+    // Regions stay below the hash range (GPU-resolved T#s) at the top of the translation buffer.
+    if (capacity > HashBase - state.next) {
         throw BindlessTableRejected("bindless image heap: the translation buffer has no room for " + std::to_string(capacity) + " more entries");
     }
     // A table that outgrew its region moves to a new one; the old region's words stay published

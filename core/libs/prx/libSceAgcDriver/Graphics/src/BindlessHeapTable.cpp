@@ -34,14 +34,15 @@ constexpr std::size_t RevalidateBudget = 128u;
 
 BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) {
     try {
-        std::array<VkDescriptorSetLayoutBinding, Heaps::KindCount + 2u> bindings{};
-        std::array<VkDescriptorBindingFlags, Heaps::KindCount + 2u> flags{};
+        std::array<VkDescriptorSetLayoutBinding, Heaps::KindCount + 3u> bindings{};
+        std::array<VkDescriptorBindingFlags, Heaps::KindCount + 3u> flags{};
         for (std::uint32_t kind = 0; kind < Heaps::KindCount; kind++) {
             bindings[kind] = {kind, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Heaps::SlotsPerKind, VK_SHADER_STAGE_ALL, nullptr};
             flags[kind] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
         }
         bindings[Heaps::KindCount] = {Heaps::TranslationBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
         bindings[Heaps::KindCount + 1u] = {Heaps::FeedbackBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
+        bindings[Heaps::KindCount + 2u] = {Heaps::KeyBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
         VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
         bindingFlags.bindingCount = static_cast<std::uint32_t>(flags.size());
         bindingFlags.pBindingFlags = flags.data();
@@ -53,7 +54,7 @@ BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) 
         const VkDescriptorSetLayoutCreateInfo emptyInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &emptyInfo, nullptr, &emptyLayout), "vkCreateDescriptorSetLayout bindless empty set");
 
-        const std::array<VkDescriptorPoolSize, 2> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Heaps::SlotsPerKind * Heaps::KindCount}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}}};
+        const std::array<VkDescriptorPoolSize, 2> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Heaps::SlotsPerKind * Heaps::KindCount}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}}};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
         poolInfo.maxSets = 1;
@@ -91,14 +92,23 @@ BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) 
         } catch (const std::exception&) {
             feedback = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         }
+        // The key buffer of GPU-resolved T#s: read by shaders, written only with commands.
+        const auto keyBytes = static_cast<std::size_t>(Heaps::HashEntries) * 8u * sizeof(std::uint32_t);
+        try {
+            keys = std::make_unique<Buffer>(context, keyBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        } catch (const std::exception&) {
+            keys = std::make_unique<Buffer>(context, keyBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        }
+        std::memset(keys->Bytes().data(), 0, keyBytes);
+        bucketWords.assign(Heaps::HashEntries, {});
         std::fill(Translation().begin(), Translation().end(), Heaps::Pending);
         std::fill(Feedback().begin(), Feedback().end(), 0u);
-        const std::array<VkDescriptorBufferInfo, 2> infos{{{translation->Handle(), 0, VK_WHOLE_SIZE}, {feedback->Handle(), 0, VK_WHOLE_SIZE}}};
-        std::array<VkWriteDescriptorSet, 2> writes{};
+        const std::array<VkDescriptorBufferInfo, 3> infos{{{translation->Handle(), 0, VK_WHOLE_SIZE}, {feedback->Handle(), 0, VK_WHOLE_SIZE}, {keys->Handle(), 0, VK_WHOLE_SIZE}}};
+        std::array<VkWriteDescriptorSet, 3> writes{};
         for (std::uint32_t i = 0; i < writes.size(); i++) {
             writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             writes[i].dstSet = set;
-            writes[i].dstBinding = i == 0 ? Heaps::TranslationBinding : Heaps::FeedbackBinding;
+            writes[i].dstBinding = i == 0 ? Heaps::TranslationBinding : i == 1 ? Heaps::FeedbackBinding : Heaps::KeyBinding;
             writes[i].descriptorCount = 1;
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[i].pBufferInfo = &infos[i];
@@ -119,6 +129,7 @@ void BindlessHeapTable::release() noexcept {
     for (auto& textures : slotTextures) textures.clear();
     translation.reset();
     feedback.reset();
+    keys.reset();
     if (pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, layout, nullptr);
     if (emptyLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, emptyLayout, nullptr);
@@ -202,6 +213,31 @@ void BindlessHeapTable::createPlaceholders() {
 
 VkBuffer BindlessHeapTable::TranslationBuffer() const {
     return translation->Handle();
+}
+
+VkBuffer BindlessHeapTable::KeyBuffer() const {
+    return keys->Handle();
+}
+
+bool BindlessHeapTable::HashedBucket(const std::array<std::uint32_t, 8>& words, std::uint32_t& bucket, bool& inserted) {
+    const auto hash = Heaps::HashWords(words.data());
+    constexpr std::array<std::uint32_t, 8> free{};
+    for (std::uint32_t probe = 0; probe < Heaps::HashProbes; ++probe) {
+        const auto candidate = (hash + probe) & (Heaps::HashEntries - 1u);
+        auto& held = bucketWords[candidate];
+        if (held == words) {
+            bucket = candidate;
+            inserted = false;
+            return true;
+        }
+        if (held == free) {
+            held = words;
+            bucket = candidate;
+            inserted = true;
+            return true;
+        }
+    }
+    return false;
 }
 
 std::span<std::uint32_t> BindlessHeapTable::Translation() {
@@ -349,6 +385,20 @@ bool integerViewFormat(VkFormat format) {
     }
 }
 
+// The numeric class a hashed entry's word carries for its view (BindlessHeaps::ClassShift).
+std::uint32_t viewNumericClass(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+        return 1u;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32A32_SINT:
+        return 2u;
+    default:
+        return 0u;
+    }
+}
+
 bool readHeapWords(std::uint64_t address, std::array<std::uint32_t, 8>& words) {
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(words))) return false;
     GuestMemory::Read(address, std::as_writable_bytes(std::span(words)));
@@ -399,21 +449,29 @@ void countDroppedLevels(const std::array<std::uint32_t, 8>& words, std::uint32_t
 // The translation word of one heap entry: the entry's texture in a slot of the kind its view has,
 // or Unusable (null, unreadable, integer or of a kind the heap set lacks). A usable entry is
 // recorded for revalidation (`existing`: the entry being revalidated, updated in place).
-std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table, Recorder& recorder, std::uint32_t index, std::uint64_t address, BindlessHeapTable::Entry* existing = nullptr) {
+// `hashed`: a GPU-resolved T# (its words, no address), whose shaders also take integer and cube
+// views (the word names the class and the cube).
+std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table, Recorder& recorder, std::uint32_t index, std::uint64_t address, BindlessHeapTable::Entry* existing = nullptr, const std::array<std::uint32_t, 8>* hashed = nullptr) {
     std::array<std::uint32_t, 8> words{};
-    if (!readHeapWords(address, words)) return Heaps::Unusable;
+    if (hashed != nullptr) words = *hashed;
+    else if (!readHeapWords(address, words)) return Heaps::Unusable;
     const auto droppable = droppableLevels(words);
     const auto texture = CachedSampledTexture(context, words, droppable);
     // Revalidation: the same T# served by the same texture needs nothing (the lookup refreshed an
     // image-backed view in place).
     if (existing != nullptr && existing->words == words && existing->texture == texture) return Heaps::Pending;
-    if (texture == nullptr || integerViewFormat(texture->ViewFormat())) return Heaps::Unusable;
+    if (texture == nullptr || (hashed == nullptr && integerViewFormat(texture->ViewFormat()))) return Heaps::Unusable;
     const auto range = texture->SampledViewRange(false);
     std::uint32_t kind = Heaps::KindCount;
+    bool cube = false;
     if (range.type == VK_IMAGE_VIEW_TYPE_2D) kind = Heaps::ImageBinding2D;
     else if (range.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY) kind = Heaps::ImageBinding2DArray;
     else if (range.type == VK_IMAGE_VIEW_TYPE_3D) kind = Heaps::ImageBinding3D;
     else if (range.type == VK_IMAGE_VIEW_TYPE_1D) kind = Heaps::ImageBinding1D;
+    else if (range.type == VK_IMAGE_VIEW_TYPE_CUBE && hashed != nullptr) {
+        kind = Heaps::ImageBinding2DArray;
+        cube = true;
+    }
     // Diagnostic: APS5_TRACE_HEAP_ENTRIES=1 prints every published entry.
     static const bool traceEntries = std::getenv("APS5_TRACE_HEAP_ENTRIES") != nullptr;
     if (kind == Heaps::KindCount) {
@@ -424,6 +482,7 @@ std::uint32_t resolveHeapEntry(const Context& context, BindlessHeapTable& table,
     // The slot word says how many guest levels the texture left out (a storage image's view: 0).
     auto word = table.Publish(kind, texture, texture->View(), texture->Layout());
     if (word != Heaps::Unusable) word |= texture->SkippedLevels() << Heaps::LevelShift;
+    if (word != Heaps::Unusable && hashed != nullptr) word |= viewNumericClass(texture->ViewFormat()) << Heaps::ClassShift | (cube ? Heaps::CubeBit : 0u);
     if (word != Heaps::Unusable) {
         if (existing != nullptr) {
             // The replaced slot (and its texture) is released once the work that may read it ends.
@@ -457,6 +516,9 @@ HeapCounters& heapCounters() {
     return counters;
 }
 
+// GPU-resolved T#s: ring entries read, entries resolved or unusable, keys taken (never released).
+std::atomic<std::uint64_t> hashedRequests{0}, hashedResolved{0}, hashedUnusable{0}, hashedKeys{0};
+
 // One line per 10 s while the heaps resolve anything: requests read, entries published, failures.
 void reportHeaps() {
     auto& counters = heapCounters();
@@ -474,7 +536,7 @@ void reportHeaps() {
 
 void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
     auto* table = context.bindlessHeaps;
-    if (table == nullptr || Heaps::RegionsGeneration() == 0u || !table->ScanMaybeDue()) return;
+    if (table == nullptr || (Heaps::RegionsGeneration() == 0u && !Heaps::HashedImagesEnabled()) || !table->ScanMaybeDue()) return;
     std::lock_guard lock(table->Mutex());
     if (!table->ScanDue()) return;
     const auto regions = Heaps::Regions();
@@ -532,6 +594,52 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             published.emplace_back(index, word);
         }
     }
+    // GPU-resolved T#s requested through the ring (BindlessHeaps.hpp). A request read while the GPU
+    // still writes it is skipped (no completion word yet) or, torn, names a T# no shader holds.
+    std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 8>>> keyWrites;
+    if (Heaps::HashedImagesEnabled()) {
+        auto& ring = feedback;
+        const auto count = std::min(ring[Heaps::RingBase], Heaps::RingCapacity);
+        ring[Heaps::RingBase] = 0u;
+        std::set<std::array<std::uint32_t, 8>> seen;
+        static std::atomic<int> fullReported{0};
+        for (std::uint32_t request = 0; request < count; ++request) {
+            auto* entry = ring.data() + Heaps::RingBase + 1u + request * Heaps::RingStride;
+            if (entry[8] == 0u) continue;
+            std::array<std::uint32_t, 8> words{};
+            std::memcpy(words.data(), entry, sizeof(words));
+            entry[8] = 0u;
+            if (!seen.insert(words).second || (published.size() >= ScanBudget || (!published.empty() && !inTime()))) continue;
+            std::uint32_t bucket = 0;
+            bool inserted = false;
+            if (!table->HashedBucket(words, bucket, inserted)) {
+                if (fullReported.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[gpu-images] no free key bucket for T# %08x %08x %08x %08x %08x %08x %08x %08x\n", words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+                continue;
+            }
+            const auto index = Heaps::HashBase + bucket;
+            if (!table->Claim(index)) continue;
+            if (inserted) keyWrites.emplace_back(bucket, words);
+            std::uint32_t word = Heaps::Unusable;
+            const auto entryStart = std::chrono::steady_clock::now();
+            try {
+                word = resolveHeapEntry(context, *table, recorder, index, 0u, nullptr, &words);
+            } catch (const std::exception& error) {
+                static std::atomic<int> reported{0};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[gpu-images] T# %08x %08x is unusable: %s\n", words[0], words[1], error.what());
+            }
+            slowestEntry = std::max(slowestEntry, std::chrono::steady_clock::now() - entryStart);
+            published.emplace_back(index, word);
+            (word != Heaps::Unusable ? hashedResolved : hashedUnusable).fetch_add(1, std::memory_order_relaxed);
+            if (inserted) hashedKeys.fetch_add(1, std::memory_order_relaxed);
+        }
+        hashedRequests.fetch_add(count, std::memory_order_relaxed);
+        static std::atomic<long long> lastHashedReport{0};
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastHashedReport.load(std::memory_order_relaxed);
+        if (now - last >= 10 && lastHashedReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[gpu-images] (10 s): %llu ring requests, %llu resolved, %llu unusable; %llu keys held\n", static_cast<unsigned long long>(hashedRequests.exchange(0)), static_cast<unsigned long long>(hashedResolved.exchange(0)), static_cast<unsigned long long>(hashedUnusable.exchange(0)), static_cast<unsigned long long>(hashedKeys.load()));
+        }
+    }
     // APS5_PROFILE_DRAW: a request scan that took a frame's worth of time.
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profiled) {
@@ -578,7 +686,7 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
             if (cursor >= entries.size()) cursor = 0;
             auto& entry = entries[cursor++];
             try {
-                const auto word = resolveHeapEntry(context, *table, recorder, entry.index, entry.address, &entry);
+                const auto word = resolveHeapEntry(context, *table, recorder, entry.index, entry.address, &entry, entry.index >= Heaps::HashBase ? &entry.words : nullptr);
                 if (word == Heaps::Pending) continue;
                 published.emplace_back(entry.index, word);
                 counters.republished.fetch_add(1, std::memory_order_relaxed);
@@ -593,6 +701,7 @@ void ResolveBindlessHeapRequests(const Context& context, Recorder& recorder) {
     // batch is taken after them: a lookup may have submitted the previous one).
     const auto commands = recorder.Commands();
     const auto updateBuffer = context.Function<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer");
+    for (const auto& [bucket, words] : keyWrites) updateBuffer(commands, table->KeyBuffer(), static_cast<VkDeviceSize>(bucket) * sizeof(words), sizeof(words), words.data());
     for (const auto& [index, word] : published) updateBuffer(commands, table->TranslationBuffer(), static_cast<VkDeviceSize>(index) * sizeof(std::uint32_t), sizeof(std::uint32_t), &word);
     // Diagnostic: APS5_TRACE_HEAP_ENTRIES=2 also reads back each newly published image-backed entry.
     static const bool dumpEntries = [] { const char* text = std::getenv("APS5_TRACE_HEAP_ENTRIES"); return text != nullptr && text[0] == '2'; }();

@@ -240,6 +240,16 @@ std::uint32_t BindlessHeapBuffer(SpirvEmitterState& state, bool feedback) {
     return variable;
 }
 
+std::uint32_t BindlessHeapKeyBuffer(SpirvEmitterState& state) {
+    auto& variable = state.bindlessHeapKeyVariable;
+    if (variable == 0u) {
+        RequireBindlessHeapCapabilities(state);
+        variable = DefineBindlessHeapVariable(state, BindlessHeapBlockType(state), spv::StorageClassStorageBuffer, BindlessHeaps::KeyBinding, "bindless_heap_keys");
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+    }
+    return variable;
+}
+
 std::uint32_t LoadSampledImageDescriptor(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t slotId) {
     const auto& imageResource = state.runtimeImage != nullptr ? *state.runtimeImage : state.program.Info().images.at(resource);
     if (imageResource.resourceClass != ImageResourceClass::Sampled) {
@@ -249,7 +259,8 @@ std::uint32_t LoadSampledImageDescriptor(SpirvEmitterState& state, std::uint32_t
     // Experiment: APS5_HEAP_ROOT_IMAGE=1 samples the table root's own binding (the representative
     // entry) in the heap branch of graphics stages instead of the heap set.
     static const bool rootImage = std::getenv("APS5_HEAP_ROOT_IMAGE") != nullptr;
-    if (state.bindlessHeapSlot != 0u && !(rootImage && state.program.Resources().stage != IrShaderStage::Compute) && state.program.Info().images.at(resource).indirectRoot == resource) {
+    const auto& resourceImage = state.program.Info().images.at(resource);
+    if (state.bindlessHeapSlot != 0u && (resourceImage.hashed || (!(rootImage && state.program.Resources().stage != IrShaderStage::Compute) && resourceImage.indirectRoot == resource))) {
         return LoadBindlessHeapImage(state, state.program.Info().images.at(resource), imageResource, state.bindlessHeapSlot);
     }
     const auto kind = DescriptorBindingForImage(imageResource);
@@ -293,7 +304,7 @@ std::uint32_t MakeSampledImage(SpirvEmitterState& state, std::uint32_t resource,
     const auto sampledType = state.module.Type(spv::OpTypeSampledImage, ImageType(state, imageResource));
     state.module.AddFunction(spv::OpSampledImage, sampledType, sampledImage, image, samplerId);
     DecorateTableNonUniform(state, slotId, sampledImage);
-    if (state.bindlessHeapSlot != 0u && !state.bindlessHeapUniformSlot && state.program.Info().images.at(resource).indirectRoot == resource) state.module.AddAnnotation(spv::OpDecorate, sampledImage, spv::DecorationNonUniform);
+    if (state.bindlessHeapSlot != 0u && !state.bindlessHeapUniformSlot && (state.program.Info().images.at(resource).indirectRoot == resource || state.program.Info().images.at(resource).hashed)) state.module.AddAnnotation(spv::OpDecorate, sampledImage, spv::DecorationNonUniform);
     return sampledImage;
 }
 

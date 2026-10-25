@@ -531,6 +531,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.indirectMappingOffset);
         out.Value(image.indirectSearchIterations);
         out.Values(std::span<const std::uint32_t>(image.indirectResources));
+        out.Value(image.hashed);
     });
     writer.Value(!info.runtimeImageModes.empty());
     writer.List(info.samplers, [](Writer& out, const SamplerResource& sampler) {
@@ -640,6 +641,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.indirectMappingOffset);
         in.Value(image.indirectSearchIterations);
         in.Values(image.indirectResources);
+        in.Value(image.hashed);
     });
     bool preparedImageModes = false;
     reader.Value(preparedImageModes);
@@ -703,6 +705,7 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
 constexpr std::string_view NeutralSwitches[] = {
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
+    "APS5_TRACE_IMAGE_MODES",
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
     "APS5_NO_PERF_FRONTEND_PAIR",
