@@ -121,6 +121,9 @@ struct ShadowState {
     std::unordered_map<std::uint64_t, SourcePlan> plans;
     std::uint64_t plansBuilt = 0, planDrawsRight = 0, planDrawsWrong = 0, planRight = 0, planWrong = 0, planUnknown = 0, relocations = 0;
     std::array<std::unordered_set<std::uint64_t>, 3> distinct;
+    // Right gathers by role (buffer, image, sampler) and source kind (Unknown, UserData, Extended,
+    // Buffer, Pointer): B2 coverage (images behind a user-data V# = the constant-buffer table form).
+    std::array<std::array<std::uint64_t, 5>, 3> sourceKinds{};
     std::unordered_set<std::uint64_t> imageBases;
     int planExamples = 0;
     std::unordered_map<std::uint64_t, NativeDrawRecord> records;
@@ -341,6 +344,7 @@ void CompareNativeDescriptors(const NativeDrawRecord& record, std::span<const De
             const auto words = GatherDescriptor(record, source);
             if (words && *words == decoded[i].words) {
                 ++state.planRight;
+                if (decoded[i].role <= 2 && source.kind <= DescriptorSource::Pointer) ++state.sourceKinds[decoded[i].role][source.kind];
                 continue;
             }
             ++state.planWrong;
@@ -507,6 +511,11 @@ void CompareNativeDraw(const NativeDrawRecord* record, std::span<const std::uint
     std::uint64_t repeats = 0;
     for (const auto& [key, draws] : state.nativeKeys) repeats += draws - 1;
     std::fprintf(stderr, "[native-shadow] native keys: %zu distinct over %llu draws (10 s; a cache keyed so would hit %.1f%%), %zu distinct in the run so far\n", state.nativeKeys.size(), static_cast<unsigned long long>(state.keyedDraws), state.keyedDraws != 0 ? 100.0 * static_cast<double>(repeats) / static_cast<double>(state.keyedDraws) : 0.0, state.runKeys.size());
+    for (std::size_t role = 0; role < 3; ++role) {
+        const auto& kinds = state.sourceKinds[role];
+        std::fprintf(stderr, "[native-shadow] %s sources (right gathers, 10 s): user data %llu, extended %llu, behind a user-data V# %llu, behind a raw pointer %llu\n", role == 0 ? "buffer" : role == 1 ? "image" : "sampler", static_cast<unsigned long long>(kinds[1]), static_cast<unsigned long long>(kinds[2]), static_cast<unsigned long long>(kinds[3]), static_cast<unsigned long long>(kinds[4]));
+    }
+    state.sourceKinds = {};
     std::fprintf(stderr, "[native-shadow] distinct bound descriptors in the run: buffers %zu, images %zu (%zu image base addresses), samplers %zu\n", state.distinct[0].size(), state.distinct[1].size(), state.imageBases.size(), state.distinct[2].size());
     std::fprintf(stderr, "[native-shadow] source plans: %zu (built %llu this window); draws gathered right %llu, not %llu; descriptors right %llu, wrong %llu, without a source %llu; sources located again %llu\n", state.plans.size(), static_cast<unsigned long long>(state.plansBuilt), static_cast<unsigned long long>(state.planDrawsRight), static_cast<unsigned long long>(state.planDrawsWrong), static_cast<unsigned long long>(state.planRight), static_cast<unsigned long long>(state.planWrong), static_cast<unsigned long long>(state.planUnknown), static_cast<unsigned long long>(state.relocations));
     state.plansBuilt = state.planDrawsRight = state.planDrawsWrong = state.planRight = state.planWrong = state.planUnknown = state.relocations = 0;
