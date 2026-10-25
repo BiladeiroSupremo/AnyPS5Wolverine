@@ -310,6 +310,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             forgetAtCapture = GuestMemory::ForgetSerial();
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
+                ShaderMemory::NoteCaptureProgram(address | (1ull << 63u));
                 return shaderMemory->Capture(invocation);
             }();
             captured = shaderMemory->Regions();

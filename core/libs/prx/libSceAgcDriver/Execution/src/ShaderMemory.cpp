@@ -190,6 +190,14 @@ bool ShaderMemory::TakeNullPageRead() {
     return std::exchange(nullPageReads(), false);
 }
 
+namespace {
+thread_local std::uint64_t captureProgram = 0;
+}
+
+void ShaderMemory::NoteCaptureProgram(std::uint64_t codeAddress) {
+    captureProgram = codeAddress;
+}
+
 bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* value) {
     auto& self = *static_cast<ShaderMemory*>(context);
     if (address % sizeof(*value) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(*value)) {
@@ -233,6 +241,23 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         if (page.wordwise) {
             policy = self.pendingWrite(address, sizeof(word), std::as_writable_bytes(std::span(&word, 1)));
             if (policy != PendingWrite::None && policy != PendingWrite::Sync && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) policy = PendingWrite::Sync;
+            // Experiment (unsafe, values may be a frame stale): APS5_RAW_GPU_READS=<hex program,...>
+            // reads the GPU-written words of those programs' captures raw instead of waiting for the
+            // writer, to measure what the wait costs (only for programs whose words are data).
+            static const std::vector<std::uint64_t> rawPrograms = [] {
+                std::vector<std::uint64_t> list;
+                if (const char* text = std::getenv("APS5_RAW_GPU_READS")) {
+                    for (const char* cursor = text; *cursor != '\0';) {
+                        char* end = nullptr;
+                        const auto value = std::strtoull(cursor, &end, 16);
+                        if (end == cursor) break;
+                        list.push_back(value);
+                        cursor = *end == ',' ? end + 1 : end;
+                    }
+                }
+                return list;
+            }();
+            if (policy == PendingWrite::Sync && !rawPrograms.empty() && std::find(rawPrograms.begin(), rawPrograms.end(), captureProgram & ~(1ull << 63u)) != rawPrograms.end() && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) policy = PendingWrite::Raw;
         }
         // A read is evidence only when the hook waited for unfinished GPU work across it.
         const auto hookWaits = [&] { return self.hookWaits != nullptr ? self.hookWaits() : 0; };
@@ -281,7 +306,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 }
                 static const bool traceSlow = std::getenv("APS5_TRACE_WORD_SYNC") != nullptr;
                 static std::atomic<int> traced{0};
-                if (traceSlow && nanoseconds >= 1000000u && traced.fetch_add(1, std::memory_order_relaxed) < 2000) std::fprintf(stderr, "[wordsync] 0x%llx waited %.2f ms: before 0x%08x after 0x%08x%s\n", static_cast<unsigned long long>(address), nanoseconds / 1e6, before, word, observed ? "" : " (before not read)");
+                if (traceSlow && nanoseconds >= 1000000u && traced.fetch_add(1, std::memory_order_relaxed) < 2000) std::fprintf(stderr, "[wordsync] 0x%llx waited %.2f ms: before 0x%08x after 0x%08x%s, program 0x%llx\n", static_cast<unsigned long long>(address), nanoseconds / 1e6, before, word, observed ? "" : " (before not read)", static_cast<unsigned long long>(captureProgram));
             }
             if (observed) report(waitsBefore, before == word);
         }

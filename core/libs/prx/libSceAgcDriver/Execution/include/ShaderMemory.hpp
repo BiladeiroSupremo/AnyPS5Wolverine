@@ -44,6 +44,9 @@ public:
         std::uint64_t served, verified, mismatches;
     };
     static KnownValueCounts KnownValues();
+    // Diagnostic (APS5_TRACE_WORD_SYNC): the program whose capture runs on this thread, named in the
+    // [wordsync] lines.
+    static void NoteCaptureProgram(std::uint64_t codeAddress);
     // Told, for a dword read that went through the hook, whether the bytes read before the hook's
     // wait were still there after it (the driver's evidence for later raw reads).
     using PendingWriteObserver = void (*)(std::uint64_t address, bool unchanged);

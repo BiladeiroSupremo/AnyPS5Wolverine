@@ -35,6 +35,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     stageCapture.pushOffset = pushOffset;
     const auto capture = [&] {
         const SampledReadScope sampling(evidenceReads);
+        ShaderMemory::NoteCaptureProgram(program.binary.codeAddress);
         return shaderMemory.Capture(invocation);
     }();
 

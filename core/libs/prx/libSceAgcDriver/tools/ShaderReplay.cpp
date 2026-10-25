@@ -17,6 +17,7 @@
 
 #include <cstdio>
 #include <exception>
+#include <map>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -41,6 +42,73 @@ std::string FirstLine(const std::string& text) {
     return shown;
 }
 
+// --reads: the guest addresses each descriptor source and each flat SRT slot reads (to tell what a
+// guest word the driver waited for feeds).
+std::vector<std::uint64_t>* g_readLog = nullptr;
+ShaderRecompiler::SrtMemoryReader g_innerReader = nullptr;
+
+bool LoggedRead(void* context, std::uint64_t address, std::uint32_t* value) {
+    if (g_readLog != nullptr) g_readLog->push_back(address);
+    return g_innerReader(context, address, value);
+}
+
+void PrintReads(const ShaderRecompiler::RecompileRequest& request) {
+    auto program = ShaderRecompiler::PrepareResourceProgram(request);
+    const auto plan = ShaderRecompiler::ResourceMaterializer{}.ExtractPlan(program);
+    ShaderRecompiler::RequestMemoryView view(request.context.memory);
+    auto runtime = view.MakeRuntime(request.context.userData, request.shader.codeAddress);
+    g_innerReader = runtime.readMemory;
+    runtime.readMemory = &LoggedRead;
+    runtime.readSpecializationMemory = &LoggedRead;
+    std::vector<std::uint64_t> log;
+    g_readLog = &log;
+    const auto printLog = [&] {
+        for (const auto address : log) std::printf(" 0x%llx", static_cast<unsigned long long>(address));
+        std::printf("\n");
+    };
+    constexpr ShaderRecompiler::SrtWalker walker;
+    for (std::uint32_t source = 0; source < plan.descriptorSources.size(); ++source) {
+        std::string roles;
+        for (std::size_t i = 0; i < plan.info.buffers.size(); ++i) if (plan.info.buffers[i].source == source) roles += " buffer" + std::to_string(i);
+        for (std::size_t i = 0; i < plan.info.images.size(); ++i) if (plan.info.images[i].source == source) roles += std::string(plan.info.images[i].hashed ? " hashed-image" : " image") + std::to_string(i);
+        for (std::size_t i = 0; i < plan.info.samplers.size(); ++i) if (plan.info.samplers[i].source == source) roles += " sampler" + std::to_string(i);
+        log.clear();
+        ShaderRecompiler::DescriptorValue value;
+        bool ok = true;
+        try {
+            walker.EvaluateDescriptorSource(plan, source, runtime, value);
+        } catch (const std::exception&) {
+            ok = false;
+        }
+        std::printf("  source %u%s%s reads:", source, roles.c_str(), ok ? "" : " (failed)");
+        printLog();
+    }
+    // The opcode that consumes each flat slot (ReadConst users in the prepared program).
+    std::map<std::uint32_t, std::string> users;
+    for (const auto& block : program.Blocks()) {
+        for (const auto* inst : block->Instructions()) {
+            if (inst->Opcode() != ShaderRecompiler::IrOpcode::ReadConst || inst->ArgumentCount() < 2u || !inst->Argument(1)->Resolve()->HasImmediate()) continue;
+            const auto slot = inst->Argument(1)->Resolve()->ImmediateU32();
+            for (const auto* user : inst->Uses()) users[slot] += " " + std::string(ShaderRecompiler::IrOpcodeName(user->Opcode()));
+        }
+    }
+    for (std::uint32_t slot = 0; slot < plan.srtReads.size(); ++slot) {
+        log.clear();
+        std::uint32_t result = 0;
+        ShaderRecompiler::IrValue* value = plan.srtReads[slot].value;
+        bool ok = true;
+        try {
+            walker.EvaluateUniformValues(plan, std::span(&value, 1), runtime, std::span(&result, 1));
+        } catch (const std::exception&) {
+            ok = false;
+        }
+        std::printf("  slot %u = 0x%08x%s (used by%s) reads:", slot, result, ok ? "" : " (failed)", users[slot].c_str());
+        printLog();
+    }
+    g_readLog = nullptr;
+}
+
+bool g_reads = false;
 bool g_disassemble = false;
 bool g_assembly = false;
 bool g_memory = false;
@@ -82,6 +150,14 @@ bool Replay(const char* path) {
             }
             std::printf("  region 0x%llx + 0x%zx -> %s\n", static_cast<unsigned long long>(region.guestAddress), region.bytes.size(), name);
         }
+    }
+    if (g_reads) {
+        try {
+            PrintReads(request.request);
+        } catch (const std::exception& error) {
+            std::printf("  reads failed: %s\n", FirstLine(error.what()).c_str());
+        }
+        return true;
     }
     if (g_code) {
         std::string name(path);
@@ -209,6 +285,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--mem") {
             g_memory = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--reads") {
+            g_reads = true;
             continue;
         }
         if (std::string(argv[i]) == "--code") {
