@@ -24,6 +24,9 @@ std::uint64_t CodeContentHash(std::span<const std::uint32_t> code);
 // Called for every request before translation: a program whose code hash is listed in
 // APS5_ADDRESS_SRT is matched by its code address from then on.
 void NoteAddressSrtCode(std::uint64_t codeAddress, std::span<const std::uint32_t> code);
+// APS5_ADDRESS_SRT_LEARN=1: a compute capture that waited for GPU-written words reports its
+// program's code hash once ([address-srt-learn]), the candidates for the next APS5_ADDRESS_SRT.
+void ReportCaptureWait(std::uint64_t codeAddress);
 bool IsRawRead(const IrResourcePlan& program, const IrValue& inst);
 bool IsRawRead(const IrResourcePlan& program, IrOpcode op, std::uint32_t memoryIndex);
 bool LoadedFromMemory(const IrValue& handle);

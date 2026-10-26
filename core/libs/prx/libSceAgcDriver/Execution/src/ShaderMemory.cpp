@@ -5,6 +5,7 @@
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -309,6 +310,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 if (nanoseconds >= WordWaitNanoseconds) {
                     ++CaptureTotals().wordWaits;
                     CaptureTotals().wordWaitNanoseconds += nanoseconds;
+                    if ((captureProgram >> 63u) != 0u) ShaderRecompiler::Detail::ReportCaptureWait(captureProgram & ~(1ull << 63u));
                 }
                 static const bool traceSlow = std::getenv("APS5_TRACE_WORD_SYNC") != nullptr;
                 static std::atomic<int> traced{0};

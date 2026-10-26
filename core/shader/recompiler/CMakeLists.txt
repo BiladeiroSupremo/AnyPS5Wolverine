@@ -227,6 +227,8 @@ function(add_shader_recompiler target runtimeTarget)
             BindlessHeaps::HashedImagesEnabled
             BindlessHeaps::HashedWordBits
             BindlessHeaps::HeapEligible
+            # Diagnostic: reports a waited capture's program hash (APS5_ADDRESS_SRT_LEARN); no output.
+            Detail::ReportCaptureWait
             BindlessHeaps::RegionBase
             BindlessHeaps::Regions
             BindlessHeaps::RegionsGeneration

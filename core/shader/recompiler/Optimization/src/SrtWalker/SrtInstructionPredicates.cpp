@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -95,6 +96,10 @@ const std::vector<std::uint64_t>& addressSrtList() {
 struct MatchedAddresses {
     std::mutex mutex;
     std::set<std::uint64_t> addresses;
+    // Every prepared compute program's code hash by address, and the hashes already reported
+    // (ReportCaptureWait).
+    std::map<std::uint64_t, std::uint64_t> hashes;
+    std::set<std::uint64_t> reported;
 };
 
 MatchedAddresses& matchedAddresses() {
@@ -115,10 +120,24 @@ std::uint64_t CodeContentHash(std::span<const std::uint32_t> code) {
 
 void NoteAddressSrtCode(std::uint64_t codeAddress, std::span<const std::uint32_t> code) {
     const auto& list = addressSrtList();
-    if (list.empty() || std::find(list.begin(), list.end(), CodeContentHash(code)) == list.end()) return;
+    static const bool learn = std::getenv("APS5_ADDRESS_SRT_LEARN") != nullptr;
+    if (list.empty() && !learn) return;
+    const auto hash = CodeContentHash(code);
     auto& matched = matchedAddresses();
     std::lock_guard lock(matched.mutex);
-    if (matched.addresses.insert(codeAddress).second) std::fprintf(stderr, "[address-srt] program 0x%llx (code hash 0x%llx) reads its SRT on the GPU\n", static_cast<unsigned long long>(codeAddress), static_cast<unsigned long long>(CodeContentHash(code)));
+    if (learn) matched.hashes[codeAddress] = hash;
+    if (std::find(list.begin(), list.end(), hash) == list.end()) return;
+    if (matched.addresses.insert(codeAddress).second) std::fprintf(stderr, "[address-srt] program 0x%llx (code hash 0x%llx) reads its SRT on the GPU\n", static_cast<unsigned long long>(codeAddress), static_cast<unsigned long long>(hash));
+}
+
+void ReportCaptureWait(std::uint64_t codeAddress) {
+    static const bool learn = std::getenv("APS5_ADDRESS_SRT_LEARN") != nullptr;
+    if (!learn) return;
+    auto& matched = matchedAddresses();
+    std::lock_guard lock(matched.mutex);
+    const auto found = matched.hashes.find(codeAddress);
+    if (found == matched.hashes.end() || matched.addresses.contains(codeAddress) || !matched.reported.insert(found->second).second) return;
+    std::fprintf(stderr, "[address-srt-learn] program 0x%llx (code hash 0x%llx) waited for GPU-written words in its capture\n", static_cast<unsigned long long>(codeAddress), static_cast<unsigned long long>(found->second));
 }
 
 bool AddressSrtProgram(const IrResourcePlan& program) {
