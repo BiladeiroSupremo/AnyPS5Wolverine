@@ -61,9 +61,15 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         const auto begin = BdaLoadAddress(state, constant(4));
         const auto finish = BdaLoadAddress(state, constant(6));
         const auto base = BdaLoadAddress(state, constant(8));
-        fail(binary(spv::OpULessThan, boolean, address, begin), BdaAbi::FaultReason::Unmapped);
-        fail(binary(spv::OpUGreaterThan, boolean, end, finish), BdaAbi::FaultReason::Unmapped);
-        state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, base, binary(spv::OpISub, u64, address, begin)));
+        // A null-page access (a pointer the title left null, plus an offset; the capture walk reads
+        // such a word as unknown) reaches the mirror's last page, which no import binds: it reads
+        // zeros and drops writes instead of faulting.
+        const auto nullPage = binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThan, boolean, address, BdaConstant(state, 0x10000u)), binary(spv::OpULessThanEqual, boolean, end, BdaConstant(state, 0x10000u)));
+        const auto nullAddress = binary(spv::OpIAdd, u64, binary(spv::OpISub, u64, binary(spv::OpIAdd, u64, base, binary(spv::OpISub, u64, finish, begin)), BdaConstant(state, 0x10000u)), address);
+        const auto mapped = binary(spv::OpIAdd, u64, base, binary(spv::OpISub, u64, address, begin));
+        const auto outside = binary(spv::OpLogicalOr, boolean, binary(spv::OpULessThan, boolean, address, begin), binary(spv::OpUGreaterThan, boolean, end, finish));
+        fail(binary(spv::OpLogicalAnd, boolean, outside, Unary(state, spv::OpLogicalNot, boolean, nullPage)), BdaAbi::FaultReason::Unmapped);
+        state.module.AddFunction(spv::OpReturnValue, Select(state, u64, nullPage, nullAddress, mapped));
         state.module.AddFunction(spv::OpFunctionEnd);
         return function;
     }

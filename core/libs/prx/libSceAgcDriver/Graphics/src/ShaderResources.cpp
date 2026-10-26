@@ -2492,6 +2492,15 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
+bool PendingCpuWritesOverlap(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || Recorder::InCompletion()) return false;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) return false;
+    const bool labels = Recorder::PendingCompletionLabels() != 0;
+    if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && DrawCopiedWriters()->empty() && !labels) return false;
+    return recorder->PendingWriteOverlaps(address, bytes);
+}
+
 void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return;
     auto* recorder = Recorder::Active();
@@ -3989,8 +3998,36 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
-    if (SkipWriteBack()) return;
+    const bool profiled = BuildProfiled();
+    const auto markStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // The cached address space's ~1200 regions are the same for every build holding it: noted once
+    // per batch (its reads list already holds them for the later uses).
+    const auto spaceSerial = guestMemory.SpaceSerial();
+    const bool withSpace = spaceSerial == 0 || recorder.NoteReadSetOnce(spaceSerial);
+    recorder.NotePendingReads(guestMemory.InPlaceReads(withSpace), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    const auto readsEnd = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // APS5_PROFILE_DRAW: the read notes and the whole mark, address-based uses apart ([mark] line).
+    const auto countMark = [&] {
+        if (!profiled) return;
+        static std::mutex mutex;
+        static std::uint64_t uses[2]{}, readsUs[2]{}, totalUs[2]{};
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const auto kind = guestMemory.HoldsLease() ? 1 : 0;
+        std::lock_guard lock(mutex);
+        ++uses[kind];
+        readsUs[kind] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(readsEnd - markStart).count());
+        totalUs[kind] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - markStart).count());
+        if (now - last < std::chrono::seconds(10)) return;
+        last = now;
+        const auto per = [](std::uint64_t us, std::uint64_t count) { return count == 0 ? 0.0 : static_cast<double>(us) / static_cast<double>(count); };
+        AgcDriver::ProfilePrint_nid_no_patch("[mark] GPU-write marks (10 s): address-based %llu, us per use: read notes %.1f, total %.1f; others %llu, read notes %.1f, total %.1f\n", static_cast<unsigned long long>(uses[1]), per(readsUs[1], uses[1]), per(totalUs[1], uses[1]), static_cast<unsigned long long>(uses[0]), per(readsUs[0], uses[0]), per(totalUs[0], uses[0]));
+        uses[0] = uses[1] = readsUs[0] = readsUs[1] = totalUs[0] = totalUs[1] = 0;
+    };
+    if (SkipWriteBack()) {
+        countMark();
+        return;
+    }
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index]) continue;
         storageTextures[index]->MarkDirty();
@@ -4004,6 +4041,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
     guestMemory.MarkDirectWrites();
+    countMark();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

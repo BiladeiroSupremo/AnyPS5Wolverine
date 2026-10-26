@@ -3139,6 +3139,14 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
 }
 
+bool Recorder::NoteReadSetOnce(std::uint64_t serial) {
+    if (!ReadTrackingEnabled()) return false;
+    ensureOpen();
+    if (std::find(open->readSets.begin(), open->readSets.end(), serial) != open->readSets.end()) return false;
+    open->readSets.push_back(serial);
+    return true;
+}
+
 const Recorder::Batch::Read* Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
     for (const auto& read : batch.reads) {
         if (address < read.end && read.begin < end) return &read;

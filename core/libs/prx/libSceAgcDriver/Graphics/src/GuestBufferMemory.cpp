@@ -2910,6 +2910,10 @@ namespace {
 std::atomic<std::uint64_t> importUs{0};
 std::atomic<std::uint64_t> allocateUs{0};
 std::atomic<std::uint64_t> readUs{0};
+std::atomic<std::uint64_t> pendingUs{0};
+std::atomic<std::uint64_t> flushUs{0};
+std::atomic<std::uint64_t> finishUs{0};
+std::atomic<std::uint64_t> prepareUs{0};
 std::atomic<std::uint64_t> uploadsProfiled{0};
 
 std::uint64_t microsecondsSince(std::chrono::steady_clock::time_point start) {
@@ -3274,6 +3278,7 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
     Require(!prepared && !uploaded, "guest memory was already uploaded");
     prepared = true;
+    const auto prepareStart = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> order(regions.size());
     std::iota(order.begin(), order.end(), 0u);
     std::sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) { return regions[left].begin < regions[right].begin; });
@@ -3439,6 +3444,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         }
         copyRegion(region, addressable);
     }
+    if (profile) prepareUs.fetch_add(microsecondsSince(prepareStart), std::memory_order_relaxed);
 }
 
 void GuestBufferMemory::UploadFinish(bool addressable) {
@@ -3446,11 +3452,24 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
     for (const auto& region : regions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-    if (space != nullptr) {
-        for (const auto& region : space->base) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+    // The space's ~1200 ranges are checked one by one only when a pending CPU write can overlap their
+    // hull: most builds have none, and each check costs a recorder scan.
+    if (space != nullptr && !space->base.empty()) {
+        auto low = space->base.front().begin;
+        auto high = space->base.front().end;
+        for (const auto& region : space->base) {
+            low = std::min(low, region.begin);
+            high = std::max(high, region.end);
+        }
+        if (PendingCpuWritesOverlap(context, low, static_cast<std::size_t>(high - low))) {
+            for (const auto& region : space->base) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        }
     }
+    if (profile) pendingUs.fetch_add(microsecondsSince(started), std::memory_order_relaxed);
+    const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     uploaded = true;
     for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
+    if (profile) flushUs.fetch_add(microsecondsSince(flushStart), std::memory_order_relaxed);
     // Registered ranges to import from. Address-based shaders hold their lease until write-back;
     // descriptor-only uploads acquire one only when the registry changed or an import must be made
     // (a lease copies every registered range's shared_ptr under the registry lock), so the guest can
@@ -3620,9 +3639,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     const auto loopUs = microsecondsSince(loopStart);
     readUs.fetch_add(refreshUs, std::memory_order_relaxed);
     importUs.fetch_add(loopUs > refreshUs + copyUs ? loopUs - refreshUs - copyUs : 0, std::memory_order_relaxed);
+    finishUs.fetch_add(microsecondsSince(started), std::memory_order_relaxed);
     const auto uploads = uploadsProfiled.fetch_add(1, std::memory_order_relaxed) + 1;
     if (uploads % 2000 == 0) {
         const auto& copies = Copies();
+        AgcDriver::ProfilePrint_nid_no_patch("[buffers] %llu uploads: prepare %.0f ms, finish %.0f ms (pending cpu writes %.0f ms, written flush %.0f ms)\n", static_cast<unsigned long long>(uploads), prepareUs.load(std::memory_order_relaxed) / 1000.0,finishUs.load(std::memory_order_relaxed) / 1000.0, pendingUs.load(std::memory_order_relaxed) / 1000.0, flushUs.load(std::memory_order_relaxed) / 1000.0);
         AgcDriver::ProfilePrint_nid_no_patch("[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)));
     }
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -4402,10 +4423,14 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
     return result;
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
+std::uint64_t GuestBufferMemory::SpaceSerial() const {
+    return space != nullptr ? space->serial : 0;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads(bool withSpace) const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (!uploaded || committed) return result;
-    if (space != nullptr) {
+    if (space != nullptr && withSpace) {
         for (const auto& region : space->base) {
             if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
         }

@@ -267,7 +267,11 @@ public:
     // regions bound in place (`direct`), an address-based build's leased heaps included. A region
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    // `withSpace` false leaves out the cached address space's regions (noted once per batch by the
+    // caller, keyed by SpaceSerial()).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads(bool withSpace = true) const;
+    // The serial of the cached address space this build holds, 0 for none.
+    std::uint64_t SpaceSerial() const;
     // Whether [address, address + bytes) overlaps one of InPlaceReads(), without building the list.
     bool InPlaceReadsOverlap(std::uint64_t address, std::size_t bytes) const;
     // Whether every uploaded region is bound in place through a host import: no copy, staging

@@ -150,6 +150,9 @@ public:
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
+    // Whether the open batch still has to note the immutable range set `serial` (nonzero; an address
+    // space shared by consecutive builds): true once per batch, and the caller then notes it.
+    bool NoteReadSetOnce(std::uint64_t serial);
     // Whether an unexecuted batch (open, or in flight with its fence unsignaled) reads the range in
     // place. A hit in an in-flight batch whose fence signaled meanwhile is a miss (one status
     // query per hit). `ignoreSignaled` false: every in-flight batch counts, whatever its fence.
@@ -560,6 +563,8 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        // The range sets noted whole into `reads` (NoteReadSetOnce).
+        std::vector<std::uint64_t> readSets;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         std::uint64_t traceId = 0;
