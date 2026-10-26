@@ -162,6 +162,8 @@ struct HostImports {
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
+    // The guest mirror these imports were bound to (each later import is bound as it is made).
+    GuestMirror* mirrored = nullptr;
     std::map<VkDevice, std::vector<std::shared_ptr<RetiredImport>>> parked;
     std::uint64_t liveBytes = 0;
     std::map<std::uint64_t, ImportFailure> failed;
@@ -1055,7 +1057,18 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "");
     entry.joined = joined;
     auto* stored = &state.imports.emplace(base, entry).first->second;
-    if (auto* mirror = GuestMirror::Get(context); mirror != nullptr && !stored->dmaBuf) mirror->Bind(*stored);
+    // The mirror shows every import, whichever context made it (copies of a context made before
+    // the device enabled the mirror do not carry the flag); the imports made before the mirror
+    // existed are bound when it first appears.
+    auto* mirror = GuestMirror::Get(context);
+    if (mirror == nullptr) mirror = GuestMirror::Instance();
+    if (mirror != nullptr && state.mirrored != mirror) {
+        state.mirrored = mirror;
+        for (const auto& [at, earlier] : state.imports) {
+            if (&earlier != stored && !earlier.dmaBuf) mirror->Bind(earlier);
+        }
+    }
+    if (mirror != nullptr && !stored->dmaBuf) mirror->Bind(*stored);
     return stored;
 }
 

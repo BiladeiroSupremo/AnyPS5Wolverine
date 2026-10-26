@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #ifdef _WIN32
 #include <windows.h>
@@ -15,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -42,7 +44,15 @@ struct MirrorState {
     std::vector<Run> pending;
     // The mirror's own imports (GuestMirror::Bind) per import memory they complete.
     std::map<VkDeviceMemory, std::vector<VkDeviceMemory>> extras;
-    std::atomic<std::uint64_t> binds{0}, unbinds{0}, deferred{0}, unaligned{0}, bindUs{0}, boundBytes{0}, extraImports{0}, extraRefused{0}, edgesSkipped{0};
+    // The imports bound and not yet unbound, by guest base (for the [mirror-coverage] line).
+    struct Bound {
+        std::uint64_t bytes;
+        VkDeviceMemory memory;
+        bool alias;
+        std::uint32_t runs;
+    };
+    std::multimap<std::uint64_t, Bound> bound;
+    std::atomic<std::uint64_t> binds{0}, unbinds{0}, deferred{0}, unaligned{0}, bindUs{0}, boundBytes{0}, extraImports{0}, extraRefused{0}, edgesSkipped{0}, edgesAliased{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -198,12 +208,17 @@ void GuestMirror::Bind(const HostImport& import) {
     const auto edge = [&](std::uint64_t first) {
         if (import.alias != nullptr || first < base || first + page > base + bytes || !importableHost(first, page)) {
             state.edgesSkipped.fetch_add(1, std::memory_order_relaxed);
+            if (import.alias != nullptr) state.edgesAliased.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         own(first, first + page);
     };
     if (start % page != 0) edge(down(start));
     if (end % page != 0 && (start % page == 0 || down(end) != down(start))) edge(down(end));
+    {
+        std::lock_guard lock(state.mutex);
+        state.bound.emplace(start, MirrorState::Bound{import.bytes, import.memory, import.alias != nullptr, static_cast<std::uint32_t>(runs.size())});
+    }
     if (runs.empty()) return;
     {
         std::lock_guard lock(state.mutex);
@@ -227,12 +242,23 @@ void GuestMirror::FlushPending() {
     std::vector<MirrorState::Run> runs;
     {
         std::lock_guard lock(state.mutex);
-        runs.swap(state.pending);
-        // A run whose owner was unbound in the meantime has no pages showing it any more.
-        std::erase_if(runs, [&](const MirrorState::Run& run) {
-            const auto found = state.pages.find(run.first);
-            return found == state.pages.end() || found->second.empty() || found->second.back().memory != run.owner.memory;
-        });
+        std::vector<MirrorState::Run> queued;
+        queued.swap(state.pending);
+        // Only the pages that still show the run's owner (a newer import of some of them, or the
+        // owner's unbind, took the others): bound as maximal stretches.
+        for (const auto& run : queued) {
+            auto stretch = run.first;
+            for (auto at = run.first; at <= run.end; at += page) {
+                bool shown = false;
+                if (at < run.end) {
+                    const auto found = state.pages.find(at);
+                    shown = found != state.pages.end() && !found->second.empty() && found->second.back().memory == run.owner.memory;
+                }
+                if (shown) continue;
+                if (at > stretch) runs.push_back({stretch, at, run.owner});
+                stretch = at + page;
+            }
+        }
     }
     for (const auto& run : runs) {
         if (submit(run.first - base, run.end - run.first, run.owner.memory, run.first - run.owner.importBase)) {
@@ -256,6 +282,11 @@ void GuestMirror::Unbind(const HostImport& import) {
         if (const auto owned = state.extras.find(import.memory); owned != state.extras.end()) {
             memories.insert(memories.end(), owned->second.begin(), owned->second.end());
             state.extras.erase(owned);
+        }
+        for (auto [at, last] = state.bound.equal_range(import.base); at != last; ++at) {
+            if (at->second.memory != import.memory) continue;
+            state.bound.erase(at);
+            break;
         }
         const auto gone = [&](VkDeviceMemory memory) { return std::find(memories.begin(), memories.end(), memory) != memories.end(); };
         std::erase_if(state.pending, [&](const MirrorState::Run& run) { return gone(run.owner.memory); });
@@ -293,6 +324,7 @@ void GuestMirror::Report() {
     const auto extraImports = take(state.extraImports);
     const auto extraRefused = take(state.extraRefused);
     const auto edgesSkipped = take(state.edgesSkipped);
+    const auto edgesAliased = take(state.edgesAliased);
     std::size_t pages = 0;
     std::size_t extrasHeld = 0;
     {
@@ -300,7 +332,57 @@ void GuestMirror::Report() {
         pages = state.pages.size();
         for (const auto& [memory, owned] : state.extras) extrasHeld += owned.size();
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[mirror] (10 s) %llu imports bound (%llu requested), %llu unbound, %llu not page-aligned; own imports %llu made, %llu refused, %llu end pages skipped, %zu held; %.1f ms in sparse binds; %zu pages shown (%.0f MiB bound)\n", binds, deferred, unbinds, unaligned, extraImports, extraRefused, edgesSkipped, extrasHeld, bindUs / 1000.0, pages, state.boundBytes.load() / 1048576.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[mirror] (10 s) %llu imports bound (%llu requested), %llu unbound, %llu not page-aligned; own imports %llu made, %llu refused, %llu end pages skipped (%llu aliased), %zu held; %.1f ms in sparse binds; %zu pages shown (%.0f MiB bound)\n", binds, deferred, unbinds, unaligned, extraImports, extraRefused, edgesSkipped, edgesAliased, extrasHeld, bindUs / 1000.0, pages, state.boundBytes.load() / 1048576.0);
+    // Coverage: the registered GPU ranges' pages the mirror does not show (their reads return zero).
+    struct Gap {
+        std::uint64_t address;
+        std::uint64_t bytes;
+        std::uint64_t missing;
+        std::uint64_t pages;
+    };
+    std::vector<Gap> gaps;
+    std::uint64_t registered = 0;
+    std::uint64_t missing = 0;
+    std::uint64_t missingReadOnly = 0;
+    {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        std::lock_guard lock(state.mutex);
+        for (const auto& range : lease) {
+            if (!range->readable || !range->gpu || range->address < base || range->address + range->bytes > base + bytes) continue;
+            registered += range->bytes;
+            Gap gap{range->address, range->bytes, 0, 0};
+            for (auto at = range->address / page * page; at < range->address + range->bytes; at += page) {
+                ++gap.pages;
+                if (!state.pages.contains(at)) ++gap.missing;
+            }
+            missing += gap.missing;
+            if (!range->writable) missingReadOnly += gap.missing;
+            if (gap.missing != 0) gaps.push_back(gap);
+        }
+    }
+    std::sort(gaps.begin(), gaps.end(), [](const Gap& left, const Gap& right) { return left.missing > right.missing; });
+    std::string largest;
+    {
+        std::lock_guard lock(state.mutex);
+        for (std::size_t index = 0; index < gaps.size() && index < 8; ++index) {
+            // The bound imports covering the gap's first byte (none: no import was ever bound there).
+            std::uint32_t covering = 0;
+            const MirrorState::Bound* first = nullptr;
+            std::uint64_t firstBase = 0;
+            for (const auto& [at, entry] : state.bound) {
+                if (at > gaps[index].address) break;
+                if (at + entry.bytes <= gaps[index].address) continue;
+                ++covering;
+                first = &entry;
+                firstBase = at;
+            }
+            char part[192];
+            if (first == nullptr) std::snprintf(part, sizeof(part), " 0x%llx+0x%llx (%llu/%llu, no bound import)", static_cast<unsigned long long>(gaps[index].address), static_cast<unsigned long long>(gaps[index].bytes), static_cast<unsigned long long>(gaps[index].missing), static_cast<unsigned long long>(gaps[index].pages));
+            else std::snprintf(part, sizeof(part), " 0x%llx+0x%llx (%llu/%llu, %u bound, last 0x%llx+0x%llx alias %d runs %u)", static_cast<unsigned long long>(gaps[index].address), static_cast<unsigned long long>(gaps[index].bytes), static_cast<unsigned long long>(gaps[index].missing), static_cast<unsigned long long>(gaps[index].pages), covering, static_cast<unsigned long long>(firstBase), static_cast<unsigned long long>(first->bytes), first->alias ? 1 : 0, first->runs);
+            largest += part;
+        }
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[mirror-coverage] registered GPU ranges %.0f MiB, pages not shown %llu (%.0f MiB, %llu of them read-only) in %zu ranges; largest:%s\n", registered / 1048576.0, static_cast<unsigned long long>(missing), static_cast<double>(missing * page) / 1048576.0, static_cast<unsigned long long>(missingReadOnly), gaps.size(), largest.c_str());
 }
 
 }

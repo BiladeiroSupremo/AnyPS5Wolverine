@@ -42,7 +42,8 @@ private:
     // A host import of [host, host + size) for the mirror's own pages, or null.
     VkDeviceMemory importHost(void* host, std::uint64_t size);
 
-    const Context& context;
+    // A copy: the context Get was called with need not outlive the mirror.
+    const Context context;
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceAddress address = 0;
     VkFence fence = VK_NULL_HANDLE;
