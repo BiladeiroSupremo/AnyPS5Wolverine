@@ -3,8 +3,12 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -36,7 +40,9 @@ struct MirrorState {
         Owner owner;
     };
     std::vector<Run> pending;
-    std::atomic<std::uint64_t> binds{0}, unbinds{0}, deferred{0}, unaligned{0}, bindUs{0}, boundBytes{0};
+    // The mirror's own imports (GuestMirror::Bind) per import memory they complete.
+    std::map<VkDeviceMemory, std::vector<VkDeviceMemory>> extras;
+    std::atomic<std::uint64_t> binds{0}, unbinds{0}, deferred{0}, unaligned{0}, bindUs{0}, boundBytes{0}, extraImports{0}, extraRefused{0}, edgesSkipped{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -48,6 +54,30 @@ MirrorState& Mirrors() {
 bool profiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
+}
+
+// Whether every byte of [address, address + size) is committed memory the driver can import
+// (writable: it refuses read-only memory).
+bool importableHost(std::uint64_t address, std::uint64_t size) {
+#ifdef _WIN32
+    // APS5_TRACE_MIRROR_EDGES=1: the first 40 refused pages with the region that refused them.
+    static const bool trace = std::getenv("APS5_TRACE_MIRROR_EDGES") != nullptr;
+    static std::atomic<int> traced{0};
+    for (auto cursor = address; cursor < address + size;) {
+        MEMORY_BASIC_INFORMATION info{};
+        const bool queried = VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) != 0;
+        if (!queried || info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 || (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) == 0) {
+            if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 40) std::fprintf(stderr, "[mirror-edge] page 0x%llx refused at 0x%llx: region 0x%llx+0x%llx state 0x%lx protect 0x%lx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(cursor), queried ? static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(info.BaseAddress)) : 0ull, queried ? static_cast<unsigned long long>(info.RegionSize) : 0ull, queried ? info.State : 0ul, queried ? info.Protect : 0ul);
+            return false;
+        }
+        cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+    }
+    return true;
+#else
+    static_cast<void>(address);
+    static_cast<void>(size);
+    return false;
+#endif
 }
 
 }
@@ -98,6 +128,7 @@ GuestMirror* GuestMirror::Get(const Context& context) {
     mirror->base = arena;
     mirror->bytes = arenaBytes;
     mirror->page = requirements.alignment;
+    mirror->memoryTypes = requirements.memoryTypeBits;
     std::fprintf(stderr, "[mirror] guest mirror of 0x%llx+0x%llx at device address 0x%llx, page %llu KiB, memory types 0x%x\n", static_cast<unsigned long long>(arena), static_cast<unsigned long long>(arenaBytes), static_cast<unsigned long long>(mirror->address), static_cast<unsigned long long>(mirror->page >> 10u), requirements.memoryTypeBits);
     state.mirror = std::move(mirror);
     return state.mirror.get();
@@ -120,19 +151,70 @@ bool GuestMirror::submit(std::uint64_t offset, std::uint64_t size, VkDeviceMemor
     return result == VK_SUCCESS;
 }
 
+VkDeviceMemory GuestMirror::importHost(void* host, std::uint64_t size) {
+    VkMemoryHostPointerPropertiesEXT pointer{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (context.Function<PFN_vkGetMemoryHostPointerPropertiesEXT>("vkGetMemoryHostPointerPropertiesEXT")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &pointer) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const auto types = pointer.memoryTypeBits & memoryTypes;
+    if (types == 0) return VK_NULL_HANDLE;
+    const VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host};
+    const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+    allocation.allocationSize = size;
+    allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return memory;
+}
+
 void GuestMirror::Bind(const HostImport& import) {
     auto& state = Mirrors();
     if (import.base < base || import.base + import.bytes > base + bytes) return;
-    if (import.base % page != 0) {
+    const auto start = import.base;
+    const auto end = import.base + import.bytes;
+    const auto down = [&](std::uint64_t value) { return value / page * page; };
+    const auto up = [&](std::uint64_t value) { return (value + page - 1) / page * page; };
+    // The guest page's host address (an aliased import maps another host view of the same memory).
+    const auto host = [&](std::uint64_t guest) { return import.alias != nullptr ? static_cast<void*>(static_cast<std::byte*>(import.alias) + (guest - start)) : reinterpret_cast<void*>(guest); };
+    std::vector<MirrorState::Run> runs;
+    std::vector<VkDeviceMemory> extras;
+    const auto own = [&](std::uint64_t first, std::uint64_t last) {
+        const auto memory = importHost(host(first), last - first);
+        if (memory == VK_NULL_HANDLE) {
+            state.extraRefused.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        state.extraImports.fetch_add(1, std::memory_order_relaxed);
+        extras.push_back(memory);
+        runs.push_back({first, last, {memory, first}});
+    };
+    if (start % page == 0) {
+        if (down(end) > start) runs.push_back({start, down(end), {import.memory, start}});
+    } else {
         state.unaligned.fetch_add(1, std::memory_order_relaxed);
-        return;
+        if (down(end) > up(start)) own(up(start), down(end));
     }
-    const auto end = (import.base + import.bytes) / page * page;
-    if (end <= import.base) return;
+    // Partial pages at either end: the whole page imported when the host memory around the import
+    // allows it (not for an aliased import, whose view ends with it).
+    const auto edge = [&](std::uint64_t first) {
+        if (import.alias != nullptr || first < base || first + page > base + bytes || !importableHost(first, page)) {
+            state.edgesSkipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        own(first, first + page);
+    };
+    if (start % page != 0) edge(down(start));
+    if (end % page != 0 && (start % page == 0 || down(end) != down(start))) edge(down(end));
+    if (runs.empty()) return;
     {
         std::lock_guard lock(state.mutex);
-        for (auto at = import.base; at < end; at += page) state.pages[at].push_back({import.memory, import.base});
-        state.pending.push_back({import.base, end, {import.memory, import.base}});
+        for (const auto& run : runs) {
+            for (auto at = run.first; at < run.end; at += page) state.pages[at].push_back(run.owner);
+            state.pending.push_back(run);
+        }
+        if (!extras.empty()) {
+            auto& owned = state.extras[import.memory];
+            owned.insert(owned.end(), extras.begin(), extras.end());
+        }
     }
     state.deferred.fetch_add(1, std::memory_order_relaxed);
     // Bound now when the GPU mutex is free; otherwise at the next present (FlushPending).
@@ -153,7 +235,7 @@ void GuestMirror::FlushPending() {
         });
     }
     for (const auto& run : runs) {
-        if (submit(run.first - base, run.end - run.first, run.owner.memory, 0)) {
+        if (submit(run.first - base, run.end - run.first, run.owner.memory, run.first - run.owner.importBase)) {
             state.binds.fetch_add(1, std::memory_order_relaxed);
             state.boundBytes.fetch_add(run.end - run.first, std::memory_order_relaxed);
         }
@@ -162,20 +244,27 @@ void GuestMirror::FlushPending() {
 
 void GuestMirror::Unbind(const HostImport& import) {
     auto& state = Mirrors();
-    if (import.base < base || import.base + import.bytes > base + bytes || import.base % page != 0) return;
-    const auto end = (import.base + import.bytes) / page * page;
-    if (end <= import.base) return;
+    if (import.base < base || import.base + import.bytes > base + bytes) return;
+    // Every page the import or its own extras may show: the end pages included.
+    const auto first = import.base / page * page;
+    const auto end = (import.base + import.bytes + page - 1) / page * page;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::vector<std::pair<std::uint64_t, Owner>> rebinds;
+    std::vector<VkDeviceMemory> memories{import.memory};
     {
         std::lock_guard lock(state.mutex);
-        std::erase_if(state.pending, [&](const MirrorState::Run& run) { return run.owner.memory == import.memory; });
-        for (auto at = import.base; at < end; at += page) {
+        if (const auto owned = state.extras.find(import.memory); owned != state.extras.end()) {
+            memories.insert(memories.end(), owned->second.begin(), owned->second.end());
+            state.extras.erase(owned);
+        }
+        const auto gone = [&](VkDeviceMemory memory) { return std::find(memories.begin(), memories.end(), memory) != memories.end(); };
+        std::erase_if(state.pending, [&](const MirrorState::Run& run) { return gone(run.owner.memory); });
+        for (auto at = first; at < end; at += page) {
             const auto found = state.pages.find(at);
             if (found == state.pages.end()) continue;
             auto& owners = found->second;
-            const bool shown = !owners.empty() && owners.back().memory == import.memory;
-            std::erase_if(owners, [&](const Owner& owner) { return owner.memory == import.memory; });
+            const bool shown = !owners.empty() && gone(owners.back().memory);
+            std::erase_if(owners, [&](const Owner& owner) { return gone(owner.memory); });
             if (shown) rebinds.emplace_back(at, owners.empty() ? Owner{VK_NULL_HANDLE, 0} : owners.back());
             if (owners.empty()) state.pages.erase(found);
         }
@@ -184,6 +273,8 @@ void GuestMirror::Unbind(const HostImport& import) {
         submit(at - base, page, owner.memory, owner.memory == VK_NULL_HANDLE ? 0 : at - owner.importBase);
         if (owner.memory == VK_NULL_HANDLE) state.boundBytes.fetch_sub(page, std::memory_order_relaxed);
     }
+    // The mirror's own imports are freed once no page shows them (the submits above waited).
+    for (std::size_t index = 1; index < memories.size(); ++index) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memories[index], nullptr);
     state.unbinds.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -199,12 +290,17 @@ void GuestMirror::Report() {
     const auto deferred = take(state.deferred);
     const auto unaligned = take(state.unaligned);
     const auto bindUs = take(state.bindUs);
+    const auto extraImports = take(state.extraImports);
+    const auto extraRefused = take(state.extraRefused);
+    const auto edgesSkipped = take(state.edgesSkipped);
     std::size_t pages = 0;
+    std::size_t extrasHeld = 0;
     {
         std::lock_guard lock(state.mutex);
         pages = state.pages.size();
+        for (const auto& [memory, owned] : state.extras) extrasHeld += owned.size();
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[mirror] (10 s) %llu imports bound (%llu requested), %llu unbound, %llu not page-aligned; %.1f ms in sparse binds; %zu pages shown (%.0f MiB bound)\n", binds, deferred, unbinds, unaligned, bindUs / 1000.0, pages, state.boundBytes.load() / 1048576.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[mirror] (10 s) %llu imports bound (%llu requested), %llu unbound, %llu not page-aligned; own imports %llu made, %llu refused, %llu end pages skipped, %zu held; %.1f ms in sparse binds; %zu pages shown (%.0f MiB bound)\n", binds, deferred, unbinds, unaligned, extraImports, extraRefused, edgesSkipped, extrasHeld, bindUs / 1000.0, pages, state.boundBytes.load() / 1048576.0);
 }
 
 }

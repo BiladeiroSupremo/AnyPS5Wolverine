@@ -37,6 +37,16 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
 std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false);
 bool BdaByteReadsForced();
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract);
+// Experiment (M4, APS5_BDA_MIRROR=1): the table is the guest mirror alone.
+bool BdaMirrorMode();
+// Mirror mode: the 32-bit word at the 4-byte aligned guest address `guest` (u64) when `valid`, else
+// zero, with no branch and no fault record: an invalid or unmapped address reads the mirror's last
+// page, which nothing binds (zeros).
+std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask);
+// The same read as one helper function (read_mirror_word) the reads call: defined with the other
+// BDA functions in mirror mode; EmitMirrorWordCall falls back to the inline read without it.
+void DefineMirrorWordFunction(SpirvEmitterState& state);
+std::uint32_t EmitMirrorWordCall(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
 
 }

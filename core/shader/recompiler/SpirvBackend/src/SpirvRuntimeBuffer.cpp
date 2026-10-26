@@ -55,7 +55,8 @@ void faultIf(SpirvValueEmitContext& context, const IrValue& instruction, std::ui
     StopBdaInvocationIf(state, condition);
 }
 
-RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& instruction) {
+// `faults` false: an invalid GPU-read V# only clears `valid` (the mirror-mode reads), with no fault record.
+RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& instruction, bool faults = true) {
     auto& state = context.state;
     const auto* handle = instruction.Argument(0)->Resolve();
     if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) context.Fail(instruction, "requires a runtime four-dword V#");
@@ -85,7 +86,7 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
             invalid = Binary(state, spv::OpLogicalOr, TypeBool(state), invalid, addTid);
         }
     }
-    if (memory.gpuDescriptor) faultIf(context, instruction, invalid, base, 0u, BdaAbi::FaultReason::InvalidDescriptor);
+    if (memory.gpuDescriptor && faults) faultIf(context, instruction, invalid, base, 0u, BdaAbi::FaultReason::InvalidDescriptor);
     const auto stride = field(state, word1, 16u, 14u);
     const auto present = runtime ? both(state, nonzero(state, context.Arg(*handle, 2u)), Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, context.Arg(*handle, 0u)), nonzero(state, field(state, word1, 0u, 16u)))) : nonzero(state, state.module.SpecializationConstant(u32, first + 2u, 0u));
     const auto valid = memory.gpuDescriptor ? both(state, Unary(state, spv::OpLogicalNot, TypeBool(state), invalid), Binary(state, spv::OpINotEqual, TypeBool(state), base, BdaConstant(state, 0u))) : present;
@@ -812,7 +813,8 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     auto& state = context.state;
     if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) context.Fail(instruction, "scalar buffer bounds require shaderInt64");
     state.module.EmitCapability(spv::CapabilityInt64);
-    const auto resource = descriptor(context, instruction);
+    const bool mirrorRead = context.Memory(instruction).gpuDescriptor && BdaMirrorMode() && !context.Memory(instruction).coherent;
+    const auto resource = descriptor(context, instruction, !mirrorRead);
     const auto u64 = TypeScalarU64(state);
     const auto size = Select(state, u64, equal(state, resource.stride, ConstantU32(state, 0u)), Unary(state, spv::OpUConvert, u64, resource.records), Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, resource.stride), Unary(state, spv::OpUConvert, u64, resource.records)));
     const auto address = EmitAddU32(state, context.Arg(instruction, 1u), ConstantU32(state, context.Memory(instruction).offset));
@@ -824,6 +826,10 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     // drops it (readOrZero): a branch around every constant load split the shader's scalar loads
     // into one memory round trip each (an s_wait_kmcnt per load in the ISA).
     if (!context.Memory(instruction).gpuDescriptor) return readOrZero(context, instruction, inBounds, [&] { return readBuffer(context, instruction, byte, 32u); });
+    // Mirror mode: one aligned load through the mirror, kept or dropped by a select (an invalid V#
+    // or an address outside the mirror reads zero; no fault is recorded).
+    // The scalar unit ignores the address's low two bits.
+    if (mirrorRead) return EmitMirrorWordCall(state, Binary(state, spv::OpBitwiseAnd, u64, Binary(state, spv::OpIAdd, u64, resource.base, offset), BdaConstant(state, ~std::uint64_t{3u})), inBounds);
     return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
 }
 

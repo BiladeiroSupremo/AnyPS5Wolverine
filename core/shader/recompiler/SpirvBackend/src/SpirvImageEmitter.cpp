@@ -30,6 +30,31 @@
 namespace ShaderRecompiler {
 namespace {
 
+// Profiling (APS5_EMIT_STATS=1): image accesses by path (hashed T#, heap-branched, plain, inside a
+// registration module or not), with their runtime mode count and the words each mode emitted,
+// printed at exit beside the per-opcode [emit-stats] lines.
+struct ImageStats {
+    std::mutex mutex;
+    // key: path * 64 + registration * 32 + min(modes, 31)
+    std::array<std::uint64_t, 256> accesses{};
+    std::array<std::uint64_t, 256> modeWords{};
+    std::array<std::uint64_t, 256> totalWords{};
+    ~ImageStats() {
+        static constexpr const char* paths[] = {"plain", "heap-slot", "heap-heap", "hashed"};
+        for (std::size_t key = 0; key < accesses.size(); ++key) {
+            if (accesses[key] == 0) continue;
+            std::fprintf(stderr, "[image-stats] %-9s reg %d modes %2zu: %6llu accesses, %8.1f words/access (%8.1f in the modes)\n", paths[key / 64], static_cast<int>((key / 32) % 2), key % 32, static_cast<unsigned long long>(accesses[key]), static_cast<double>(totalWords[key]) / static_cast<double>(accesses[key]), static_cast<double>(modeWords[key]) / static_cast<double>(accesses[key]));
+        }
+    }
+};
+
+ImageStats* ImageStatistics() {
+    static ImageStats* stats = std::getenv("APS5_EMIT_STATS") != nullptr ? new ImageStats : nullptr;
+    static const bool registered = stats != nullptr && std::atexit([] { delete ImageStatistics(); }) == 0;
+    static_cast<void>(registered);
+    return stats;
+}
+
 // A bindless table root's runtime slot and whether the key is mapped (SPIR-V ids), both 0 for a
 // direct image.
 struct TableSelection {
@@ -1850,9 +1875,16 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     state.module.AddFunction(spv::OpBranch, merge);
 
     EmitLabel(state, slotLabel);
-    EmitImage(ctx, inst);
-    const auto slotValue = returnsValue ? ctx.Def(&inst) : 0u;
-    ctx.definitions.erase(&inst);
+    // APS5_HEAP_ONLY (graphics): no slot search; the materializer rejects a table it would bind
+    // slot by slot, so this branch only runs without a header and reads zeros.
+    std::uint32_t slotValue = 0u;
+    if (ResourceMaterializer::HeapOnlyGraphics() && StageOf(state) != IrShaderStage::Compute) {
+        if (returnsValue) slotValue = state.module.Constant(spv::OpConstantNull, TypeId(state, inst.Type()));
+    } else {
+        EmitImage(ctx, inst);
+        slotValue = returnsValue ? ctx.Def(&inst) : 0u;
+        ctx.definitions.erase(&inst);
+    }
     const auto slotEnd = state.currentLabel;
     state.module.AddFunction(spv::OpBranch, merge);
     state.bindlessHeapBranch = false;
@@ -2010,12 +2042,44 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         return;
     }
     const auto modes = ResourceMaterializer::RuntimeImageModes(base);
+    // The modes emitted, by their index in `modes` (the selector's value). The heap branch of a
+    // table root samples with its representative's mode, always a heap mode (HeapImageMode, which
+    // the materializer requires of the representative): the other modes are left out there, and
+    // any other selector value takes the first heap mode.
+    const bool heapModes = state.bindlessHeapBranch && state.bindlessHeapSlot != 0u && state.hashedImageSelector == 0u && !base.hashed;
+    std::vector<std::uint32_t> used;
+    for (std::uint32_t index = 0u; index < modes.size(); ++index) {
+        if (!heapModes || ResourceMaterializer::HeapImageMode(base, modes[index])) used.push_back(index);
+    }
+    if (used.empty()) ctx.Fail(inst, "has no heap image mode for its bindless table");
+    auto* stats = ImageStatistics();
+    const auto statsStart = stats != nullptr ? state.module.FunctionWords() : 0u;
+    std::uint64_t statsModeWords = 0;
+    const auto countStats = [&] {
+        if (stats == nullptr) return;
+        const std::size_t path = state.hashedImageSelector != 0u ? 3u : state.bindlessHeapBranch ? (state.bindlessHeapSlot != 0u ? 2u : 1u) : 0u;
+        const auto key = path * 64u + (state.registrationModules ? 32u : 0u) + std::min<std::size_t>(used.size(), 31u);
+        std::lock_guard lock(stats->mutex);
+        ++stats->accesses[key];
+        stats->modeWords[key] += statsModeWords;
+        stats->totalWords[key] += state.module.FunctionWords() - statsStart;
+    };
     state.runtimeImageMetadata = ConstantU32(state, memory.resource);
     const auto table = TableSlot(ctx, inst, memory, base);
     if (table.slot != 0u) {
         state.runtimeImageMetadata = table.slot;
     }
     const auto emitMode = [&](const ImageResource& mode) {
+        const auto modeStart = stats != nullptr ? state.module.FunctionWords() : 0u;
+        struct ModeWords {
+            std::uint64_t& into;
+            SpirvModule& module;
+            std::size_t start;
+            bool on;
+            ~ModeWords() {
+                if (on) into += module.FunctionWords() - start;
+            }
+        } modeWords{statsModeWords, state.module, modeStart, stats != nullptr};
         state.runtimeImage = &mode;
         if (mode.packedFormat == IrBufferFormat::Fmask8_S2_F1) {
             if (inst.Opcode() == IrOpcode::ImageRead && memory.dataBits == 32u) {
@@ -2038,6 +2102,14 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         emitMode(modes.front());
         state.runtimeImage = nullptr;
         state.runtimeImageMetadata = 0u;
+        countStats();
+        return;
+    }
+    if (used.size() == 1u) {
+        emitMode(modes[used.front()]);
+        state.runtimeImage = nullptr;
+        state.runtimeImageMetadata = 0u;
+        countStats();
         return;
     }
     const auto selector = state.hashedImageSelector != 0u ? state.hashedImageSelector : base.indirectRoot == ImageResource::NoIndirectImage && !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u) : RuntimeImageMode(state, memory.resource);
@@ -2046,22 +2118,22 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     ctx.definitions.erase(&inst);
     const bool exits = !state.continueTarget;
     const auto merge = state.module.AllocateId();
-    const auto invalid = exits ? state.module.AllocateId() : merge;
-    const auto undefined = returnsValue && !exits ? state.module.AllocateId() : 0u;
     std::vector<std::uint32_t> labels(modes.size());
+    for (const auto index : used) labels[index] = state.module.AllocateId();
+    // Heap modes: an unlisted selector takes the first heap mode, so the switch never reaches the
+    // merge directly.
+    const auto invalid = heapModes ? labels[used.front()] : exits ? state.module.AllocateId() : merge;
+    const auto undefined = returnsValue && !exits ? state.module.AllocateId() : 0u;
     std::vector<std::uint32_t> words{spv::OpSwitch, selector, invalid};
-    for (std::uint32_t index = 0u; index < modes.size(); ++index) {
-        labels[index] = state.module.AllocateId();
-        words.insert(words.end(), {index, labels[index]});
-    }
+    for (const auto index : used) words.insert(words.end(), {index, labels[index]});
     std::vector<std::uint32_t> incoming;
     if (undefined != 0u) {
         state.module.AddFunction(spv::OpUndef, TypeId(state, inst.Type()), undefined);
-        incoming.insert(incoming.end(), {undefined, state.currentLabel});
+        if (invalid == merge) incoming.insert(incoming.end(), {undefined, state.currentLabel});
     }
     state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
     state.module.AddFunction(words);
-    for (std::uint32_t index = 0u; index < modes.size(); ++index) {
+    for (const auto index : used) {
         EmitLabel(state, labels[index]);
         std::uint32_t modeMerge = 0u;
         if (base.indirectRoot != ImageResource::NoIndirectImage && !state.registrationModules) {
@@ -2095,7 +2167,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     }
     state.runtimeImage = nullptr;
     state.runtimeImageMetadata = 0u;
-    if (exits) {
+    if (exits && !heapModes) {
         EmitLabel(state, invalid);
         state.module.AddFunction(spv::OpUnreachable);
     }
@@ -2106,6 +2178,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         state.module.AddFunction(phi);
         ctx.definitions.emplace(&inst, resultId);
     }
+    countStats();
 }
 
 void EmitGetImageResource(SpirvValueEmitContext& context) {

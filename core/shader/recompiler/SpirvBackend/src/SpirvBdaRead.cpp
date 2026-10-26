@@ -667,4 +667,52 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
     return values;
 }
 
+bool BdaMirrorMode() {
+    static const bool mirror = std::getenv("APS5_BDA_MIRROR") != nullptr;
+    return mirror;
+}
+
+void DefineMirrorWordFunction(SpirvEmitterState& state) {
+    if (!BdaMirrorMode() || state.bdaPagetableVariable == 0u) return;
+    const auto u32 = TypeU32(state);
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, "read_mirror_word");
+    state.module.AddFunction(spv::OpFunction, u32, function, spv::FunctionControlMaskNone, state.module.Type(spv::OpTypeFunction, u32, TypeScalarU64(state), TypeBool(state)));
+    const auto guest = state.module.AllocateId();
+    const auto valid = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, TypeScalarU64(state), guest);
+    state.module.AddFunction(spv::OpFunctionParameter, TypeBool(state), valid);
+    EmitLabel(state, state.module.AllocateId());
+    state.module.AddFunction(spv::OpReturnValue, EmitMirrorWordRead(state, guest, valid, 0u));
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.mirrorWordFunction = function;
+}
+
+std::uint32_t EmitMirrorWordCall(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid) {
+    if (state.mirrorWordFunction == 0u) return EmitMirrorWordRead(state, guest, valid, 0u);
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, TypeU32(state), value, state.mirrorWordFunction, guest, valid);
+    return value;
+}
+
+std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask) {
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    // The mirror entry (BdaResources: one range, words 4/6/8 = begin, end, device address); uniform
+    // loads the compiler keeps once per shader.
+    const auto begin = BdaLoadAddress(state, ConstantU32(state, 4u));
+    const auto finish = BdaLoadAddress(state, ConstantU32(state, 6u));
+    const auto base = BdaLoadAddress(state, ConstantU32(state, 8u));
+    const auto inside = Binary(state, spv::OpLogicalAnd, boolean, valid, Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpUGreaterThanEqual, boolean, guest, begin), Binary(state, spv::OpULessThan, boolean, guest, finish)));
+    // Anything else reads the unbound last page at the address's offset in its page.
+    const auto lastPage = Binary(state, spv::OpISub, u64, Binary(state, spv::OpIAdd, u64, base, Binary(state, spv::OpISub, u64, finish, begin)), BdaConstant(state, 0x10000u));
+    const auto spare = Binary(state, spv::OpIAdd, u64, lastPage, Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, 0xfffcu)));
+    const auto physical = Select(state, u64, inside, Binary(state, spv::OpIAdd, u64, base, Binary(state, spv::OpISub, u64, guest, begin)), spare);
+    const auto pointer = state.module.AllocateId();
+    state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, physical);
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, accessMask | spv::MemoryAccessAlignedMask, 4u);
+    return Select(state, TypeU32(state), inside, value, ConstantU32(state, 0u));
+}
+
 }

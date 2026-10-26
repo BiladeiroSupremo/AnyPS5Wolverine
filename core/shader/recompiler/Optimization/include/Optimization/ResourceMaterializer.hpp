@@ -11,7 +11,7 @@ namespace ShaderRecompiler {
 
 // Why a bindless image table (a T# loaded from a table buffer at a runtime key) was not bound;
 // counted on the [bindless] line (APS5_PROFILE_DRAW).
-enum class BindlessRejection { Capacity, MaterialScan, NoEntry, Storage, NonUniform, ImageSlots, Count };
+enum class BindlessRejection { Capacity, MaterialScan, NoEntry, Storage, NonUniform, ImageSlots, HeapOnly, Count };
 
 // A bindless image table the materializer cannot bind (BindlessRejection): the work using it cannot
 // run, which a driver may report and skip instead of failing the process.
@@ -31,6 +31,14 @@ public:
     void ApplyStaticInterface(IrProgram& program, bool nativeSampleOffsets = true) const;
     static std::vector<ImageResource> RuntimeImageModes(const ImageResource& image);
     static std::uint32_t RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
+    // Whether `mode` (one of RuntimeImageModes(image)) can serve a heap-sampled table: the heap path
+    // takes the mode of the table's representative entry, which is a float entry of the access's own
+    // dimension, so the integer, conversion and packed modes and the other dimensions never apply
+    // there (SpirvImageEmitter emits only these in the heap branch).
+    static bool HeapImageMode(const ImageResource& image, const ImageResource& mode);
+    // APS5_HEAP_ONLY=1: graphics stages emit only the heap branch of a heap-branched table (no slot
+    // search); a table the driver would bind slot by slot is rejected instead (BindlessRejection::HeapOnly).
+    static bool HeapOnlyGraphics();
     static void PrepareImageModes(ShaderInfo& info);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;

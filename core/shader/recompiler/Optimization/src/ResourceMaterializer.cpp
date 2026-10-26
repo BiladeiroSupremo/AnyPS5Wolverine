@@ -250,6 +250,8 @@ bool BindlessTraced() {
 struct BindlessCounters {
     std::atomic<std::uint64_t> tablesMaterial{0};
     std::atomic<std::uint64_t> tablesWhole{0};
+    // Of tablesWhole: sampled through the heap set.
+    std::atomic<std::uint64_t> tablesHeap{0};
     std::atomic<std::uint64_t> keys{0};
     std::atomic<std::uint64_t> paddedNull{0};
     std::atomic<std::uint64_t> paddedShape{0};
@@ -290,10 +292,10 @@ void reportBindless() {
     }
     if (material + whole + rejections == 0) return;
     const auto tables = material + whole;
-    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu\n",
-        static_cast<unsigned long long>(tables), static_cast<unsigned long long>(material), static_cast<unsigned long long>(whole), ResourceMaterializer::BindlessSlots(), tables != 0 ? static_cast<double>(keys) / static_cast<double>(tables) : 0.0,
+    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu of them heap %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu, heap only %llu\n",
+        static_cast<unsigned long long>(tables), static_cast<unsigned long long>(material), static_cast<unsigned long long>(whole), static_cast<unsigned long long>(counters.tablesHeap.exchange(0, std::memory_order_relaxed)), ResourceMaterializer::BindlessSlots(), tables != 0 ? static_cast<double>(keys) / static_cast<double>(tables) : 0.0,
         static_cast<unsigned long long>(counters.paddedNull.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedShape.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedConversion.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.outOfRange.exchange(0, std::memory_order_relaxed)),
-        static_cast<unsigned long long>(rejected[0]), static_cast<unsigned long long>(rejected[1]), static_cast<unsigned long long>(rejected[2]), static_cast<unsigned long long>(rejected[3]), static_cast<unsigned long long>(rejected[4]), static_cast<unsigned long long>(rejected[5]));
+        static_cast<unsigned long long>(rejected[0]), static_cast<unsigned long long>(rejected[1]), static_cast<unsigned long long>(rejected[2]), static_cast<unsigned long long>(rejected[3]), static_cast<unsigned long long>(rejected[4]), static_cast<unsigned long long>(rejected[5]), static_cast<unsigned long long>(rejected[6]));
 }
 
 struct TableResolution {
@@ -408,13 +410,16 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
             try {
                 const auto decoded = decodeImageDescriptor(candidate, image, plan.srgbDecodeFormats);
                 if (decoded.fmask || decoded.numericClass != IrTextureNumericClass::Float || decoded.dimension != image.dimension) continue;
-                static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, candidate, plan.info.runtimeImageModes.at(imageIndex)));
+                // The heap branch holds only the heap modes: the representative must select one.
+                const auto& modes = plan.info.runtimeImageModes.at(imageIndex);
+                if (!ResourceMaterializer::HeapImageMode(image, modes.at(ResourceMaterializer::RuntimeImageMode(image, candidate, modes)))) continue;
             } catch (const std::exception&) {
                 continue;
             }
             resolution.slots.assign(slots, candidate);
             resolution.mapping.clear();
             resolution.heap = true;
+            counters.tablesHeap.fetch_add(1, std::memory_order_relaxed);
             resolution.heapBase = base;
             resolution.entryOffset = table.entryOffset;
             resolution.entries = entries;
@@ -425,6 +430,8 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         }
         rejectTable(BindlessRejection::NoEntry, "bindless image heap: no float entry of the instruction's dimension among the first " + std::to_string(std::min(entries, HeapShapeScan)));
     }
+    // A heap-only build (APS5_HEAP_ONLY) has no slot search to bind.
+    if (heapEligible && plan.stage != IrShaderStage::Compute && ResourceMaterializer::HeapOnlyGraphics()) rejectTable(BindlessRejection::HeapOnly, "bindless image table bound slot by slot in a heap-only build (APS5_HEAP_ONLY)");
     if (!materialMode) {
         if (entries > slots) {
             rejectTable(table.hasMaterial ? BindlessRejection::MaterialScan : BindlessRejection::Capacity, "bindless image table has " + std::to_string(entries) + " entries (" + std::to_string(materialEntries) + " materials), limit " + std::to_string(slots) + " (dim " + std::to_string(static_cast<std::uint32_t>(image.dimension)) + (image.resourceClass == ImageResourceClass::Sampled ? "" : ", storage") + (image.depthCompare ? ", depth compare" : "") + (image.r128 ? ", r128" : "") + ")");
@@ -897,6 +904,15 @@ const char* ResourceMaterializer::UnnormalizedSampleMismatch(const ImageResource
     if (image.depthCompare) return "is used with depth comparison";
     if (image.conversionFormat != IrBufferFormat::Invalid || image.packed) return "samples an image that needs a format conversion or packed access";
     return nullptr;
+}
+
+bool ResourceMaterializer::HeapImageMode(const ImageResource& image, const ImageResource& mode) {
+    return mode.numericClass == IrTextureNumericClass::Float && mode.conversionFormat == IrBufferFormat::Invalid && mode.packedFormat == IrBufferFormat::Invalid && mode.dimension == image.dimension;
+}
+
+bool ResourceMaterializer::HeapOnlyGraphics() {
+    static const bool enabled = std::getenv("APS5_HEAP_ONLY") != nullptr;
+    return enabled;
 }
 
 std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes) {

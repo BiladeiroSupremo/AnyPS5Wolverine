@@ -26,8 +26,10 @@ public:
     VkDeviceAddress Address() const { return address; }
     std::uint64_t Base() const { return base; }
     std::uint64_t Bytes() const { return bytes; }
-    // Binds the import's whole pages; an import whose guest base is not page-aligned cannot be
-    // bound (its memory offsets would not be) and is only counted.
+    // Binds the import's pages. Its memory serves the pages at page-aligned offsets from its base;
+    // the rest (an import whose base is not page-aligned, and partial pages at either end) is served
+    // by host imports of the mirror's own: the aligned interior, and each partial end page whose
+    // whole 64 KiB is committed writable memory. They live as long as the import's binding.
     void Bind(const HostImport& import);
     // Before the import's memory is freed: its pages show the next owner, or none.
     void Unbind(const HostImport& import);
@@ -37,6 +39,8 @@ public:
 private:
     explicit GuestMirror(const Context& context);
     bool submit(std::uint64_t offset, std::uint64_t size, VkDeviceMemory memory, std::uint64_t memoryOffset);
+    // A host import of [host, host + size) for the mirror's own pages, or null.
+    VkDeviceMemory importHost(void* host, std::uint64_t size);
 
     const Context& context;
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -45,6 +49,7 @@ private:
     std::uint64_t base = 0;
     std::uint64_t bytes = 0;
     std::uint64_t page = 0;
+    std::uint32_t memoryTypes = 0;
 };
 
 }
