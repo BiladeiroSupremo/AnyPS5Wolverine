@@ -89,7 +89,8 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
     return {base, context.Arg(*handle, 2u), stride, word3, both(state, nonzero(state, stride), nonzero(state, field(state, word1, 31u, 1u))), index, valid};
 }
 
-RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t componentOffset, std::uint32_t bytes) {
+// `componentOffset` and `bytes` are SPIR-V ids (constants or run-time values: formattedRuntime).
+RuntimeAddress addressIds(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t componentOffset, std::uint32_t bytes) {
     auto& state = context.state;
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
@@ -98,9 +99,9 @@ RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instructio
     const auto mul = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpIMul, u32, left, right); };
     const auto less = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpULessThan, boolean, left, right); };
     const auto fits = [&](std::uint32_t offset, std::uint32_t size) {
-        return both(state, Binary(state, spv::OpUGreaterThanEqual, boolean, size, constant(bytes)), Binary(state, spv::OpULessThanEqual, boolean, offset, Binary(state, spv::OpISub, u32, size, constant(bytes))));
+        return both(state, Binary(state, spv::OpUGreaterThanEqual, boolean, size, bytes), Binary(state, spv::OpULessThanEqual, boolean, offset, Binary(state, spv::OpISub, u32, size, bytes)));
     };
-    const auto offset = resource.offset != 0u ? add(resource.offset, constant(componentOffset)) : add(context.Arg(instruction, 2u), constant(context.Memory(instruction).offset + componentOffset));
+    const auto offset = resource.offset != 0u ? add(resource.offset, componentOffset) : add(context.Arg(instruction, 2u), add(constant(context.Memory(instruction).offset), componentOffset));
     const auto soffset = resource.soffset != 0u ? resource.soffset : context.Arg(instruction, 3u);
     const auto indexShift = add(field(state, resource.word3, 21u, 2u), constant(3u));
     const auto indices = Binary(state, spv::OpShiftLeftLogical, u32, constant(1u), indexShift);
@@ -121,6 +122,10 @@ RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instructio
     inBounds = both(state, resource.valid, both(state, nonzero(state, field(state, resource.word3, 12u, 7u)), inBounds));
     if (!context.Memory(instruction).gpuDescriptor) return {byte, inBounds};
     return {AddBdaAddress(context, instruction, resource.base, Unary(state, spv::OpUConvert, TypeScalarU64(state), byte), false), inBounds};
+}
+
+RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t componentOffset, std::uint32_t bytes) {
+    return addressIds(context, instruction, resource, ConstantU32(context.state, componentOffset), ConstantU32(context.state, bytes));
 }
 
 MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue& instruction, bool wide = false, bool plainLoad = false) {
@@ -386,6 +391,143 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
     return composite(state, components, outputs);
 }
 
+// A formatted load whose format is known only at run time (a GPU-selected V#, or the word 3 a
+// registration module receives): the up to four components are read once, at the byte offsets and
+// sizes of the format's layout (formats come in runs of one layout, selected by range), and only
+// their conversion branches on the format. formatSwitch repeated the bounds checks and reads in
+// each of its ~70 cases (~25k SPIR-V lines per helper; the AMD compiler then took minutes for one
+// pipeline part).
+std::uint32_t formattedRuntime(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components) {
+    auto& state = context.state;
+    const auto& memory = context.Memory(instruction);
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto format = field(state, resource.word3, 12u, 7u);
+    constexpr std::uint32_t count = static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float);
+    // Layout words: component count (bits 0-2), packed (bit 3), component bits (6 each from bit 4);
+    // bit offsets (7 each).
+    struct Layout {
+        std::uint32_t last;
+        std::uint32_t shape;
+        std::uint32_t offsets;
+    };
+    std::vector<Layout> layouts;
+    for (std::uint32_t index = 1u; index <= count; ++index) {
+        const auto info = GetFormatInfo(static_cast<IrBufferFormat>(index));
+        std::uint32_t shape = info.componentCount | (info.packedBitfield ? 8u : 0u), offsets = 0u;
+        for (std::uint32_t component = 0; component < info.componentCount; ++component) {
+            shape |= info.componentBits[component] << (4u + 6u * component);
+            offsets |= info.componentBitOffset[component] << (7u * component);
+        }
+        if (!layouts.empty() && layouts.back().shape == shape && layouts.back().offsets == offsets) layouts.back().last = index;
+        else layouts.push_back({index, shape, offsets});
+    }
+    auto shape = constant(0u);
+    auto offsets = constant(0u);
+    for (auto layout = layouts.rbegin(); layout != layouts.rend(); ++layout) {
+        const auto inRun = Binary(state, spv::OpULessThanEqual, boolean, format, constant(layout->last));
+        shape = Select(state, u32, inRun, constant(layout->shape), shape);
+        offsets = Select(state, u32, inRun, constant(layout->offsets), offsets);
+    }
+    shape = Select(state, u32, Binary(state, spv::OpLogicalOr, boolean, equal(state, format, constant(0u)), Binary(state, spv::OpUGreaterThan, boolean, format, constant(count))), constant(0u), shape);
+    const auto componentCount = field(state, shape, 0u, 3u);
+    const auto packed = nonzero(state, field(state, shape, 3u, 1u));
+    std::array<std::uint32_t, 4> bits{}, bitOffset{}, selectors{}, selected{}, required{};
+    std::array<RuntimeAddress, 4> addresses{};
+    const auto divisor = Select(state, u32, equal(state, componentCount, constant(0u)), constant(1u), componentCount);
+    for (std::uint32_t output = 0; output < components; ++output) {
+        selectors[output] = field(state, resource.word3, output * 3u, 3u);
+        selected[output] = Binary(state, spv::OpUMod, u32, Binary(state, spv::OpISub, u32, selectors[output], constant(4u)), divisor);
+    }
+    auto inBounds = ConstantBool(state, true);
+    for (std::uint32_t component = 0; component < 4u; ++component) {
+        bits[component] = field(state, shape, 4u + 6u * component, 6u);
+        bitOffset[component] = field(state, offsets, 7u * component, 7u);
+        required[component] = ConstantBool(state, false);
+        for (std::uint32_t output = 0; output < components; ++output) {
+            const auto fromMemory = Binary(state, spv::OpUGreaterThanEqual, boolean, selectors[output], constant(4u));
+            required[component] = Binary(state, spv::OpLogicalOr, boolean, required[component], both(state, fromMemory, equal(state, selected[output], constant(component))));
+        }
+        required[component] = both(state, required[component], Binary(state, spv::OpULessThan, boolean, constant(component), componentCount));
+        const auto byteOffset = Select(state, u32, packed, constant(0u), Binary(state, spv::OpShiftRightLogical, u32, bitOffset[component], constant(3u)));
+        const auto bytes = Select(state, u32, packed, constant(4u), Binary(state, spv::OpShiftRightLogical, u32, bits[component], constant(3u)));
+        addresses[component] = addressIds(context, instruction, resource, byteOffset, bytes);
+        inBounds = both(state, inBounds, Binary(state, spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, required[component]), addresses[component].inBounds));
+    }
+    // The raw components, zero-extended to their width.
+    std::array<std::uint32_t, 4> raw{};
+    for (std::uint32_t component = 0; component < 4u; ++component) {
+        const auto read = readOrZero(context, instruction, both(state, inBounds, required[component]), [&] {
+            const auto guest = addresses[component].guest;
+            const auto sized = EmitValueIfElse(state, Binary(state, spv::OpLogicalOr, boolean, packed, equal(state, bits[component], constant(32u))), u32, [&] { return readBuffer(context, instruction, guest, 32u); }, [&] {
+                return EmitValueIfElse(state, equal(state, bits[component], constant(16u)), u32, [&] { return readBuffer(context, instruction, guest, 16u); }, [&] { return readBuffer(context, instruction, guest, 8u); });
+            });
+            return sized;
+        });
+        const auto extracted = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBitFieldUExtract, u32, extracted, read, bitOffset[component], bits[component]);
+        raw[component] = Select(state, u32, packed, extracted, read);
+    }
+    // The conversion, per format.
+    const auto type = components == 1u ? u32 : TypeU32Composite(state, components);
+    const auto merge = state.module.AllocateId();
+    const auto invalid = state.module.AllocateId();
+    std::vector<std::uint32_t> labels(count);
+    std::vector<std::uint32_t> branch{spv::OpSwitch, format, invalid};
+    for (std::uint32_t index = 0; index < count; ++index) {
+        labels[index] = state.module.AllocateId();
+        branch.insert(branch.end(), {index + 1u, labels[index]});
+    }
+    const auto result = state.module.AllocateId();
+    std::vector<std::uint32_t> phi{spv::OpPhi, type, result};
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(branch);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        EmitLabel(state, labels[index]);
+        const auto info = GetFormatInfo(static_cast<IrBufferFormat>(index + 1u));
+        std::array<std::uint32_t, 4> values{};
+        for (std::uint32_t component = 0; component < info.componentCount; ++component) {
+            auto value = raw[component];
+            const auto width = info.componentBits[component];
+            if (width != 32u && IsSignedFormatComponent(info.type)) {
+                const auto extended = state.module.AllocateId();
+                state.module.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), extended, Unary(state, spv::OpBitcast, TypeI32(state), value), constant(0u), constant(width));
+                value = Unary(state, spv::OpBitcast, u32, extended);
+            }
+            values[component] = NormalizeFormatComponent(state, info, component, value);
+        }
+        const bool integer = info.type == SpirvFormatComponentType::Uint || info.type == SpirvFormatComponentType::Sint;
+        const auto one = constant(integer ? 1u : 0x3f800000u);
+        std::array<std::uint32_t, 4> outputs{};
+        for (std::uint32_t output = 0; output < components; ++output) {
+            const auto pick = Binary(state, spv::OpUMod, u32, Binary(state, spv::OpISub, u32, selectors[output], constant(4u)), constant(info.componentCount));
+            auto value = values[0];
+            for (std::uint32_t component = 1; component < info.componentCount; ++component) value = Select(state, u32, equal(state, pick, constant(component)), values[component], value);
+            value = Select(state, u32, equal(state, selectors[output], constant(1u)), one, value);
+            outputs[output] = Select(state, u32, equal(state, selectors[output], constant(0u)), constant(0u), value);
+        }
+        const auto value = composite(state, components, outputs);
+        const auto exit = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBranch, exit);
+        EmitLabel(state, exit);
+        state.module.AddFunction(spv::OpBranch, merge);
+        phi.insert(phi.end(), {value, exit});
+    }
+    EmitLabel(state, invalid);
+    if (memory.gpuDescriptor) RecordBdaFault(state, resource.base, constant(0u), BdaInstructionPc(state, instruction), BdaAbi::FaultReason::InvalidDescriptor);
+    const auto zero = components == 1u ? constant(0u) : ConstantU32CompositeZero(state, components);
+    const auto invalidExit = state.module.AllocateId();
+    state.module.AddFunction(spv::OpBranch, invalidExit);
+    EmitLabel(state, invalidExit);
+    state.module.AddFunction(spv::OpBranch, merge);
+    phi.insert(phi.end(), {zero, invalidExit});
+    EmitLabel(state, merge);
+    state.module.AddFunction(phi);
+    if (memory.gpuDescriptor) StopBdaInvocationIf(state, Binary(state, spv::OpLogicalOr, boolean, equal(state, format, constant(0u)), Binary(state, spv::OpUGreaterThan, boolean, format, constant(count))));
+    return result;
+}
+
 std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, bool store, std::uint32_t data);
 std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, bool store, std::uint32_t data);
 std::uint32_t formattedGpuCall(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, bool store, std::uint32_t data);
@@ -419,6 +561,9 @@ std::uint32_t formattedDispatch(SpirvValueEmitContext& context, const IrValue& i
 std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, bool store, std::uint32_t data) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
+    // APS5_NO_FORMATTED_RUNTIME=1: loads take the per-format cases below too.
+    static const bool runtimeLoads = std::getenv("APS5_NO_FORMATTED_RUNTIME") == nullptr;
+    if (runtimeLoads && !store && !memory.d16) return formattedRuntime(context, instruction, resource, components);
     const auto format = field(state, resource.word3, 12u, 7u);
     const auto merge = state.module.AllocateId();
     const auto invalid = state.module.AllocateId();

@@ -141,6 +141,10 @@ void ReportCaptureWait(std::uint64_t codeAddress) {
 }
 
 bool AddressSrtProgram(const IrResourcePlan& program) {
+    // Experiment (M4 step A): APS5_ADDRESS_SRT_GRAPHICS=1 puts every pixel and vertex-like program on
+    // the address path, to measure its per-draw cost and correctness.
+    static const bool graphics = std::getenv("APS5_ADDRESS_SRT_GRAPHICS") != nullptr;
+    if (graphics && program.stage != IrShaderStage::Compute && program.stage != IrShaderStage::TessellationControl) return true;
     const auto& list = addressSrtList();
     if (program.stage != IrShaderStage::Compute || list.empty()) return false;
     if (std::find(list.begin(), list.end(), program.shaderHash) != list.end()) return true;
