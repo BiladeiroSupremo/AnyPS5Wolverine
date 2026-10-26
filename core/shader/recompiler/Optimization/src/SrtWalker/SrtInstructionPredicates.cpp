@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
@@ -68,7 +70,12 @@ bool HashedSamplerCandidate(const IrResourcePlan& program, const IrValue& handle
     return true;
 }
 
-bool AddressSrtProgram(const IrResourcePlan& program) {
+namespace {
+
+// APS5_ADDRESS_SRT entries: code addresses or code content hashes (CodeContentHash). Host-code
+// programs move with the game image between runs, so the hashes are the stable names; a request
+// whose code hashes to an entry adds its address to the matched set (NoteAddressSrtCode).
+const std::vector<std::uint64_t>& addressSrtList() {
     static const std::vector<std::uint64_t> list = [] {
         std::vector<std::uint64_t> programs;
         if (const char* text = std::getenv("APS5_ADDRESS_SRT")) {
@@ -82,7 +89,45 @@ bool AddressSrtProgram(const IrResourcePlan& program) {
         }
         return programs;
     }();
-    return program.stage == IrShaderStage::Compute && !list.empty() && std::find(list.begin(), list.end(), program.shaderHash) != list.end();
+    return list;
+}
+
+struct MatchedAddresses {
+    std::mutex mutex;
+    std::set<std::uint64_t> addresses;
+};
+
+MatchedAddresses& matchedAddresses() {
+    static MatchedAddresses matched;
+    return matched;
+}
+
+}
+
+std::uint64_t CodeContentHash(std::span<const std::uint32_t> code) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto word : code) {
+        hash ^= word;
+        hash *= 0x100000001b3ull;
+    }
+    return hash;
+}
+
+void NoteAddressSrtCode(std::uint64_t codeAddress, std::span<const std::uint32_t> code) {
+    const auto& list = addressSrtList();
+    if (list.empty() || std::find(list.begin(), list.end(), CodeContentHash(code)) == list.end()) return;
+    auto& matched = matchedAddresses();
+    std::lock_guard lock(matched.mutex);
+    if (matched.addresses.insert(codeAddress).second) std::fprintf(stderr, "[address-srt] program 0x%llx (code hash 0x%llx) reads its SRT on the GPU\n", static_cast<unsigned long long>(codeAddress), static_cast<unsigned long long>(CodeContentHash(code)));
+}
+
+bool AddressSrtProgram(const IrResourcePlan& program) {
+    const auto& list = addressSrtList();
+    if (program.stage != IrShaderStage::Compute || list.empty()) return false;
+    if (std::find(list.begin(), list.end(), program.shaderHash) != list.end()) return true;
+    auto& matched = matchedAddresses();
+    std::lock_guard lock(matched.mutex);
+    return matched.addresses.contains(program.shaderHash);
 }
 
 bool HashedImageCandidate(const IrResourcePlan& program, const IrValue& handle, std::array<IrValue*, 8>* reads, std::uint32_t* offset) {

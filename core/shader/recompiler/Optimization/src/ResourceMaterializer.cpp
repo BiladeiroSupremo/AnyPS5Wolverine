@@ -2,6 +2,7 @@
 #include "Optimization/BindlessHeaps.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
+#include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
@@ -1207,8 +1208,11 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     plan.info = source.info;
     PrepareImageModes(plan.info);
     plan.uniformFill = source.uniformFill;
+    // An address-SRT program's branches are not decided at capture: their conditions read the words
+    // the GPU writes, which the shader reads itself. Every block's sources stay active.
+    const bool addressSrt = Detail::AddressSrtProgram(source);
     for (auto& block : plan.controlFlow) {
-        if (block.condition != nullptr && !Detail::Evaluator::MayEvaluate(source, block.condition)) block.condition = nullptr;
+        if (block.condition != nullptr && (addressSrt || !Detail::Evaluator::MayEvaluate(source, block.condition))) block.condition = nullptr;
     }
     ownPlanValues(plan);
     const auto addSource = [&plan](std::uint32_t index) {

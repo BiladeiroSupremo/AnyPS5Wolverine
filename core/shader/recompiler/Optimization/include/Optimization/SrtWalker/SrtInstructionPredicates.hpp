@@ -3,6 +3,7 @@
 
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include <array>
+#include <span>
 
 namespace ShaderRecompiler::Detail {
 
@@ -18,6 +19,11 @@ bool HashedSamplerCandidate(const IrResourcePlan& program, const IrValue& handle
 // (no flat slots, buffers whose V# is not user data go through the address-based path), for
 // programs that read words an earlier GPU pass writes, so the CPU never waits for that pass.
 bool AddressSrtProgram(const IrResourcePlan& program);
+// FNV-1a over a program's code words: its name for APS5_ADDRESS_SRT across runs.
+std::uint64_t CodeContentHash(std::span<const std::uint32_t> code);
+// Called for every request before translation: a program whose code hash is listed in
+// APS5_ADDRESS_SRT is matched by its code address from then on.
+void NoteAddressSrtCode(std::uint64_t codeAddress, std::span<const std::uint32_t> code);
 bool IsRawRead(const IrResourcePlan& program, const IrValue& inst);
 bool IsRawRead(const IrResourcePlan& program, IrOpcode op, std::uint32_t memoryIndex);
 bool LoadedFromMemory(const IrValue& handle);

@@ -7,6 +7,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/RequestMemoryView.hpp"
+#include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "Recompiler.hpp"
 #include "ShaderDiskCache.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -108,7 +109,24 @@ void PrintReads(const ShaderRecompiler::RecompileRequest& request) {
     g_readLog = nullptr;
 }
 
+// --capture-reads: every guest address the driver's resource capture (CaptureResources) reads.
+void PrintCaptureReads(const ShaderRecompiler::RecompileRequest& request) {
+    ShaderRecompiler::RequestMemoryView view(request.context.memory);
+    auto runtime = view.MakeRuntime(request.context.userData, request.shader.codeAddress);
+    g_innerReader = runtime.readMemory;
+    runtime.readMemory = &LoggedRead;
+    runtime.readSpecializationMemory = &LoggedRead;
+    std::vector<std::uint64_t> log;
+    g_readLog = &log;
+    const auto capture = ShaderRecompiler::CaptureResources(request, runtime);
+    g_readLog = nullptr;
+    std::printf("  capture reads (%zu):", log.size());
+    for (const auto address : log) std::printf(" 0x%llx", static_cast<unsigned long long>(address));
+    std::printf("\n");
+}
+
 bool g_reads = false;
+bool g_captureReads = false;
 bool g_disassemble = false;
 bool g_assembly = false;
 bool g_memory = false;
@@ -123,7 +141,7 @@ bool g_specialized = false;
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
-    std::printf("%s: code 0x%llx, %zu code words, %zu user data, %zu memory regions, wave%u\n", path, static_cast<unsigned long long>(request.request.shader.codeAddress), request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
+    std::printf("%s: code 0x%llx (hash 0x%llx), %zu code words, %zu user data, %zu memory regions, wave%u\n", path, static_cast<unsigned long long>(request.request.shader.codeAddress), static_cast<unsigned long long>(ShaderRecompiler::Detail::CodeContentHash(request.request.shader.code)), request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;
         std::printf("  compute: threads %ux%ux%u, lds %u dwords, group ids %d%d%d, tg size %d, thread id components %u\n", compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], compute.ldsSizeDwords, compute.groupIdEnable[0], compute.groupIdEnable[1], compute.groupIdEnable[2], compute.tgSizeEnable, compute.threadIdComponentCount);
@@ -151,6 +169,14 @@ bool Replay(const char* path) {
             }
             std::printf("  region 0x%llx + 0x%zx -> %s\n", static_cast<unsigned long long>(region.guestAddress), region.bytes.size(), name);
         }
+    }
+    if (g_captureReads) {
+        try {
+            PrintCaptureReads(request.request);
+        } catch (const std::exception& error) {
+            std::printf("  capture failed: %s\n", FirstLine(error.what()).c_str());
+        }
+        return true;
     }
     if (g_reads) {
         try {
@@ -301,6 +327,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--reads") {
             g_reads = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--capture-reads") {
+            g_captureReads = true;
             continue;
         }
         if (std::string(argv[i]) == "--code") {

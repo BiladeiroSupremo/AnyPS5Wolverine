@@ -42,6 +42,7 @@
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
+#include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "Optimization/include/Optimization/SsaBuilder.hpp"
 #include "Optimization/include/Optimization/TessellationLowering.hpp"
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
@@ -190,6 +191,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     TranslateOptions translateOptions {};
     translateOptions.stage = stageKind;
     translateOptions.shaderHash = request.shader.codeAddress;
+    Detail::NoteAddressSrtCode(request.shader.codeAddress, request.shader.code);
     translateOptions.waveSize = request.context.waveSize;
     translateOptions.userDataBaseRegister = request.context.userDataBaseRegister;
     translateOptions.userDataCount = static_cast<std::uint32_t>(request.context.userData.size());
