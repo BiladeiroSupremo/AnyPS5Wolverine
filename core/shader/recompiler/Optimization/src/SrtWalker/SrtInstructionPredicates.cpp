@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
@@ -118,14 +119,43 @@ std::uint64_t CodeContentHash(std::span<const std::uint32_t> code) {
     return hash;
 }
 
+// APS5_ADDRESS_SRT_GRAPHICS_MASK=<mask>/<value> (hex): only the graphics programs whose code hash
+// ANDed with the mask equals the value take the address path (bisecting a fault over programs);
+// APS5_ADDRESS_SRT_GRAPHICS_STAGES=pixel|other: only pixel programs, or only the other graphics
+// stages. Both apply under APS5_ADDRESS_SRT_GRAPHICS.
+struct GraphicsSelection {
+    bool masked = false;
+    std::uint64_t mask = 0;
+    std::uint64_t value = 0;
+    int stages = 0;  // 0 all, 1 pixel only, 2 the others only
+};
+
+const GraphicsSelection& graphicsSelection() {
+    static const GraphicsSelection selection = [] {
+        GraphicsSelection result;
+        if (const char* text = std::getenv("APS5_ADDRESS_SRT_GRAPHICS_MASK")) {
+            char* end = nullptr;
+            result.mask = std::strtoull(text, &end, 16);
+            if (end != nullptr && *end == '/') {
+                result.value = std::strtoull(end + 1, nullptr, 16);
+                result.masked = true;
+            }
+        }
+        if (const char* text = std::getenv("APS5_ADDRESS_SRT_GRAPHICS_STAGES")) result.stages = std::strcmp(text, "pixel") == 0 ? 1 : std::strcmp(text, "other") == 0 ? 2 : 0;
+        return result;
+    }();
+    return selection;
+}
+
 void NoteAddressSrtCode(std::uint64_t codeAddress, std::span<const std::uint32_t> code) {
     const auto& list = addressSrtList();
     static const bool learn = std::getenv("APS5_ADDRESS_SRT_LEARN") != nullptr;
-    if (list.empty() && !learn) return;
+    const bool masked = graphicsSelection().masked;
+    if (list.empty() && !learn && !masked) return;
     const auto hash = CodeContentHash(code);
     auto& matched = matchedAddresses();
     std::lock_guard lock(matched.mutex);
-    if (learn) matched.hashes[codeAddress] = hash;
+    if (learn || masked) matched.hashes[codeAddress] = hash;
     if (std::find(list.begin(), list.end(), hash) == list.end()) return;
     if (matched.addresses.insert(codeAddress).second) std::fprintf(stderr, "[address-srt] program 0x%llx (code hash 0x%llx) reads its SRT on the GPU\n", static_cast<unsigned long long>(codeAddress), static_cast<unsigned long long>(hash));
 }
@@ -144,7 +174,18 @@ bool AddressSrtProgram(const IrResourcePlan& program) {
     // Experiment (M4 step A): APS5_ADDRESS_SRT_GRAPHICS=1 puts every pixel and vertex-like program on
     // the address path, to measure its per-draw cost and correctness.
     static const bool graphics = std::getenv("APS5_ADDRESS_SRT_GRAPHICS") != nullptr;
-    if (graphics && program.stage != IrShaderStage::Compute && program.stage != IrShaderStage::TessellationControl) return true;
+    if (graphics && program.stage != IrShaderStage::Compute && program.stage != IrShaderStage::TessellationControl) {
+        const auto& selection = graphicsSelection();
+        const bool pixel = program.stage == IrShaderStage::Pixel;
+        if ((selection.stages == 1 && !pixel) || (selection.stages == 2 && pixel)) return false;
+        if (!selection.masked) return true;
+        auto& matched = matchedAddresses();
+        std::lock_guard lock(matched.mutex);
+        const auto found = matched.hashes.find(program.shaderHash);
+        if (found == matched.hashes.end() || (found->second & selection.mask) != selection.value) return false;
+        if (matched.reported.insert(found->second).second) std::fprintf(stderr, "[address-srt] graphics program 0x%llx (code hash 0x%llx) selected by the mask\n", static_cast<unsigned long long>(program.shaderHash), static_cast<unsigned long long>(found->second));
+        return true;
+    }
     const auto& list = addressSrtList();
     if (program.stage != IrShaderStage::Compute || list.empty()) return false;
     if (std::find(list.begin(), list.end(), program.shaderHash) != list.end()) return true;

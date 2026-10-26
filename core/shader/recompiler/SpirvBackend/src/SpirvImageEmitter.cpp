@@ -1805,7 +1805,95 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     // per-invocation slot the GPU hung in PPSA03671's pixel shaders (2026-10-15; compute was fine).
     // APS5_HEAP_NONUNIFORM=1 restores the decorated per-invocation index.
     static const bool nonUniform = std::getenv("APS5_HEAP_NONUNIFORM") != nullptr;
-    if (StageOf(state) != IrShaderStage::Compute && !nonUniform) {
+    // APS5_HEAP_QUAD_LOOP=1 (pixel stages): the loop keeps every invocation in it until the whole
+    // subgroup is served (at most 64 passes), and a pass samples in every quad with an invocation
+    // of that pass's slot, so implicit-LOD derivatives see whole quads. The loop below lets each
+    // invocation leave once served and samples only in the matching invocations: their quads can
+    // be partial, which leaves the derivatives undefined.
+    static const bool quadLoop = std::getenv("APS5_HEAP_QUAD_LOOP") != nullptr;
+    if (quadLoop && StageOf(state) == IrShaderStage::Pixel && !nonUniform) {
+        state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+        state.module.EmitCapability(spv::CapabilityGroupNonUniformBallot);
+        state.module.EmitCapability(spv::CapabilityGroupNonUniformVote);
+        state.module.EmitCapability(spv::CapabilityGroupNonUniformShuffle);
+        state.module.EmitCapability(spv::CapabilityGroupNonUniformQuad);
+        const auto subgroup = ConstantU32(state, spv::ScopeSubgroup);
+        const auto resultType = returnsValue ? TypeId(state, inst.Type()) : 0u;
+        std::uint32_t undefined = 0u;
+        if (returnsValue) {
+            undefined = state.module.AllocateId();
+            state.module.AddFunction(spv::OpUndef, resultType, undefined);
+        }
+        const auto entryLabel = state.currentLabel;
+        const auto header = state.module.AllocateId();
+        const auto body = state.module.AllocateId();
+        const auto sample = state.module.AllocateId();
+        const auto joined = state.module.AllocateId();
+        const auto continued = state.module.AllocateId();
+        const auto exit = state.module.AllocateId();
+        const auto done = state.module.AllocateId();
+        const auto carried = state.module.AllocateId();
+        const auto count = state.module.AllocateId();
+        const auto doneNext = state.module.AllocateId();
+        const auto carriedNext = state.module.AllocateId();
+        const auto countNext = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, header);
+        state.module.AddFunction(spv::OpPhi, boolean, done, ConstantBool(state, false), entryLabel, doneNext, continued);
+        if (returnsValue) state.module.AddFunction(spv::OpPhi, resultType, carried, undefined, entryLabel, carriedNext, continued);
+        state.module.AddFunction(spv::OpPhi, u32, count, ConstantU32(state, 0u), entryLabel, countNext, continued);
+        const auto pending = Unary(state, spv::OpLogicalNot, boolean, done);
+        const auto anyPending = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformAny, boolean, anyPending, subgroup, pending);
+        const auto more = Binary(state, spv::OpLogicalAnd, boolean, anyPending, Binary(state, spv::OpULessThan, boolean, count, ConstantU32(state, 64u)));
+        state.module.AddFunction(spv::OpLoopMerge, exit, continued, spv::LoopControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, more, body, exit);
+        EmitLabel(state, body);
+        const auto ballot = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Composite(state, 4u), ballot, subgroup, pending);
+        const auto lane = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformBallotFindLSB, u32, lane, subgroup, ballot);
+        const auto first = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, u32, first, subgroup, slot, lane);
+        const auto mine = Binary(state, spv::OpLogicalAnd, boolean, pending, Binary(state, spv::OpIEqual, boolean, slot, first));
+        auto quad = Select(state, u32, mine, ConstantU32(state, 1u), ConstantU32(state, 0u));
+        const auto own = quad;
+        for (std::uint32_t direction = 0; direction < 3u; ++direction) {
+            const auto swapped = state.module.AllocateId();
+            state.module.AddFunction(spv::OpGroupNonUniformQuadSwap, u32, swapped, subgroup, own, ConstantU32(state, direction));
+            quad = Binary(state, spv::OpBitwiseOr, u32, quad, swapped);
+        }
+        const auto quadActive = Binary(state, spv::OpINotEqual, boolean, quad, ConstantU32(state, 0u));
+        state.module.AddFunction(spv::OpSelectionMerge, joined, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, quadActive, sample, joined);
+        EmitLabel(state, sample);
+        state.bindlessHeapSlot = first;
+        state.bindlessHeapMapped = mapped;
+        state.bindlessHeapLevels = levels;
+        state.bindlessHeapUniformSlot = true;
+        EmitImage(ctx, inst);
+        state.bindlessHeapUniformSlot = false;
+        state.bindlessHeapSlot = 0u;
+        state.bindlessHeapMapped = 0u;
+        state.bindlessHeapLevels = 0u;
+        const auto sampled = returnsValue ? ctx.Def(&inst) : 0u;
+        ctx.definitions.erase(&inst);
+        const auto sampleEnd = state.currentLabel;
+        state.module.AddFunction(spv::OpBranch, joined);
+        EmitLabel(state, joined);
+        if (returnsValue) {
+            const auto reached = state.module.AllocateId();
+            state.module.AddFunction(spv::OpPhi, resultType, reached, sampled, sampleEnd, undefined, body);
+            state.module.AddFunction(spv::OpSelect, resultType, carriedNext, mine, reached, carried);
+        }
+        state.module.AddFunction(spv::OpLogicalOr, boolean, doneNext, done, mine);
+        state.module.AddFunction(spv::OpIAdd, u32, countNext, count, ConstantU32(state, 1u));
+        state.module.AddFunction(spv::OpBranch, continued);
+        EmitLabel(state, continued);
+        state.module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, exit);
+        heapValue = returnsValue ? carried : 0u;
+    } else if (StageOf(state) != IrShaderStage::Compute && !nonUniform) {
         state.module.EmitCapability(spv::CapabilityGroupNonUniform);
         state.module.EmitCapability(spv::CapabilityGroupNonUniformBallot);
         const auto resultType = returnsValue ? TypeId(state, inst.Type()) : 0u;
@@ -1878,8 +1966,51 @@ void EmitHeapBranchedImage(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     // APS5_HEAP_ONLY (graphics): no slot search; the materializer rejects a table it would bind
     // slot by slot, so this branch only runs without a header and reads zeros.
     std::uint32_t slotValue = 0u;
-    if (ResourceMaterializer::HeapOnlyGraphics() && StageOf(state) != IrShaderStage::Compute) {
+    // Diagnostic: APS5_HEAP_ONLY_KEEP_SLOT=1 keeps the slot search under APS5_HEAP_ONLY (the
+    // materializer still rejects slot tables), to tell the shader change from the binding one.
+    static const bool keepSlot = std::getenv("APS5_HEAP_ONLY_KEEP_SLOT") != nullptr;
+    // Diagnostic: APS5_HEAP_ONLY_MASK=<mask>/<value> (hex) drops the slot search only in programs
+    // whose code address >> 8 ANDed with the mask equals the value (bisecting what breaks).
+    static const std::pair<std::uint64_t, std::uint64_t> onlyMask = [] {
+        std::pair<std::uint64_t, std::uint64_t> result{0u, 0u};
+        if (const char* text = std::getenv("APS5_HEAP_ONLY_MASK")) {
+            char* end = nullptr;
+            result.first = std::strtoull(text, &end, 16);
+            if (end != nullptr && *end == '/') result.second = std::strtoull(end + 1, nullptr, 16);
+        }
+        return result;
+    }();
+    const bool maskedOut = ((state.program.Resources().shaderHash >> 8u) & onlyMask.first) != onlyMask.second;
+    if (ResourceMaterializer::HeapOnlyGraphics() && !keepSlot && !maskedOut && StageOf(state) != IrShaderStage::Compute) {
         if (returnsValue) slotValue = state.module.Constant(spv::OpConstantNull, TypeId(state, inst.Type()));
+        {
+            static std::mutex droppedMutex;
+            static std::set<std::uint64_t> dropped;
+            std::lock_guard droppedLock(droppedMutex);
+            if (onlyMask.first != 0u && dropped.insert(state.program.Resources().shaderHash).second) std::fprintf(stderr, "[bindless] heap-only: shader %llx drops its slot search\n", static_cast<unsigned long long>(state.program.Resources().shaderHash));
+        }
+        // Diagnostic: APS5_HEAP_ONLY_MAGENTA=1 makes the branch's texels magenta (1, 0, 1, 1) instead.
+        static const bool magenta = std::getenv("APS5_HEAP_ONLY_MAGENTA") != nullptr;
+        if (returnsValue && magenta) {
+            static std::atomic<int> reported{0};
+            const auto type = TypeId(state, inst.Type());
+            const auto one = ConstantU32(state, 0x3f800000u);
+            const auto zero = ConstantU32(state, 0u);
+            const auto bits = state.module.Constant(spv::OpConstantComposite, TypeU32Composite(state, 4u), one, zero, one, one);
+            if (type == TypeU32Composite(state, 4u)) {
+                slotValue = bits;
+            } else {
+                // Same-size vectors (f32x4) take the bits as they are.
+                slotValue = state.module.AllocateId();
+                state.module.AddFunction(spv::OpBitcast, type, slotValue, bits);
+            }
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 4) std::fprintf(stderr, "[bindless] heap-only magenta slot branch, result type id %u (u32x4 %u)\n", type, TypeU32Composite(state, 4u));
+        }
+        // Diagnostic: the branch names its shader in the feedback buffer's last word (reported as
+        // the "last out-of-table key"): 0x80000000 | code address >> 8.
+        const auto probe = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), probe, BindlessHeapBuffer(state, true), ConstantU32(state, 0), ConstantU32(state, BindlessHeaps::TranslationEntries - 1u));
+        state.module.AddFunction(spv::OpStore, probe, ConstantU32(state, 0x80000000u | static_cast<std::uint32_t>((state.program.Resources().shaderHash >> 8u) & 0x7fffffffu)));
     } else {
         EmitImage(ctx, inst);
         slotValue = returnsValue ? ctx.Def(&inst) : 0u;

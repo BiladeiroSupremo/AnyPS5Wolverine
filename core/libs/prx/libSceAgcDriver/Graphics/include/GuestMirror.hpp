@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <cstdint>
+#include <span>
 
 namespace AgcDriver::Graphics {
 
@@ -39,6 +40,8 @@ public:
 private:
     explicit GuestMirror(const Context& context);
     bool submit(std::uint64_t offset, std::uint64_t size, VkDeviceMemory memory, std::uint64_t memoryOffset);
+    // All the binds in one vkQueueBindSparse and one fence wait.
+    bool submit(std::span<const VkSparseMemoryBind> binds);
     // A host import of [host, host + size) for the mirror's own pages, or null.
     VkDeviceMemory importHost(void* host, std::uint64_t size);
 

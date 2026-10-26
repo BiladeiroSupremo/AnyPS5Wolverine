@@ -145,9 +145,14 @@ GuestMirror* GuestMirror::Get(const Context& context) {
 }
 
 bool GuestMirror::submit(std::uint64_t offset, std::uint64_t size, VkDeviceMemory memory, std::uint64_t memoryOffset) {
-    const auto started = std::chrono::steady_clock::now();
     const VkSparseMemoryBind bind{offset, size, memory, memoryOffset, 0};
-    const VkSparseBufferMemoryBindInfo bufferBind{buffer, 1, &bind};
+    return submit(std::span<const VkSparseMemoryBind>(&bind, 1));
+}
+
+bool GuestMirror::submit(std::span<const VkSparseMemoryBind> binds) {
+    if (binds.empty()) return true;
+    const auto started = std::chrono::steady_clock::now();
+    const VkSparseBufferMemoryBindInfo bufferBind{buffer, static_cast<std::uint32_t>(binds.size()), binds.data()};
     VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
     info.bufferBindCount = 1;
     info.pBufferBinds = &bufferBind;
@@ -157,7 +162,7 @@ bool GuestMirror::submit(std::uint64_t offset, std::uint64_t size, VkDeviceMemor
     auto result = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(context.queue, 1, &info, fence);
     if (result == VK_SUCCESS) result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
     Mirrors().bindUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
-    if (result != VK_SUCCESS) std::fprintf(stderr, "[mirror] vkQueueBindSparse of +0x%llx+0x%llx failed (%d)\n", static_cast<unsigned long long>(offset), static_cast<unsigned long long>(size), static_cast<int>(result));
+    if (result != VK_SUCCESS) std::fprintf(stderr, "[mirror] vkQueueBindSparse of %zu binds from +0x%llx failed (%d)\n", binds.size(), static_cast<unsigned long long>(binds.front().resourceOffset), static_cast<int>(result));
     return result == VK_SUCCESS;
 }
 
@@ -260,11 +265,16 @@ void GuestMirror::FlushPending() {
             }
         }
     }
+    std::vector<VkSparseMemoryBind> binds;
+    binds.reserve(runs.size());
+    std::uint64_t boundNow = 0;
     for (const auto& run : runs) {
-        if (submit(run.first - base, run.end - run.first, run.owner.memory, run.first - run.owner.importBase)) {
-            state.binds.fetch_add(1, std::memory_order_relaxed);
-            state.boundBytes.fetch_add(run.end - run.first, std::memory_order_relaxed);
-        }
+        binds.push_back({run.first - base, run.end - run.first, run.owner.memory, run.first - run.owner.importBase, 0});
+        boundNow += run.end - run.first;
+    }
+    if (submit(binds)) {
+        state.binds.fetch_add(binds.size(), std::memory_order_relaxed);
+        state.boundBytes.fetch_add(boundNow, std::memory_order_relaxed);
     }
 }
 
@@ -300,10 +310,13 @@ void GuestMirror::Unbind(const HostImport& import) {
             if (owners.empty()) state.pages.erase(found);
         }
     }
+    std::vector<VkSparseMemoryBind> binds;
+    binds.reserve(rebinds.size());
     for (const auto& [at, owner] : rebinds) {
-        submit(at - base, page, owner.memory, owner.memory == VK_NULL_HANDLE ? 0 : at - owner.importBase);
+        binds.push_back({at - base, page, owner.memory, owner.memory == VK_NULL_HANDLE ? 0 : at - owner.importBase, 0});
         if (owner.memory == VK_NULL_HANDLE) state.boundBytes.fetch_sub(page, std::memory_order_relaxed);
     }
+    submit(binds);
     // The mirror's own imports are freed once no page shows them (the submits above waited).
     for (std::size_t index = 1; index < memories.size(); ++index) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memories[index], nullptr);
     state.unbinds.fetch_add(1, std::memory_order_relaxed);
