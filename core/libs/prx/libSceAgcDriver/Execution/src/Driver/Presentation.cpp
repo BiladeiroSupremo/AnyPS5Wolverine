@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestMirror.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -67,6 +68,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("gpu_mutex_wait");
             require(device != nullptr && device->Window() == window.context, "presentation window is not attached to the device");
             presenting = device;
+            // Imports made while the GPU mutex was taken reach the guest mirror here.
+            Graphics::GuestMirror::FlushAll();
             timing.Mark("device_setup");
             std::uint32_t drawableWidth = 0;
             std::uint32_t drawableHeight = 0;

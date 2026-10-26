@@ -302,6 +302,8 @@ struct VulkanDevice::State {
     // VK_EXT_robustness2 robustBufferAccess2 enabled: shaders leave aligned word accesses' binding
     // range checks to the device (SpirvTarget::robustBufferAccess2).
     bool robustBufferAccess2 = false;
+    // APS5_GUEST_MIRROR: sparse binding enabled for the guest mirror (GuestMirror.cpp).
+    bool guestMirror = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
@@ -1402,6 +1404,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // Guest shaders routinely read past descriptor ranges; robust access turns that into zeros
     // instead of a GPU fault that loses the device.
     enabled.robustBufferAccess = available.robustBufferAccess;
+    // M4 mirrored address space (APS5_GUEST_MIRROR=1, GuestMirror.cpp): one sparse buffer whose pages
+    // are the guest's host imports at their guest offsets. Needs sparse binding on the queue family.
+    if (std::getenv("APS5_GUEST_MIRROR") != nullptr) {
+        std::uint32_t familyCount = 0;
+        const auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        getFamilies(selected, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> familyProperties(familyCount);
+        getFamilies(selected, &familyCount, familyProperties.data());
+        const bool sparseQueue = family < familyCount && (familyProperties[family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
+        state->guestMirror = sparseQueue && available.sparseBinding && available.sparseResidencyBuffer;
+        enabled.sparseBinding = state->guestMirror ? VK_TRUE : VK_FALSE;
+        enabled.sparseResidencyBuffer = state->guestMirror ? VK_TRUE : VK_FALSE;
+        std::fprintf(stderr, "[mirror] guest mirror %s (sparse queue %d, sparseBinding %u, sparseResidencyBuffer %u)\n", state->guestMirror ? "on" : "unavailable", sparseQueue ? 1 : 0, available.sparseBinding, available.sparseResidencyBuffer);
+    }
     // Indirect draw records with a non-zero first instance, and several records per call.
     enabled.drawIndirectFirstInstance = available.drawIndirectFirstInstance;
     enabled.multiDrawIndirect = available.multiDrawIndirect;
@@ -3328,6 +3344,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
+    context.guestMirror = state->guestMirror;
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     context.sampleLocationSampleCounts = state->sampleLocationSampleCounts;
     context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestMirror.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
@@ -128,6 +129,27 @@ BdaResources::BdaResources(const Context& context) {
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+    // Experiment (M4, APS5_BDA_MIRROR=1 with APS5_GUEST_MIRROR=1): the table is the guest mirror alone,
+    // one range for every build, so shaders reach a guest address at mirror + (address - base)
+    // (SpirvBdaLookup reads that entry without searching). Ranges the driver serves from copies read
+    // the guest's own bytes instead: stale where only a copy holds newer results.
+    static const bool mirrorTable = std::getenv("APS5_BDA_MIRROR") != nullptr;
+    if (const auto* mirror = mirrorTable ? GuestMirror::Instance() : nullptr) {
+        static std::mutex mutex;
+        static std::shared_ptr<Buffer> shared;
+        std::lock_guard lock(mutex);
+        if (shared == nullptr) {
+            const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, 1u, sizeof(ShaderRecompiler::BdaAbi::Range), 0};
+            const ShaderRecompiler::BdaAbi::Range range{mirror->Base(), mirror->Base() + mirror->Bytes(), mirror->Address(), ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write, 0};
+            tableBytes = sizeof(header) + sizeof(range);
+            shared = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            std::memcpy(shared->Bytes().data(), &header, sizeof(header));
+            std::memcpy(shared->Bytes().data() + sizeof(header), &range, sizeof(range));
+        }
+        tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + sizeof(ShaderRecompiler::BdaAbi::Range);
+        table = shared;
+        return;
+    }
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();

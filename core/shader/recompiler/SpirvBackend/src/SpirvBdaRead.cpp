@@ -67,6 +67,27 @@ std::uint32_t EmitBdaByte(SpirvEmitterState& state, std::uint32_t guest, std::ui
 }
 
 std::uint32_t EmitBdaBytes(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t accessMask) {
+    // Experiment (M4, APS5_BDA_MIRROR=1): the table is one range (the guest mirror), so the bytes
+    // of an access are found by one lookup of the whole span instead of one per byte.
+    static const bool mirror = std::getenv("APS5_BDA_MIRROR") != nullptr;
+    if (mirror) {
+        const auto byteType = state.module.Type(spv::OpTypeInt, 8u, 0u);
+        const auto bytePointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, byteType);
+        const auto physical = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaPointerFunction, address, ConstantU32(state, bytes), instruction);
+        if (state.bdaStopsInvocations) StopBdaInvocationIf(state, Binary(state, spv::OpIEqual, TypeBool(state), physical, BdaConstant(state, 0u)));
+        return EmitValueOrZeroIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u)), [&] {
+            auto result = ConstantU32(state, 0u);
+            for (std::uint32_t byte = 0; byte < bytes; ++byte) {
+                const auto pointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpConvertUToPtr, bytePointer, pointer, byte == 0u ? physical : Binary(state, spv::OpIAdd, TypeScalarU64(state), physical, BdaConstant(state, byte)));
+                const auto loaded = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, byteType, loaded, pointer, accessMask, 1u);
+                result = Binary(state, spv::OpBitwiseOr, TypeU32(state), result, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), Unary(state, spv::OpUConvert, TypeU32(state), loaded), ConstantU32(state, byte * 8u)));
+            }
+            return result;
+        });
+    }
     auto result = ConstantU32(state, 0u);
     for (std::uint32_t byte = 0; byte < bytes; ++byte) {
         const auto guest = Binary(state, spv::OpIAdd, TypeScalarU64(state), address, BdaConstant(state, byte));

@@ -192,6 +192,8 @@ struct Context {
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    // Sparse binding is on for the guest mirror (APS5_GUEST_MIRROR, GuestMirror.hpp).
+    bool guestMirror = false;
     bool graphicsPipelineLibrary = false;
     bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -218,6 +219,7 @@ void reportImports(const HostImports& state) {
 }
 
 void destroyImport(const Context& context, const HostImport& entry) {
+    if (auto* mirror = GuestMirror::Instance()) mirror->Unbind(entry);
     context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
 #ifdef _WIN32
@@ -236,6 +238,7 @@ struct RetiredImport {
     RetiredImport& operator=(const RetiredImport&) = delete;
     ~RetiredImport() {
         const auto& entry = node.mapped();
+        if (auto* mirror = GuestMirror::Instance()) mirror->Unbind(entry);
         destroyBuffer(device, entry.buffer, nullptr);
         freeMemory(device, entry.memory, nullptr);
 #ifdef _WIN32
@@ -1051,7 +1054,9 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     state.liveBytes += bytes;
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "");
     entry.joined = joined;
-    return &state.imports.emplace(base, entry).first->second;
+    auto* stored = &state.imports.emplace(base, entry).first->second;
+    if (auto* mirror = GuestMirror::Get(context); mirror != nullptr && !stored->dmaBuf) mirror->Bind(*stored);
+    return stored;
 }
 
 // The lease is in address order (it is built from the registry map), so a range is found by binary search.

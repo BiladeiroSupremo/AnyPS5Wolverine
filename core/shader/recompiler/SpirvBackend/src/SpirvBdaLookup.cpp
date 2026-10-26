@@ -51,6 +51,22 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
             ReturnBdaZeroIf(state, condition);
         }
     };
+    // Experiment (M4, APS5_BDA_MIRROR=1): the driver's table is one range, the guest mirror
+    // (GuestMirror / BdaResources): its entry is read in place, with no header checks or search.
+    static const bool mirror = std::getenv("APS5_BDA_MIRROR") != nullptr;
+    if (mirror) {
+        fail(binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow);
+        const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+        fail(binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow);
+        const auto begin = BdaLoadAddress(state, constant(4));
+        const auto finish = BdaLoadAddress(state, constant(6));
+        const auto base = BdaLoadAddress(state, constant(8));
+        fail(binary(spv::OpULessThan, boolean, address, begin), BdaAbi::FaultReason::Unmapped);
+        fail(binary(spv::OpUGreaterThan, boolean, end, finish), BdaAbi::FaultReason::Unmapped);
+        state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, base, binary(spv::OpISub, u64, address, begin)));
+        state.module.AddFunction(spv::OpFunctionEnd);
+        return function;
+    }
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
