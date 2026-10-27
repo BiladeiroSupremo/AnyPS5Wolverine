@@ -42,7 +42,17 @@ bool BdaMirrorMode();
 // Mirror mode: the 32-bit word at the 4-byte aligned guest address `guest` (u64) when `valid`, else
 // zero, with no branch and no fault record: an invalid or unmapped address reads the mirror's last
 // page, which nothing binds (zeros).
-std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask);
+// The mirror's table words (ids): begin and end of the mirrored guest range, its device address.
+struct MirrorWords {
+    std::uint32_t begin;
+    std::uint32_t finish;
+    std::uint32_t base;
+};
+// The words the current body holds (HoistMirrorWords), else loaded here.
+MirrorWords LoadMirrorWords(SpirvEmitterState& state);
+// Loads them once at the start of a body (the entry block) in mirror mode; clears them otherwise.
+void HoistMirrorWords(SpirvEmitterState& state);
+std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask, const MirrorWords& words);
 // The same read as one helper function (read_mirror_word) the reads call: defined with the other
 // BDA functions in mirror mode; EmitMirrorWordCall falls back to the inline read without it.
 void DefineMirrorWordFunction(SpirvEmitterState& state);

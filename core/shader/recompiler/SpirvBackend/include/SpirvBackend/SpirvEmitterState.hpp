@@ -126,8 +126,14 @@ struct SpirvEmitterState {
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
     // every read takes the byte path.
     std::uint32_t bdaProbeFunction = 0;
-    // Mirror mode (APS5_BDA_MIRROR): (u64 guest, bool valid) -> u32, see EmitMirrorWordRead.
+    // Mirror mode (APS5_BDA_MIRROR): (u64 guest, bool valid, u64 begin, u64 end, u64 base) -> u32,
+    // see EmitMirrorWordRead.
     std::uint32_t mirrorWordFunction = 0;
+    // The mirror's table words (begin, end, device address) loaded once in the body's entry block
+    // (HoistMirrorWords) for every mirror read of the body; 0 outside a body.
+    std::uint32_t mirrorBegin = 0;
+    std::uint32_t mirrorFinish = 0;
+    std::uint32_t mirrorBase = 0;
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaWriteProbeFunction = 0;
     std::uint32_t bdaAtomicPointerFunction = 0;

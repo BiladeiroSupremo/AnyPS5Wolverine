@@ -1272,6 +1272,8 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         state.module.AddFunction(spv::OpStore, state.loopGuardVisits, ConstantU32(state, 0u));
         state.module.AddFunction(spv::OpStore, state.loopGuardPc, ConstantU32(state, 0u));
     }
+    // The guest mirror's table words, once per body (every mirror read of the body uses them).
+    HoistMirrorWords(state);
     state.module.AddFunction(spv::OpBranch, context.Label(blocks.front()));
     if (ExecRegionsEnabled() && state.laneCount == 1u && context.otherHalf == nullptr && program.Resources().stage == IrShaderStage::Compute) PlanExecRegions(program, state, functionState);
     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;

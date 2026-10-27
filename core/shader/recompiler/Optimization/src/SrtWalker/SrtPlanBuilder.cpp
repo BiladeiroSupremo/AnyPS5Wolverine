@@ -15,7 +15,13 @@ namespace ShaderRecompiler::Detail {
 void PlanBuilder::Run() {
     _program.Resources().srtReads.clear();
     _program.Metadata().dynamicReads.clear();
-    if (AddressSrtProgram(_program.Resources())) return;
+    // An address-SRT program walks its SRT itself, per invocation, through device addresses.
+    // Experiment (M4 per-draw resolve, step 1): APS5_ADDRESS_SRT_FLAT=1 plans its flat slots as for
+    // any program, so the walk's immediate-offset reads become per-draw flattened SRT words (one
+    // uniform load each) while its V#s stay GPU-read (ResourceTracker gpuDescriptor). The CPU fills
+    // the slots per draw for now; a GPU evaluator of the same tape is step 2.
+    static const bool flatSlots = std::getenv("APS5_ADDRESS_SRT_FLAT") != nullptr;
+    if (AddressSrtProgram(_program.Resources()) && !flatSlots) return;
     for (auto& block : _program.Blocks()) {
         for (IrValue* inst : block->Instructions()) {
             const auto op = inst->Opcode();
