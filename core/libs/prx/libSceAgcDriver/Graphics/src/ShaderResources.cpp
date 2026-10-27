@@ -3802,6 +3802,14 @@ void ShaderResources::WriteBack() {
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index]) continue;
+        bool duplicate = false;
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (storageWritten[previous] && storageTextures[previous] == storageTextures[index]) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
         storageTextures[index]->MarkDirty();
         static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
     }
@@ -3815,6 +3823,14 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index]) continue;
+        bool duplicate = false;
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (storageWritten[previous] && storageTextures[previous] == storageTextures[index]) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
         storageTextures[index]->MarkDirty();
         static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
     }
