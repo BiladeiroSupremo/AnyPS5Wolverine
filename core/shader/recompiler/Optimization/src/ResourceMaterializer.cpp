@@ -458,8 +458,8 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         if (decoded.fmask) throw std::runtime_error("bindless FMASK images are unsupported");
         const auto& modes = plan.info.runtimeImageModes.at(imageIndex);
         const auto mode = ResourceMaterializer::RuntimeImageMode(image, candidate, modes);
-        // The slot search of an APS5_SLOT_HEAP_MODES build samples only the heap modes.
-        if (heapEligible && plan.stage != IrShaderStage::Compute && ResourceMaterializer::SlotHeapModes() && !ResourceMaterializer::HeapImageMode(image, modes.at(mode))) rejectTable(BindlessRejection::HeapOnly, "bindless image table bound slot by slot has an entry outside the heap modes (APS5_SLOT_HEAP_MODES)");
+        // The slot search of a graphics stage samples only the heap modes (SlotHeapModes).
+        if (heapEligible && plan.stage != IrShaderStage::Compute && ResourceMaterializer::SlotHeapModes() && !ResourceMaterializer::HeapImageMode(image, modes.at(mode))) rejectTable(BindlessRejection::HeapOnly, "bindless image table bound slot by slot has an entry outside the heap modes (APS5_SLOT_ALL_MODES=1 emits every mode)");
         valid[i] = 1u;
     }
     resolution.mapping.clear();
@@ -919,7 +919,7 @@ bool ResourceMaterializer::HeapOnlyGraphics() {
 }
 
 bool ResourceMaterializer::SlotHeapModes() {
-    static const bool enabled = std::getenv("APS5_SLOT_HEAP_MODES") != nullptr;
+    static const bool enabled = std::getenv("APS5_SLOT_ALL_MODES") == nullptr;
     return enabled;
 }
 

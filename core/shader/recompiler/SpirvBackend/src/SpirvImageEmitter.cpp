@@ -2177,7 +2177,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     // table root samples with its representative's mode, always a heap mode (HeapImageMode, which
     // the materializer requires of the representative): the other modes are left out there, and
     // any other selector value takes the first heap mode.
-    // APS5_SLOT_HEAP_MODES: the slot branch of a graphics stage too (the materializer rejects a
+    // The slot branch of a graphics stage too (SlotHeapModes; the materializer rejects a
     // slot-bound table with an entry of another mode).
     const bool slotBranchHeapModes = state.bindlessHeapSlot == 0u && ResourceMaterializer::SlotHeapModes() && StageOf(state) != IrShaderStage::Compute;
     const bool heapModes = state.bindlessHeapBranch && (state.bindlessHeapSlot != 0u || slotBranchHeapModes) && state.hashedImageSelector == 0u && !base.hashed;
