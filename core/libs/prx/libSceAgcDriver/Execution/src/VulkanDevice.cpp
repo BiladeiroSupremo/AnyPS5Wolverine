@@ -4240,15 +4240,13 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
     };
-    // An address-based build that only reads (no stage stores through addresses) flushes on the
-    // known overlaps alone, like a bound one: what it may read elsewhere is a label word the GPU
-    // would have written by now on the console, read stale by a shader here (none known to).
-    // Flushing on every such build ended the draw pass each time (Recorder::closeStoreRun).
-    // APS5_ADDRESS_FLUSH_ALL_STORES=1 flushes for every address-based build as before.
-    static const bool flushAll = std::getenv("APS5_ADDRESS_FLUSH_ALL_STORES") != nullptr;
-    const bool unknownWrites = resources.HoldsLease() && (flushAll || resources.AddressWrites());
-    if (recorder.HasQueuedKeyStores() && (unknownWrites || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
-    if (recorder.HasQueuedStores() && (unknownWrites || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    // An address-based dispatch flushes every queued store: a compute kernel may spin on a label
+    // word (a GPU-side wait), which recorded after the dispatch instead of before would hang the
+    // GPU (GUESS for the 2026-10-27 trwarm4 freeze, ~1950 s into gameplay, with the draw rule
+    // below applied to dispatches too). Read-only address-based DRAWS flush on known overlaps only
+    // (Graphics::Draw): a pixel or vertex shader spinning on a label is not a thing.
+    if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
+    if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);
