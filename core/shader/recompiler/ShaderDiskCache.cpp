@@ -741,6 +741,84 @@ std::string hex(std::uint64_t value) {
     return text;
 }
 
+double CacheSetting(const char* name, double fallback) {
+    const char* text = std::getenv(name);
+    return text != nullptr ? std::strtod(text, nullptr) : fallback;
+}
+
+// Versions not used for this long are removed at start (DiskStore::housekeeping).
+std::filesystem::file_time_type::duration CacheKeepTime() {
+    return std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::duration<double, std::ratio<86400>>(CacheSetting("APS5_SHADER_CACHE_KEEP_DAYS", 3.0)));
+}
+
+// Size cap of a cache root. Every recompiler build writes a version directory of its own (3-12 GB
+// for PPSA03671): one root reached 147 GB in ten days of switch experiments. Once per start, 30 s in
+// (after the boot's own reads, off the writer thread: the walk takes a while), the oldest versions
+// other than this build's are removed while the root exceeds APS5_SHADER_CACHE_MAX_GB (40), and
+// pipeline-cache writes that never finished (vk-pipelines-*.bin.tmp.*, older than a day) too. A
+// version's age is its last write or the last start of a build that used it ("last-used").
+// APS5_NO_SHADER_CACHE_PRUNE=1 keeps everything (here and in housekeeping).
+void CapCacheRoot(const std::filesystem::path& root, const std::filesystem::path& current) {
+    namespace fs = std::filesystem;
+    std::error_code error;
+    if (std::getenv("APS5_NO_SHADER_CACHE_PRUNE") != nullptr) return;
+    const auto keep = CacheKeepTime();
+    const auto budget = static_cast<std::uint64_t>(CacheSetting("APS5_SHADER_CACHE_MAX_GB", 40.0) * 1073741824.0);
+    const auto now = fs::file_time_type::clock::now();
+    const auto bytesOf = [&](const fs::path& path) {
+        std::uint64_t bytes = 0;
+        for (auto it = fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied, error); !error && it != fs::recursive_directory_iterator(); it.increment(error)) {
+            std::error_code sizeError;
+            if (it->is_regular_file(sizeError)) bytes += it->file_size(sizeError);
+        }
+        error.clear();
+        return bytes;
+    };
+    struct Version {
+        fs::path path;
+        fs::file_time_type used;
+        std::uint64_t bytes;
+    };
+    std::vector<Version> versions;
+    std::uint64_t total = 0;
+    std::uint64_t removedBytes = 0;
+    std::size_t removedVersions = 0;
+    std::size_t removedTemporary = 0;
+    for (const auto& entry : fs::directory_iterator(root, error)) {
+        const auto name = entry.path().filename().string();
+        std::error_code entryError;
+        if (entry.is_regular_file(entryError)) {
+            const auto bytes = entry.file_size(entryError);
+            // A pipeline cache write that never finished (vk-pipelines-*.bin.tmp.*).
+            if (name.find(".bin.tmp.") != std::string::npos && now - entry.last_write_time(entryError) > std::chrono::hours(24) && fs::remove(entry.path(), entryError)) {
+                ++removedTemporary;
+                removedBytes += bytes;
+            } else {
+                total += bytes;
+            }
+            continue;
+        }
+        const bool version = name.size() == 16 && std::all_of(name.begin(), name.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+        if (!version || !entry.is_directory(entryError)) continue;
+        auto used = entry.last_write_time(entryError);
+        if (const auto marked = fs::last_write_time(entry.path() / "last-used", entryError); !entryError && marked > used) used = marked;
+        const auto bytes = bytesOf(entry.path());
+        total += bytes;
+        if (entry.path() != current) versions.push_back({entry.path(), used, bytes});
+    }
+    std::sort(versions.begin(), versions.end(), [](const Version& left, const Version& right) { return left.used < right.used; });
+    for (const auto& version : versions) {
+        if (now - version.used <= keep && total <= budget) break;
+        std::error_code removeError;
+        fs::remove_all(version.path, removeError);
+        if (removeError) continue;
+        ++removedVersions;
+        removedBytes += version.bytes;
+        total -= version.bytes;
+    }
+    if (removedVersions != 0 || removedTemporary != 0) std::fprintf(stderr, "[shader-disk-cache] pruned %s: %zu old versions and %zu temporary files (%.1f GB); %.1f GB left\n", root.string().c_str(), removedVersions, removedTemporary, removedBytes / 1073741824.0, total / 1073741824.0);
+}
+
 class DiskStore {
 public:
     DiskStore() {
@@ -749,6 +827,16 @@ public:
         this->root = root;
         directory = root / hex(SourceVersion());
         std::thread([this] { run(); }).detach();
+        std::thread([root, current = directory] {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            try {
+                std::error_code error;
+                std::filesystem::create_directories(current, error);
+                CapCacheRoot(root, current);
+            } catch (const std::exception& failure) {
+                std::fprintf(stderr, "[shader-disk-cache] pruning failed: %s\n", failure.what());
+            }
+        }).detach();
     }
 
     [[nodiscard]] bool Enabled() const { return !directory.empty(); }
@@ -889,15 +977,19 @@ private:
         std::ofstream(stamp, std::ios::binary | std::ios::trunc).close();
         std::filesystem::last_write_time(stamp, std::filesystem::file_time_type::clock::now(), error);
         const auto now = std::filesystem::file_time_type::clock::now();
-        for (std::filesystem::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
+        // Other builds' versions unused for APS5_SHADER_CACHE_KEEP_DAYS (3; was 14 days); the size
+        // cap is CapCacheRoot's.
+        const auto keep = CacheKeepTime();
+        const bool prune = std::getenv("APS5_NO_SHADER_CACHE_PRUNE") == nullptr;
+        for (std::filesystem::directory_iterator it(root, error), end; prune && !error && it != end; it.increment(error)) {
             const auto name = it->path().filename().string();
             if (it->path() == directory || name.size() != 16 || name.find_first_not_of("0123456789abcdef") != std::string::npos || !it->is_directory(error)) continue;
             std::error_code timeError;
             auto used = std::filesystem::last_write_time(it->path() / "last-used", timeError);
             if (timeError) used = std::filesystem::last_write_time(it->path(), timeError);
-            if (!timeError && now - used > std::chrono::hours(24 * 14)) {
+            if (!timeError && now - used > keep) {
                 std::error_code removeError;
-                std::filesystem::remove_all(it->path(), removeError);
+                if (std::filesystem::remove_all(it->path(), removeError) != 0 && !removeError) std::fprintf(stderr, "[shader-disk-cache] removed version %s, unused for more than %.1f days\n", name.c_str(), CacheSetting("APS5_SHADER_CACHE_KEEP_DAYS", 3.0));
             }
         }
         error.clear();
