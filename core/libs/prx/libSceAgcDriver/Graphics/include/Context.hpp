@@ -192,8 +192,10 @@ struct Context {
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
-    // Sparse binding is on for the guest mirror (APS5_GUEST_MIRROR, GuestMirror.hpp).
+    // Sparse binding is on for the guest mirror (APS5_GUEST_MIRROR, GuestMirror.hpp); its binds go
+    // to `sparseQueue` (a queue of its own, externally synchronized by GuestMirror) unless null.
     bool guestMirror = false;
+    VkQueue sparseQueue = VK_NULL_HANDLE;
     bool graphicsPipelineLibrary = false;
     bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;

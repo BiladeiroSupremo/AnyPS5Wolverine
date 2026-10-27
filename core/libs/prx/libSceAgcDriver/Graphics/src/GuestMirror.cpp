@@ -70,6 +70,14 @@ struct UnbindBatchState {
 struct UnbindBatchTag {};
 UnbindBatchState& Batched() { return HostThreadLocal<UnbindBatchState, UnbindBatchTag>(); }
 
+// With the mirror's own queue (Context::sparseQueue), its binds are serialized by this mutex instead
+// of the GPU mutex: held from choosing the binds to their fence (FlushPending, unbindAll), so a flush
+// never binds an import an unbind is freeing. Taken before Mirrors().mutex.
+std::mutex& BindMutex() {
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+
 bool profiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
@@ -168,7 +176,8 @@ bool GuestMirror::submit(std::span<const VkSparseMemoryBind> binds) {
     // Sparse binds are not ordered with the queue's command batches: the bind completes here before
     // any later batch may use the pages, and an unbind before the memory is freed.
     context.Function<PFN_vkResetFences>("vkResetFences")(context.device, 1, &fence);
-    auto result = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(context.queue, 1, &info, fence);
+    const auto queue = context.sparseQueue != VK_NULL_HANDLE ? context.sparseQueue : context.queue;
+    auto result = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(queue, 1, &info, fence);
     if (result == VK_SUCCESS) result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
     Mirrors().bindUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     if (result != VK_SUCCESS) std::fprintf(stderr, "[mirror] vkQueueBindSparse of %zu binds from +0x%llx failed (%d)\n", binds.size(), static_cast<unsigned long long>(binds.front().resourceOffset), static_cast<int>(result));
@@ -246,6 +255,11 @@ void GuestMirror::Bind(const HostImport& import) {
         }
     }
     state.deferred.fetch_add(1, std::memory_order_relaxed);
+    // On the mirror's own queue: bound now.
+    if (context.sparseQueue != VK_NULL_HANDLE) {
+        FlushPending();
+        return;
+    }
     // Bound now when the GPU mutex is free; otherwise at the next present (FlushPending).
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::try_to_lock);
     if (gpu.owns_lock()) FlushPending();
@@ -253,6 +267,9 @@ void GuestMirror::Bind(const HostImport& import) {
 
 void GuestMirror::FlushPending() {
     auto& state = Mirrors();
+    // Without the mirror's own queue the caller holds the GPU mutex.
+    std::unique_lock own(BindMutex(), std::defer_lock);
+    if (context.sparseQueue != VK_NULL_HANDLE) own.lock();
     std::vector<MirrorState::Run> runs;
     {
         std::lock_guard lock(state.mutex);
@@ -309,7 +326,11 @@ void GuestMirror::unbindAll(std::vector<Unbinding>& unbinding) {
     std::vector<VkDeviceMemory> memories;
     std::size_t imports = 0;
     {
-        std::lock_guard gpu(GuestMemory::GpuMutex());
+        // The mirror's own queue needs only its bind mutex; the rendering queue needs the GPU mutex.
+        std::unique_lock own(BindMutex(), std::defer_lock);
+        std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
+        if (context.sparseQueue != VK_NULL_HANDLE) own.lock();
+        else gpu.lock();
         // Every page the imports or their own extras may show (the end pages included), each once.
         std::vector<std::uint64_t> pages;
         {

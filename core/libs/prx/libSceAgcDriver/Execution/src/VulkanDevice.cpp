@@ -302,8 +302,11 @@ struct VulkanDevice::State {
     // VK_EXT_robustness2 robustBufferAccess2 enabled: shaders leave aligned word accesses' binding
     // range checks to the device (SpirvTarget::robustBufferAccess2).
     bool robustBufferAccess2 = false;
-    // APS5_GUEST_MIRROR: sparse binding enabled for the guest mirror (GuestMirror.cpp).
+    // APS5_GUEST_MIRROR: sparse binding enabled for the guest mirror (GuestMirror.cpp), on its own
+    // queue (index 1 of the family) when `mirrorQueue`.
     bool guestMirror = false;
+    bool mirrorQueue = false;
+    VkQueue sparseQueue = VK_NULL_HANDLE;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
@@ -1374,11 +1377,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->capabilities.push_back(5283);
         state->spirvExtensions.push_back("SPV_EXT_mesh_shader");
     }
-    const float priority = 1.0f;
+    // The second priority serves the guest mirror's own sparse-binding queue (below).
+    const float priorities[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueInfo.queueFamilyIndex = family;
     queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &priority;
+    queueInfo.pQueuePriorities = priorities;
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
@@ -1416,7 +1420,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->guestMirror = sparseQueue && available.sparseBinding && available.sparseResidencyBuffer;
         enabled.sparseBinding = state->guestMirror ? VK_TRUE : VK_FALSE;
         enabled.sparseResidencyBuffer = state->guestMirror ? VK_TRUE : VK_FALSE;
-        std::fprintf(stderr, "[mirror] guest mirror %s (sparse queue %d, sparseBinding %u, sparseResidencyBuffer %u)\n", state->guestMirror ? "on" : "unavailable", sparseQueue ? 1 : 0, available.sparseBinding, available.sparseResidencyBuffer);
+        // The mirror's binds go to a second queue of the family when it has one: on the rendering
+        // queue each bind's fence waited for every batch submitted before it (a GPU drain per bind
+        // and unbind, under the GPU mutex). APS5_MIRROR_MAIN_QUEUE=1 binds on the rendering queue.
+        static const bool mainQueue = std::getenv("APS5_MIRROR_MAIN_QUEUE") != nullptr;
+        state->mirrorQueue = state->guestMirror && !mainQueue && familyProperties[family].queueCount >= 2;
+        if (state->mirrorQueue) queueInfo.queueCount = 2;
+        std::fprintf(stderr, "[mirror] guest mirror %s (sparse queue %d, sparseBinding %u, sparseResidencyBuffer %u, own queue %d)\n", state->guestMirror ? "on" : "unavailable", sparseQueue ? 1 : 0, available.sparseBinding, available.sparseResidencyBuffer, state->mirrorQueue ? 1 : 0);
     }
     // Indirect draw records with a non-zero first instance, and several records per call.
     enabled.drawIndirectFirstInstance = available.drawIndirectFirstInstance;
@@ -1719,6 +1729,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     if (deviceFault) Graphics::SetDeviceLostReporter(state->device, state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT"));
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
+    if (state->mirrorQueue) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 1, &state->sparseQueue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -3345,6 +3356,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
     context.guestMirror = state->guestMirror;
+    context.sparseQueue = state->sparseQueue;
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     context.sampleLocationSampleCounts = state->sampleLocationSampleCounts;
     context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
