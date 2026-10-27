@@ -1791,9 +1791,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (!gpuIndirect) return false;
         return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };
-    if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
+    // A read-only address-based draw (no stage stores through addresses) flushes on the known
+    // overlaps alone, as VulkanDevice::dispatch does: the flush of every address draw ended the
+    // open pass each time (trgt6: 34-38k not-open pass starts per 10 s, default 13-26k).
+    // APS5_ADDRESS_FLUSH_ALL_STORES=1 flushes for every address-based draw as before.
+    static const bool flushAll = std::getenv("APS5_ADDRESS_FLUSH_ALL_STORES") != nullptr;
+    const bool flushUnknown = resources.HoldsLease() && (flushAll || resources.AddressWrites());
+    if (recorder->HasQueuedKeyStores() && (flushUnknown || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
-    if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    if (recorder->HasQueuedStores() && (flushUnknown || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     split.mark(RecordFlush);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
     split.mark(RecordBindings);

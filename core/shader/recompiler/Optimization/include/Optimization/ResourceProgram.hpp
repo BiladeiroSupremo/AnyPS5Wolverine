@@ -55,12 +55,14 @@ class PreparedShaderInvocation {
 public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key);
+    // Moves the request into the invocation when the handle matches; otherwise it is left as it was.
+    static std::optional<PreparedShaderInvocation> TryCreate(RecompileRequest&& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key);
     const RecompileRequest& Request() const { return request; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
 
 private:
-    PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
+    PreparedShaderInvocation(RecompileRequest&& request, const std::shared_ptr<const SourceHandle>& handle);
     RecompileRequest request;
     std::shared_ptr<const SourceHandle> handle;
 };

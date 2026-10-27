@@ -719,8 +719,14 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
     const auto linked = LinkUserDataCallees(request);
-    auto source = request;
-    if (!linked.empty()) source.shader.code = linked;
+    // One copy of the request (the stage infos hold 32-entry arrays), which a matching entry's
+    // invocation takes over; three copies per stage were ~2 us of each draw packet.
+    std::optional<ShaderRecompiler::RecompileRequest> relinked;
+    if (!linked.empty()) {
+        relinked = request;
+        relinked->shader.code = linked;
+    }
+    const auto& source = relinked ? *relinked : request;
     auto invocationRequest = source;
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
@@ -747,7 +753,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         if (entry.codeOffset != codeOffset) continue;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
         if (!linked.empty() && !std::ranges::equal(invocationRequest.shader.code, linked)) continue;
-        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
+        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(std::move(invocationRequest), entry.handle, key)) return std::move(*invocation);
     }
     static const bool asyncAtUse = std::getenv("APS5_SYNC_PREPARE_AT_USE") == nullptr;
     const auto identity = atUseIdentity(snapshot.prepared.get(), codeOffset, key, source.shader.code);

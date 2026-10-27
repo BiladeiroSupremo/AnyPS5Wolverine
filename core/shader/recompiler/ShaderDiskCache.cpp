@@ -704,6 +704,10 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
     reader.Value(allocation.pushConstantSizeBytes);
 }
 
+// Switches the recompiler reads that change no emitted code: profiling and tracing prints, runtime
+// evaluation and caching policy. Every other listed switch, when set, makes every entry key
+// different (a cold cache): a profiling run with APS5_PROFILE_SRT_TAPE recompiled every shader
+// (2026-10-27, trtp1: 0 hits, 2044 misses). APS5_PROBE stays keyed: it changes the emitted code.
 constexpr std::string_view NeutralSwitches[] = {
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
@@ -717,6 +721,29 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_RESULT_MEMO",
     "APS5_NO_SPIRV_EVICTION",
     "APS5_SPIRV_IDLE_SECONDS",
+    "APS5_EMIT_STATS",
+    "APS5_PROFILE_SRT_TAPE",
+    "APS5_SHADER_CACHE_MAX_GB",
+    "APS5_SHADER_CACHE_KEEP_DAYS",
+    "APS5_NO_SHADER_CACHE_PRUNE",
+    "APS5_SRT_DEBUG",
+    "APS5_VERIFY_SRT_TAPE",
+    "APS5_VERIFY_SRT_COMPACT",
+    "APS5_SPECIALIZATION_THREADS",
+    "APS5_SPECIALIZATION_WAIT_MS",
+    "APS5_SPECIALIZED_DISK_CACHE_ENTRIES",
+    "APS5_SPECIALIZED_DISK_CACHE_MAX_MIB",
+    "APS5_RESULT_MEMO_ENTRIES",
+    "APS5_TRACE_BDA",
+    "APS5_TRACE_BINDLESS",
+    "APS5_TRACE_BUFFER_WRITTEN",
+    "APS5_TRACE_EXEC_REGIONS",
+    "APS5_TRACE_HASH_CANDIDATES",
+    "APS5_TRACE_PLAN_SIZES",
+    "APS5_TRACE_ROW_REDUCTION",
+    "APS5_TRACE_RUNTIME_VALIDATE",
+    "APS5_TRACE_TABLE_PLANS",
+    "APS5_TRACE_VARIANTS",
 };
 
 const std::vector<std::byte>& switchKey() {
