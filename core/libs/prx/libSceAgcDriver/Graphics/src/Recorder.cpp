@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -382,13 +383,18 @@ void DestroyDeferred(std::vector<DeferredBatch> releasing, bool onThread) {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto count = releasing.size();
     std::uint64_t objects = 0;
-    for (auto& batch : releasing) {
-        objects += batch.kept.size();
-        // The completions first (their captures hold some of the objects), then the objects.
-        batch.completions.clear();
-        batch.kept.clear();
-        deferredPending.fetch_sub(1, std::memory_order_acq_rel);
+    {
+        // The batches' retired imports leave the guest mirror together (one sparse submit), freed
+        // at the end of this block: only then do the batches count off.
+        GuestMirror::UnbindBatch unbinds;
+        for (auto& batch : releasing) {
+            objects += batch.kept.size();
+            // The completions first (their captures hold some of the objects), then the objects.
+            batch.completions.clear();
+            batch.kept.clear();
+        }
     }
+    deferredPending.fetch_sub(count, std::memory_order_acq_rel);
     releasing.clear();
     if (profile) {
         const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
@@ -4043,6 +4049,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and
     // a caller finishing batches without the mutex (a test) might never make one.
     if (releaseNow || ReleaseUnderLock() || !GuestMemory::GpuMutex().HeldByThisThread()) {
+        GuestMirror::UnbindBatch unbinds;
         batch->completions.clear();
         batch->kept.clear();
     } else {

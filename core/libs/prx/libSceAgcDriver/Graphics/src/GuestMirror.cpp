@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -52,7 +53,7 @@ struct MirrorState {
         std::uint32_t runs;
     };
     std::multimap<std::uint64_t, Bound> bound;
-    std::atomic<std::uint64_t> binds{0}, unbinds{0}, deferred{0}, unaligned{0}, bindUs{0}, boundBytes{0}, extraImports{0}, extraRefused{0}, edgesSkipped{0}, edgesAliased{0};
+    std::atomic<std::uint64_t> binds{0}, unbinds{0}, unbindSubmits{0}, deferred{0}, unaligned{0}, bindUs{0}, boundBytes{0}, extraImports{0}, extraRefused{0}, edgesSkipped{0}, edgesAliased{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -60,6 +61,14 @@ MirrorState& Mirrors() {
     static auto* state = new MirrorState;
     return *state;
 }
+
+// This thread's open GuestMirror::UnbindBatch: its depth and the unbinds waiting for its end.
+struct UnbindBatchState {
+    int depth = 0;
+    std::vector<GuestMirror::Unbinding> unbinding;
+};
+struct UnbindBatchTag {};
+UnbindBatchState& Batched() { return HostThreadLocal<UnbindBatchState, UnbindBatchTag>(); }
 
 bool profiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -278,48 +287,109 @@ void GuestMirror::FlushPending() {
     }
 }
 
-void GuestMirror::Unbind(const HostImport& import) {
+void GuestMirror::Unbind(const HostImport& import, std::function<void()> release) {
+    if (import.base < base || import.base + import.bytes > base + bytes) {
+        if (release) release();
+        return;
+    }
+    auto& batch = Batched();
+    if (batch.depth > 0) {
+        batch.unbinding.push_back({import.base, import.bytes, import.memory, std::move(release)});
+        return;
+    }
+    std::vector<Unbinding> one;
+    one.push_back({import.base, import.bytes, import.memory, std::move(release)});
+    unbindAll(one);
+}
+
+void GuestMirror::unbindAll(std::vector<Unbinding>& unbinding) {
+    if (unbinding.empty()) return;
     auto& state = Mirrors();
-    if (import.base < base || import.base + import.bytes > base + bytes) return;
-    // Every page the import or its own extras may show: the end pages included.
-    const auto first = import.base / page * page;
-    const auto end = (import.base + import.bytes + page - 1) / page * page;
-    std::lock_guard gpu(GuestMemory::GpuMutex());
-    std::vector<std::pair<std::uint64_t, Owner>> rebinds;
-    std::vector<VkDeviceMemory> memories{import.memory};
-    {
-        std::lock_guard lock(state.mutex);
-        if (const auto owned = state.extras.find(import.memory); owned != state.extras.end()) {
-            memories.insert(memories.end(), owned->second.begin(), owned->second.end());
-            state.extras.erase(owned);
-        }
-        for (auto [at, last] = state.bound.equal_range(import.base); at != last; ++at) {
-            if (at->second.memory != import.memory) continue;
-            state.bound.erase(at);
-            break;
-        }
-        const auto gone = [&](VkDeviceMemory memory) { return std::find(memories.begin(), memories.end(), memory) != memories.end(); };
-        std::erase_if(state.pending, [&](const MirrorState::Run& run) { return gone(run.owner.memory); });
-        for (auto at = first; at < end; at += page) {
-            const auto found = state.pages.find(at);
-            if (found == state.pages.end()) continue;
-            auto& owners = found->second;
-            const bool shown = !owners.empty() && gone(owners.back().memory);
-            std::erase_if(owners, [&](const Owner& owner) { return gone(owner.memory); });
-            if (shown) rebinds.emplace_back(at, owners.empty() ? Owner{VK_NULL_HANDLE, 0} : owners.back());
-            if (owners.empty()) state.pages.erase(found);
-        }
-    }
     std::vector<VkSparseMemoryBind> binds;
-    binds.reserve(rebinds.size());
-    for (const auto& [at, owner] : rebinds) {
-        binds.push_back({at - base, page, owner.memory, owner.memory == VK_NULL_HANDLE ? 0 : at - owner.importBase, 0});
-        if (owner.memory == VK_NULL_HANDLE) state.boundBytes.fetch_sub(page, std::memory_order_relaxed);
+    std::vector<VkDeviceMemory> memories;
+    std::size_t imports = 0;
+    {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        // Every page the imports or their own extras may show (the end pages included), each once.
+        std::vector<std::uint64_t> pages;
+        {
+            std::lock_guard lock(state.mutex);
+            for (const auto& entry : unbinding) {
+                memories.push_back(entry.memory);
+                imports = memories.size();
+                for (auto at = entry.base / page * page; at < entry.base + entry.bytes; at += page) pages.push_back(at);
+                for (auto [at, last] = state.bound.equal_range(entry.base); at != last; ++at) {
+                    if (at->second.memory != entry.memory) continue;
+                    state.bound.erase(at);
+                    break;
+                }
+            }
+            for (const auto& entry : unbinding) {
+                if (const auto owned = state.extras.find(entry.memory); owned != state.extras.end()) {
+                    memories.insert(memories.end(), owned->second.begin(), owned->second.end());
+                    state.extras.erase(owned);
+                }
+            }
+            std::sort(pages.begin(), pages.end());
+            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+            std::vector<VkDeviceMemory> sorted = memories;
+            std::sort(sorted.begin(), sorted.end());
+            const auto gone = [&](VkDeviceMemory memory) { return std::binary_search(sorted.begin(), sorted.end(), memory); };
+            std::erase_if(state.pending, [&](const MirrorState::Run& run) { return gone(run.owner.memory); });
+            for (const auto at : pages) {
+                const auto found = state.pages.find(at);
+                if (found == state.pages.end()) continue;
+                auto& owners = found->second;
+                const bool shown = !owners.empty() && gone(owners.back().memory);
+                std::erase_if(owners, [&](const Owner& owner) { return gone(owner.memory); });
+                if (shown) {
+                    const auto owner = owners.empty() ? Owner{VK_NULL_HANDLE, 0} : owners.back();
+                    // Adjacent pages of one new owner (or none) at consecutive offsets join one bind.
+                    const auto memoryOffset = owner.memory == VK_NULL_HANDLE ? 0 : at - owner.importBase;
+                    if (!binds.empty() && binds.back().memory == owner.memory && binds.back().resourceOffset + binds.back().size == at - base && (owner.memory == VK_NULL_HANDLE || binds.back().memoryOffset + binds.back().size == memoryOffset)) binds.back().size += page;
+                    else binds.push_back({at - base, page, owner.memory, memoryOffset, 0});
+                    if (owner.memory == VK_NULL_HANDLE) state.boundBytes.fetch_sub(page, std::memory_order_relaxed);
+                }
+                if (owners.empty()) state.pages.erase(found);
+            }
+        }
+        submit(binds);
     }
-    submit(binds);
-    // The mirror's own imports are freed once no page shows them (the submits above waited).
-    for (std::size_t index = 1; index < memories.size(); ++index) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memories[index], nullptr);
-    state.unbinds.fetch_add(1, std::memory_order_relaxed);
+    // The mirror's own imports are freed once no page shows them (the submit above waited), then
+    // the imports themselves.
+    for (std::size_t index = imports; index < memories.size(); ++index) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memories[index], nullptr);
+    state.unbinds.fetch_add(unbinding.size(), std::memory_order_relaxed);
+    state.unbindSubmits.fetch_add(1, std::memory_order_relaxed);
+    for (auto& entry : unbinding) {
+        if (entry.release) entry.release();
+    }
+    unbinding.clear();
+}
+
+namespace {
+// UnbindBatch is opt-in (APS5_MIRROR_UNBIND_BATCH=1): batched, gameplay ran slower (trab4/trab5
+// 7.10/6.60 FPS, median 116/134 ms) than with an unbind per import (trab2/trab6 8.16/7.95 FPS,
+// median 109/115 ms), same save and config; GUESS: one long GPU mutex hold per batch on the release
+// thread stalls the render path more than many short ones.
+bool unbindEach() {
+    static const bool each = std::getenv("APS5_MIRROR_UNBIND_BATCH") == nullptr;
+    return each;
+}
+}
+
+GuestMirror::UnbindBatch::UnbindBatch() {
+    if (!unbindEach()) ++Batched().depth;
+}
+
+GuestMirror::UnbindBatch::~UnbindBatch() {
+    if (unbindEach()) return;
+    auto& batch = Batched();
+    if (--batch.depth > 0) return;
+    if (batch.unbinding.empty()) return;
+    auto unbinding = std::move(batch.unbinding);
+    batch.unbinding.clear();
+    if (auto* mirror = Instance()) mirror->unbindAll(unbinding);
+    else for (auto& entry : unbinding) if (entry.release) entry.release();
 }
 
 void GuestMirror::Report() {
@@ -331,6 +401,7 @@ void GuestMirror::Report() {
     const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
     const auto binds = take(state.binds);
     const auto unbinds = take(state.unbinds);
+    const auto unbindSubmits = take(state.unbindSubmits);
     const auto deferred = take(state.deferred);
     const auto unaligned = take(state.unaligned);
     const auto bindUs = take(state.bindUs);
@@ -345,7 +416,7 @@ void GuestMirror::Report() {
         pages = state.pages.size();
         for (const auto& [memory, owned] : state.extras) extrasHeld += owned.size();
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[mirror] (10 s) %llu imports bound (%llu requested), %llu unbound, %llu not page-aligned; own imports %llu made, %llu refused, %llu end pages skipped (%llu aliased), %zu held; %.1f ms in sparse binds; %zu pages shown (%.0f MiB bound)\n", binds, deferred, unbinds, unaligned, extraImports, extraRefused, edgesSkipped, edgesAliased, extrasHeld, bindUs / 1000.0, pages, state.boundBytes.load() / 1048576.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[mirror] (10 s) %llu imports bound (%llu requested), %llu unbound in %llu submits, %llu not page-aligned; own imports %llu made, %llu refused, %llu end pages skipped (%llu aliased), %zu held; %.1f ms in sparse binds; %zu pages shown (%.0f MiB bound)\n", binds, deferred, unbinds, unbindSubmits, unaligned, extraImports, extraRefused, edgesSkipped, edgesAliased, extrasHeld, bindUs / 1000.0, pages, state.boundBytes.load() / 1048576.0);
     // Coverage: the registered GPU ranges' pages the mirror does not show (their reads return zero).
     struct Gap {
         std::uint64_t address;

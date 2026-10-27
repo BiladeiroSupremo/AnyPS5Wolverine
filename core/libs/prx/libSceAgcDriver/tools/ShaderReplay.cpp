@@ -16,6 +16,7 @@
 #include "spirv-tools/libspirv.hpp"
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <exception>
 #include <map>
@@ -130,6 +131,7 @@ bool g_captureReads = false;
 bool g_disassemble = false;
 bool g_assembly = false;
 bool g_memory = false;
+bool g_nativeFlush = false;
 bool g_spirv = false;
 bool g_prepare = false;
 bool g_materialize = false;
@@ -154,6 +156,20 @@ bool Replay(const char* path) {
             const auto& mesh = *graphics.mesh;
             std::printf("  mesh: input primitive %u, %u primitives / %u vertices per group, max %u vertices / %u primitives, %u threads, lds %u dwords, provoking %u, ESGS item %u\n", mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize);
         }
+    }
+    {
+        // The float mode (FP_DENORM in bits 4-5) and whether the target can flush f32 denormals natively.
+        auto& capabilities = request.request.target.supportedCapabilities;
+        if (g_nativeFlush && std::find(capabilities.begin(), capabilities.end(), 4465u) == capabilities.end()) {
+            // The request's list is a view: a copy with the capability (kept until the next request).
+            static std::vector<std::uint32_t> extended;
+            extended.assign(capabilities.begin(), capabilities.end());
+            extended.push_back(4465u);
+            capabilities = extended;
+        }
+        const bool flushCapable = std::find(capabilities.begin(), capabilities.end(), 4465u /* spv::CapabilityDenormFlushToZero */) != capabilities.end();
+        const auto& mode = request.request.context.floatMode;
+        std::printf("  float mode %s0x%x (f32 denormals %u), target DenormFlushToZero %s\n", mode.has_value() ? "" : "absent ", mode.has_value() ? mode->floatMode : 0u, mode.has_value() ? (mode->floatMode >> 4u) & 3u : 0u, flushCapable ? "yes" : "no");
     }
     if (g_memory) {
         // --mem: the captured inputs. User data words are printed; each memory region is written to
@@ -323,6 +339,12 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--mem") {
             g_memory = true;
+            continue;
+        }
+        // --native-flush: as on a device with f32 DenormFlushToZero (requests saved before the
+        // driver listed it emulate the flush around every float operation).
+        if (std::string(argv[i]) == "--native-flush") {
+            g_nativeFlush = true;
             continue;
         }
         if (std::string(argv[i]) == "--reads") {

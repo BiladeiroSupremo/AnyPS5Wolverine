@@ -39,6 +39,10 @@ public:
     // APS5_HEAP_ONLY=1: graphics stages emit only the heap branch of a heap-branched table (no slot
     // search); a table the driver would bind slot by slot is rejected instead (BindlessRejection::HeapOnly).
     static bool HeapOnlyGraphics();
+    // APS5_SLOT_HEAP_MODES=1: the slot search of a heap-branched table in a graphics stage also holds
+    // only the heap modes (a compile-size cut that keeps the branch, unlike APS5_HEAP_ONLY); a table
+    // bound slot by slot with an entry of another mode is rejected (BindlessRejection::HeapOnly).
+    static bool SlotHeapModes();
     static void PrepareImageModes(ShaderInfo& info);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;

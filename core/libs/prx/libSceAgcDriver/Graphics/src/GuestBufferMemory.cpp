@@ -220,13 +220,23 @@ void reportImports(const HostImports& state) {
     AgcDriver::ProfilePrint_nid_no_patch("[imports] (10 s) %llu made in %.1f ms; retired: overlapping a new run %llu, registry changed %llu, lease %llu; %llu registry walks in %.1f ms over %llu imports; %zu live (%.0f MiB)\n", created, createUs / 1000.0, overlapped, refreshed, leased, walks, walkUs / 1000.0, walked, state.imports.size(), state.liveBytes / 1048576.0);
 }
 
-void destroyImport(const Context& context, const HostImport& entry) {
-    if (auto* mirror = GuestMirror::Instance()) mirror->Unbind(entry);
-    context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
-    context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
+// Frees the import's buffer, memory and alias view (after the guest mirror let go of its pages).
+std::function<void()> importRelease(VkDevice device, PFN_vkDestroyBuffer destroyBuffer, PFN_vkFreeMemory freeMemory, const HostImport& entry) {
+    return [device, destroyBuffer, freeMemory, buffer = entry.buffer, memory = entry.memory, alias = entry.alias] {
+        destroyBuffer(device, buffer, nullptr);
+        freeMemory(device, memory, nullptr);
 #ifdef _WIN32
-    GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
+        GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
+#else
+        static_cast<void>(alias);
 #endif
+    };
+}
+
+void destroyImport(const Context& context, const HostImport& entry) {
+    auto release = importRelease(context.device, context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer"), context.Function<PFN_vkFreeMemory>("vkFreeMemory"), entry);
+    if (auto* mirror = GuestMirror::Instance()) mirror->Unbind(entry, std::move(release));
+    else release();
 }
 
 using ImportNode = std::map<std::uint64_t, HostImport>::node_type;
@@ -240,12 +250,9 @@ struct RetiredImport {
     RetiredImport& operator=(const RetiredImport&) = delete;
     ~RetiredImport() {
         const auto& entry = node.mapped();
-        if (auto* mirror = GuestMirror::Instance()) mirror->Unbind(entry);
-        destroyBuffer(device, entry.buffer, nullptr);
-        freeMemory(device, entry.memory, nullptr);
-#ifdef _WIN32
-        GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
-#endif
+        auto release = importRelease(device, destroyBuffer, freeMemory, entry);
+        if (auto* mirror = GuestMirror::Instance()) mirror->Unbind(entry, std::move(release));
+        else release();
     }
     VkDevice device;
     PFN_vkDestroyBuffer destroyBuffer;
@@ -290,6 +297,7 @@ void releaseLater(std::vector<std::shared_ptr<RetiredImport>> retired) {
                     auto taken = std::move(state.pending);
                     state.pending.clear();
                     lock.unlock();
+                    GuestMirror::UnbindBatch unbinds;
                     taken.clear();
                 }
             }).detach();
@@ -309,7 +317,10 @@ void drainReaper() {
         std::lock_guard lock(reaper.mutex);
         taken.swap(reaper.pending);
     }
-    taken.clear();
+    {
+        GuestMirror::UnbindBatch unbinds;
+        taken.clear();
+    }
     std::lock_guard destroying(reaper.destroying);
 }
 

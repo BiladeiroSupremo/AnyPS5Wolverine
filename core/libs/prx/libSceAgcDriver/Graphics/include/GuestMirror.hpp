@@ -3,7 +3,9 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <cstdint>
+#include <functional>
 #include <span>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -32,8 +34,27 @@ public:
     // by host imports of the mirror's own: the aligned interior, and each partial end page whose
     // whole 64 KiB is committed writable memory. They live as long as the import's binding.
     void Bind(const HostImport& import);
-    // Before the import's memory is freed: its pages show the next owner, or none.
-    void Unbind(const HostImport& import);
+    // Before the import's memory is freed: its pages show the next owner, or none; then `release`
+    // (frees the import) runs. Inside an UnbindBatch on this thread both wait for the batch's end.
+    void Unbind(const HostImport& import, std::function<void()> release);
+    // The unbinds of a release of many imports (a finished batch's kept objects, the import reaper)
+    // in one vkQueueBindSparse, one fence wait and one GPU mutex hold, instead of one each: the
+    // release thread took the GPU mutex 1-2k times per 10 s for them (trab3). Nests. Opt-in
+    // (APS5_MIRROR_UNBIND_BATCH=1): it measured slower (GuestMirror.cpp).
+    class UnbindBatch {
+    public:
+        UnbindBatch();
+        ~UnbindBatch();
+        UnbindBatch(const UnbindBatch&) = delete;
+        UnbindBatch& operator=(const UnbindBatch&) = delete;
+    };
+    // An unbind waiting for its batch's end.
+    struct Unbinding {
+        std::uint64_t base;
+        std::uint64_t bytes;
+        VkDeviceMemory memory;
+        std::function<void()> release;
+    };
     // [mirror] line every 10 s (APS5_PROFILE_DRAW).
     void Report();
 
@@ -44,6 +65,8 @@ private:
     bool submit(std::span<const VkSparseMemoryBind> binds);
     // A host import of [host, host + size) for the mirror's own pages, or null.
     VkDeviceMemory importHost(void* host, std::uint64_t size);
+    // The unbinds of `unbinding` in one submit, then their releases.
+    void unbindAll(std::vector<Unbinding>& unbinding);
 
     // A copy: the context Get was called with need not outlive the mirror.
     const Context context;
