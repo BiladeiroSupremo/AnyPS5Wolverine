@@ -21,7 +21,15 @@ void PlanBuilder::Run() {
     // uniform load each) while its V#s stay GPU-read (ResourceTracker gpuDescriptor). The CPU fills
     // the slots per draw for now; a GPU evaluator of the same tape is step 2.
     static const bool flatSlots = std::getenv("APS5_ADDRESS_SRT_FLAT") != nullptr;
-    if (AddressSrtProgram(_program.Resources()) && !flatSlots) return;
+    // An address-SRT program's WRITTEN V#s stay on the bound path (ResourceTracker::TakeGpuDescriptor:
+    // the real pipelines' ISA showed each address-path store as a bounds branch, the store and a
+    // written-page note call: mesh executables 17x larger, 2026-10-27 trisa2), so the reads their
+    // dwords come from are planned as flat slots: the CPU fills those few words per draw.
+    // APS5_ADDRESS_GPU_WRITES=1 keeps every V# of such a program GPU-read as before.
+    static const bool boundWrites = std::getenv("APS5_ADDRESS_GPU_WRITES") == nullptr;
+    const bool addressProgram = AddressSrtProgram(_program.Resources());
+    if (addressProgram && !flatSlots && !boundWrites) return;
+    const bool writesOnly = addressProgram && !flatSlots;
     for (auto& block : _program.Blocks()) {
         for (IrValue* inst : block->Instructions()) {
             const auto op = inst->Opcode();
@@ -36,6 +44,15 @@ void PlanBuilder::Run() {
                 }
             }
             if (IsDescriptorHandle(inst->Opcode())) {
+                // The written V#s only (see above): a buffer handle used by a store or an atomic.
+                if (writesOnly) {
+                    if (inst->Opcode() != IrOpcode::GetBufferResource) continue;
+                    const bool written = std::any_of(inst->Uses().begin(), inst->Uses().end(), [](const IrValue* user) {
+                        const auto access = BufferAccessOf(user->Opcode());
+                        return access == BufferAccess::Write || access == BufferAccess::Atomic;
+                    });
+                    if (!written) continue;
+                }
                 // A GPU-resolved T# or S#: only the V# of the buffer it is read from is planned.
                 std::array<IrValue*, 8> reads{};
                 if (HashedImageCandidate(_program.Resources(), *inst, &reads) || HashedSamplerCandidate(_program.Resources(), *inst, &reads)) {
@@ -48,10 +65,12 @@ void PlanBuilder::Run() {
             }
         }
     }
-    for (auto& block : _program.Blocks()) {
-        for (IrValue* inst : block->Instructions()) {
-            if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {
-                Collect(inst, inst->Flags<MemoryFlags>().pc);
+    if (!writesOnly) {
+        for (auto& block : _program.Blocks()) {
+            for (IrValue* inst : block->Instructions()) {
+                if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {
+                    Collect(inst, inst->Flags<MemoryFlags>().pc);
+                }
             }
         }
     }

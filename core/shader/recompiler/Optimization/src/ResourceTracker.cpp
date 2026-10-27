@@ -1413,13 +1413,16 @@ private:
         std::uint32_t badDword = 0;
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
-        // An address-SRT program (Detail::AddressSrtProgram) binds only V#s held in user data; any
-        // other V# is read by the shader itself.
+        // An address-SRT program (Detail::AddressSrtProgram) binds only V#s held in user data, and
+        // the V#s it stores through (planned as flat slots by SrtPlanBuilder; APS5_ADDRESS_GPU_WRITES=1
+        // keeps them GPU-read); any other V# is read by the shader itself.
         const bool userDataOnly = std::ranges::all_of(std::span(descriptor.dwords).first(4), [](IrValue* dword) {
             const auto* value = dword->Resolve();
             return value->Opcode() == IrOpcode::GetUserData || value->HasImmediate();
         });
-        if ((!Detail::AddressSrtProgram(m_program.Resources()) || userDataOnly) && ValidateSource(descriptor, badDword)) {
+        static const bool boundWrites = std::getenv("APS5_ADDRESS_GPU_WRITES") == nullptr;
+        const bool boundWrite = boundWrites && (access == BufferAccess::Write || access == BufferAccess::Atomic);
+        if ((!Detail::AddressSrtProgram(m_program.Resources()) || userDataOnly || boundWrite) && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");
