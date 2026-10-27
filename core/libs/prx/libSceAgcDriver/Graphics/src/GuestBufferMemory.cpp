@@ -1272,6 +1272,16 @@ bool mirrorsEnabled() {
     return !disabled;
 }
 
+// Experiment (M4): APS5_SKIP_COPY_REFRESH=1 with the guest mirror's BDA table (APS5_BDA_MIRROR): a
+// cached address space's copy mirrors are not compared with guest memory per build. Shaders reach
+// guest memory through the guest mirror there (BdaResources), so the copies serve only a V# bound by
+// descriptor inside such a range, which then may read stale bytes. The refresh was ~29 us of the
+// ~65 us per address-based build (trasp1, title).
+bool skipCopyRefresh() {
+    static const bool skip = std::getenv("APS5_SKIP_COPY_REFRESH") != nullptr && std::getenv("APS5_BDA_MIRROR") != nullptr && std::getenv("APS5_GUEST_MIRROR") != nullptr;
+    return skip;
+}
+
 std::uint64_t heapMirrorBudget() {
     static const std::uint64_t bytes = [] {
         const char* value = std::getenv("APS5_HEAP_MIRROR_MIB");
@@ -2494,7 +2504,7 @@ void GuestBufferMemory::AcquireRegistered() {
             // before any of them is dereferenced.
             served = true;
             mirrored = space->mirrored;
-            for (const auto index : space->writableMirrors) {
+            for (const auto index : skipCopyRefresh() ? std::span<const std::size_t>{} : std::span<const std::size_t>(space->writableMirrors)) {
                 const auto& region = space->base[index];
                 if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
             }
@@ -2638,8 +2648,11 @@ void GuestBufferMemory::AcquireRegistered() {
         }
     }
     std::vector<std::pair<std::size_t, std::uint64_t>> checked;
-    if (served) checked = refreshHeapRuns(*space, blocks);
-    else refreshHeapMirrors(heaps, blocks);
+    if (served) {
+        if (!skipCopyRefresh()) checked = refreshHeapRuns(*space, blocks);
+    } else {
+        refreshHeapMirrors(heaps, blocks);
+    }
     lap(timing.mirrorsUs, at);
     const auto copiedBefore = Mirrors().blocksCopied;
     compareBlocks(blocks);
