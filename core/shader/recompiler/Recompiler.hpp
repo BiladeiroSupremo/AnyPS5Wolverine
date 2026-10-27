@@ -528,6 +528,9 @@ struct CompiledShaderArtifact {
     std::uint32_t runtimeImageCount = 0;
     std::vector<std::uint32_t> runtimeImageResources;
     bool registrationModule = false;
+    // The program may store or atomically update memory through device addresses (ShaderInfo::
+    // bdaWrites): an address-based draw without it only reads guest memory (its render pass hazards).
+    bool bdaWrites = false;
     std::uint32_t bdaAbiVersion = 0;
     std::uint32_t runtimeAbiVersion = RuntimeAbi::Version;
     std::vector<VertexInput> vertexInputs;

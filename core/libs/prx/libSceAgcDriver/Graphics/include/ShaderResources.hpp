@@ -175,6 +175,8 @@ public:
     std::string DescribeCopiedWrite() const { return guestMemory.DescribeCopiedWrite(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
+    // Whether an address-based stage may store into guest memory (else it only reads it).
+    bool AddressWrites() const { return addressWrites; }
     // Why the recorded work of this object could not run on a second queue beside the graphics
     // work (it shares state the graphics queue's recorded work may produce or consume), or null:
     // every buffer is bound in place and nothing else is bound but samplers and data buffers.
@@ -461,6 +463,8 @@ private:
     GuestBufferMemory guestMemory;
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
+    // A stage stores through device addresses (CompiledShaderArtifact::bdaWrites).
+    bool addressWrites = false;
     bool usesFaultBuffer = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.

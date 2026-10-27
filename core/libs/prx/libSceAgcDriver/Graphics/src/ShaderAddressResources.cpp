@@ -21,6 +21,7 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         // Rect-list validation needs a fault buffer, but never accesses guest addresses.
         usesBda = usesBda || tables != 0;
         usesFaultBuffer = usesFaultBuffer || faults != 0;
+        addressWrites = addressWrites || (tables != 0 && shader.program->bdaWrites);
     }
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");

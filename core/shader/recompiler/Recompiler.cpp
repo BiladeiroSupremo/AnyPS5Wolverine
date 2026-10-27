@@ -528,6 +528,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
     }
     result.registrationModule = registration;
+    result.bdaWrites = program.Info().bdaWrites;
 
     result.bdaAbiVersion = program.Info().usesDma || program.Info().usesFaultBuffer ? request.target.bdaAbiVersion : 0u;
     result.memoryOffsetDword = bindings.layout.memoryOffsetDword;
@@ -992,6 +993,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .runtimeImageCount = artifact.runtimeImageCount,
         .runtimeImageResources = artifact.runtimeImageResources,
         .registrationModule = artifact.registrationModule,
+        .bdaWrites = variant.info.info.bdaWrites,
         .bdaAbiVersion = artifact.bdaAbiVersion,
         .runtimeAbiVersion = artifact.runtimeAbiVersion,
         .vertexInputs = artifact.vertexInputs,

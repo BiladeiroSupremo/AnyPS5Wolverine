@@ -1815,8 +1815,16 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
-    const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    // An address-based draw may read any guest memory, and writes it only when a stage stores
+    // through addresses: read-only ones (most pixel and vertex programs) continue the pass of the
+    // previous draw like bound ones. Marking every address draw a writer broke the pass at every
+    // draw (trasp2: 19.8k of 27k draws per 10 s started a pass for a hazard; GPU 3x per frame).
+    // APS5_ADDRESS_PASS_ANY_WRITES=1 marks them all writers as before.
+    static const bool anyWrites = std::getenv("APS5_ADDRESS_PASS_ANY_WRITES") != nullptr;
+    const bool addressMemory = addressBased || resources.UsesAddressTable();
+    const bool unknownReads = addressMemory || resources.HasCopiedWrites();
+    const bool unknownWrites = (addressMemory && (anyWrites || resources.AddressWrites())) || resources.HasCopiedWrites();
+    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownReads, unknownWrites};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     if (recorder->RenderPassOpen()) {
         if (capture) Recorder::CountPassStart(Recorder::PassStart::ForcedCapture);
