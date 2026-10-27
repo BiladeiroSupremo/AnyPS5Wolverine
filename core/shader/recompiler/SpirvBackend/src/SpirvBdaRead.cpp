@@ -720,8 +720,10 @@ bool BdaMirrorMode() {
 
 MirrorWords LoadMirrorWords(SpirvEmitterState& state) {
     // The mirror entry (BdaResources: one range, words 4/6/8 = begin, end, device address): the
-    // body's copy from its entry block (EmitControlFlow), or loaded here (inside a helper function).
-    if (state.mirrorBegin != 0u) return {state.mirrorBegin, state.mirrorFinish, state.mirrorBase};
+    // body's copy from its entry block (EmitControlFlow), or loaded here inside a helper function
+    // (load_formatted_gpu_buffer_*, defined during the body into their own section: the body's ids
+    // would not dominate their uses there).
+    if (state.mirrorBegin != 0u && !state.module.InHelperFunction()) return {state.mirrorBegin, state.mirrorFinish, state.mirrorBase};
     return {BdaLoadAddress(state, ConstantU32(state, 4u)), BdaLoadAddress(state, ConstantU32(state, 6u)), BdaLoadAddress(state, ConstantU32(state, 8u))};
 }
 

@@ -1112,6 +1112,9 @@ void EmitProgram(SpirvEmitterState& state) {
         EmitControlFlow(ctx, functionState, program);
     }
     state.module.AddFunction(spv::OpFunctionEnd);
+    // The body's hoisted mirror words (HoistMirrorWords) are its own: nothing emitted after it
+    // may use them.
+    state.mirrorBegin = state.mirrorFinish = state.mirrorBase = 0u;
     if (state.program.Resources().stage == IrShaderStage::Mesh) {
         EmitMeshEntryPoint(state);
     }
