@@ -63,15 +63,21 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
     const auto& memory = context.Memory(instruction);
     const bool runtime = memory.gpuDescriptor || state.registrationModules;
     const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
-    const auto word1 = runtime ? context.Arg(*handle, 1u) : state.module.SpecializationConstant(TypeU32(state), first, 0u);
+    // A GPU-read V#'s words are guest SGPRs: wave-uniform (BdaUniformReads), so the base and the
+    // bounds math stay in scalar registers.
+    const bool uniform = memory.gpuDescriptor && BdaUniformReads();
+    const auto word = [&](std::uint32_t index) { return uniform ? BroadcastFirstU32(state, context.Arg(*handle, index)) : context.Arg(*handle, index); };
+    const auto word0 = word(0u);
+    const auto word1 = runtime ? word(1u) : state.module.SpecializationConstant(TypeU32(state), first, 0u);
+    const auto word2 = word(2u);
     const bool runtimeFormat = memory.gpuDescriptor || (state.registrationModules && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
-    const auto word3 = runtimeFormat ? context.Arg(*handle, 3u) : state.module.SpecializationConstant(TypeU32(state), first + 1u, 0u);
+    const auto word3 = runtimeFormat ? word(3u) : state.module.SpecializationConstant(TypeU32(state), first + 1u, 0u);
     const auto u32 = TypeU32(state);
     auto base = ConstantU32(state, 0u);
     if (memory.gpuDescriptor || BufferAccessOf(instruction.Opcode()) == BufferAccess::Atomic) {
         const auto u64 = TypeScalarU64(state);
-        const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, field(state, context.Arg(*handle, 1u), 0u, 16u)), BdaConstant(state, 32u));
-        base = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, context.Arg(*handle, 0u)), high);
+        const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, field(state, word1, 0u, 16u)), BdaConstant(state, 32u));
+        base = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, word0), high);
     }
     auto invalid = nonzero(state, field(state, word3, 30u, 2u));
     auto index = ConstantU32(state, 0u);
@@ -88,9 +94,9 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
     }
     if (memory.gpuDescriptor && faults) faultIf(context, instruction, invalid, base, 0u, BdaAbi::FaultReason::InvalidDescriptor);
     const auto stride = field(state, word1, 16u, 14u);
-    const auto present = runtime ? both(state, nonzero(state, context.Arg(*handle, 2u)), Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, context.Arg(*handle, 0u)), nonzero(state, field(state, word1, 0u, 16u)))) : nonzero(state, state.module.SpecializationConstant(u32, first + 2u, 0u));
+    const auto present = runtime ? both(state, nonzero(state, word2), Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, word0), nonzero(state, field(state, word1, 0u, 16u)))) : nonzero(state, state.module.SpecializationConstant(u32, first + 2u, 0u));
     const auto valid = memory.gpuDescriptor ? both(state, Unary(state, spv::OpLogicalNot, TypeBool(state), invalid), Binary(state, spv::OpINotEqual, TypeBool(state), base, BdaConstant(state, 0u))) : present;
-    return {base, context.Arg(*handle, 2u), stride, word3, both(state, nonzero(state, stride), nonzero(state, field(state, word1, 31u, 1u))), index, valid};
+    return {base, word2, stride, word3, both(state, nonzero(state, stride), nonzero(state, field(state, word1, 31u, 1u))), index, valid};
 }
 
 // `componentOffset` and `bytes` are SPIR-V ids (constants or run-time values: formattedRuntime).
@@ -829,7 +835,12 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     // Mirror mode: one aligned load through the mirror, kept or dropped by a select (an invalid V#
     // or an address outside the mirror reads zero; no fault is recorded).
     // The scalar unit ignores the address's low two bits.
-    if (mirrorRead) return EmitMirrorWordCall(state, Binary(state, spv::OpBitwiseAnd, u64, Binary(state, spv::OpIAdd, u64, resource.base, offset), BdaConstant(state, ~std::uint64_t{3u})), inBounds);
+    if (mirrorRead) {
+        // A guest scalar load (s_buffer_load): its address is wave-uniform (BdaUniformReads).
+        auto guest = Binary(state, spv::OpBitwiseAnd, u64, Binary(state, spv::OpIAdd, u64, resource.base, offset), BdaConstant(state, ~std::uint64_t{3u}));
+        if (BdaUniformReads()) guest = BroadcastFirstU64(state, guest);
+        return EmitMirrorWordCall(state, guest, inBounds);
+    }
     return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
 }
 

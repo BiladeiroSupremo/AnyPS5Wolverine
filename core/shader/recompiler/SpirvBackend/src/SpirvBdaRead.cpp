@@ -676,7 +676,10 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
     if (BdaMirrorMode() && !spanOnly && !BdaCoherent(state, inst)) {
         const auto u64 = TypeScalarU64(state);
         const auto boolean = TypeBool(state);
-        const auto guest = offset != 0u ? Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, offset)) : address;
+        // A guest scalar load's address (ScalarAddress: s_load through a pointer) is wave-uniform.
+        const auto kind = ctx.Memory(inst).kind;
+        const bool uniform = BdaUniformReads() && (kind == ResourceKind::ScalarAddress || kind == ResourceKind::ScalarBuffer);
+        const auto guest = uniform ? BroadcastFirstU64(state, offset != 0u ? Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, offset)) : address) : (offset != 0u ? Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, offset)) : address);
         const auto aligned = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, 3u)), BdaConstant(state, 0u));
         read = EmitValueIfElse(state, aligned, vector, [&] {
             const auto [begin, finish, base] = LoadMirrorWords(state);
@@ -716,6 +719,35 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
 bool BdaMirrorMode() {
     static const bool mirror = std::getenv("APS5_BDA_MIRROR") != nullptr;
     return mirror;
+}
+
+// Experiment (M4): the address-SRT path's reads of guest-scalar values (an SRT or constant word the
+// guest loaded with s_load, a V# in SGPRs) are wave-uniform by the guest's own semantics, but the
+// host compiler sees per-lane 64-bit pointer arithmetic: the real pipelines' ISA (2026-10-27,
+// trisa1/trisa2) had ~7x the 64-bit VALU ops, 30x the scratch ops and 25-50% more VGPRs per
+// fragment executable, and that occupancy loss was the address path's GPU cost. Broadcasting the
+// first lane's value (as two 32-bit halves: 64-bit subgroup broadcasts need the extended-types
+// feature) tells the compiler the value is uniform, so it lives in SGPRs and its arithmetic in the
+// scalar unit. APS5_NO_BDA_UNIFORM=1 leaves the values per lane as before.
+bool BdaUniformReads() {
+    static const bool enabled = std::getenv("APS5_NO_BDA_UNIFORM") == nullptr;
+    return enabled;
+}
+
+std::uint32_t BroadcastFirstU32(SpirvEmitterState& state, std::uint32_t value) {
+    state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+    state.module.EmitCapability(spv::CapabilityGroupNonUniformBallot);
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpGroupNonUniformBroadcastFirst, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup), value);
+    return result;
+}
+
+std::uint32_t BroadcastFirstU64(SpirvEmitterState& state, std::uint32_t value) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto low = BroadcastFirstU32(state, Unary(state, spv::OpUConvert, u32, value));
+    const auto high = BroadcastFirstU32(state, Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64, value, BdaConstant(state, 32u))));
+    return Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, low), Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, high), BdaConstant(state, 32u)));
 }
 
 MirrorWords LoadMirrorWords(SpirvEmitterState& state) {

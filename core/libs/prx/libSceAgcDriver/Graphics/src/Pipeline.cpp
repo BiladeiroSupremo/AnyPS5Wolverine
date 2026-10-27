@@ -8,10 +8,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <condition_variable>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <cstdlib>
 #include <deque>
 #include <list>
@@ -30,6 +34,13 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
     if (!context.pipelineExecutableInfo) return;
     const auto getProperties = context.Function<PFN_vkGetPipelineExecutablePropertiesKHR>("vkGetPipelineExecutablePropertiesKHR");
     const auto getStatistics = context.Function<PFN_vkGetPipelineExecutableStatisticsKHR>("vkGetPipelineExecutableStatisticsKHR");
+    // Diagnostic (with APS5_PIPELINE_STATS=1): APS5_PIPELINE_ISA=<directory> writes each executable's
+    // textual internal representations (the driver's ISA disassembly among them) to
+    // <directory>\<n>_<stages>_<name>_<representation>.txt, for an instruction-mix comparison of
+    // the real pipelines (the offline RGA route compiles with default specialization values).
+    static const char* isaDirectory = std::getenv("APS5_PIPELINE_ISA");
+    static std::atomic<std::uint32_t> isaCounter{0};
+    const auto getRepresentations = isaDirectory != nullptr && *isaDirectory != '\0' ? context.Function<PFN_vkGetPipelineExecutableInternalRepresentationsKHR>("vkGetPipelineExecutableInternalRepresentationsKHR") : nullptr;
     VkPipelineInfoKHR pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
     pipelineInfo.pipeline = pipeline;
     std::uint32_t count = 0;
@@ -67,6 +78,27 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
                 throw std::runtime_error("unsupported pipeline statistic format");
             }
             std::fprintf(stderr, " (%s)\n", statistic.description);
+        }
+        if (getRepresentations == nullptr) continue;
+        count = 0;
+        if (getRepresentations(context.device, &executable, &count, nullptr) != VK_SUCCESS || count == 0) continue;
+        std::vector<VkPipelineExecutableInternalRepresentationKHR> representations(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+        // First for the sizes (pData null), then for the data.
+        if (getRepresentations(context.device, &executable, &count, representations.data()) != VK_SUCCESS) continue;
+        std::vector<std::vector<char>> storage(count);
+        for (std::uint32_t at = 0; at < count; ++at) {
+            storage[at].resize(representations[at].dataSize + 1u);
+            representations[at].pData = storage[at].data();
+        }
+        if (getRepresentations(context.device, &executable, &count, representations.data()) != VK_SUCCESS && representations.empty()) continue;
+        const auto serial = isaCounter.fetch_add(1, std::memory_order_relaxed);
+        for (std::uint32_t at = 0; at < count; ++at) {
+            const auto& representation = representations[at];
+            if (!representation.isText || representation.dataSize == 0) continue;
+            std::string file = std::to_string(serial) + "_0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%x", property.stages); return std::string(text); }() + "_" + property.name + "_" + representation.name + ".txt";
+            for (auto& c : file) if (c == '/' || c == '\\' || c == ':' || c == ' ') c = '_';
+            std::ofstream out(std::filesystem::path(isaDirectory) / file, std::ios::binary);
+            out.write(static_cast<const char*>(representation.pData), static_cast<std::streamsize>(representation.dataSize));
         }
     }
 }
