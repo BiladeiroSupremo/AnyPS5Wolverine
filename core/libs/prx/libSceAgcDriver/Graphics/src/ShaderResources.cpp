@@ -1906,7 +1906,13 @@ bool LoopGuardEnabled() {
 }
 
 bool ShaderResources::BdaTemplates() {
-    static const bool enabled = std::getenv("APS5_BDA_TEMPLATES") != nullptr && std::getenv("APS5_BDA_MIRROR") != nullptr && std::getenv("APS5_GUEST_MIRROR") != nullptr;
+    // Default on in mirror mode since 2026-10-28 (PPSA03671 address-path gameplay A/B: 6.4-6.5 ->
+    // 8.0 FPS, median frame 151 -> 120 ms; committer 42 -> 28 us per commit, address draws 130k
+    // BDA builds -> 3k per 10 s). APS5_BDA_TEMPLATES=0 builds every address draw as before.
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_BDA_TEMPLATES");
+        return (text == nullptr || std::strcmp(text, "0") != 0) && std::getenv("APS5_BDA_MIRROR") != nullptr && std::getenv("APS5_GUEST_MIRROR") != nullptr;
+    }();
     return enabled;
 }
 
