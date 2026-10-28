@@ -174,7 +174,13 @@ bool AddressSrtProgram(const IrResourcePlan& program) {
     // Experiment (M4 step A): APS5_ADDRESS_SRT_GRAPHICS=1 puts every pixel and vertex-like program on
     // the address path, to measure its per-draw cost and correctness.
     static const bool graphics = std::getenv("APS5_ADDRESS_SRT_GRAPHICS") != nullptr;
-    if (graphics && program.stage != IrShaderStage::Compute && program.stage != IrShaderStage::TessellationControl) {
+    // The tessellation stages stay on the bound path: with the local and domain stages on the
+    // address path most terrain was missing in gameplay (user report 2026-10-28, traw18/trbfm1
+    // shots) while pixel-only address runs (trps1) drew it. APS5_ADDRESS_SRT_TESS=1 puts those two
+    // back, for finding the cause.
+    static const bool tess = std::getenv("APS5_ADDRESS_SRT_TESS") != nullptr;
+    const bool tessStage = program.stage == IrShaderStage::TessellationControl || (!tess && (program.stage == IrShaderStage::Local || program.stage == IrShaderStage::TessellationEvaluation));
+    if (graphics && program.stage != IrShaderStage::Compute && !tessStage) {
         const auto& selection = graphicsSelection();
         const bool pixel = program.stage == IrShaderStage::Pixel;
         if ((selection.stages == 1 && !pixel) || (selection.stages == 2 && pixel)) return false;
