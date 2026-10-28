@@ -1427,8 +1427,14 @@ private:
         // load; read by the shader, word3 is a run-time value and every fetch carries the whole format
         // decode (2026-10-28 ISA: address-path mesh executables 13-16x the bound path's, s_cmp trees over
         // 62 format keys, 1,280 SGPR lane spills). SrtPlanBuilder plans the reads its dwords come from.
-        const bool boundFormat = Detail::AddressBoundFormats() && memory.formatted && !memory.typed && access == BufferAccess::Read;
-        if ((!Detail::AddressSrtProgram(m_program.Resources()) || userDataOnly || boundWrite || boundFormat) && ValidateSource(descriptor, badDword)) {
+        const bool runtimeFormat = memory.formatted && !memory.typed;
+        const bool boundFormat = Detail::AddressBoundFormats() && runtimeFormat && access == BufferAccess::Read;
+        // APS5_ADDRESS_USER_VSHARPS=1: a user-data V# that is only read without a run-time format is
+        // read through the mirror like the SRT's V#s: no descriptor of its own, so a reused build needs
+        // no new set per draw (2026-10-28 trmv1: ~11 moved buffers per template use, pixel ~6, the
+        // select loop 6.1 us of a 30 us commit).
+        const bool userBound = userDataOnly && !(Detail::AddressUserVsharps() && access == BufferAccess::Read && !runtimeFormat);
+        if ((!Detail::AddressSrtProgram(m_program.Resources()) || userBound || boundWrite || boundFormat) && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");

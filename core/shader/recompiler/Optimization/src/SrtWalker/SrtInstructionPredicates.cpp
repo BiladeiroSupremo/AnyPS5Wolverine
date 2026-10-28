@@ -205,6 +205,11 @@ bool AddressBoundFormats() {
     return enabled;
 }
 
+bool AddressUserVsharps() {
+    static const bool enabled = std::getenv("APS5_ADDRESS_USER_VSHARPS") != nullptr;
+    return enabled;
+}
+
 bool AddressBoundAccess(const IrResourcePlan& program, const IrValue& user) {
     static const bool boundWrites = std::getenv("APS5_ADDRESS_BOUND_WRITES") != nullptr;
     const auto access = BufferAccessOf(user.Opcode());
