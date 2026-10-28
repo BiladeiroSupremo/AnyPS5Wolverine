@@ -60,6 +60,13 @@ public:
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    // Dispatch runs (VulkanDevice::recordDispatch, APS5_DISPATCH_RUNS=1): a direct dispatch's trailing
+    // barrier (compute writes -> every later stage and the host) is held, `queue` = its guest queue
+    // + 1. The next dispatch of that queue in the same run takes it over (TakeDispatchTrail: no
+    // barrier between the two, the guest orders none); any other command recorded first, a store, a
+    // sample fold or the batch's submit gets it ahead of itself, where it stood before.
+    void DeferDispatchTrail(std::uint32_t queue);
+    bool TakeDispatchTrail(std::uint32_t queue);
     struct DrawPassStart {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
@@ -633,6 +640,8 @@ private:
         } run;
         // See Commands(): the accesses the last recorded command's trailing barrier covers.
         VkAccessFlags coveredAccess = 0;
+        // DeferDispatchTrail's queue + 1 while a dispatch's trailing barrier is held, else 0.
+        std::uint32_t heldTrailQueue = 0;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {
             struct Range {
@@ -767,6 +776,8 @@ private:
     // Per-batch runs: records the queued stores with their barriers (`atSubmit`: the batch-end
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
+    // Records the held dispatch trailing barrier (DeferDispatchTrail), if any.
+    void flushDispatchTrail();
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
     void endOpenRenderPass(bool barrier = true);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or

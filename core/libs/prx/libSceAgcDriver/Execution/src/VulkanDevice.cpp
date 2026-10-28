@@ -1213,6 +1213,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // f32 flush-to-zero beside the f16/f64 modes needs at least 32-bit independence
     // (ShaderRecompiler NativeF32Flush).
     if (floatControls.shaderDenormFlushToZeroFloat32 == VK_TRUE && floatControls.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE) state->capabilities.push_back(spv::CapabilityDenormFlushToZero);
+    // Whether shaders get the hardware f32 flush or emulate it per float op (KytyPS5-Frank measured
+    // its heaviest pixel shader 5.9 -> 0.96 ms per frame with the hardware flush).
+    std::fprintf(stderr, "[vulkan] float controls: f32 flush-to-zero %s, f32 denorm preserve %s, f16 preserve %s, independence %s => f32 flush %s\n", floatControls.shaderDenormFlushToZeroFloat32 == VK_TRUE ? "yes" : "no", floatControls.shaderDenormPreserveFloat32 == VK_TRUE ? "yes" : "no", floatControls.shaderDenormPreserveFloat16 == VK_TRUE ? "yes" : "no", floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL ? "all" : floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY ? "32-bit only" : "none", std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormFlushToZero)) != state->capabilities.end() ? "native" : "EMULATED");
     deviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     deviceExtensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
     state->capabilities.push_back(4448);
@@ -3965,6 +3968,26 @@ void VulkanDevice::SetIndirectThreads(const std::array<std::uint32_t, 3>* thread
     if (threadsPerGroup != nullptr) indirectThreadsPerGroup = *threadsPerGroup;
 }
 
+namespace {
+thread_local VulkanDevice::DispatchRun currentDispatchRun{};
+}
+
+void VulkanDevice::SetDispatchRun(DispatchRun run) {
+    currentDispatchRun = run;
+}
+
+VulkanDevice::DispatchRun VulkanDevice::CurrentDispatchRun() {
+    return currentDispatchRun;
+}
+
+bool VulkanDevice::DispatchRuns() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_DISPATCH_RUNS");
+        return text != nullptr && text[0] == '1';
+    }();
+    return enabled;
+}
+
 VkDevice VulkanDevice::Device() const {
     return state->device;
 }
@@ -4285,8 +4308,18 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // (Graphics::Draw): a pixel or vertex shader spinning on a label is not a thing.
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    // Dispatch runs (APS5_DISPATCH_RUNS=1, after KytyPS5-Frank 98c18d9: title 9.9 -> ~20 FPS there):
+    // the guest orders its dispatches only where its command stream asks (EVENT_WRITE
+    // CS_PARTIAL_FLUSH, ACQUIRE_MEM, RELEASE_MEM, WAIT_REG_MEM, ...). A direct dispatch that follows
+    // its queue's previous one with only SET_SH_REG / NOP packets between them takes over that
+    // dispatch's held trailing barrier and needs no leading one, so the two may overlap on the GPU as
+    // on the console. Anything else recorded in between gets the held barrier first (Recorder).
+    const auto run = CurrentDispatchRun();
+    const bool runs = DispatchRuns() && barrierElision && argumentImport == nullptr && run.queue != 0;
+    const bool inRun = runs && run.inRun && recorder.TakeDispatchTrail(run.queue);
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
+    if (inRun) covered = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
@@ -4475,12 +4508,18 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     recorder.EndGpuTiming(gpuTiming);
     Graphics::Breadcrumbs::Mark(commands, argumentImport != nullptr ? "dispatch-indirect" : "dispatch", record.programAddress, record.x, record.y, record.z);
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
-    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (runs) {
+        // Held: the next command records it (the same barrier, where it stood), unless it is the next
+        // dispatch of this run.
+        recorder.DeferDispatchTrail(run.queue);
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
     recordStep(PhaseRecordMarks);

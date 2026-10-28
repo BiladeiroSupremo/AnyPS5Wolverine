@@ -254,6 +254,9 @@ private:
         bool attach = false;
         bool dataHit = false;
         bool noteWrites = false;
+        // The packet loop's dispatch run for this dispatch (VulkanDevice::SetDispatchRun).
+        std::uint32_t runQueue = 0;
+        bool inRun = false;
         // The registered shader, its expansion, shader memory and capture the snapshots point into.
         std::vector<std::shared_ptr<const void>> owners;
         std::vector<std::uint32_t> liveWords;

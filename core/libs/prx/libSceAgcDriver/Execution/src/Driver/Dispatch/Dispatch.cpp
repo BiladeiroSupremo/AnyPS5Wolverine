@@ -489,6 +489,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         commit.attach = attachTo != nullptr;
         commit.dataHit = dataHit;
         commit.noteWrites = noteWrites;
+        commit.runQueue = VulkanDevice::CurrentDispatchRun().queue;
+        commit.inRun = VulkanDevice::CurrentDispatchRun().inRun;
         commit.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         commit.owners = {registeredShader, expanded, shaderMemory, capture};
         commit.liveWords = std::move(liveWords);
@@ -595,6 +597,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 void Driver::commitDispatch(PipelinedDispatch& commit) {
     DrawPipeline::FollowEpoch(commit.epoch);
     GuestMemory::SetCurrentPacket(0x15, commit.queue);
+    struct RunScope {
+        explicit RunScope(VulkanDevice::DispatchRun run) { VulkanDevice::SetDispatchRun(run); }
+        ~RunScope() { VulkanDevice::SetDispatchRun({}); }
+    } runScope({commit.runQueue, commit.inRun});
     const auto& compiled = *commit.compiled;
     auto* const attachTo = !commit.attach ? nullptr : commit.keepVariant != nullptr ? commit.keepVariant.get() : commit.attachVariant.get();
     try {

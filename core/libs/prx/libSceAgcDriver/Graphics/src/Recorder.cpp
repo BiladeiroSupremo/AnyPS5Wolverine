@@ -1380,6 +1380,7 @@ std::uint64_t Recorder::ReapsWithWork() {
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
+    flushDispatchTrail();
     if (open->renderPass.open) CountPassCloser(__builtin_return_address(0));
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
@@ -1462,6 +1463,29 @@ VkCommandBuffer Recorder::PrePassCommands() const {
 
 void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
+}
+
+void Recorder::DeferDispatchTrail(std::uint32_t queue) {
+    ensureOpen();
+    open->heldTrailQueue = queue;
+    open->coveredAccess = 0;
+}
+
+bool Recorder::TakeDispatchTrail(std::uint32_t queue) {
+    if (open == nullptr || queue == 0 || open->heldTrailQueue != queue || open->renderPass.open) return false;
+    open->heldTrailQueue = 0;
+    CountMerged(CommandClass::DispatchTrailing);
+    return true;
+}
+
+void Recorder::flushDispatchTrail() {
+    if (open == nullptr || open->heldTrailQueue == 0) return;
+    open->heldTrailQueue = 0;
+    // VulkanDevice::recordDispatch's trailing barrier, as it records it outside a run.
+    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+    CountBarriers(CommandClass::DispatchTrailing);
+    open->coveredAccess = dispatchedAccess;
 }
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
@@ -1637,6 +1661,7 @@ void Recorder::ensureOpen() {
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
     ensureOpen();
+    flushDispatchTrail();
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -1747,6 +1772,7 @@ void Recorder::flushPendingStore() {
 }
 
 bool Recorder::closeStoreRun(bool atSubmit) {
+    flushDispatchTrail();
     auto& run = open->run;
     if (LabelRunsPerBatch()) {
         auto stores = std::move(run.queued);
@@ -2365,6 +2391,7 @@ void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::
 }
 
 void Recorder::foldSegments() {
+    flushDispatchTrail();
     const auto commands = open->commands;
     const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(pendingSamples.size(), SegmentFoldCapacity));
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -3478,6 +3505,7 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    flushDispatchTrail();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();

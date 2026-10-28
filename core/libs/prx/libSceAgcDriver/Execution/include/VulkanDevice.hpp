@@ -275,6 +275,17 @@ public:
     // The calling thread's next DispatchIndirect has thread dimensions with these per-group sizes
     // (nullptr: group counts, the default). The driver sets it around the call.
     static void SetIndirectThreads(const std::array<std::uint32_t, 3>* threadsPerGroup);
+    // Dispatch runs (APS5_DISPATCH_RUNS=1): the guest queue (+ 1; 0 = unknown) of the calling
+    // thread's next dispatch, and whether it follows that queue's previous dispatch with only
+    // SET_SH_REG / NOP packets between them (the guest orders none of the two). The driver sets it
+    // around the call (the packet loop, or the committer from the queued dispatch).
+    struct DispatchRun {
+        std::uint32_t queue = 0;
+        bool inRun = false;
+    };
+    static void SetDispatchRun(DispatchRun run);
+    static DispatchRun CurrentDispatchRun();
+    static bool DispatchRuns();
     // Whether compute templates refresh their data buffers with a hit's words instead of keying
     // them (APS5_NO_TEMPLATE_DATA_REFRESH unset); the driver's data-only hits require it.
     static bool TemplateDataRefresh();

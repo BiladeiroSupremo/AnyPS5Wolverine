@@ -164,6 +164,10 @@ void Driver::execute(const Submission& submission) {
     struct ClearAhead {
         ~ClearAhead() { clearResolvedAhead(); }
     } clearAhead;
+    // Dispatch runs (VulkanDevice::DispatchRuns): whether the packets since this submission's last
+    // dispatch were only SET_SH_REG and NOP (markers): the guest then orders the next dispatch after
+    // it by nothing, as on hardware, where such dispatches overlap.
+    bool dispatchRun = false;
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -173,6 +177,38 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        if (header == FlipPacketHeader || header == RenderingWaitPacketHeader || (opcode != 0x76 && opcode != 0x10 && opcode != 0x15 && opcode != 0x16)) {
+            // APS5_PROFILE_DRAW: which packets end dispatch runs, on a [dispatch-runs] line every 10 s.
+            if (dispatchRun && profilePackets) {
+                static std::array<std::atomic<std::uint64_t>, 258> breakers{};
+                static std::array<std::atomic<std::uint64_t>, 64> eventBreakers{};
+                static std::atomic<long long> lastReport{0};
+                ++breakers[header == FlipPacketHeader ? 256 : header == RenderingWaitPacketHeader ? 257 : opcode];
+                // EVENT_WRITE by event type (CS_PARTIAL_FLUSH = 0x07 orders dispatches; others may not).
+                if (opcode == 0x46 && packet.size() >= 2) ++eventBreakers[packet[1] & 0x3fu];
+                const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                auto last = lastReport.load(std::memory_order_relaxed);
+                if (last == 0) lastReport.compare_exchange_strong(last, now);
+                else if (now - last >= 10 && lastReport.compare_exchange_strong(last, now)) {
+                    std::string line = "[dispatch-runs] packets ending a run (10 s):";
+                    for (std::size_t index = 0; index < breakers.size(); ++index) {
+                        const auto count = breakers[index].exchange(0, std::memory_order_relaxed);
+                        if (count == 0) continue;
+                        line += " " + (index == 256 ? std::string("flip") : index == 257 ? std::string("rendering-wait") : Pm4::Name(static_cast<std::uint32_t>(0xc0000000u | (index << 8u)))) + " " + std::to_string(count);
+                    }
+                    line += "; EVENT_WRITE by type:";
+                    for (std::size_t type = 0; type < eventBreakers.size(); ++type) {
+                        const auto count = eventBreakers[type].exchange(0, std::memory_order_relaxed);
+                        if (count == 0) continue;
+                        char item[32];
+                        std::snprintf(item, sizeof(item), " 0x%02zx %llu", type, static_cast<unsigned long long>(count));
+                        line += item;
+                    }
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
+            }
+            dispatchRun = false;
+        }
         // A label behind queued draws, or inside a window of draws prepared ahead (DrawAhead.hpp), is
         // stored by the committer after them (commitLabelPacket); APS5_NO_PIPELINED_LABELS=1 waits for
         // the draws and stores it here instead.
@@ -346,6 +382,11 @@ void Driver::execute(const Submission& submission) {
             // dispatch faults unless it runs no group.
             timed(&WorkerProfile::dispatchMs, [&] {
                 static_cast<void>(ShaderMemory::TakeNullPageRead());
+                struct RunScope {
+                    explicit RunScope(VulkanDevice::DispatchRun run) { VulkanDevice::SetDispatchRun(run); }
+                    ~RunScope() { VulkanDevice::SetDispatchRun({}); }
+                } runScope({submission.queue + 1u, opcode == 0x15 && dispatchRun});
+                dispatchRun = true;
                 try {
                     if (opcode == 0x15) dispatch(queue, packet, submission);
                     else dispatchIndirect(queue, packet, submission);
