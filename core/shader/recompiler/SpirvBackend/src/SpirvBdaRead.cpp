@@ -712,10 +712,15 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
         const auto guest = uniform ? BroadcastFirstU64(state, offset != 0u ? Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, offset)) : address) : (offset != 0u ? Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, offset)) : address);
         const auto words = LoadMirrorWords(state);
         const auto valid = ConstantBool(state, true);
-        // The mirror's word at the 4-aligned address `from` + 4 * index (zero outside the mirror; the
-        // end is page-aligned, so an aligned dword below it lies wholly inside).
-        const auto wordAt = [&](std::uint32_t from, std::uint32_t index) {
-            return EmitMirrorWordRead(state, index != 0u ? Binary(state, spv::OpIAdd, u64, from, BdaConstant(state, index * 4u)) : from, valid, 0u, words);
+        // The used words first..last(+1) as one span from the 4-aligned address `from`: one range
+        // check, one pointer, a vector load for four (EmitMirrorWordsRead); `span[index]` is the
+        // word at from + 4 * index.
+        const auto spanAt = [&](std::uint32_t from, std::uint32_t count) {
+            const auto start = first != 0u ? Binary(state, spv::OpIAdd, u64, from, BdaConstant(state, first * 4u)) : from;
+            const auto values = EmitMirrorWordsRead(state, start, count, valid, words);
+            std::array<std::uint32_t, 5> span{};
+            for (std::uint32_t index = 0; index < count; ++index) span[first + index] = values[index];
+            return span;
         };
         const auto compose = [&](const std::array<std::uint32_t, 4>& parts) {
             const auto composite = state.module.AllocateId();
@@ -725,9 +730,10 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
         const auto zero = ConstantU32(state, 0u);
         const auto aligned = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, 3u)), BdaConstant(state, 0u));
         read = EmitValueIfElse(state, aligned, vector, [&] {
+            const auto span = spanAt(guest, last - first + 1u);
             std::array<std::uint32_t, 4> parts{zero, zero, zero, zero};
             for (std::uint32_t dword = 0; dword < 4u; ++dword) {
-                if (isUsed(dword)) parts[dword] = wordAt(guest, dword);
+                if (isUsed(dword)) parts[dword] = span[dword];
             }
             return compose(parts);
         }, [&] {
@@ -736,8 +742,7 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
             const auto from = Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, ~std::uint64_t{3u}));
             const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, 3u))), ConstantU32(state, 3u));
             const auto back = Binary(state, spv::OpISub, u32, ConstantU32(state, 32u), shift);
-            std::array<std::uint32_t, 5> loaded{};
-            for (std::uint32_t index = first; index <= last + 1u; ++index) loaded[index] = wordAt(from, index);
+            const auto loaded = spanAt(from, last - first + 2u);
             std::array<std::uint32_t, 4> parts{zero, zero, zero, zero};
             for (std::uint32_t dword = 0; dword < 4u; ++dword) {
                 if (!isUsed(dword)) continue;
@@ -854,6 +859,51 @@ std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, 
     const auto value = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, accessMask | spv::MemoryAccessAlignedMask, 4u);
     return Select(state, TypeU32(state), inside, value, ConstantU32(state, 0u));
+}
+
+std::array<std::uint32_t, 5> EmitMirrorWordsRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t count, std::uint32_t valid, const MirrorWords& words) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    std::array<std::uint32_t, 5> values{};
+    if (count == 0u || count > 5u) return values;
+    // One check for the span: it starts inside the mirror and ends at or before its end (the end
+    // is page-aligned and the address 4-aligned, so the bytes between lie inside). The per-word
+    // 64-bit compares, selects and pointer conversions of the word-by-word read were most of a
+    // mesh executable's code on the address path (isa_trbf1, 2026-10-28).
+    const auto bytes = BdaConstant(state, count * 4u);
+    const auto inside = Binary(state, spv::OpLogicalAnd, boolean, valid, Binary(state, spv::OpLogicalAnd, boolean,
+        Binary(state, spv::OpUGreaterThanEqual, boolean, guest, words.begin),
+        Binary(state, spv::OpULessThanEqual, boolean, Binary(state, spv::OpIAdd, u64, guest, bytes), words.finish)));
+    // Anything else reads the unbound last page; the span's offset in it keeps 32 bytes of room.
+    const auto lastPage = Binary(state, spv::OpISub, u64, Binary(state, spv::OpIAdd, u64, words.base, Binary(state, spv::OpISub, u64, words.finish, words.begin)), BdaConstant(state, 0x10000u));
+    const auto spare = Binary(state, spv::OpIAdd, u64, lastPage, Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, 0xffe0u)));
+    const auto physical = Select(state, u64, inside, Binary(state, spv::OpIAdd, u64, words.base, Binary(state, spv::OpISub, u64, guest, words.begin)), spare);
+    const auto zero = ConstantU32(state, 0u);
+    const auto keep = [&](std::uint32_t value) { return Select(state, u32, inside, value, zero); };
+    std::uint32_t index = 0;
+    if (count >= 4u) {
+        // The first four words as one 16-byte load (global_load_b128 in the ISA).
+        const auto vector = TypeU32Vector(state, 4);
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, vector), pointer, physical);
+        const auto loaded = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, vector, loaded, pointer, spv::MemoryAccessAlignedMask, 4u);
+        for (; index < 4u; ++index) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u32, value, loaded, index);
+            values[index] = keep(value);
+        }
+    }
+    for (; index < count; ++index) {
+        const auto at = index != 0u ? Binary(state, spv::OpIAdd, u64, physical, BdaConstant(state, index * 4u)) : physical;
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, at);
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, pointer, spv::MemoryAccessAlignedMask, 4u);
+        values[index] = keep(value);
+    }
+    return values;
 }
 
 }
