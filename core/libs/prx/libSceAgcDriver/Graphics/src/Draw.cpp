@@ -1121,8 +1121,37 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     ValidateViewport(context, state.viewport);
     ValidateDepthBounds(context, state);
     timer.phase(PhaseValidate);
+    // APS5_PROFILE_DRAW: the vertex phase by part (index import lookup, highest-index scan, vertex
+    // buffers and layout), on a [vertex-split] line every 10 s.
+    static const bool splitVertex = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint64_t> splitNs[3]{}, splitDraws{0}, splitIndexed{0}, splitScanned{0};
+    static std::atomic<long long> splitReport{0};
+    auto splitAt = splitVertex ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto splitMark = [&](std::size_t part) {
+        if (!splitVertex) return;
+        const auto now = std::chrono::steady_clock::now();
+        splitNs[part].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - splitAt).count()), std::memory_order_relaxed);
+        splitAt = now;
+    };
+    struct SplitReport {
+        bool on;
+        ~SplitReport() {
+            if (!on) return;
+            const auto draws = splitDraws.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto last = splitReport.load(std::memory_order_relaxed);
+            if (last == 0) splitReport.compare_exchange_strong(last, now);
+            else if (now - last >= 10 && splitReport.compare_exchange_strong(last, now)) {
+                const auto per = [&](std::size_t part) { return static_cast<double>(splitNs[part].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws); };
+                const auto index = per(0), scan = per(1), vertex = per(2);
+                std::fprintf(stderr, "[vertex-split] %llu draws (10 s; %llu indexed, %llu index scans), us per draw: index import %.2f, highest-index %.2f, vertex buffers+layout %.2f\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(splitIndexed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(splitScanned.exchange(0, std::memory_order_relaxed)), index, scan, vertex);
+                splitDraws.store(0, std::memory_order_relaxed);
+            }
+        }
+    } splitReportScope{splitVertex};
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (draw.indexed) {
+        if (splitVertex) splitIndexed.fetch_add(1, std::memory_order_relaxed);
         const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
@@ -1132,8 +1161,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
+        splitMark(0);
         if (import != nullptr) {
-            highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            const auto range = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart);
+            highest = range.highest;
+            if (splitVertex && !range.reused) splitScanned.fetch_add(1, std::memory_order_relaxed);
         } else if (!copy.reused) {
             highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
@@ -1142,6 +1174,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         } else if (copy.derived != 0) {
             highest = copy.derived - 1u;
         }
+        splitMark(1);
         if (!highest) {
             inputs.nothing = true;
             return inputs;
@@ -1272,6 +1305,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.vertexHandles.push_back(rangeHandles[plan.copyOf[j]]);
         inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[j]] + plan.offsets[j];
     }
+    splitMark(2);
     timer.phase(PhaseVertex);
     return inputs;
 }
