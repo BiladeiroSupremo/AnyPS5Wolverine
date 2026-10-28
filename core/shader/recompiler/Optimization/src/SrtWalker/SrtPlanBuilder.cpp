@@ -25,8 +25,9 @@ void PlanBuilder::Run() {
     // the real pipelines' ISA showed each address-path store as a bounds branch, the store and a
     // written-page note call: mesh executables 17x larger, 2026-10-27 trisa2), so the reads their
     // dwords come from are planned as flat slots: the CPU fills those few words per draw.
-    // APS5_ADDRESS_GPU_WRITES=1 keeps every V# of such a program GPU-read as before.
-    static const bool boundWrites = std::getenv("APS5_ADDRESS_GPU_WRITES") == nullptr;
+    // Opt-in (APS5_ADDRESS_BOUND_WRITES=1): the mesh stores turned out not to be V# stores (their
+    // ISA did not change, trbw1) and the game froze on entering gameplay with it (cause unknown).
+    static const bool boundWrites = std::getenv("APS5_ADDRESS_BOUND_WRITES") != nullptr;
     const bool addressProgram = AddressSrtProgram(_program.Resources());
     if (addressProgram && !flatSlots && !boundWrites) return;
     const bool writesOnly = addressProgram && !flatSlots;

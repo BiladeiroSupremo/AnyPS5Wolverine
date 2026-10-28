@@ -42,6 +42,10 @@ bool BdaMirrorMode();
 // Mirror mode: the 32-bit word at the 4-byte aligned guest address `guest` (u64) when `valid`, else
 // zero, with no branch and no fault record: an invalid or unmapped address reads the mirror's last
 // page, which nothing binds (zeros).
+// Mirror mode, a non-coherent read: no fault record and no stop at any of its sites (the invalid-V#,
+// overflow and unmapped cases read zero through selects). The real pipelines' ISA (2026-10-27) had
+// the inlined fault records at every vector read site: mesh executables 17x larger.
+bool BdaMirrorFaultless(const SpirvEmitterState& state, const IrValue& inst);
 // Experiment: guest-scalar values read on the address path are made wave-uniform (SpirvBdaRead.cpp).
 bool BdaUniformReads();
 std::uint32_t BroadcastFirstU32(SpirvEmitterState& state, std::uint32_t value);

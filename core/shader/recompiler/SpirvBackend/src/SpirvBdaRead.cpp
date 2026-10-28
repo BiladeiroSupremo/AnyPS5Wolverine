@@ -353,9 +353,18 @@ std::uint32_t BdaInstructionPc(SpirvEmitterState& state, const IrValue& inst) {
     return state.bdaPcOverride != 0u ? state.bdaPcOverride : ConstantU32(state, inst.Flags<MemoryFlags>().pc);
 }
 
+bool BdaMirrorFaultless(const SpirvEmitterState& state, const IrValue& inst) {
+    if (!BdaMirrorMode() || BdaCoherent(state, inst)) return false;
+    const auto op = inst.Opcode();
+    return BufferAccessOf(op) == BufferAccess::Read || AddressOpcodeInfoOf(op).access == AddressAccess::Read;
+}
+
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract) {
     auto& state = ctx.state;
     const auto result = Binary(state, subtract ? spv::OpISub : spv::OpIAdd, TypeScalarU64(state), address, offset);
+    // A mirror-mode read records no fault (BdaMirrorFaultless): a wrapped address reads zero
+    // through the mirror's range select like any other address outside it.
+    if (BdaMirrorFaultless(state, inst)) return result;
     const auto overflow = subtract ? Binary(state, spv::OpUGreaterThan, TypeBool(state), offset, address) : Binary(state, spv::OpULessThan, TypeBool(state), result, address);
     EmitIfCondition(state, overflow, [&] { RecordBdaFault(state, address, ConstantU32(state, 0u), BdaInstructionPc(state, inst), BdaAbi::FaultReason::Overflow); });
     StopBdaInvocationIf(state, overflow);

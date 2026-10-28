@@ -51,6 +51,8 @@ std::uint32_t nonzero(SpirvEmitterState& state, std::uint32_t value) {
 
 void faultIf(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t condition, std::uint32_t address, std::uint32_t bytes, BdaAbi::FaultReason reason) {
     auto& state = context.state;
+    // A mirror-mode read: the condition already drops the value (a select to zero), no record, no stop.
+    if (BdaMirrorFaultless(state, instruction)) return;
     EmitIfCondition(state, condition, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason); });
     StopBdaInvocationIf(state, condition);
 }

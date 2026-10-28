@@ -1420,7 +1420,7 @@ private:
             const auto* value = dword->Resolve();
             return value->Opcode() == IrOpcode::GetUserData || value->HasImmediate();
         });
-        static const bool boundWrites = std::getenv("APS5_ADDRESS_GPU_WRITES") == nullptr;
+        static const bool boundWrites = std::getenv("APS5_ADDRESS_BOUND_WRITES") != nullptr;
         const bool boundWrite = boundWrites && (access == BufferAccess::Write || access == BufferAccess::Atomic);
         if ((!Detail::AddressSrtProgram(m_program.Resources()) || userDataOnly || boundWrite) && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
