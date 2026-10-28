@@ -3808,9 +3808,21 @@ ShaderResources::DrawBindings::~DrawBindings() {
     if (cache != nullptr && fragmentAllocation.set != VK_NULL_HANDLE) cache->Free(fragmentAllocation);
 }
 
+namespace {
+// Profiling (APS5_PROFILE_DRAW): moved buffers of the reused builds by stage, address-based builds
+// apart, on a [moved] line with the [bindings] report.
+constexpr std::size_t MovedStageCount = 8;
+constexpr const char* MovedStageNames[MovedStageCount] = {"cs", "vs", "hs", "ds", "gs", "ps", "ls", "ms"};
+std::atomic<std::uint64_t> movedByStage[2][MovedStageCount]{};
+std::atomic<std::uint64_t> movedData[2]{};
+}
+
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
     std::vector<MovedBuffer> moved;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !bdaTemplate)) return moved;
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::array<std::uint32_t, MovedStageCount> perStage{};
+    std::uint32_t dataMoved = 0;
     // By binding number (bindingSlots, built with the template); the linear search stays for an
     // object noted reusable before the slots existed (none today).
     const auto keptBinding = [&](std::uint32_t number) {
@@ -3822,6 +3834,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     };
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
+        const auto before = moved.size();
         for (const auto& binding : shader.program->bindings) {
             if (DataRole(binding.role)) {
                 const auto kept = keptBinding(binding.binding);
@@ -3834,6 +3847,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 if (same) continue;
                 if (item.dataWords.empty() && patched) return std::nullopt;
                 moved.push_back({index, 0, item.size, binding.guestDescriptor});
+                dataMoved++;
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -3861,6 +3875,14 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
         }
+        perStage[static_cast<std::size_t>(shader.stage) % MovedStageCount] += static_cast<std::uint32_t>(moved.size() - before);
+    }
+    if (profiled && !moved.empty()) {
+        const std::size_t kind = usesBda ? 0 : 1;
+        for (std::size_t stage = 0; stage < MovedStageCount; ++stage) {
+            if (perStage[stage] != 0) movedByStage[kind][stage].fetch_add(perStage[stage], std::memory_order_relaxed);
+        }
+        if (dataMoved != 0) movedData[kind].fetch_add(dataMoved, std::memory_order_relaxed);
     }
     return moved;
 }
@@ -3885,8 +3907,8 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
 namespace {
 // Profiling (APS5_PROFILE_DRAW): PrepareDrawBindings by section, per call, on the [bindings] line
 // every 10 s, with the snapshots taken, reused and created.
-enum BindingSection : std::size_t { BindingSelect, BindingCollect, BindingReuse, BindingCreate, BindingAllocate, BindingUpdate, BindingKeep, BindingSectionCount };
-constexpr const char* BindingSectionNames[BindingSectionCount] = {"select", "collect", "reuse-lookup", "create+copy", "allocate", "update", "keep"};
+enum BindingSection : std::size_t { BindingSetup, BindingSelect, BindingCollect, BindingReuse, BindingCreate, BindingAllocate, BindingUpdate, BindingKeep, BindingSectionCount };
+constexpr const char* BindingSectionNames[BindingSectionCount] = {"setup", "select", "collect", "reuse-lookup", "create+copy", "allocate", "update", "keep"};
 std::atomic<std::uint64_t> bindingSectionNs[BindingSectionCount]{};
 std::atomic<std::uint64_t> bindingCalls{0}, bindingSnapshots{0}, bindingReused{0}, bindingCreated{0}, bindingEmpty{0}, bindingCreatedBytes{0}, bindingCreatedLarge{0}, bindingInPlace{0};
 std::atomic<std::int64_t> bindingReportNs{0};
@@ -3928,6 +3950,16 @@ struct BindingSplit {
             n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; storage lookups %llu avg %.2f us, refreshes %llu avg %.2f us over avg %.1f KiB, %llu failed", static_cast<unsigned long long>(lookups[0]), per(lookups[1], lookups[0]) / 1000.0, static_cast<unsigned long long>(lookups[2]), per(lookups[3], lookups[2]) / 1000.0, per(lookups[4], lookups[2]) / 1024.0, static_cast<unsigned long long>(lookups[5]));
         }
         std::fprintf(stderr, "%s\n", line);
+        n = std::snprintf(line, sizeof(line), "[moved] buffers of reused builds (10 s, of them data blocks):");
+        for (std::size_t kind = 0; kind < 2 && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++kind) {
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s (data %llu)", kind == 0 ? "address-based" : "other", static_cast<unsigned long long>(movedData[kind].exchange(0, std::memory_order_relaxed)));
+            for (std::size_t stage = 0; stage < MovedStageCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++stage) {
+                const auto count = movedByStage[kind][stage].exchange(0, std::memory_order_relaxed);
+                if (count != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", MovedStageNames[stage], static_cast<unsigned long long>(count));
+            }
+            if (kind == 0 && n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ";");
+        }
+        std::fprintf(stderr, "%s\n", line);
     }
 };
 }
@@ -3941,7 +3973,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     // Nothing is snapshotted (the default): only moved buffers need bindings of their own.
     if (maxSnapshotBytes == 0 && moved.empty() && !bdaUse) return {};
     BindingSplit split;
-    const auto reads = guestMemory.InPlaceReads();
+    // Without a snapshot limit (the default) only the moved buffers get bindings of their own: the
+    // walk takes them directly instead of every allocation with a search of the moved list each
+    // (PPSA03671: ~10 moved buffers per template hit, 7.6 us of a 29 us commit in the select loop).
+    const bool movedOnly = maxSnapshotBytes == 0;
+    // The in-place read ranges only decide unmoved snapshots, which a moved-only walk never takes.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    if (!movedOnly) reads = guestMemory.InPlaceReads();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
     if (bdaUse) {
@@ -3949,11 +3987,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->space = std::make_unique<GuestBufferMemory>(context);
         result->space->AcquireRegistered();
     }
+    split.mark(BindingSetup);
     std::vector<std::size_t> selected;
-    // Without a snapshot limit (the default) only the moved buffers get bindings of their own: the
-    // walk takes them directly instead of every allocation with a search of the moved list each
-    // (PPSA03671: ~10 moved buffers per template hit, 7.6 us of a 29 us commit in the select loop).
-    const bool movedOnly = maxSnapshotBytes == 0;
     const auto steps = movedOnly ? moved.size() : allocations.size();
     for (std::size_t step = 0; step < steps; ++step) {
         const auto override = movedOnly ? moved.begin() + static_cast<std::ptrdiff_t>(step) : std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == step; });
