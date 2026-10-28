@@ -183,7 +183,10 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
 template<typename Read>
 std::uint32_t readOrZero(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t condition, Read&& read) {
     auto& state = context.state;
-    if (!state.robustBufferAccess2 || context.Memory(instruction).gpuDescriptor) return EmitValueOrZeroIfCondition(state, condition, read);
+    // A mirror-mode read cannot fault either (an address outside the mirror reads its unbound last
+    // page): a select, no branch around every component.
+    const bool branch = context.Memory(instruction).gpuDescriptor ? !BdaMirrorFaultless(state, instruction) : !state.robustBufferAccess2;
+    if (branch) return EmitValueOrZeroIfCondition(state, condition, read);
     return Select(state, TypeU32(state), condition, read(), ConstantU32(state, 0u));
 }
 
@@ -547,7 +550,8 @@ std::uint32_t formattedRuntime(SpirvValueEmitContext& context, const IrValue& in
         outputs[output] = Select(state, u32, valid, value, constant(0u));
     }
     const auto unsupported = Unary(state, spv::OpLogicalNot, boolean, valid);
-    if (memory.gpuDescriptor) {
+    // A mirror-mode read of an unsupported format reads zeros (the selects above), no record.
+    if (memory.gpuDescriptor && !BdaMirrorFaultless(state, instruction)) {
         EmitIfCondition(state, unsupported, [&] { RecordBdaFault(state, resource.base, constant(0u), BdaInstructionPc(state, instruction), BdaAbi::FaultReason::InvalidDescriptor); });
         StopBdaInvocationIf(state, unsupported);
     }
