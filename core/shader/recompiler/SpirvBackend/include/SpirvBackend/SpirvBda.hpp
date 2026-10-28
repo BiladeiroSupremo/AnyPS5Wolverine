@@ -64,11 +64,13 @@ struct MirrorWords {
 MirrorWords LoadMirrorWords(SpirvEmitterState& state);
 // Loads them once at the start of a body (the entry block) in mirror mode; clears them otherwise.
 void HoistMirrorWords(SpirvEmitterState& state);
-std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask, const MirrorWords& words);
+// `uniform`: the caller knows `guest` is wave-uniform (a guest scalar load), so a window read
+// (BdaMirrorWindows) may pick its window from the first lane; otherwise every lane picks its own.
+std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask, const MirrorWords& words, bool uniform = false);
 // `count` (1-5) consecutive words from the 4-aligned guest address with ONE range check and one
 // pointer for the whole span (a span crossing the mirror's end reads zero as a whole); four of them
 // as one vector load. Unused entries of the result are 0 ids.
-std::array<std::uint32_t, 5> EmitMirrorWordsRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t count, std::uint32_t valid, const MirrorWords& words);
+std::array<std::uint32_t, 5> EmitMirrorWordsRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t count, std::uint32_t valid, const MirrorWords& words, bool uniform = false);
 // The same read as one helper function (read_mirror_word) the reads call: defined with the other
 // BDA functions in mirror mode; EmitMirrorWordCall falls back to the inline read without it.
 void DefineMirrorWordFunction(SpirvEmitterState& state);

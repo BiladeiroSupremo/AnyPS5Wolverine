@@ -282,6 +282,7 @@ struct VulkanDevice::State {
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
+    bool storageBufferNonUniformIndexing = false;
     bool bindlessHeaps = false;
     std::unique_ptr<Graphics::BindlessHeapTable> bindlessTable;
     // The guest mirror's window set (APS5_MIRROR_WINDOWS), made with the device.
@@ -1486,6 +1487,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &descriptorIndexingFeatures};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         state->descriptorIndexing = descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
+        // The guest mirror's windows (MirrorWindowSet) are indexed per lane by divergent reads.
+        state->storageBufferNonUniformIndexing = descriptorIndexingFeatures.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE;
         state->storageBufferUpdateAfterBind = descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE;
         state->descriptorBindingPartiallyBound = compileOnly && descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
         state->descriptorBindingVariableDescriptorCount = compileOnly && descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
@@ -1501,7 +1504,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     descriptorIndexingFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
-    if (state->descriptorIndexing || state->storageBufferUpdateAfterBind || state->descriptorBindingPartiallyBound || state->descriptorBindingVariableDescriptorCount || state->runtimeDescriptorArray) deviceExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+    if (state->descriptorIndexing || state->storageBufferNonUniformIndexing || state->storageBufferUpdateAfterBind || state->descriptorBindingPartiallyBound || state->descriptorBindingVariableDescriptorCount || state->runtimeDescriptorArray) deviceExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
     if (state->descriptorIndexing) {
         descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
         descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
@@ -1509,6 +1512,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->capabilities.push_back(spv::CapabilitySampledImageArrayNonUniformIndexing);
         state->capabilities.push_back(spv::CapabilityStorageImageArrayNonUniformIndexing);
         state->spirvExtensions.push_back("SPV_EXT_descriptor_indexing");
+    }
+    if (state->storageBufferNonUniformIndexing) {
+        descriptorIndexingFeatures.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+        if (!state->descriptorIndexing) {
+            state->capabilities.push_back(spv::CapabilityShaderNonUniform);
+            state->spirvExtensions.push_back("SPV_EXT_descriptor_indexing");
+        }
+        state->capabilities.push_back(spv::CapabilityStorageBufferArrayNonUniformIndexing);
     }
     descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind = state->storageBufferUpdateAfterBind ? VK_TRUE : VK_FALSE;
     descriptorIndexingFeatures.descriptorBindingPartiallyBound = state->descriptorBindingPartiallyBound ? VK_TRUE : VK_FALSE;
