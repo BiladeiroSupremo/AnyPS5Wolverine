@@ -27,9 +27,11 @@ void PlanBuilder::Run() {
     // dwords come from are planned as flat slots: the CPU fills those few words per draw.
     // Opt-in (APS5_ADDRESS_BOUND_WRITES=1): the mesh stores turned out not to be V# stores (their
     // ISA did not change, trbw1) and the game froze on entering gameplay with it (cause unknown).
+    // APS5_ADDRESS_BOUND_FORMATS=1 likewise keeps the V#s of format-converting loads (vertex fetches)
+    // bound, so their format is a specialization constant (AddressBoundAccess).
     static const bool boundWrites = std::getenv("APS5_ADDRESS_BOUND_WRITES") != nullptr;
     const bool addressProgram = AddressSrtProgram(_program.Resources());
-    if (addressProgram && !flatSlots && !boundWrites) return;
+    if (addressProgram && !flatSlots && !boundWrites && !AddressBoundFormats()) return;
     const bool writesOnly = addressProgram && !flatSlots;
     for (auto& block : _program.Blocks()) {
         for (IrValue* inst : block->Instructions()) {
@@ -45,14 +47,12 @@ void PlanBuilder::Run() {
                 }
             }
             if (IsDescriptorHandle(inst->Opcode())) {
-                // The written V#s only (see above): a buffer handle used by a store or an atomic.
+                // The bound V#s only (see above): a buffer handle used by a store or an atomic
+                // (APS5_ADDRESS_BOUND_WRITES) or by a format-converting load (APS5_ADDRESS_BOUND_FORMATS).
                 if (writesOnly) {
                     if (inst->Opcode() != IrOpcode::GetBufferResource) continue;
-                    const bool written = std::any_of(inst->Uses().begin(), inst->Uses().end(), [](const IrValue* user) {
-                        const auto access = BufferAccessOf(user->Opcode());
-                        return access == BufferAccess::Write || access == BufferAccess::Atomic;
-                    });
-                    if (!written) continue;
+                    const bool bound = std::any_of(inst->Uses().begin(), inst->Uses().end(), [&](const IrValue* user) { return AddressBoundAccess(_program.Resources(), *user); });
+                    if (!bound) continue;
                 }
                 // A GPU-resolved T# or S#: only the V# of the buffer it is read from is planned.
                 std::array<IrValue*, 8> reads{};

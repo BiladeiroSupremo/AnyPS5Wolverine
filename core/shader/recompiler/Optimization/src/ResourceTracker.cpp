@@ -1422,7 +1422,13 @@ private:
         });
         static const bool boundWrites = std::getenv("APS5_ADDRESS_BOUND_WRITES") != nullptr;
         const bool boundWrite = boundWrites && (access == BufferAccess::Write || access == BufferAccess::Atomic);
-        if ((!Detail::AddressSrtProgram(m_program.Resources()) || userDataOnly || boundWrite) && ValidateSource(descriptor, badDword)) {
+        // APS5_ADDRESS_BOUND_FORMATS=1: a V# read by a format-converting load (vertex fetches) stays on
+        // the bound path, whose word3 is a specialization constant the driver folds into one fixed-format
+        // load; read by the shader, word3 is a run-time value and every fetch carries the whole format
+        // decode (2026-10-28 ISA: address-path mesh executables 13-16x the bound path's, s_cmp trees over
+        // 62 format keys, 1,280 SGPR lane spills). SrtPlanBuilder plans the reads its dwords come from.
+        const bool boundFormat = Detail::AddressBoundFormats() && memory.formatted && !memory.typed && access == BufferAccess::Read;
+        if ((!Detail::AddressSrtProgram(m_program.Resources()) || userDataOnly || boundWrite || boundFormat) && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");

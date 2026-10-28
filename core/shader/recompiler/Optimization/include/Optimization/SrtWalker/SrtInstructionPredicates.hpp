@@ -19,6 +19,12 @@ bool HashedSamplerCandidate(const IrResourcePlan& program, const IrValue& handle
 // (no flat slots, buffers whose V# is not user data go through the address-based path), for
 // programs that read words an earlier GPU pass writes, so the CPU never waits for that pass.
 bool AddressSrtProgram(const IrResourcePlan& program);
+// APS5_ADDRESS_BOUND_FORMATS=1: an address-SRT program's V#s read by format-converting loads stay on
+// the bound path (ResourceTracker::TakeGpuDescriptor; SrtPlanBuilder plans their dwords' reads).
+bool AddressBoundFormats();
+// Whether an address-SRT program binds the V# a buffer access uses: user-data V#s always, written
+// V#s with APS5_ADDRESS_BOUND_WRITES, format-converting reads with APS5_ADDRESS_BOUND_FORMATS.
+bool AddressBoundAccess(const IrResourcePlan& program, const IrValue& user);
 // FNV-1a over a program's code words: its name for APS5_ADDRESS_SRT across runs.
 std::uint64_t CodeContentHash(std::span<const std::uint32_t> code);
 // Called for every request before translation: a program whose code hash is listed in

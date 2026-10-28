@@ -194,6 +194,22 @@ bool AddressSrtProgram(const IrResourcePlan& program) {
     return matched.addresses.contains(program.shaderHash);
 }
 
+bool AddressBoundFormats() {
+    static const bool enabled = std::getenv("APS5_ADDRESS_BOUND_FORMATS") != nullptr;
+    return enabled;
+}
+
+bool AddressBoundAccess(const IrResourcePlan& program, const IrValue& user) {
+    static const bool boundWrites = std::getenv("APS5_ADDRESS_BOUND_WRITES") != nullptr;
+    const auto access = BufferAccessOf(user.Opcode());
+    if (boundWrites && (access == BufferAccess::Write || access == BufferAccess::Atomic)) return true;
+    if (!AddressBoundFormats() || access != BufferAccess::Read) return false;
+    const auto index = user.Flags<MemoryFlags>().index;
+    if (index >= program.memoryInfo.size()) return false;
+    const auto& memory = program.memoryInfo[index];
+    return memory.formatted && !memory.typed;
+}
+
 bool HashedImageCandidate(const IrResourcePlan& program, const IrValue& handle, std::array<IrValue*, 8>* reads, std::uint32_t* offset) {
     std::uint32_t first = 0;
     if (!BindlessHeaps::HashedImagesEnabled() || handle.Opcode() != IrOpcode::GetImageResource || !ConstantOffsetReads(program, handle, 8u, reads, &first)) return false;
