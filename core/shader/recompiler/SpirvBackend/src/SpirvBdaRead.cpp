@@ -405,6 +405,25 @@ std::uint32_t EmitBdaRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::
     if (bits != 8u && bits != 16u && bits != 32u) ctx.Fail(inst, "unsupported BDA read width");
     if (state.bdaPointerFunction == 0) ctx.Fail(inst, "BDA lookup function is missing");
     if (bits == 32u) return EmitBdaDwordReads(ctx, inst, address, 0u, 1u)[0];
+    if (BdaMirrorFaultless(state, inst)) {
+        // Mirror mode: the byte or halfword out of its aligned word(s), no byte lookups, no fault.
+        const auto u32 = TypeU32(state);
+        const auto u64 = TypeScalarU64(state);
+        const auto words = LoadMirrorWords(state);
+        const auto valid = ConstantBool(state, true);
+        const auto from = Binary(state, spv::OpBitwiseAnd, u64, address, BdaConstant(state, ~std::uint64_t{3u}));
+        const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpBitwiseAnd, u64, address, BdaConstant(state, 3u))), ConstantU32(state, 3u));
+        auto value = Binary(state, spv::OpShiftRightLogical, u32, EmitMirrorWordRead(state, from, valid, 0u, words), shift);
+        if (bits == 16u) {
+            // A halfword at byte 3 straddles the next word: the shift by 32 - 24 brings its low byte
+            // in; shifts of 32 or more (bytes 0-2) are out of range, so they are masked off instead.
+            const auto next = EmitMirrorWordRead(state, Binary(state, spv::OpIAdd, u64, from, BdaConstant(state, 4u)), valid, 0u, words);
+            const auto straddles = Binary(state, spv::OpIEqual, TypeBool(state), shift, ConstantU32(state, 24u));
+            const auto high = Select(state, u32, straddles, Binary(state, spv::OpShiftLeftLogical, u32, next, ConstantU32(state, 8u)), ConstantU32(state, 0u));
+            value = Binary(state, spv::OpBitwiseOr, u32, value, high);
+        }
+        return Binary(state, spv::OpBitwiseAnd, u32, value, ConstantU32(state, (1u << bits) - 1u));
+    }
     const auto instruction = BdaInstructionPc(state, inst);
     EmitBdaOverflowCheck(state, address, bits / 8u, instruction);
     return EmitBdaBytes(state, address, bits / 8u, instruction, BdaAccessMask(state, inst));
@@ -678,8 +697,10 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
     // is loaded dword by dword from mirror + (guest - begin), each dword kept or dropped by a select
     // (outside the mirror it reads the unbound last page and yields zero, as the scalar reads do):
     // no probe or span function call, no fault record or stop, no runtime used-dword branches. An
-    // unaligned span takes the span path; a coherent (atomic) read always does.
-    // APS5_BDA_MIRROR_SPAN=1 keeps the span path for every read (A/B).
+    // unaligned span is funnel-shifted out of the adjacent aligned words the same way (the span path
+    // it took before was the bulk of every read site in the real ISA, 2026-10-27: the inlined probe,
+    // byte path and two Overflow fault records per site); a coherent (atomic) read takes the span
+    // path. APS5_BDA_MIRROR_SPAN=1 keeps the span path for every read (A/B).
     static const bool spanOnly = std::getenv("APS5_BDA_MIRROR_SPAN") != nullptr;
     std::uint32_t read = 0;
     if (BdaMirrorMode() && !spanOnly && !BdaCoherent(state, inst)) {
@@ -689,31 +710,41 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
         const auto kind = ctx.Memory(inst).kind;
         const bool uniform = BdaUniformReads() && (kind == ResourceKind::ScalarAddress || kind == ResourceKind::ScalarBuffer);
         const auto guest = uniform ? BroadcastFirstU64(state, offset != 0u ? Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, offset)) : address) : (offset != 0u ? Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, offset)) : address);
-        const auto aligned = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, 3u)), BdaConstant(state, 0u));
-        read = EmitValueIfElse(state, aligned, vector, [&] {
-            const auto [begin, finish, base] = LoadMirrorWords(state);
-            const auto lastPage = Binary(state, spv::OpISub, u64, Binary(state, spv::OpIAdd, u64, base, Binary(state, spv::OpISub, u64, finish, begin)), BdaConstant(state, 0x10000u));
-            std::array<std::uint32_t, 4> parts{};
-            for (std::uint32_t dword = 0; dword < 4u; ++dword) {
-                if (!isUsed(dword)) {
-                    parts[dword] = ConstantU32(state, 0u);
-                    continue;
-                }
-                const auto at = dword != 0u ? Binary(state, spv::OpIAdd, u64, guest, BdaConstant(state, dword * 4u)) : guest;
-                // The end is page-aligned, so an aligned dword below it lies wholly inside.
-                const auto inside = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpUGreaterThanEqual, boolean, at, begin), Binary(state, spv::OpULessThan, boolean, at, finish));
-                const auto spare = Binary(state, spv::OpIAdd, u64, lastPage, Binary(state, spv::OpBitwiseAnd, u64, at, BdaConstant(state, 0xfffcu)));
-                const auto physical = Select(state, u64, inside, Binary(state, spv::OpIAdd, u64, base, Binary(state, spv::OpISub, u64, at, begin)), spare);
-                const auto pointer = state.module.AllocateId();
-                state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, physical);
-                const auto value = state.module.AllocateId();
-                state.module.AddFunction(spv::OpLoad, u32, value, pointer, BdaAccessMask(false), 4u);
-                parts[dword] = Select(state, u32, inside, value, ConstantU32(state, 0u));
-            }
+        const auto words = LoadMirrorWords(state);
+        const auto valid = ConstantBool(state, true);
+        // The mirror's word at the 4-aligned address `from` + 4 * index (zero outside the mirror; the
+        // end is page-aligned, so an aligned dword below it lies wholly inside).
+        const auto wordAt = [&](std::uint32_t from, std::uint32_t index) {
+            return EmitMirrorWordRead(state, index != 0u ? Binary(state, spv::OpIAdd, u64, from, BdaConstant(state, index * 4u)) : from, valid, 0u, words);
+        };
+        const auto compose = [&](const std::array<std::uint32_t, 4>& parts) {
             const auto composite = state.module.AllocateId();
             state.module.AddFunction(spv::OpCompositeConstruct, vector, composite, parts[0], parts[1], parts[2], parts[3]);
             return composite;
-        }, spanRead);
+        };
+        const auto zero = ConstantU32(state, 0u);
+        const auto aligned = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, 3u)), BdaConstant(state, 0u));
+        read = EmitValueIfElse(state, aligned, vector, [&] {
+            std::array<std::uint32_t, 4> parts{zero, zero, zero, zero};
+            for (std::uint32_t dword = 0; dword < 4u; ++dword) {
+                if (isUsed(dword)) parts[dword] = wordAt(guest, dword);
+            }
+            return compose(parts);
+        }, [&] {
+            // Dword d spans aligned words d and d + 1: (w[d] >> shift) | (w[d + 1] << (32 - shift)),
+            // shift = 8, 16 or 24 bits.
+            const auto from = Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, ~std::uint64_t{3u}));
+            const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpBitwiseAnd, u64, guest, BdaConstant(state, 3u))), ConstantU32(state, 3u));
+            const auto back = Binary(state, spv::OpISub, u32, ConstantU32(state, 32u), shift);
+            std::array<std::uint32_t, 5> loaded{};
+            for (std::uint32_t index = first; index <= last + 1u; ++index) loaded[index] = wordAt(from, index);
+            std::array<std::uint32_t, 4> parts{zero, zero, zero, zero};
+            for (std::uint32_t dword = 0; dword < 4u; ++dword) {
+                if (!isUsed(dword)) continue;
+                parts[dword] = Binary(state, spv::OpBitwiseOr, u32, Binary(state, spv::OpShiftRightLogical, u32, loaded[dword], shift), Binary(state, spv::OpShiftLeftLogical, u32, loaded[dword + 1u], back));
+            }
+            return compose(parts);
+        });
     } else {
         read = spanRead();
     }
