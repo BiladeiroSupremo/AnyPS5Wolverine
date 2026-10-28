@@ -205,6 +205,18 @@ bool AddressBoundFormats() {
     return enabled;
 }
 
+bool AddressBoundFormats(const IrResourcePlan& program) {
+    // Pixel programs keep their format-converting reads GPU-read unless APS5_ADDRESS_BOUND_FORMATS=all:
+    // binding them cost a CPU walk per draw (their V#s sit in per-draw constant buffers, e.g. pixel
+    // 11d1418800's three, 2026-10-28 replay) for no ISA gain (fragment executables 18.4k vs 19.3k
+    // instructions mean, isa_trbf2 vs isa_trbfs1); the vertex fetches of mesh programs shrank 8x.
+    static const bool everyStage = [] {
+        const char* text = std::getenv("APS5_ADDRESS_BOUND_FORMATS");
+        return text != nullptr && std::strcmp(text, "all") == 0;
+    }();
+    return AddressBoundFormats() && (everyStage || program.stage != IrShaderStage::Pixel);
+}
+
 bool AddressUserVsharps() {
     static const bool enabled = std::getenv("APS5_ADDRESS_USER_VSHARPS") != nullptr;
     return enabled;
@@ -214,7 +226,7 @@ bool AddressBoundAccess(const IrResourcePlan& program, const IrValue& user) {
     static const bool boundWrites = std::getenv("APS5_ADDRESS_BOUND_WRITES") != nullptr;
     const auto access = BufferAccessOf(user.Opcode());
     if (boundWrites && (access == BufferAccess::Write || access == BufferAccess::Atomic)) return true;
-    if (!AddressBoundFormats() || access != BufferAccess::Read) return false;
+    if (!AddressBoundFormats(program) || access != BufferAccess::Read) return false;
     const auto index = user.Flags<MemoryFlags>().index;
     if (index >= program.memoryInfo.size()) return false;
     const auto& memory = program.memoryInfo[index];

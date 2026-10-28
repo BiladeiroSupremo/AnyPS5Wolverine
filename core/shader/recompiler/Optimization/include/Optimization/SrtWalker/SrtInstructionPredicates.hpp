@@ -22,6 +22,9 @@ bool AddressSrtProgram(const IrResourcePlan& program);
 // APS5_ADDRESS_BOUND_FORMATS=1: an address-SRT program's V#s read by format-converting loads stay on
 // the bound path (ResourceTracker::TakeGpuDescriptor; SrtPlanBuilder plans their dwords' reads).
 bool AddressBoundFormats();
+// Whether this program binds its format-converting reads: non-pixel stages, or every stage with
+// APS5_ADDRESS_BOUND_FORMATS=all.
+bool AddressBoundFormats(const IrResourcePlan& program);
 // APS5_ADDRESS_USER_VSHARPS=1: an address-SRT program reads its user-data V#s through the mirror
 // too, unless it writes through them or reads them with a run-time format.
 bool AddressUserVsharps();

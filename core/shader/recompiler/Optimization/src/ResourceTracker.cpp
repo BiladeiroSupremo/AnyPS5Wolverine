@@ -1428,7 +1428,7 @@ private:
         // decode (2026-10-28 ISA: address-path mesh executables 13-16x the bound path's, s_cmp trees over
         // 62 format keys, 1,280 SGPR lane spills). SrtPlanBuilder plans the reads its dwords come from.
         const bool runtimeFormat = memory.formatted && !memory.typed;
-        const bool boundFormat = Detail::AddressBoundFormats() && runtimeFormat && access == BufferAccess::Read;
+        const bool boundFormat = Detail::AddressBoundFormats(m_program.Resources()) && runtimeFormat && access == BufferAccess::Read;
         // APS5_ADDRESS_USER_VSHARPS=1: a user-data V# that is only read without a run-time format is
         // read through the mirror like the SRT's V#s: no descriptor of its own, so a reused build needs
         // no new set per draw (2026-10-28 trmv1: ~11 moved buffers per template use, pixel ~6, the
