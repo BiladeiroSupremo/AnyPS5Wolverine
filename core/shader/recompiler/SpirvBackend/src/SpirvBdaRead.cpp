@@ -4,6 +4,7 @@
 #include <spirv/unified1/GLSL.std.450.h>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -771,6 +772,16 @@ bool BdaMirrorWindows() {
     return windows;
 }
 
+bool MirrorWindowsForStage(IrShaderStage stage) {
+    static const int only = [] {
+        const char* text = std::getenv("APS5_MIRROR_WINDOWS_STAGES");
+        if (text == nullptr) return 0;
+        return std::strcmp(text, "graphics") == 0 ? 1 : std::strcmp(text, "compute") == 0 ? 2 : 0;
+    }();
+    if (only == 0) return true;
+    return (stage == IrShaderStage::Compute) == (only == 2);
+}
+
 namespace {
 
 // Mirror windows: the window index and the word index of `guest` in it, as the two indices of an
@@ -805,7 +816,9 @@ MirrorWindowIndices mirrorWindowIndices(SpirvEmitterState& state, std::uint32_t 
     auto index = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64, centred, BdaConstant(state, BdaAbi::MirrorWindowShift)));
     // A per-lane window needs non-uniform descriptor indexing; without it the first lane's window
     // serves (lanes more than a window away from it read zero).
-    const bool nonUniform = !uniform && mirrorWindowsNonUniformSupported(state);
+    // APS5_MIRROR_WINDOWS_UNIFORM=1 (diagnostic): every read takes the first lane's window.
+    static const bool forceUniform = std::getenv("APS5_MIRROR_WINDOWS_UNIFORM") != nullptr;
+    const bool nonUniform = !uniform && !forceUniform && mirrorWindowsNonUniformSupported(state);
     if (!nonUniform) index = BroadcastFirstU32(state, index);
     const auto window = Select(state, u32, Binary(state, spv::OpULessThan, boolean, index, ConstantU32(state, BdaAbi::MirrorWindowCount)), index, ConstantU32(state, BdaAbi::MirrorWindowCount - 1u));
     const auto windowBase = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, window), BdaConstant(state, BdaAbi::MirrorWindowShift));
@@ -915,8 +928,67 @@ std::uint32_t EmitMirrorWordCall(SpirvEmitterState& state, std::uint32_t guest, 
     return value;
 }
 
+namespace {
+
+// APS5_MIRROR_WINDOWS_VERIFY=1 (diagnostic): every window read is made through the pointer path
+// too; the pointer's value is used and a differing window value is recorded in the use's fault
+// buffer (FaultReason::WindowMismatch: guest address, window value, pointer value), which the
+// driver prints with the draw's program.
+bool mirrorWindowsVerify() {
+    static const bool verify = std::getenv("APS5_MIRROR_WINDOWS_VERIFY") != nullptr;
+    return verify;
+}
+
+std::uint32_t verifiedWindowValue(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t window, std::uint32_t pointer) {
+    if (state.bdaFaultFunction != 0u && state.program.Info().usesDma) {
+        const auto differs = Binary(state, spv::OpINotEqual, TypeBool(state), window, pointer);
+        EmitIfCondition(state, differs, [&] { RecordBdaFault(state, guest, window, pointer, BdaAbi::FaultReason::WindowMismatch); });
+    }
+    return pointer;
+}
+
+std::uint32_t pointerWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask, const MirrorWords& words);
+std::array<std::uint32_t, 5> pointerWordsRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t count, std::uint32_t valid, const MirrorWords& words);
+
+}
+
+// APS5_MIRROR_WINDOWS_PROBE=bind (diagnostic): reads stay on the pointer path, but each one also
+// takes the length of window 0 (a descriptor access, no memory read through it) and folds an
+// impossible comparison of it into the value, so the window set is bound and used by the shader
+// without any window load.
+static bool mirrorWindowsBindProbe() {
+    static const bool probe = [] {
+        const char* text = std::getenv("APS5_MIRROR_WINDOWS_PROBE");
+        return text != nullptr && std::strcmp(text, "bind") == 0;
+    }();
+    return probe;
+}
+
+static std::uint32_t touchedWindowValue(SpirvEmitterState& state, std::uint32_t value) {
+    const auto u32 = TypeU32(state);
+    const auto window = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassStorageBuffer, state.mirrorWindowBlockType), window, state.mirrorWindowsVariable, ConstantU32(state, 0u));
+    const auto length = state.module.AllocateId();
+    state.module.AddFunction(spv::OpArrayLength, u32, length, window, 0u);
+    // Window 0 holds 0x20000000 words; a value the compiler cannot rule out (any length up to 2^30
+    // is possible to it), so the descriptor access stays.
+    const auto impossible = Binary(state, spv::OpIEqual, TypeBool(state), length, ConstantU32(state, 0x01234567u));
+    return Binary(state, spv::OpIAdd, u32, value, Select(state, u32, impossible, ConstantU32(state, 1u), ConstantU32(state, 0u)));
+}
+
 std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask, const MirrorWords& words, bool uniform) {
-    if (BdaMirrorWindows() && state.mirrorWindowsVariable != 0u) return mirrorWindowLoad(state, mirrorWindowIndices(state, guest, valid, words.begin, uniform), 0u);
+    if (BdaMirrorWindows() && state.mirrorWindowsVariable != 0u && mirrorWindowsBindProbe()) return touchedWindowValue(state, pointerWordRead(state, guest, valid, accessMask, words));
+    if (BdaMirrorWindows() && state.mirrorWindowsVariable != 0u) {
+        const auto window = mirrorWindowLoad(state, mirrorWindowIndices(state, guest, valid, words.begin, uniform), 0u);
+        if (!mirrorWindowsVerify()) return window;
+        return verifiedWindowValue(state, guest, window, pointerWordRead(state, guest, valid, accessMask, words));
+    }
+    return pointerWordRead(state, guest, valid, accessMask, words);
+}
+
+namespace {
+
+std::uint32_t pointerWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask, const MirrorWords& words) {
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
     const auto begin = words.begin;
@@ -934,18 +1006,38 @@ std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, 
     return Select(state, TypeU32(state), inside, value, ConstantU32(state, 0u));
 }
 
+}
+
 std::array<std::uint32_t, 5> EmitMirrorWordsRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t count, std::uint32_t valid, const MirrorWords& words, bool uniform) {
-    const auto u32 = TypeU32(state);
-    const auto u64 = TypeScalarU64(state);
-    const auto boolean = TypeBool(state);
     std::array<std::uint32_t, 5> values{};
     if (count == 0u || count > 5u) return values;
+    if (BdaMirrorWindows() && state.mirrorWindowsVariable != 0u && mirrorWindowsBindProbe()) {
+        values = pointerWordsRead(state, guest, count, valid, words);
+        values[0] = touchedWindowValue(state, values[0]);
+        return values;
+    }
     if (BdaMirrorWindows() && state.mirrorWindowsVariable != 0u) {
         // Window reads: consecutive words of one window (the compiler merges adjacent loads).
         const auto indices = mirrorWindowIndices(state, guest, valid, words.begin, uniform);
         for (std::uint32_t index = 0; index < count; ++index) values[index] = mirrorWindowLoad(state, indices, index);
+        if (!mirrorWindowsVerify()) return values;
+        const auto pointers = pointerWordsRead(state, guest, count, valid, words);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const auto at = index != 0u ? Binary(state, spv::OpIAdd, TypeScalarU64(state), guest, BdaConstant(state, index * 4u)) : guest;
+            values[index] = verifiedWindowValue(state, at, values[index], pointers[index]);
+        }
         return values;
     }
+    return pointerWordsRead(state, guest, count, valid, words);
+}
+
+namespace {
+
+std::array<std::uint32_t, 5> pointerWordsRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t count, std::uint32_t valid, const MirrorWords& words) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    std::array<std::uint32_t, 5> values{};
     // One check for the span: it starts inside the mirror and ends at or before its end (the end
     // is page-aligned and the address 4-aligned, so the bytes between lie inside). The per-word
     // 64-bit compares, selects and pointer conversions of the word-by-word read were most of a
@@ -983,6 +1075,8 @@ std::array<std::uint32_t, 5> EmitMirrorWordsRead(SpirvEmitterState& state, std::
         values[index] = keep(value);
     }
     return values;
+}
+
 }
 
 }

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeapTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MirrorWindowSet.hpp"
+#include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -35,8 +37,11 @@ constexpr std::size_t RevalidateBudget = 128u;
 
 BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) {
     try {
-        std::array<VkDescriptorSetLayoutBinding, Heaps::KindCount + 4u> bindings{};
-        std::array<VkDescriptorBindingFlags, Heaps::KindCount + 4u> flags{};
+        // + the guest mirror's windows (BdaAbi::MirrorWindowBinding, APS5_MIRROR_WINDOWS): written
+        // once by MirrorWindowSet::WriteInto when the mirror exists, never updated after binding.
+        const bool windows = MirrorWindowSet::Enabled();
+        std::array<VkDescriptorSetLayoutBinding, Heaps::KindCount + 5u> bindings{};
+        std::array<VkDescriptorBindingFlags, Heaps::KindCount + 5u> flags{};
         for (std::uint32_t kind = 0; kind < Heaps::KindCount; kind++) {
             bindings[kind] = {kind, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Heaps::SlotsPerKind, VK_SHADER_STAGE_ALL, nullptr};
             flags[kind] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
@@ -46,18 +51,21 @@ BindlessHeapTable::BindlessHeapTable(const Context& context) : context(context) 
         bindings[Heaps::KindCount + 2u] = {Heaps::KeyBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
         bindings[Heaps::KindCount + 3u] = {Heaps::SamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, Heaps::SamplerPairs * 2u, VK_SHADER_STAGE_ALL, nullptr};
         flags[Heaps::KindCount + 3u] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+        static_assert(ShaderRecompiler::BdaAbi::MirrorWindowSet == Heaps::DescriptorSet && ShaderRecompiler::BdaAbi::MirrorWindowBinding == Heaps::SamplerBinding + 1u);
+        bindings[Heaps::KindCount + 4u] = {ShaderRecompiler::BdaAbi::MirrorWindowBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, ShaderRecompiler::BdaAbi::MirrorWindowCount, VK_SHADER_STAGE_ALL, nullptr};
+        const std::uint32_t bindingCount = windows ? Heaps::KindCount + 5u : Heaps::KindCount + 4u;
         VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-        bindingFlags.bindingCount = static_cast<std::uint32_t>(flags.size());
+        bindingFlags.bindingCount = bindingCount;
         bindingFlags.pBindingFlags = flags.data();
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &bindingFlags};
         layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-        layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+        layoutInfo.bindingCount = bindingCount;
         layoutInfo.pBindings = bindings.data();
         Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreateDescriptorSetLayout bindless heaps");
         const VkDescriptorSetLayoutCreateInfo emptyInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &emptyInfo, nullptr, &emptyLayout), "vkCreateDescriptorSetLayout bindless empty set");
 
-        const std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Heaps::SlotsPerKind * Heaps::KindCount}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}, {VK_DESCRIPTOR_TYPE_SAMPLER, Heaps::SamplerPairs * 2u}}};
+        const std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Heaps::SlotsPerKind * Heaps::KindCount}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3u + (windows ? ShaderRecompiler::BdaAbi::MirrorWindowCount : 0u)}, {VK_DESCRIPTOR_TYPE_SAMPLER, Heaps::SamplerPairs * 2u}}};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
         poolInfo.maxSets = 1;

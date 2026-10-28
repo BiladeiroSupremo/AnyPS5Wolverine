@@ -1,4 +1,5 @@
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Optimization/BindlessHeaps.hpp"
 #include "BdaAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
@@ -435,16 +436,27 @@ void DefineDescriptors(SpirvEmitterState& state) {
         case DescriptorBindingKind::BdaPagetable:
             state.bdaPagetableVariable = Define(StorageBufferBlockType(state), "bda_pagetable");
             ReadOnlyDriverBuffer(state, state.bdaPagetableVariable);
-            if (BdaMirrorWindows()) {
-                // The guest mirror's windows (BdaAbi::MirrorWindow*), a static set the driver binds
-                // with the stage sets; read-only here (stores and atomics keep the pointer path).
-                const auto windows = state.module.Type(spv::OpTypeArray, StorageBufferBlockType(state), ConstantU32(state, BdaAbi::MirrorWindowCount));
+            if (BdaMirrorWindows() && MirrorWindowsForStage(stage) && BindlessHeaps::Enabled()) {
+                // The guest mirror's windows (BdaAbi::MirrorWindow*), a binding of the device's
+                // bindless heap set (without the heaps the reads stay on pointers); only read
+                // through (stores and atomics keep the pointer path).
+                // The same memory is written through pointers, so the variable is Aliased by
+                // default; APS5_MIRROR_WINDOWS_READONLY=1 declares it NonWritable + Restrict as
+                // first written (the compiler may then serve uniform reads from the scalar cache
+                // and move them across the pointer stores).
+                state.mirrorWindowBlockType = StorageBufferBlockType(state);
+                const auto windows = state.module.Type(spv::OpTypeArray, state.mirrorWindowBlockType, ConstantU32(state, BdaAbi::MirrorWindowCount));
                 state.mirrorWindowsVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassStorageBuffer, windows), spv::StorageClassStorageBuffer);
                 state.module.AddName(state.mirrorWindowsVariable, "mirror_windows");
                 state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationDescriptorSet, BdaAbi::MirrorWindowSet);
                 state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationBinding, BdaAbi::MirrorWindowBinding);
-                state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationNonWritable);
-                state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationRestrict);
+                static const bool readOnly = std::getenv("APS5_MIRROR_WINDOWS_READONLY") != nullptr;
+                if (readOnly) {
+                    state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationNonWritable);
+                    state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationRestrict);
+                } else {
+                    state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationAliased);
+                }
             }
             break;
         case DescriptorBindingKind::FaultBuffer:

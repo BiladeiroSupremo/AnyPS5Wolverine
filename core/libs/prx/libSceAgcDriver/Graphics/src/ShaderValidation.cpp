@@ -1,4 +1,5 @@
 #include "BdaAbi.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MirrorWindowSet.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -286,11 +287,18 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 // Bindless image tables index their slots non-uniformly in graphics stages
                 // (VK_EXT_descriptor_indexing, enabled by the device setup when available).
                 const bool isDescriptorIndexingCapability =
-                    descriptorIndexing &&
-                    (capability == spv::CapabilityShaderNonUniform ||
-                     capability == spv::CapabilityRuntimeDescriptorArray ||
-                     capability == spv::CapabilitySampledImageArrayNonUniformIndexing ||
-                     capability == spv::CapabilityStorageImageArrayNonUniformIndexing);
+                    (descriptorIndexing &&
+                     (capability == spv::CapabilityShaderNonUniform ||
+                      capability == spv::CapabilityRuntimeDescriptorArray ||
+                      capability == spv::CapabilitySampledImageArrayNonUniformIndexing ||
+                      capability == spv::CapabilityStorageImageArrayNonUniformIndexing)) ||
+                    // The guest mirror's windows are indexed per lane by divergent reads (the
+                    // recompiler emits these only when the device setup advertised them, which it
+                    // does when shaderStorageBufferArrayNonUniformIndexing is enabled). Missing here,
+                    // every graphics draw with such a read was skipped (2026-10-28: no menu UI).
+                    (MirrorWindowSet::Enabled() &&
+                     (capability == spv::CapabilityShaderNonUniform ||
+                      capability == spv::CapabilityStorageBufferArrayNonUniformIndexing));
 
                 Require(
                     isBaseCapability ||
@@ -500,6 +508,10 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         // The bindless heap set (BindlessHeaps::DescriptorSet) is the device's, bound to every
         // pipeline layout; its variables alias per image type and are not plan bindings.
         if ((variable.storage == spv::StorageClassUniformConstant || variable.storage == spv::StorageClassStorageBuffer) && decoration.set && *decoration.set == ShaderRecompiler::BindlessHeaps::DescriptorSet) continue;
+        // Likewise the guest mirror's window set (BdaAbi::MirrorWindowSet, APS5_MIRROR_WINDOWS):
+        // without this every graphics module reading through it was rejected as "absent from
+        // recompiler binding metadata" and its draws skipped (2026-10-28: no menu UI).
+        if (variable.storage == spv::StorageClassStorageBuffer && decoration.set && *decoration.set == ShaderRecompiler::BdaAbi::MirrorWindowSet && MirrorWindowSet::Enabled()) continue;
         const auto& type = module.Type(typeId);
         Require(!decoration.index || (fragment && output && state.dualSourceBlend && decoration.location == 0u && *decoration.index == 1u), "only the second dual-source blend color may use the Index decoration, at location 0 index 1");
         if (variable.storage == spv::StorageClassInput || variable.storage == spv::StorageClassOutput) {

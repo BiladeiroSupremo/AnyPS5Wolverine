@@ -63,6 +63,27 @@ MirrorWindowSet::MirrorWindowSet(const Context& context, const GuestMirror& mirr
     }
 }
 
+void MirrorWindowSet::WriteInto(const Context& context, const GuestMirror& mirror, VkDescriptorSet set) {
+    Require(set != VK_NULL_HANDLE, "mirror windows need the bindless heap set");
+    Require(context.limits.maxStorageBufferRange >= Abi::MirrorWindowBytes, "mirror windows need a 2 GiB storage buffer range");
+    const std::uint64_t stride = std::uint64_t{1} << Abi::MirrorWindowShift;
+    Require(mirror.Bytes() >= stride * 2u && (mirror.Bytes() & 0xffffu) == 0u, "the guest mirror is too small or unaligned for windows");
+    std::vector<VkDescriptorBufferInfo> infos(Abi::MirrorWindowCount);
+    const std::uint64_t lastPage = mirror.Bytes() - 0x10000u;
+    for (std::uint32_t window = 0; window < Abi::MirrorWindowCount; ++window) {
+        const auto offset = std::min<std::uint64_t>(static_cast<std::uint64_t>(window) * stride, lastPage);
+        infos[window] = {mirror.Handle(), offset, std::min<std::uint64_t>(Abi::MirrorWindowBytes, mirror.Bytes() - offset)};
+    }
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.dstBinding = Abi::MirrorWindowBinding;
+    write.descriptorCount = Abi::MirrorWindowCount;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = infos.data();
+    context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &write, 0, nullptr);
+    std::fprintf(stderr, "[mirror] %u windows of 0x%llx bytes every 0x%llx over the guest mirror, descriptor set %u binding %u\n", Abi::MirrorWindowCount, static_cast<unsigned long long>(Abi::MirrorWindowBytes), static_cast<unsigned long long>(stride), Abi::MirrorWindowSet, Abi::MirrorWindowBinding);
+}
+
 MirrorWindowSet::~MirrorWindowSet() {
     release();
 }

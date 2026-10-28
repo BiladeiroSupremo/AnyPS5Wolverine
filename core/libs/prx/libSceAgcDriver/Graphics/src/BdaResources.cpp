@@ -1,7 +1,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestMirror.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <set>
+#include <tuple>
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -161,6 +164,7 @@ BdaResources::BdaResources(const Context& context) {
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     fault = std::make_shared<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
+    program = DrawTimingProgram();
 }
 
 BdaResources::~BdaResources() {
@@ -200,6 +204,7 @@ BdaResources::BdaResources(const Context& context, std::shared_ptr<Buffer> poole
     // A pooled buffer's record was cleared by the previous use's CheckFault; cleared again for the
     // case of a use that never completed (its batch failed).
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
+    program = DrawTimingProgram();
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
@@ -331,6 +336,22 @@ void BdaResources::CheckFault() const {
     }
     Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && report.reserved == 0, "incomplete or invalid BDA fault record");
     Require(report.reason != ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, "rect-list requires finite nondegenerate axis-aligned positions with equal positive W");
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::WindowMismatch) {
+        // APS5_MIRROR_WINDOWS_VERIFY: the shader went on with the pointer's value; reported, not
+        // thrown. One line per (program, stage, page) the first time, then counted.
+        static std::mutex mutex;
+        static std::set<std::tuple<std::uint64_t, std::uint32_t, std::uint64_t>> seen;
+        static std::uint64_t total = 0;
+        bool first = false;
+        {
+            std::lock_guard lock(mutex);
+            ++total;
+            first = seen.size() < 2000 && seen.emplace(program, report.stage, report.address >> 12).second;
+        }
+        if (first) std::fprintf(stderr, "[mirror] window mismatch: program 0x%llx stage %u guest 0x%llx window 0x%08x pointer 0x%08x (%llu so far)\n", static_cast<unsigned long long>(program), report.stage, static_cast<unsigned long long>(report.address), report.bytes, report.instruction, static_cast<unsigned long long>(total));
+        std::memset(fault->Bytes().data(), 0, sizeof(report));
+        return;
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
         loopGuardTripped.store(true, std::memory_order_relaxed);

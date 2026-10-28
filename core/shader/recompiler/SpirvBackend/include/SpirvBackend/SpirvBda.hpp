@@ -43,6 +43,9 @@ bool BdaMirrorMode();
 // (BdaAbi::MirrorWindow*, state.mirrorWindowsVariable) instead of pointers, so a wave-uniform read
 // is a scalar buffer load with the device's bounds check, no 64-bit lane math and no select.
 bool BdaMirrorWindows();
+// Bisecting aid: APS5_MIRROR_WINDOWS_STAGES=graphics|compute keeps the windows to those programs
+// (the others read through pointers as without the switch); unset, every stage.
+bool MirrorWindowsForStage(IrShaderStage stage);
 // Mirror mode: the 32-bit word at the 4-byte aligned guest address `guest` (u64) when `valid`, else
 // zero, with no branch and no fault record: an invalid or unmapped address reads the mirror's last
 // page, which nothing binds (zeros).

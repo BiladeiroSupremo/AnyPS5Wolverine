@@ -1487,8 +1487,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &descriptorIndexingFeatures};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         state->descriptorIndexing = descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
-        // The guest mirror's windows (MirrorWindowSet) are indexed per lane by divergent reads.
-        state->storageBufferNonUniformIndexing = descriptorIndexingFeatures.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE;
+        // The guest mirror's windows (MirrorWindowSet) are indexed per lane by divergent reads. Only
+        // with the windows: the capability list is part of every shader's cache key, so advertising
+        // it always recompiled every shader of every path.
+        state->storageBufferNonUniformIndexing = descriptorIndexingFeatures.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE && Graphics::MirrorWindowSet::Enabled();
         state->storageBufferUpdateAfterBind = descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE;
         state->descriptorBindingPartiallyBound = compileOnly && descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
         state->descriptorBindingVariableDescriptorCount = compileOnly && descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
@@ -1803,7 +1805,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         try {
             auto* mirror = Graphics::GuestMirror::Get(graphicsContext());
             if (mirror == nullptr) throw std::runtime_error("the guest mirror could not be made");
-            state->mirrorWindows = std::make_unique<Graphics::MirrorWindowSet>(graphicsContext(), *mirror);
+            // Into the bindless heap set (binding BdaAbi::MirrorWindowBinding), not a set of its own.
+            if (state->bindlessTable == nullptr) throw std::runtime_error("the windows need the bindless heap set");
+            Graphics::MirrorWindowSet::WriteInto(graphicsContext(), *mirror, state->bindlessTable->Set());
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[mirror] window set unavailable, address-path shaders would read nothing: %s\n", error.what());
             throw;
@@ -4697,7 +4701,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // Set 2 is the bindless heap set (BindlessHeaps::DescriptorSet) when the device has one; an
         // empty layout stands in for the workgroup memory set a shader does not use.
         static_assert(ShaderRecompiler::BindlessHeaps::DescriptorSet == ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1);
-        static_assert(ShaderRecompiler::BdaAbi::MirrorWindowSet == ShaderRecompiler::BindlessHeaps::DescriptorSet + 1);
         const bool heaps = context.bindlessLayout != VK_NULL_HANDLE;
         // Set 3 is the guest mirror's window set (BdaAbi::MirrorWindowSet) when the device has one,
         // with empty layouts standing in for the unused sets below it.

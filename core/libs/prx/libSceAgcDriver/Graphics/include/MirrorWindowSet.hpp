@@ -20,6 +20,10 @@ public:
     MirrorWindowSet& operator=(const MirrorWindowSet&) = delete;
     // APS5_MIRROR_WINDOWS=1 (with the guest mirror and APS5_BDA_MIRROR).
     static bool Enabled();
+    // Writes the windows into `set` at BdaAbi::MirrorWindowBinding (the bindless heap set, whose
+    // layout has the binding when Enabled()). The layout of the class's own set (set 3) is unused
+    // since 2026-10-28: a fourth set in graphics shaders broke the game's rendering.
+    static void WriteInto(const Context& context, const GuestMirror& mirror, VkDescriptorSet set);
 
     VkDescriptorSetLayout Layout() const { return layout; }
     VkDescriptorSetLayout EmptyLayout() const { return emptyLayout; }

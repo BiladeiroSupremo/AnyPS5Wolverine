@@ -53,6 +53,9 @@ private:
     std::size_t tableBytes = 0;
     // The fault buffer came from the pool and goes back to it (ForMirrorUse).
     VkDevice pooled = VK_NULL_HANDLE;
+    // The code address of the draw's last program when this was made (DrawTimingProgram), for the
+    // window-mismatch reports (APS5_MIRROR_WINDOWS_VERIFY).
+    std::uint64_t program = 0;
 };
 
 }

@@ -24,8 +24,12 @@ inline constexpr std::uint32_t Write = 2;
 // for most window offsets (+66 GiB, +298 GiB, +598 GiB; the first two windows and a last window
 // clipped to 2 GiB worked), while 2 GiB ranges read correctly at every offset tested, per lane
 // and first lane, with the sentinel, unbound pages and addresses beyond the mirror reading zero.
-inline constexpr std::uint32_t MirrorWindowSet = 3;
-inline constexpr std::uint32_t MirrorWindowBinding = 0;
+// In the device's bindless heap set (BindlessHeaps::DescriptorSet, bindings 0-7 taken), not a set
+// of its own: a fourth descriptor set used by graphics shaders broke the game's rendering
+// (2026-10-28: the title scene drew ~1/3 of its draws even when the shaders read nothing through
+// it), while compute worked. The windows therefore need the bindless heaps.
+inline constexpr std::uint32_t MirrorWindowSet = 2;
+inline constexpr std::uint32_t MirrorWindowBinding = 8;
 inline constexpr std::uint32_t MirrorWindowShift = 30;
 inline constexpr std::uint32_t MirrorWindowCount = 1024;
 inline constexpr std::uint64_t MirrorWindowBytes = 0x80000000ull;
@@ -46,7 +50,10 @@ struct Range {
 };
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
-enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor };
+// WindowMismatch (APS5_MIRROR_WINDOWS_VERIFY): a mirror-window read differed from the pointer read
+// of the same word; address = the guest address, bytes = the window's value, instruction = the
+// pointer's value (the shader went on with the pointer's).
+enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, WindowMismatch };
 
 struct Fault {
     FaultState state;
