@@ -5,11 +5,17 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -52,9 +58,20 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         if (profile) {
             static std::atomic<std::uint64_t> stages{0}, walkFree{0}, words{0};
             static std::atomic<long long> lastReport{0};
+            // The programs whose captures read the most words, for a replay of their sources
+            // (agc_shader_replay --reads): code address -> (stages, words).
+            static std::mutex walkMutex;
+            static std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> walkByProgram;
             ++stages;
-            words += capture->userDataUse.reads.size();
-            if (capture->userDataUse.reads.empty()) ++walkFree;
+            const auto read = capture->userDataUse.reads.size();
+            words += read;
+            if (read == 0) ++walkFree;
+            else {
+                std::lock_guard lock(walkMutex);
+                auto& entry = walkByProgram[program.binary.codeAddress];
+                ++entry.first;
+                entry.second += read;
+            }
             const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
             auto last = lastReport.load(std::memory_order_relaxed);
             if (last == 0) lastReport.compare_exchange_strong(last, now);
@@ -62,6 +79,20 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                 const auto total = stages.exchange(0);
                 const auto free = walkFree.exchange(0);
                 std::fprintf(stderr, "[walk-free] (10 s): %llu of %llu captured draw stages read no guest memory (%.1f%%), %.1f guest words read per stage\n", static_cast<unsigned long long>(free), static_cast<unsigned long long>(total), total != 0 ? 100.0 * static_cast<double>(free) / static_cast<double>(total) : 0.0, total != 0 ? static_cast<double>(words.exchange(0)) / static_cast<double>(total) : 0.0);
+                std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>> top;
+                {
+                    std::lock_guard lock(walkMutex);
+                    top.assign(walkByProgram.begin(), walkByProgram.end());
+                    walkByProgram.clear();
+                }
+                std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+                std::string line = "[walk-top] (10 s) programs by words read (stages/words):";
+                char item[64];
+                for (std::size_t index = 0; index < top.size() && index < 16u; ++index) {
+                    std::snprintf(item, sizeof(item), " %llx %llu/%llu", static_cast<unsigned long long>(top[index].first), static_cast<unsigned long long>(top[index].second.first), static_cast<unsigned long long>(top[index].second.second));
+                    line += item;
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
             }
         }
     }
