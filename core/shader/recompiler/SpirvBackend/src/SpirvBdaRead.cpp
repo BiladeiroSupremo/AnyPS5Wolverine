@@ -766,6 +766,52 @@ bool BdaMirrorMode() {
     return mirror;
 }
 
+bool BdaMirrorWindows() {
+    static const bool windows = BdaMirrorMode() && std::getenv("APS5_MIRROR_WINDOWS") != nullptr;
+    return windows;
+}
+
+namespace {
+
+// Mirror windows: the window index (wave-uniform, from the first lane's address) and the word index
+// of `guest` in it, as the two indices of an access chain into state.mirrorWindowsVariable. Any
+// address the window does not cover, and an invalid one, gets the sentinel word index past the
+// window's 4 GiB (room for a span of up to 8 words), which the device's robust bounds read as zero.
+struct MirrorWindowIndices {
+    std::uint32_t window;
+    std::uint32_t word;
+};
+
+MirrorWindowIndices mirrorWindowIndices(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t begin) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto relative = Binary(state, spv::OpISub, u64, guest, begin);
+    const auto half = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64, relative, BdaConstant(state, BdaAbi::MirrorWindowShift)));
+    // The window one half-window below the first lane's (so lanes up to a half-window before or
+    // after it stay inside), clamped to the array.
+    const auto first = BroadcastFirstU32(state, half);
+    const auto lowered = Select(state, u32, Binary(state, spv::OpUGreaterThan, boolean, first, ConstantU32(state, 0u)), Binary(state, spv::OpISub, u32, first, ConstantU32(state, 1u)), ConstantU32(state, 0u));
+    const auto window = Select(state, u32, Binary(state, spv::OpULessThan, boolean, lowered, ConstantU32(state, BdaAbi::MirrorWindowCount)), lowered, ConstantU32(state, BdaAbi::MirrorWindowCount - 1u));
+    const auto windowBase = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, window), BdaConstant(state, BdaAbi::MirrorWindowShift));
+    const auto offset = Binary(state, spv::OpISub, u64, relative, windowBase);
+    // Inside: the offset fits 32 bits (a guest address below the mirror wraps `relative` high).
+    const auto inside = Binary(state, spv::OpLogicalAnd, boolean, valid, Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpShiftRightLogical, u64, offset, BdaConstant(state, 32u)), BdaConstant(state, 0u)));
+    const auto word = Select(state, u32, inside, Binary(state, spv::OpShiftRightLogical, u32, Unary(state, spv::OpUConvert, u32, offset), ConstantU32(state, 2u)), ConstantU32(state, 0x3ffffff0u));
+    return {window, word};
+}
+
+std::uint32_t mirrorWindowLoad(SpirvEmitterState& state, const MirrorWindowIndices& indices, std::uint32_t wordOffset) {
+    const auto word = wordOffset != 0u ? Binary(state, spv::OpIAdd, TypeU32(state), indices.word, ConstantU32(state, wordOffset)) : indices.word;
+    const auto pointer = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.mirrorWindowsVariable, indices.window, ConstantU32(state, 0u), word);
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+    return value;
+}
+
+}
+
 // Experiment (M4): the address-SRT path's reads of guest-scalar values (an SRT or constant word the
 // guest loaded with s_load, a V# in SGPRs) are wave-uniform by the guest's own semantics, but the
 // host compiler sees per-lane 64-bit pointer arithmetic: the real pipelines' ISA (2026-10-27,
@@ -844,6 +890,7 @@ std::uint32_t EmitMirrorWordCall(SpirvEmitterState& state, std::uint32_t guest, 
 }
 
 std::uint32_t EmitMirrorWordRead(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, std::uint32_t accessMask, const MirrorWords& words) {
+    if (BdaMirrorWindows() && state.mirrorWindowsVariable != 0u) return mirrorWindowLoad(state, mirrorWindowIndices(state, guest, valid, words.begin), 0u);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
     const auto begin = words.begin;
@@ -867,6 +914,12 @@ std::array<std::uint32_t, 5> EmitMirrorWordsRead(SpirvEmitterState& state, std::
     const auto boolean = TypeBool(state);
     std::array<std::uint32_t, 5> values{};
     if (count == 0u || count > 5u) return values;
+    if (BdaMirrorWindows() && state.mirrorWindowsVariable != 0u) {
+        // Window reads: consecutive words of one window (the compiler merges adjacent loads).
+        const auto indices = mirrorWindowIndices(state, guest, valid, words.begin);
+        for (std::uint32_t index = 0; index < count; ++index) values[index] = mirrorWindowLoad(state, indices, index);
+        return values;
+    }
     // One check for the span: it starts inside the mirror and ends at or before its end (the end
     // is page-aligned and the address 4-aligned, so the bytes between lie inside). The per-word
     // 64-bit compares, selects and pointer conversions of the word-by-word read were most of a

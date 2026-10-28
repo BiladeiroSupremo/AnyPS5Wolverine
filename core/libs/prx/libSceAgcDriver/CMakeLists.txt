@@ -1,4 +1,4 @@
-function(ensure_agc_glslang)
+﻿function(ensure_agc_glslang)
     if(TARGET glslang AND TARGET SPIRV AND TARGET glslang-standalone)
         return()
     endif()
@@ -211,6 +211,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindlessHeapTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestMirror.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MirrorWindowSet.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp

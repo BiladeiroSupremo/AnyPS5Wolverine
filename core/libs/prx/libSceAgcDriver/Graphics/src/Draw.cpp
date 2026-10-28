@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeapTable.hpp"
+#include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -1988,6 +1989,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
     if (context.bindlessSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::BindlessHeaps::DescriptorSet, 1, &context.bindlessSet, 0, nullptr);
+    if (context.mirrorWindowsSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::BdaAbi::MirrorWindowSet, 1, &context.mirrorWindowsSet, 0, nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     if (!state.colors.empty() && (tracedDraw || (state.depth && TraceDrawIoDepth(state.depth->address)) || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return TraceDrawIoTarget(color.address, color.format); })) && TraceDrawIoBudget()) {
         std::string stages;
@@ -2639,6 +2641,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     if (context.bindlessSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::BindlessHeaps::DescriptorSet, 1, &context.bindlessSet, 0, nullptr);
+    if (context.mirrorWindowsSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::BdaAbi::MirrorWindowSet, 1, &context.mirrorWindowsSet, 0, nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     if (state.colors.empty() && state.depth && (tracedDraw || TraceDrawIoDepth(state.depth->address) || TraceDrawIoTarget(state.depth->address, state.depth->format)) && TraceDrawIoBudget()) {
         std::fprintf(stderr, "[draw-io] depth-only draw depth 0x%llx %ux%u vk%d, %u indices x%u, test %d write %d op %d htile 0x%llx%s:%s\n", static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format), draw.indexCount, draw.instanceCount, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare), static_cast<unsigned long long>(state.depth->htileAddress), DescribeStencil(state).c_str(), resources != nullptr ? resources->Describe().c_str() : " (no resources)");

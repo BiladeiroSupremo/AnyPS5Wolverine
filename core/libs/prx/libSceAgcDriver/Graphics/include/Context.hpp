@@ -170,6 +170,13 @@ struct Context {
     VkDescriptorSetLayout bindlessLayout = VK_NULL_HANDLE;
     VkDescriptorSet bindlessSet = VK_NULL_HANDLE;
     VkDescriptorSetLayout bindlessEmptyLayout = VK_NULL_HANDLE;
+    // The guest mirror's window set (MirrorWindowSet, APS5_MIRROR_WINDOWS), null without it: every
+    // pipeline layout takes mirrorWindowsLayout as set ShaderRecompiler::BdaAbi::MirrorWindowSet
+    // (mirrorWindowsEmptyLayout standing in for an unused set below it) and every draw and dispatch
+    // binds mirrorWindowsSet there.
+    VkDescriptorSetLayout mirrorWindowsLayout = VK_NULL_HANDLE;
+    VkDescriptorSet mirrorWindowsSet = VK_NULL_HANDLE;
+    VkDescriptorSetLayout mirrorWindowsEmptyLayout = VK_NULL_HANDLE;
     // The device's list of recorded dispatches whose copied written buffers await a CPU write-back
     // (VulkanDevice's State::copiedWriters; the draw counterpart is DrawCopiedWriters): an indirect
     // draw whose records one of them produces reads them on the CPU. Null in tests.

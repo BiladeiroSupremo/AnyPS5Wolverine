@@ -2,6 +2,7 @@
 #include "BdaAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
@@ -434,6 +435,17 @@ void DefineDescriptors(SpirvEmitterState& state) {
         case DescriptorBindingKind::BdaPagetable:
             state.bdaPagetableVariable = Define(StorageBufferBlockType(state), "bda_pagetable");
             ReadOnlyDriverBuffer(state, state.bdaPagetableVariable);
+            if (BdaMirrorWindows()) {
+                // The guest mirror's windows (BdaAbi::MirrorWindow*), a static set the driver binds
+                // with the stage sets; read-only here (stores and atomics keep the pointer path).
+                const auto windows = state.module.Type(spv::OpTypeArray, StorageBufferBlockType(state), ConstantU32(state, BdaAbi::MirrorWindowCount));
+                state.mirrorWindowsVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassStorageBuffer, windows), spv::StorageClassStorageBuffer);
+                state.module.AddName(state.mirrorWindowsVariable, "mirror_windows");
+                state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationDescriptorSet, BdaAbi::MirrorWindowSet);
+                state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationBinding, BdaAbi::MirrorWindowBinding);
+                state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationNonWritable);
+                state.module.AddAnnotation(spv::OpDecorate, state.mirrorWindowsVariable, spv::DecorationRestrict);
+            }
             break;
         case DescriptorBindingKind::FaultBuffer:
             state.faultBufferVariable = Define(StorageBufferBlockType(state), "fault_buffer");

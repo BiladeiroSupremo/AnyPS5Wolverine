@@ -27,6 +27,7 @@ public:
     static void FlushAll();
     void FlushPending();
     VkDeviceAddress Address() const { return address; }
+    VkBuffer Handle() const { return buffer; }
     std::uint64_t Base() const { return base; }
     std::uint64_t Bytes() const { return bytes; }
     // Binds the import's pages. Its memory serves the pages at page-aligned offsets from its base;

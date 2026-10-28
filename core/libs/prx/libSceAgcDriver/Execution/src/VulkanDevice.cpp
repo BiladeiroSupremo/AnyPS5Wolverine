@@ -18,6 +18,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Breadcrumbs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeapTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestMirror.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MirrorWindowSet.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
@@ -282,6 +284,8 @@ struct VulkanDevice::State {
     bool descriptorIndexing = false;
     bool bindlessHeaps = false;
     std::unique_ptr<Graphics::BindlessHeapTable> bindlessTable;
+    // The guest mirror's window set (APS5_MIRROR_WINDOWS), made with the device.
+    std::unique_ptr<Graphics::MirrorWindowSet> mirrorWindows;
     bool storageBufferUpdateAfterBind = false;
     bool descriptorBindingPartiallyBound = false;
     bool descriptorBindingVariableDescriptorCount = false;
@@ -712,6 +716,7 @@ struct VulkanDevice::State {
             workgroupMemory.reset();
             if (workgroupMemoryLayout != VK_NULL_HANDLE) reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(deviceProc(device, "vkDestroyDescriptorSetLayout"))(device, workgroupMemoryLayout, nullptr);
             descriptorCache.reset();
+            mirrorWindows.reset();
             bindlessTable.reset();
             emptyBuffer.reset();
             placeholderImages.reset();
@@ -1398,6 +1403,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->float64DenormPreserve && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormPreserve)) == state->capabilities.end()) state->capabilities.push_back(spv::CapabilityDenormPreserve);
     enabled.vertexPipelineStoresAndAtomics = VK_TRUE;
     enabled.fragmentStoresAndAtomics = VK_TRUE;
+    // The guest mirror's window set is indexed by a wave-uniform window number (MirrorWindowSet).
+    enabled.shaderStorageBufferArrayDynamicIndexing = available.shaderStorageBufferArrayDynamicIndexing;
     enabled.tessellationShader = available.tessellationShader;
     state->tessellationShader = enabled.tessellationShader == VK_TRUE;
     if (state->tessellationShader) state->capabilities.push_back(3);
@@ -1776,6 +1783,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[bindless] heap set unavailable, wide bindless tables stay rejected: %s\n", error.what());
             state->bindlessTable.reset();
+        }
+    }
+    // The guest mirror's window set (APS5_MIRROR_WINDOWS=1): the mirror is made here, before any
+    // pipeline layout, so every layout can take the set. Shaders prepared without it read through
+    // pointers as before (the switch is part of their cache key).
+    if (state->guestMirror && Graphics::MirrorWindowSet::Enabled()) {
+        try {
+            auto* mirror = Graphics::GuestMirror::Get(graphicsContext());
+            if (mirror == nullptr) throw std::runtime_error("the guest mirror could not be made");
+            state->mirrorWindows = std::make_unique<Graphics::MirrorWindowSet>(graphicsContext(), *mirror);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[mirror] window set unavailable, address-path shaders would read nothing: %s\n", error.what());
+            throw;
         }
     }
     if (!state->shaderProfile->NullDescriptors()) {
@@ -3339,6 +3359,9 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.bindlessLayout = state->bindlessTable ? state->bindlessTable->Layout() : VK_NULL_HANDLE;
     context.bindlessSet = state->bindlessTable ? state->bindlessTable->Set() : VK_NULL_HANDLE;
     context.bindlessEmptyLayout = state->bindlessTable ? state->bindlessTable->EmptyLayout() : VK_NULL_HANDLE;
+    context.mirrorWindowsLayout = state->mirrorWindows ? state->mirrorWindows->Layout() : VK_NULL_HANDLE;
+    context.mirrorWindowsSet = state->mirrorWindows ? state->mirrorWindows->Set() : VK_NULL_HANDLE;
+    context.mirrorWindowsEmptyLayout = state->mirrorWindows ? state->mirrorWindows->EmptyLayout() : VK_NULL_HANDLE;
     context.copiedWriters = state->copiedWriters.get();
     context.functions = state->functionsReady ? &state->deviceFunctions : nullptr;
     context.descriptorIndexing = state->descriptorIndexing;
@@ -4320,6 +4343,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
     resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (context.bindlessSet != VK_NULL_HANDLE) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::BindlessHeaps::DescriptorSet, 1, &context.bindlessSet, 0, nullptr);
+    if (context.mirrorWindowsSet != VK_NULL_HANDLE) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::BdaAbi::MirrorWindowSet, 1, &context.mirrorWindowsSet, 0, nullptr);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
         auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
@@ -4662,11 +4686,16 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // Set 2 is the bindless heap set (BindlessHeaps::DescriptorSet) when the device has one; an
         // empty layout stands in for the workgroup memory set a shader does not use.
         static_assert(ShaderRecompiler::BindlessHeaps::DescriptorSet == ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1);
+        static_assert(ShaderRecompiler::BdaAbi::MirrorWindowSet == ShaderRecompiler::BindlessHeaps::DescriptorSet + 1);
         const bool heaps = context.bindlessLayout != VK_NULL_HANDLE;
-        const std::array<VkDescriptorSetLayout, 3> setLayouts{resources->Layout(), shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : (heaps ? context.bindlessEmptyLayout : VK_NULL_HANDLE), context.bindlessLayout};
+        // Set 3 is the guest mirror's window set (BdaAbi::MirrorWindowSet) when the device has one,
+        // with empty layouts standing in for the unused sets below it.
+        const bool windows = context.mirrorWindowsLayout != VK_NULL_HANDLE;
+        const VkDescriptorSetLayout emptyLayout = heaps ? context.bindlessEmptyLayout : context.mirrorWindowsEmptyLayout;
+        const std::array<VkDescriptorSetLayout, 4> setLayouts{resources->Layout(), shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : (heaps || windows ? emptyLayout : VK_NULL_HANDLE), heaps ? context.bindlessLayout : emptyLayout, context.mirrorWindowsLayout};
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.setLayoutCount = heaps ? ShaderRecompiler::BindlessHeaps::DescriptorSet + 1 : shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
+        layoutInfo.setLayoutCount = windows ? ShaderRecompiler::BdaAbi::MirrorWindowSet + 1 : heaps ? ShaderRecompiler::BindlessHeaps::DescriptorSet + 1 : shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;

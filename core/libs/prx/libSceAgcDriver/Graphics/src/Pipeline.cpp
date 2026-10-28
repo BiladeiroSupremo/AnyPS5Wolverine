@@ -294,11 +294,13 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
             for (const auto word : resources.fragmentKey) appendKey(key, word);
         }
     };
-    // Any stage may sample through the bindless heap set (set 2).
+    // Any stage may sample through the bindless heap set (set 2) or read the guest mirror's windows
+    // (set 3; an empty set 2 stands in without heaps).
     const auto heapSet = context.bindlessLayout != VK_NULL_HANDLE ? 4u : 0u;
-    keys.preRasterizationSets |= heapSet;
-    keys.fragmentSets |= heapSet;
-    splitKey(keys.layout, 3u | heapSet);
+    const auto windowSets = context.mirrorWindowsLayout != VK_NULL_HANDLE ? 12u : 0u;
+    keys.preRasterizationSets |= heapSet | windowSets;
+    keys.fragmentSets |= heapSet | windowSets;
+    splitKey(keys.layout, 3u | heapSet | windowSets);
     splitKey(keys.preRasterizationLayout, keys.preRasterizationSets);
     splitKey(keys.fragmentLayout, keys.fragmentSets);
     return true;
@@ -367,12 +369,15 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         // Set 2 is the bindless heap set (BindlessHeaps::DescriptorSet) when the device has one; an
         // empty layout stands in for the fragment set of an unsplit layout.
         const bool heaps = context.bindlessLayout != VK_NULL_HANDLE;
-        const std::array<VkDescriptorSetLayout, 3> setLayouts{resources.main, resources.split ? resources.fragment : context.bindlessEmptyLayout, context.bindlessLayout};
+        // Set 3 is the guest mirror's window set (BdaAbi::MirrorWindowSet) when the device has one.
+        const bool windows = context.mirrorWindowsLayout != VK_NULL_HANDLE;
+        const VkDescriptorSetLayout emptyLayout = heaps ? context.bindlessEmptyLayout : context.mirrorWindowsEmptyLayout;
+        const std::array<VkDescriptorSetLayout, 4> setLayouts{resources.main, resources.split ? resources.fragment : emptyLayout, heaps ? context.bindlessLayout : emptyLayout, context.mirrorWindowsLayout};
         const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};
         const std::array<VkPushConstantRange, 2> slots{{{pushStagesOf(context), 0, PipelinePushSlotBytes}, {VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes}}};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layoutInfo.flags = resources.split ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0;
-        layoutInfo.setLayoutCount = heaps ? 3u : resources.split ? 2u : 1u;
+        layoutInfo.setLayoutCount = windows ? 4u : heaps ? 3u : resources.split ? 2u : 1u;
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
