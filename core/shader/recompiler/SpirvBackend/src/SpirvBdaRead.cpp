@@ -774,14 +774,14 @@ bool BdaMirrorWindows() {
 namespace {
 
 // Mirror windows: the window index and the word index of `guest` in it, as the two indices of an
-// access chain into state.mirrorWindowsVariable. The window is the one starting a half-window
-// (2 GiB) below the address rounded down (w = (rel - 1 GiB) / 2 GiB), so the address has at least
-// 1 GiB of room either side in it: a wave-uniform read (`uniform`) picks it from the first lane
-// (lanes within 1 GiB of it, e.g. a V#'s records, stay inside), any other read per lane, with the
-// access chain NonUniform. An address the window does not cover, and an invalid one (`inside`
-// false), reads the last word of the window's 4 GiB range (0xfffffffc: the access ends past the
-// range, so the device's robust bounds read it as zero; a byte offset past 2^32 would wrap) and
-// the value is dropped by a select, so the result never depends on the robustness mode.
+// access chain into state.mirrorWindowsVariable. The window is the one starting a stride below the
+// address rounded down (w = (rel - stride / 2) / stride; the range is two strides), so the address
+// has at least half a stride of room either side in it: a wave-uniform read (`uniform`) picks it
+// from the first lane (lanes within half a stride of it, e.g. a V#'s records, stay inside), any
+// other read per lane, with the access chain NonUniform. An address the window does not cover, and
+// an invalid one (`inside` false), reads word 0x3fffffff (byte 0xfffffffc, past any window's range,
+// which the device's robust bounds read as zero; a byte offset past 2^32 would wrap) and the value
+// is dropped by a select, so the result never depends on the robustness mode.
 struct MirrorWindowIndices {
     std::uint32_t window;
     std::uint32_t word;

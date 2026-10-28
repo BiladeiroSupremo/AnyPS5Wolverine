@@ -13,17 +13,22 @@ inline constexpr std::uint32_t Read = 1;
 inline constexpr std::uint32_t Write = 2;
 
 // Mirror windows (APS5_MIRROR_WINDOWS=1 with APS5_BDA_MIRROR): the guest mirror bound as a static
-// descriptor set of storage-buffer windows, window w = [w * 2^MirrorWindowShift, + 2^32 - 1) of the
-// mirror; consecutive windows overlap by half, so the window chosen from a V#'s base (or the first
-// lane's address) covers every address less than 2^MirrorWindowShift beyond it. The shader reads a
-// guest address through windows[w][(guest - begin - w * 2^shift) / 4], with the device's robust
-// bounds standing in for the range check: an address outside the window (or beyond the mirror's
-// end) reads zero.
+// descriptor set of storage-buffer windows, window w = [w * 2^MirrorWindowShift, + MirrorWindowBytes)
+// of the mirror; consecutive windows overlap by half, so the window starting a half-window below an
+// address (rounded down) covers every address within half a window of it either way. The shader
+// reads a guest address through windows[w][(guest - begin - w * 2^shift) / 4], with the device's
+// robust bounds standing in for the range check: an address outside the window (or beyond the
+// mirror's end) reads zero.
+// Range 2 GiB, stride 1 GiB (2026-10-28, scratchpad sparse\windows_test.cpp on the RX 9070, driver
+// 0x8001a0, CONFIRMED): descriptors with a range near 4 GiB (0xffffffff or 0xfffffffc) read zero
+// for most window offsets (+66 GiB, +298 GiB, +598 GiB; the first two windows and a last window
+// clipped to 2 GiB worked), while 2 GiB ranges read correctly at every offset tested, per lane
+// and first lane, with the sentinel, unbound pages and addresses beyond the mirror reading zero.
 inline constexpr std::uint32_t MirrorWindowSet = 3;
 inline constexpr std::uint32_t MirrorWindowBinding = 0;
-inline constexpr std::uint32_t MirrorWindowShift = 31;
-inline constexpr std::uint32_t MirrorWindowCount = 512;
-inline constexpr std::uint64_t MirrorWindowBytes = 0xffffffffull;
+inline constexpr std::uint32_t MirrorWindowShift = 30;
+inline constexpr std::uint32_t MirrorWindowCount = 1024;
+inline constexpr std::uint64_t MirrorWindowBytes = 0x80000000ull;
 
 struct Header {
     std::uint32_t version;
