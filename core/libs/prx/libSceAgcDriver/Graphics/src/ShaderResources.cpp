@@ -3815,6 +3815,13 @@ constexpr std::size_t MovedStageCount = 8;
 constexpr const char* MovedStageNames[MovedStageCount] = {"cs", "vs", "hs", "ds", "gs", "ps", "ls", "ms"};
 std::atomic<std::uint64_t> movedByStage[2][MovedStageCount]{};
 std::atomic<std::uint64_t> movedData[2]{};
+// Native draw class census (M4 step D): reused builds by what a use must redo, address-based apart:
+// nothing moved, only data blocks (per-draw words), or guest buffers (descriptor rewrites); and the
+// data blocks' bytes.
+std::atomic<std::uint64_t> useNone[2]{}, useDataOnly[2]{}, useBuffers[2]{}, useDataBytes[2]{};
+// Moved data blocks of address-based uses by role: flattened SRT (flat slots, bindless mapping) or
+// shader data (user data words), count and bytes.
+std::atomic<std::uint64_t> movedFlat{0}, movedFlatBytes{0}, movedShaderData{0}, movedShaderDataBytes{0};
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
@@ -3848,6 +3855,11 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 if (item.dataWords.empty() && patched) return std::nullopt;
                 moved.push_back({index, 0, item.size, binding.guestDescriptor});
                 dataMoved++;
+                if (profiled && usesBda) {
+                    const bool flat = binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt;
+                    (flat ? movedFlat : movedShaderData).fetch_add(1, std::memory_order_relaxed);
+                    (flat ? movedFlatBytes : movedShaderDataBytes).fetch_add(item.size, std::memory_order_relaxed);
+                }
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -3876,6 +3888,15 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
             }
         }
         perStage[static_cast<std::size_t>(shader.stage) % MovedStageCount] += static_cast<std::uint32_t>(moved.size() - before);
+    }
+    if (profiled) {
+        const std::size_t kind = usesBda ? 0 : 1;
+        if (moved.empty()) useNone[kind].fetch_add(1, std::memory_order_relaxed);
+        else if (dataMoved == moved.size()) useDataOnly[kind].fetch_add(1, std::memory_order_relaxed);
+        else useBuffers[kind].fetch_add(1, std::memory_order_relaxed);
+        std::size_t bytes = 0;
+        for (const auto& entry : moved) bytes += entry.words.size() * sizeof(std::uint32_t);
+        if (bytes != 0) useDataBytes[kind].fetch_add(bytes, std::memory_order_relaxed);
     }
     if (profiled && !moved.empty()) {
         const std::size_t kind = usesBda ? 0 : 1;
@@ -3958,6 +3979,23 @@ struct BindingSplit {
                 if (count != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", MovedStageNames[stage], static_cast<unsigned long long>(count));
             }
             if (kind == 0 && n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ";");
+        }
+        std::fprintf(stderr, "%s\n", line);
+        n = std::snprintf(line, sizeof(line), "[native-class] reused builds (10 s) by what a use redoes:");
+        for (std::size_t kind = 0; kind < 2 && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++kind) {
+            const auto none = useNone[kind].exchange(0, std::memory_order_relaxed);
+            const auto dataOnly = useDataOnly[kind].exchange(0, std::memory_order_relaxed);
+            const auto buffers = useBuffers[kind].exchange(0, std::memory_order_relaxed);
+            const auto bytes = useDataBytes[kind].exchange(0, std::memory_order_relaxed);
+            const auto withData = dataOnly + buffers;
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s: nothing %llu, data blocks only %llu, guest buffers %llu (data avg %.0f B per use with data)%s", kind == 0 ? "address-based" : "other", static_cast<unsigned long long>(none), static_cast<unsigned long long>(dataOnly), static_cast<unsigned long long>(buffers), withData != 0 ? static_cast<double>(bytes) / static_cast<double>(withData) : 0.0, kind == 0 ? ";" : "");
+        }
+        if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
+            const auto flat = movedFlat.exchange(0, std::memory_order_relaxed);
+            const auto flatBytes = movedFlatBytes.exchange(0, std::memory_order_relaxed);
+            const auto data = movedShaderData.exchange(0, std::memory_order_relaxed);
+            const auto dataBytes = movedShaderDataBytes.exchange(0, std::memory_order_relaxed);
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; address-based data blocks: flattened SRT %llu (avg %.0f B), shader data %llu (avg %.0f B)", static_cast<unsigned long long>(flat), flat != 0 ? static_cast<double>(flatBytes) / static_cast<double>(flat) : 0.0, static_cast<unsigned long long>(data), data != 0 ? static_cast<double>(dataBytes) / static_cast<double>(data) : 0.0);
         }
         std::fprintf(stderr, "%s\n", line);
     }
