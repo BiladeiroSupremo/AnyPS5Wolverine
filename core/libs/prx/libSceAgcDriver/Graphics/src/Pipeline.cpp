@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -58,7 +59,9 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
         Check(getStatistics(context.device, &executable, &count, statistics.data()), "vkGetPipelineExecutableStatisticsKHR");
         statistics.resize(count);
         const auto& property = properties[index];
-        std::fprintf(stderr, "[pipeline-stats] executable=%u stages=0x%x subgroup=%u name=%s\n", index, property.stages, property.subgroupSize, property.name);
+        // program = the creating draw's last (pixel) program (DrawTimingProgram), the key the
+        // [gputime] program list uses too; 0 when not created on a draw thread.
+        std::fprintf(stderr, "[pipeline-stats] executable=%u stages=0x%x subgroup=%u program=0x%llx name=%s\n", index, property.stages, property.subgroupSize, static_cast<unsigned long long>(DrawTimingProgram()), property.name);
         for (const auto& statistic : statistics) {
             std::fprintf(stderr, "[pipeline-stats] executable=%u %s=", index, statistic.name);
             switch (statistic.format) {
@@ -95,7 +98,7 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
         for (std::uint32_t at = 0; at < count; ++at) {
             const auto& representation = representations[at];
             if (!representation.isText || representation.dataSize == 0) continue;
-            std::string file = std::to_string(serial) + "_0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%x", property.stages); return std::string(text); }() + "_" + property.name + "_" + representation.name + ".txt";
+            std::string file = std::to_string(serial) + "_0x" + [&] { char text[48]; std::snprintf(text, sizeof(text), "%x_p%llx", property.stages, static_cast<unsigned long long>(DrawTimingProgram())); return std::string(text); }() + "_" + property.name + "_" + representation.name + ".txt";
             for (auto& c : file) if (c == '/' || c == '\\' || c == ':' || c == ' ') c = '_';
             std::ofstream out(std::filesystem::path(isaDirectory) / file, std::ios::binary);
             out.write(static_cast<const char*>(representation.pData), static_cast<std::streamsize>(representation.dataSize));

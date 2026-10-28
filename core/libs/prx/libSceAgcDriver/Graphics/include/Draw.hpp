@@ -107,6 +107,9 @@ bool TraceDrawProgram(std::uint64_t address);
 void MarkTracedDraw(bool traced);
 // The calling thread's current draw's last program, for APS5_GPU_TIME_DRAW_PROGRAMS timing.
 void SetDrawTimingProgram(std::uint64_t address);
+// That address (0 outside a draw): the [pipeline-stats] header and the APS5_PIPELINE_ISA file names
+// carry it, so executables of two runs can be matched by draw program.
+std::uint64_t DrawTimingProgram();
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,

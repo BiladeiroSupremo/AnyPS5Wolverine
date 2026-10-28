@@ -2918,4 +2918,8 @@ void SetDrawTimingProgram(std::uint64_t address) {
     drawTimingProgram = address;
 }
 
+std::uint64_t DrawTimingProgram() {
+    return drawTimingProgram;
+}
+
 }
