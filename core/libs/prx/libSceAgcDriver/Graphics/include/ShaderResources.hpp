@@ -151,8 +151,19 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // A BDA template's use (see noteReusable): its own fault buffer, bound in the set copy, whose
+        // written-page record the completion consumes (CheckFault), and the address space holder
+        // that pins the registered ranges until then and notes their in-place reads.
+        std::shared_ptr<BdaResources> bda;
+        std::unique_ptr<GuestBufferMemory> space;
         ~DrawBindings();
     };
+    // APS5_BDA_TEMPLATES=1 (mirror mode): an address-based build whose stages bind no guest buffer
+    // (walk-free: the shaders read guest memory through the mirror alone) serves later draws of the
+    // same content like a bound build's template, with a fault buffer and address-space holder per
+    // use (DrawBindings). Else every address-based draw builds its resources anew (~35 us).
+    static bool BdaTemplates();
+    bool BdaTemplate() const { return bdaTemplate; }
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
@@ -516,6 +527,8 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    // A reusable address-based build (BdaTemplates): its uses bind their own fault buffer.
+    bool bdaTemplate = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before

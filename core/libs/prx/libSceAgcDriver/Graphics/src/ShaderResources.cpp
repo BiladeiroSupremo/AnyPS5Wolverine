@@ -1905,16 +1905,67 @@ bool LoopGuardEnabled() {
 
 }
 
+bool ShaderResources::BdaTemplates() {
+    static const bool enabled = std::getenv("APS5_BDA_TEMPLATES") != nullptr && std::getenv("APS5_BDA_MIRROR") != nullptr && std::getenv("APS5_GUEST_MIRROR") != nullptr;
+    return enabled;
+}
+
+namespace {
+
+// APS5_PROFILE_DRAW with BdaTemplates: why address-based builds were not made templates, every 10 s.
+void countBdaTemplate(std::size_t reason) {
+    static const char* const names[] = {"template", "own lease", "copied writes", "space-copied", "regions", "other"};
+    static std::mutex mutex;
+    static std::array<std::uint64_t, 6> counts{};
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    ++counts[reason];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    char line[256];
+    int n = std::snprintf(line, sizeof(line), "[bda-template] address-based builds (10 s):");
+    for (std::size_t index = 0; index < counts.size() && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++index) {
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", names[index], static_cast<unsigned long long>(counts[index]));
+        counts[index] = 0;
+    }
+    std::fprintf(stderr, "%s\n", line);
+}
+
+}
+
 void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation();
     reusable = false;
+    bdaTemplate = false;
     directRegions.clear();
-    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
-    const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    // An address-based build becomes a template (BdaTemplates) when it holds no lease of its own (it
+    // was served by the cached address space, which it drops below) and copies nothing: its uses
+    // then differ only in their fault buffer and the address space they pin (DrawBindings). The
+    // guest buffers it binds are checked per use like any template's (directRegions): the ones the
+    // space served, bound against its imports, join the serial-checked ranges below.
+    const bool profiled = BuildProfiled();
+    const bool bdaUse = usesBda && BdaTemplates() && !guestMemory.HoldsOwnLease() && !guestMemory.HasCopiedWrites();
+    if (usesBda && profiled && BdaTemplates() && !bdaUse) countBdaTemplate(guestMemory.HoldsOwnLease() ? 1 : 2);
+    if (guestMemory.HasCopiedWrites() || (!bdaUse && (HoldsLease() || usesBda)) || (bda != nullptr && LoopGuardEnabled())) return;
+    const auto refused = [&](std::size_t reason) {
+        if (bdaUse && profiled) countBdaTemplate(reason);
+    };
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return refused(5);
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return refused(5);
+    auto regions = guestMemory.DirectRegions(!bdaUse);
+    if (!regions.has_value()) return refused(4);
+    if (bdaUse) {
+        for (const auto& allocation : allocations) {
+            if (!allocation.guest || allocation.size == 0) continue;
+            const auto begin = allocation.address - allocation.adjustment;
+            const auto end = allocation.address + allocation.size;
+            if (std::any_of(regions->begin(), regions->end(), [&](const std::pair<std::uint64_t, std::uint64_t>& region) { return begin >= region.first && end <= region.second; })) continue;
+            if (!guestMemory.SpaceServesDirect(begin, static_cast<std::size_t>(end - begin))) return refused(3);
+            regions->emplace_back(begin, end);
+        }
+    }
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
@@ -1922,16 +1973,26 @@ void ShaderResources::noteReusable() {
         // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
         // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) {
+            directRegions.clear();
+            return refused(5);
+        }
         directRegions.push_back({begin, end, serial});
     }
+    if (bdaUse) {
+        guestMemory.DropSpace();
+        bdaTemplate = true;
+    }
     reusable = true;
+    refused(0);
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
+    // An address-based build may be a template (noteReusable decides per build).
+    const bool bdaTemplates = BdaTemplates();
+    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, bdaTemplates](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, bdaTemplates](const ShaderRecompiler::DescriptorBinding& binding) { return (!bdaTemplates && binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
 }
 
@@ -3737,7 +3798,7 @@ ShaderResources::DrawBindings::~DrawBindings() {
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
     std::vector<MovedBuffer> moved;
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !bdaTemplate)) return moved;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
@@ -3851,14 +3912,22 @@ struct BindingSplit {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    // A BDA template's use always gets a set of its own (its fault buffer); other address-based
+    // builds bind their own set.
+    const bool bdaUse = usesBda && bdaTemplate;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !bdaUse)) return {};
     const auto maxSnapshotBytes = MaxDrawSnapshotBytes();
     // Nothing is snapshotted (the default): only moved buffers need bindings of their own.
-    if (maxSnapshotBytes == 0 && moved.empty()) return {};
+    if (maxSnapshotBytes == 0 && moved.empty() && !bdaUse) return {};
     BindingSplit split;
     const auto reads = guestMemory.InPlaceReads();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
+    if (bdaUse) {
+        result->bda = BdaResources::ForMirrorUse(context);
+        result->space = std::make_unique<GuestBufferMemory>(context);
+        result->space->AcquireRegistered();
+    }
     std::vector<std::size_t> selected;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
@@ -3926,7 +3995,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     split.mark(BindingSelect);
-    if (selected.empty()) {
+    if (selected.empty() && !bdaUse) {
         if (split.on) bindingEmpty.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
@@ -3955,6 +4024,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
         write.pBufferInfo = buffers.data() + offset;
         for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            if (bdaUse && allocations[binding.allocations[element]].role == ShaderRecompiler::DescriptorRole::FaultBuffer) {
+                buffers[offset + element] = result->bda->Fault();
+                continue;
+            }
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];

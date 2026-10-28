@@ -11,6 +11,11 @@ class BdaResources {
 public:
     explicit BdaResources(const Context& context);
     BdaResources(const Context& context, const GuestBufferMemory& memory);
+    ~BdaResources();
+    // One use of a BDA template in mirror mode (APS5_BDA_TEMPLATES, see ShaderResources::noteReusable):
+    // the shared mirror table and a fault buffer of its own from the per-device pool (the written-page
+    // record is per use), returned to the pool when the use completed.
+    static std::shared_ptr<BdaResources> ForMirrorUse(const Context& context);
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
@@ -37,13 +42,17 @@ public:
     static TableCacheStats TableCacheCounters();
 
 private:
+    // A use's fault buffer from the pool (ForMirrorUse).
+    BdaResources(const Context& context, std::shared_ptr<Buffer> pooledFault);
     // The page table is read-only to the shader, so consecutive builds mapping the same ranges to the
     // same device addresses share one buffer while one of them is alive (see the table cache in
     // BdaResources.cpp, which refers to it weakly).
     void markWrittenPages() const;
     std::shared_ptr<Buffer> table;
-    std::unique_ptr<Buffer> fault;
+    std::shared_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
+    // The fault buffer came from the pool and goes back to it (ForMirrorUse).
+    VkDevice pooled = VK_NULL_HANDLE;
 };
 
 }

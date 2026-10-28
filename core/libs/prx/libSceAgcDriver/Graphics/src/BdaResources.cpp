@@ -121,10 +121,84 @@ std::uint64_t hashRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& ran
 
 }
 
+namespace {
+
+// The one-range table of mirror mode (see the constructor below), shared by every build.
+std::shared_ptr<Buffer> mirrorTable(const Context& context, const GuestMirror& mirror) {
+    static std::mutex mutex;
+    static std::shared_ptr<Buffer> shared;
+    std::lock_guard lock(mutex);
+    if (shared == nullptr) {
+        const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, 1u, sizeof(ShaderRecompiler::BdaAbi::Range), 0};
+        const ShaderRecompiler::BdaAbi::Range range{mirror.Base(), mirror.Base() + mirror.Bytes(), mirror.Address(), ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write, 0};
+        shared = std::make_shared<Buffer>(context, sizeof(header) + sizeof(range), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(shared->Bytes().data(), &header, sizeof(header));
+        std::memcpy(shared->Bytes().data() + sizeof(header), &range, sizeof(range));
+    }
+    return shared;
+}
+
+// Fault buffers of BDA template uses (ForMirrorUse), per device: a use takes one and gives it back
+// when it completed (its written-page record consumed and cleared by CheckFault), so the ~2,000
+// uses per frame make no buffers after the first frames.
+struct FaultPool {
+    std::mutex mutex;
+    VkDevice device = VK_NULL_HANDLE;
+    std::vector<std::shared_ptr<Buffer>> free;
+};
+
+FaultPool& Faults() {
+    static FaultPool pool;
+    return pool;
+}
+
+constexpr std::size_t FaultPoolCapacity = 8192;
+
+}
+
 BdaResources::BdaResources(const Context& context) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
-    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    fault = std::make_shared<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
+}
+
+BdaResources::~BdaResources() {
+    if (pooled == VK_NULL_HANDLE || fault == nullptr) return;
+    auto& pool = Faults();
+    std::lock_guard lock(pool.mutex);
+    if (pool.device == pooled && pool.free.size() < FaultPoolCapacity) pool.free.push_back(std::move(fault));
+}
+
+std::shared_ptr<BdaResources> BdaResources::ForMirrorUse(const Context& context) {
+    const auto* mirror = GuestMirror::Instance();
+    Require(mirror != nullptr, "a BDA template use needs the guest mirror");
+    std::shared_ptr<Buffer> buffer;
+    {
+        auto& pool = Faults();
+        std::lock_guard lock(pool.mutex);
+        if (pool.device != context.device) {
+            pool.free.clear();
+            pool.device = context.device;
+        }
+        if (!pool.free.empty()) {
+            buffer = std::move(pool.free.back());
+            pool.free.pop_back();
+        }
+    }
+    if (buffer == nullptr) buffer = std::make_shared<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::shared_ptr<BdaResources> use(new BdaResources(context, std::move(buffer)));
+    use->pooled = context.device;
+    use->table = mirrorTable(context, *mirror);
+    use->tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + sizeof(ShaderRecompiler::BdaAbi::Range);
+    return use;
+}
+
+BdaResources::BdaResources(const Context& context, std::shared_ptr<Buffer> pooledFault) {
+    Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
+    fault = std::move(pooledFault);
+    // A pooled buffer's record was cleared by the previous use's CheckFault; cleared again for the
+    // case of a use that never completed (its batch failed).
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
 }
 
@@ -133,21 +207,10 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     // one range for every build, so shaders reach a guest address at mirror + (address - base)
     // (SpirvBdaLookup reads that entry without searching). Ranges the driver serves from copies read
     // the guest's own bytes instead: stale where only a copy holds newer results.
-    static const bool mirrorTable = std::getenv("APS5_BDA_MIRROR") != nullptr;
-    if (const auto* mirror = mirrorTable ? GuestMirror::Instance() : nullptr) {
-        static std::mutex mutex;
-        static std::shared_ptr<Buffer> shared;
-        std::lock_guard lock(mutex);
-        if (shared == nullptr) {
-            const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, 1u, sizeof(ShaderRecompiler::BdaAbi::Range), 0};
-            const ShaderRecompiler::BdaAbi::Range range{mirror->Base(), mirror->Base() + mirror->Bytes(), mirror->Address(), ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write, 0};
-            tableBytes = sizeof(header) + sizeof(range);
-            shared = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            std::memcpy(shared->Bytes().data(), &header, sizeof(header));
-            std::memcpy(shared->Bytes().data() + sizeof(header), &range, sizeof(range));
-        }
+    static const bool mirrorTableMode = std::getenv("APS5_BDA_MIRROR") != nullptr;
+    if (const auto* mirror = mirrorTableMode ? GuestMirror::Instance() : nullptr) {
+        table = mirrorTable(context, *mirror);
         tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + sizeof(ShaderRecompiler::BdaAbi::Range);
-        table = shared;
         return;
     }
     const auto cached = memory.CachedAddressTable();

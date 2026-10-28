@@ -254,6 +254,22 @@ public:
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
+    // By this build's own lease (the per-build form), not through the cached address space.
+    bool HoldsOwnLease() const { return !lease.empty(); }
+    // A BDA template (ShaderResources::noteReusable) lets go of the address space it was built
+    // through: a cached object must not pin the registered ranges; every use pins them through its
+    // own holder (ShaderResources::DrawBindings::space). Only without an own lease and regions
+    // served by the space.
+    void DropSpace();
+    // BDA templates: whether the cached address space serves [address, address + bytes) from a host
+    // import or a read-only mirror, so a binding written against it stays valid while the serial of
+    // that import (HostImportSerial / ImageMirrorSerial of the range) does. False when the range
+    // lies in no base region (an own region serves it, see DirectRegions), crosses one, or lies in
+    // a copied or writable-mirror region (served by bytes this build refreshed).
+    bool SpaceServesDirect(std::uint64_t address, std::size_t bytes) const;
+    // The in-place reads of the address space this holder took (AcquireRegistered alone, no
+    // upload), noted once per batch like ShaderResources::MarkGpuWrites notes a build's.
+    void NoteSpaceReads(Recorder& recorder) const;
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
@@ -262,7 +278,9 @@ public:
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
-    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    // `withSpace` false leaves the cached address space's regions out (a BDA template drops the
+    // space and records the ranges it binds through it by themselves, see SpaceServesDirect).
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions(bool withSpace = true) const;
     // Every region the recorded work reads in place through a host import, as [begin, end): the
     // regions bound in place (`direct`), an address-based build's leased heaps included. A region
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.

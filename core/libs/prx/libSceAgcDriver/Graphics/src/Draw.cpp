@@ -1531,7 +1531,7 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, const std::shared_ptr<ShaderResources::DrawBindings>& bindings, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -1550,9 +1550,17 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     if (resources->HoldsLease()) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
     // Every use of a (possibly shared) resources object registers its GPU writes anew.
     resources->MarkGpuWrites(recorder);
+    // A BDA template's use pins and notes the address space through its own holder (the template
+    // dropped its own, see ShaderResources::noteReusable).
+    const bool templateUse = bindings != nullptr && bindings->bda != nullptr;
+    if (templateUse && bindings->space != nullptr) bindings->space->NoteSpaceReads(recorder);
     // The write-back (fault check, copied buffers) runs when the batch completed; a fault is
     // reported by the recorder ("deferred write-back failed") instead of thrown out of the draw.
-    if (listed && resources->HasCopiedWrites()) {
+    if (templateUse) {
+        // The use's fault buffer (its written-page record) is checked, and the holder released,
+        // once the batch completed; the bindings keep the set copy alive until then too.
+        recorder.OnComplete([bindings] { bindings->bda->CheckFault(); });
+    } else if (listed && resources->HasCopiedWrites()) {
         // As VulkanDevice::dispatch lists its copied writers: delisted before the write-back
         // (one that fails must not keep indirect dispatches on the CPU), listed after the
         // registration (a throw there leaves nothing behind).
@@ -1796,7 +1804,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // open pass each time (trgt6: 34-38k not-open pass starts per 10 s, default 13-26k).
     // APS5_ADDRESS_FLUSH_ALL_STORES=1 flushes for every address-based draw as before.
     static const bool flushAll = std::getenv("APS5_ADDRESS_FLUSH_ALL_STORES") != nullptr;
-    const bool flushUnknown = resources.HoldsLease() && (flushAll || resources.AddressWrites());
+    // A BDA template holds no lease of its own (its uses pin the space apart), so the address table
+    // says what reads guest memory through addresses.
+    const bool flushUnknown = (resources.HoldsLease() || resources.UsesAddressTable()) && (flushAll || resources.AddressWrites());
     if (recorder->HasQueuedKeyStores() && (flushUnknown || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (flushUnknown || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
@@ -1809,7 +1819,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // indirect draw's argument barrier and rewrite, there (Recorder::OpenPrePass): the draw
     // continues it like any other.
     const VkCommandBuffer prePass = meshIndirect || gpuIndirect ? recorder->PrePassCommands() : VK_NULL_HANDLE;
-    const bool addressBased = resources.HoldsLease();
+    const bool addressBased = resources.HoldsLease() || resources.UsesAddressTable();
     auto passReads = addressBased ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{} : resources.DeviceReads();
     if (gpuIndirect) {
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
@@ -1951,7 +1961,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     split.mark(RecordLeave);
     timer.phase(PhaseRecord);
-    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
+    keepRecordedDraw(*recorder, record.resources, drawBindings, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -2444,7 +2454,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty() && !multisampled) {
+        // A BDA template's use needs its own bindings (fault buffer, space holder): no recipe.
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->BdaTemplate() && !state.depth && resolved.moved.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -2650,7 +2661,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
-        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, std::move(scratch), std::move(checkRecords), listed, completion, outcome);
+        keepRecordedDraw(*recorder, resources, nullptr, pipeline, framebuffer, inputs, owners, std::move(scratch), std::move(checkRecords), listed, completion, outcome);
         timer.phase(PhaseKeep);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the

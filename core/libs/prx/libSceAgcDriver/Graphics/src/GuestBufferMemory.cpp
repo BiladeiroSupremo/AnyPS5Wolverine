@@ -4441,10 +4441,33 @@ void GuestBufferMemory::WriteBack() {
     heapReferences.clear();
 }
 
-std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions() const {
+void GuestBufferMemory::DropSpace() {
+    Require(lease.empty(), "a build with its own lease cannot drop the address space");
+    space.reset();
+}
+
+bool GuestBufferMemory::SpaceServesDirect(std::uint64_t address, std::size_t bytes) const {
+    if (space == nullptr || !uploaded || committed || bytes == 0) return false;
+    const Region* owner = nullptr;
+    if (baseOverlap(address, address + bytes, &owner) != BaseOverlap::Inside || owner == nullptr) return false;
+    if (owner->direct != nullptr) return true;
+    return owner->mirror != nullptr && !owner->mirror->writable && !owner->mirror->heap;
+}
+
+void GuestBufferMemory::NoteSpaceReads(Recorder& recorder) const {
+    if (space == nullptr || !recorder.NoteReadSetOnce(space->serial)) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    reads.reserve(space->base.size());
+    for (const auto& region : space->base) {
+        if (region.direct != nullptr) reads.emplace_back(region.begin, region.end);
+    }
+    recorder.NotePendingReads(reads, Recorder::ReadKind::AddressBased);
+}
+
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions(bool withSpace) const {
     if (!uploaded || committed) return std::nullopt;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (space != nullptr) {
+    if (space != nullptr && withSpace) {
         for (const auto& region : space->base) {
             if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return std::nullopt;
             result.emplace_back(region.begin, region.end);
