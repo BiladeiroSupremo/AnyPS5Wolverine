@@ -1989,6 +1989,12 @@ void ShaderResources::noteReusable() {
         guestMemory.DropSpace();
         bdaTemplate = true;
     }
+    bindingSlots.clear();
+    for (std::size_t index = 0; index < bindings.size(); ++index) {
+        const auto number = bindings[index].layout.binding;
+        if (number >= bindingSlots.size()) bindingSlots.resize(static_cast<std::size_t>(number) + 1u, 0u);
+        if (bindingSlots[number] == 0u) bindingSlots[number] = static_cast<std::uint32_t>(index + 1u);
+    }
     reusable = true;
     refused(0);
 }
@@ -3805,11 +3811,20 @@ ShaderResources::DrawBindings::~DrawBindings() {
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
     std::vector<MovedBuffer> moved;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !bdaTemplate)) return moved;
+    // By binding number (bindingSlots, built with the template); the linear search stays for an
+    // object noted reusable before the slots existed (none today).
+    const auto keptBinding = [&](std::uint32_t number) {
+        if (number < bindingSlots.size()) {
+            const auto slot = bindingSlots[number];
+            return slot != 0u ? bindings.begin() + static_cast<std::ptrdiff_t>(slot - 1u) : bindings.end();
+        }
+        return bindingSlots.empty() ? std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == number; }) : bindings.end();
+    };
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
             if (DataRole(binding.role)) {
-                const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+                const auto kept = keptBinding(binding.binding);
                 if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
                 const auto index = kept->allocations.front();
                 const auto& item = allocations[index];
@@ -3822,7 +3837,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
-            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+            const auto kept = keptBinding(binding.binding);
             if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
@@ -3935,9 +3950,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->space->AcquireRegistered();
     }
     std::vector<std::size_t> selected;
-    for (std::size_t index = 0; index < allocations.size(); ++index) {
+    // Without a snapshot limit (the default) only the moved buffers get bindings of their own: the
+    // walk takes them directly instead of every allocation with a search of the moved list each
+    // (PPSA03671: ~10 moved buffers per template hit, 7.6 us of a 29 us commit in the select loop).
+    const bool movedOnly = maxSnapshotBytes == 0;
+    const auto steps = movedOnly ? moved.size() : allocations.size();
+    for (std::size_t step = 0; step < steps; ++step) {
+        const auto override = movedOnly ? moved.begin() + static_cast<std::ptrdiff_t>(step) : std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == step; });
+        const auto index = movedOnly ? override->allocation : step;
         const auto& item = allocations[index];
-        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);

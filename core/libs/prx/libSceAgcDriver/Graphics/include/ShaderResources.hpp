@@ -530,6 +530,9 @@ private:
     // A reusable address-based build (BdaTemplates): its uses bind their own fault buffer.
     bool bdaTemplate = false;
     std::vector<DirectRegion> directRegions;
+    // A template's bindings by descriptor binding number (index + 1, 0 = none), for the per-use
+    // walks (MovedReadOnlyBuffers): binding numbers are unique across the build's stages.
+    std::vector<std::uint32_t> bindingSlots;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
     // its checks and kept only when unchanged after them (0: none): while it is still the serial,

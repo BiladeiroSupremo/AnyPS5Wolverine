@@ -924,18 +924,83 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
     recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
 }
 
+namespace {
+// Profiling (APS5_PROFILE_DRAW): InPlaceDrawInput by step, us per call, on an [inplace] line every
+// 10 s, with the calls that found no import (by the step that refused).
+enum InPlaceStep : std::size_t { InPlaceFlush, InPlacePending, InPlaceWriters, InPlaceImport, InPlaceNote, InPlaceStepCount };
+constexpr const char* InPlaceStepNames[InPlaceStepCount] = {"flush", "pending", "writers", "import", "note"};
+std::atomic<std::uint64_t> inPlaceStepNs[InPlaceStepCount]{};
+std::atomic<std::uint64_t> inPlaceCalls{0}, inPlaceRefused[InPlaceStepCount]{};
+std::atomic<std::int64_t> inPlaceReportNs{0};
+bool InPlaceProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+struct InPlaceSplit {
+    bool on = InPlaceProfiled();
+    std::chrono::steady_clock::time_point last = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void mark(InPlaceStep step) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        inPlaceStepNs[step].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        last = now;
+    }
+    void refused(InPlaceStep step) {
+        if (on) inPlaceRefused[step].fetch_add(1, std::memory_order_relaxed);
+    }
+    ~InPlaceSplit() {
+        if (!on) return;
+        const auto calls = inPlaceCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto previous = inPlaceReportNs.load(std::memory_order_relaxed);
+        if (previous == 0) {
+            inPlaceReportNs.compare_exchange_strong(previous, now);
+            return;
+        }
+        if (now - previous < 10'000'000'000ll || !inPlaceReportNs.compare_exchange_strong(previous, now)) return;
+        char line[400];
+        int n = std::snprintf(line, sizeof(line), "[inplace] %llu draw-input lookups (10 s), us per call:", static_cast<unsigned long long>(calls));
+        for (std::size_t i = 0; i < InPlaceStepCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.2f", InPlaceStepNames[i], static_cast<double>(inPlaceStepNs[i].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(calls));
+        }
+        if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; refused by");
+        for (std::size_t i = 0; i < InPlaceStepCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", InPlaceStepNames[i], static_cast<unsigned long long>(inPlaceRefused[i].exchange(0, std::memory_order_relaxed)));
+        }
+        inPlaceCalls.store(0, std::memory_order_relaxed);
+        std::fprintf(stderr, "%s\n", line);
+    }
+};
+}
+
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0) return nullptr;
+    InPlaceSplit split;
     GuestMemory::FlushGpuWrites(address, bytes);
-    if (recorder->PendingWriteOverlaps(address, bytes) || recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
+    split.mark(InPlaceFlush);
+    if (recorder->PendingWriteOverlaps(address, bytes) || recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) {
+        split.mark(InPlacePending);
+        split.refused(InPlacePending);
+        return nullptr;
+    }
+    split.mark(InPlacePending);
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
-    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
     const auto drawWriters = DrawCopiedWriters();
-    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
+    if ((context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) || std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) {
+        split.mark(InPlaceWriters);
+        split.refused(InPlaceWriters);
+        return nullptr;
+    }
+    split.mark(InPlaceWriters);
     const auto* import = HostImportFor(context, address, bytes);
-    if (import == nullptr || (address - import->base) % alignment != 0) return nullptr;
+    split.mark(InPlaceImport);
+    if (import == nullptr || (address - import->base) % alignment != 0) {
+        split.refused(InPlaceImport);
+        return nullptr;
+    }
     recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+    split.mark(InPlaceNote);
     return import;
 }
 
