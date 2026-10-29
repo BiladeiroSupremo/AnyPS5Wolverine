@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <shared_mutex>
 
@@ -42,6 +43,54 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
         }
         default: return false;
     }
+}
+
+// A memory wait (0x3c, 0x93) that is met without the queued draws, so they stay queued (the CP passes
+// it at once on hardware): Memory = met at submission (noteHeldAtSubmit) or in guest memory now, with
+// no queued item storing to its address (waitMemory then returns at entry); QueuedLabel = the newest
+// queued item storing to its address is a label of this submission whose value meets it, the
+// storedSince case before the label is stored (the wait is then passed without waitMemory), only
+// under APS5_QUEUED_LABEL_WAITS=1. In PPSA03671 gameplay (2026-10-29) ~3.5k WAIT_REG_MEM per 10 s
+// drain the queue for a label it holds: QueuedLabel removes them all but the packet drains after
+// them wait longer for the committer (500 -> 600-700 ms per 10 s) and FPS is flat (77.9 vs 79.8
+// presents per 10 s, trmw2 vs trrt1); Memory took 0x93 drains ~460 -> ~150, also flat (trmw1).
+// APS5_DRAIN_MET_WAITS=1 drains for every wait as before.
+enum class MetWait { No, Memory, QueuedLabel };
+
+MetWait metWait(std::span<const std::uint32_t> packet, bool heldAtSubmit) {
+    static const bool drainAll = std::getenv("APS5_DRAIN_MET_WAITS") != nullptr;
+    static const bool queuedLabels = std::getenv("APS5_QUEUED_LABEL_WAITS") != nullptr;
+    if (drainAll || packet.size() < 7 || ((packet[1] >> 4u) & 3u) != 1u) return MetWait::No;
+    const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    const auto bytes = Pm4::WaitAwaitedBytes(packet);
+    if (address % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return MetWait::No;
+    if (DrawPipeline::Queue0().Overlaps(address, bytes)) {
+        if (!queuedLabels) return MetWait::No;
+        const auto value = DrawPipeline::Queue0().PendingLabel(address, bytes);
+        return value.has_value() && Pm4::WaitComparesValue(packet, *value) ? MetWait::QueuedLabel : MetWait::No;
+    }
+    return heldAtSubmit || Pm4::WaitSatisfiedUnchecked(packet) ? MetWait::Memory : MetWait::No;
+}
+
+// APS5_PROFILE_DRAW: the DMA_DATA packets that drain the draw pipeline, by source and destination
+// select and size, on a [dma-drains] line every 10 s (the kinds that could join it as ordered items).
+void noteDmaDrain(std::span<const std::uint32_t> packet) {
+    if (packet.size() < 7) return;
+    static std::mutex mutex;
+    static std::map<std::string, std::uint64_t> kinds;
+    static auto reported = std::chrono::steady_clock::now();
+    const std::size_t bytes = packet[6] & 0x3ffffffu;
+    char key[48];
+    std::snprintf(key, sizeof(key), "src%u>dst%u%s", Pm4::DmaSource(packet), Pm4::DmaDestination(packet), bytes <= 64 ? "<=64B" : bytes <= 4096 ? "<=4K" : bytes <= 65536 ? "<=64K" : ">64K");
+    std::lock_guard lock(mutex);
+    ++kinds[key];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    std::string line = "[dma-drains] DMA_DATA packets draining the draw pipeline (10 s):";
+    for (const auto& [kind, count] : kinds) line += " " + kind + " x" + std::to_string(count);
+    std::fprintf(stderr, "%s\n", line.c_str());
+    kinds.clear();
 }
 
 }
@@ -218,7 +267,10 @@ void Driver::execute(const Submission& submission) {
             std::vector<DrawPipeline::Range> writes{{label->address, label->address + label->Bytes().size()}};
             if (auto* windowWrites = DrawWindowWrites()) windowWrites->insert(windowWrites->end(), writes.begin(), writes.end());
             const auto labelQueue = submission.queue;
-            DrawPipeline::Queue0().Enqueue([this, labelQueue, words = std::vector<std::uint32_t>(packet.begin(), packet.end())] { commitLabelPacket(labelQueue, words); }, std::move(writes));
+            // The value a later wait of this queue compares (metWait); a timestamp has none yet.
+            std::vector<std::byte> value;
+            if (opcode != 0x49 || (packet[2] >> 29u) != 3u) value.assign(label->Bytes().begin(), label->Bytes().end());
+            DrawPipeline::Queue0().Enqueue([this, labelQueue, words = std::vector<std::uint32_t>(packet.begin(), packet.end())] { commitLabelPacket(labelQueue, words); }, std::move(writes), label->address, std::move(value));
             cursor = nextCursor;
             continue;
         }
@@ -236,12 +288,18 @@ void Driver::execute(const Submission& submission) {
             cursor = nextCursor;
             continue;
         }
+        bool waitMetByQueuedLabel = false;
         if (pipelined && DrawPipeline::Queue0().Busy()) {
             // A predicated packet reads its predicate first: queued draws that may write it go first.
             const bool predicateQueued = Pm4::Predicated(header) && queue.predication.operation != 0 && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4);
             // A direct dispatch joins the queue itself (Driver::dispatch drains for what it records inline).
             const bool queuedDispatch = opcode == 0x15 && pipelinedDispatches() && DrawWindowWrites() == nullptr;
-            if ((!keepsDrawPipeline(packet, header, opcode) && !queuedDispatch) || predicateQueued) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0x100u : opcode);
+            const auto met = (opcode == 0x3c || opcode == 0x93) && header != FlipPacketHeader && header != RenderingWaitPacketHeader ? metWait(packet, submission.heldAtSubmit.contains(cursor)) : MetWait::No;
+            waitMetByQueuedLabel = met == MetWait::QueuedLabel && !predicateQueued;
+            if ((!keepsDrawPipeline(packet, header, opcode) && !queuedDispatch && met == MetWait::No) || predicateQueued) {
+                if (profilePackets && opcode == 0x50 && header != FlipPacketHeader) noteDmaDrain(packet);
+                DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0x100u : opcode);
+            }
         }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
@@ -408,7 +466,9 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode == 0x3c || opcode == 0x93) {
             static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
             const auto waitStart = std::chrono::steady_clock::now();
-            timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor)); });
+            // Met by a label this queue stores ahead of it (metWait): passed as waitMemory passes a wait
+            // whose same-queue store landed (storedSince), without waiting for the queued draws.
+            if (!waitMetByQueuedLabel) timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor)); });
             gateOpened() = true;
             if (traceGpu && std::chrono::steady_clock::now() - waitStart > std::chrono::milliseconds(200)) {
 
