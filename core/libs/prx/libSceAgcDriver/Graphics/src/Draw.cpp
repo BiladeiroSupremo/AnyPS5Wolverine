@@ -1648,6 +1648,8 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     // finishes the recorder up to the open batch, which holds the kept resources and gets the
     // next serial), or waited for by the caller (any wait releases it at once).
     if (resources->HoldsLease()) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
+    // A template use holds no lease of its own but stores through addresses all the same.
+    if (!outcome.waited && (resources->HoldsLease() || resources->UsesAddressTable()) && resources->AddressWrites()) NoteAddressStores(recorder.Submissions() + 1);
     // Every use of a (possibly shared) resources object registers its GPU writes anew.
     resources->MarkGpuWrites(recorder);
     // A BDA template's use pins and notes the address space through its own holder (the template

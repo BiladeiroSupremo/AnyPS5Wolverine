@@ -1873,6 +1873,10 @@ struct LeaseState {
     const Recorder* leaseRecorder = nullptr;
     std::uint64_t newestLeaseSerial = 0;
     std::uint64_t finishedLeaseSerial = 0;
+    // Under GuestMemory::GpuMutex: the recorder and serial of the newest batch holding address-based
+    // work that may store through addresses (NoteAddressStores).
+    const Recorder* storeRecorder = nullptr;
+    std::uint64_t newestStoreSerial = 0;
 };
 
 LeaseState& Leases() {
@@ -2088,6 +2092,16 @@ void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
     const auto table = BdaResources::TableCacheCounters();
     const auto& snapshots = Snapshots();
     AgcDriver::ProfilePrint_nid_no_patch("[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s; BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
+}
+
+void NoteAddressStores(std::uint64_t batchSerial) {
+    GuestMemory::AssertGpuLockHeld("NoteAddressStores");
+    auto& state = Leases();
+    if (const auto* recorder = Recorder::Active(); recorder != state.storeRecorder) {
+        state.storeRecorder = recorder;
+        state.newestStoreSerial = 0;
+    }
+    state.newestStoreSerial = std::max(state.newestStoreSerial, batchSerial);
 }
 
 LeaseStats LeaseCounters() {
@@ -3231,10 +3245,15 @@ void putResident(VkDevice device, std::uint64_t begin, std::uint64_t end, VkBuff
     residents.registered.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Under GuestMemory::GpuMutex: address-based work recorded by this recorder may not have completed.
+// Under GuestMemory::GpuMutex: address-based work recorded by this recorder that may store through
+// addresses may not have completed. Read-only address-based work (most address-path draws) cannot
+// change a staged range; counting it as well kept every copy-in on the address path (always some in
+// flight). APS5_RESIDENT_ANY_LEASE=1 counts every lease batch as before.
 bool leaseWorkInFlight(const Recorder& recorder) {
+    static const bool anyLease = std::getenv("APS5_RESIDENT_ANY_LEASE") != nullptr;
     const auto& state = Leases();
-    return state.leaseRecorder == &recorder && state.newestLeaseSerial > recorder.CompletedThrough();
+    if (anyLease) return state.leaseRecorder == &recorder && state.newestLeaseSerial > recorder.CompletedThrough();
+    return state.storeRecorder == &recorder && state.newestStoreSerial > recorder.CompletedThrough();
 }
 
 void reportResidentStaging() {

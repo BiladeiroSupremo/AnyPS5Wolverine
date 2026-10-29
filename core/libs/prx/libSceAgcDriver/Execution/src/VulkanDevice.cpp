@@ -4869,6 +4869,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // The lease is in the open batch (kept above, nothing submitted since): the pin waiter
         // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
+        if (resources->AddressWrites()) Graphics::NoteAddressStores(recorder.Submissions() + 1);
     }
     if (TraceDispatchIo(programAddress)) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
     FlushAfterDispatch(programAddress, *resources, *state->recorder);

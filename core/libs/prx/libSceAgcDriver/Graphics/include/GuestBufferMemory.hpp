@@ -115,6 +115,11 @@ std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, s
 // prints the [address-sync] leases line every 10 s from LeaseCounters (cumulative).
 bool SyncLeaseWork();
 void CountLeaseOutcome(bool synced, std::uint64_t batchSerial);
+// Address-based work that may store through addresses (ShaderResources::AddressWrites) was kept by
+// the open batch, whose serial is `batchSerial` (under the device lock). Its stores are stamped only
+// when it completed, so a resident staging shadow skips no copy-in until then; read-only
+// address-based work leaves the shadows alone.
+void NoteAddressStores(std::uint64_t batchSerial);
 struct LeaseStats {
     std::uint64_t deferred = 0;
     std::uint64_t synced = 0;
