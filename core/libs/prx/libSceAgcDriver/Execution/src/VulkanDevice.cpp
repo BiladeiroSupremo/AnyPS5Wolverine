@@ -4538,6 +4538,47 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
     recordStep(PhaseRecordMarks);
+    // APS5_PROFILE_DRAW: the programs whose written ranges are large (>= 1 MiB each; the pending-write
+    // notes CPU reads then wait behind), by program: dispatches, ranges, MiB per range and the
+    // dispatch's groups, on a [big-writes] line every 10 s.
+    static const bool bigWritesProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (bigWritesProfile) {
+        struct BigWrites {
+            std::uint64_t dispatches = 0, ranges = 0, bytes = 0, threads = 0;
+        };
+        static std::mutex bigMutex;
+        static std::map<std::uint64_t, BigWrites> big;
+        static auto bigReported = std::chrono::steady_clock::now();
+        std::uint64_t largeRanges = 0, largeBytes = 0;
+        for (const auto& [begin, end] : resources.GpuWrites()) {
+            if (end - begin < (std::uint64_t{1} << 20u)) continue;
+            ++largeRanges;
+            largeBytes += end - begin;
+        }
+        std::lock_guard bigLock(bigMutex);
+        if (largeRanges != 0) {
+            auto& entry = big[record.programAddress];
+            ++entry.dispatches;
+            entry.ranges += largeRanges;
+            entry.bytes += largeBytes;
+            entry.threads += static_cast<std::uint64_t>(record.x) * record.y * record.z;
+        }
+        if (std::chrono::steady_clock::now() - bigReported > std::chrono::seconds(10)) {
+            bigReported = std::chrono::steady_clock::now();
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> order;
+            for (const auto& [program, entry] : big) order.emplace_back(entry.bytes, program);
+            std::sort(order.rbegin(), order.rend());
+            std::string line;
+            for (std::size_t i = 0; i < order.size() && i < 16; ++i) {
+                const auto& entry = big[order[i].second];
+                char text[160];
+                std::snprintf(text, sizeof(text), " 0x%llx x%llu (%.1f ranges, %.1f MiB each, %.0f groups)", static_cast<unsigned long long>(order[i].second), static_cast<unsigned long long>(entry.dispatches), static_cast<double>(entry.ranges) / static_cast<double>(entry.dispatches), static_cast<double>(entry.bytes) / 1048576.0 / static_cast<double>(entry.ranges), static_cast<double>(entry.threads) / static_cast<double>(entry.dispatches));
+                line += text;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[big-writes] (10 s) dispatches noting written ranges of 1 MiB or more, by program:%s\n", line.c_str());
+            big.clear();
+        }
+    }
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
     if (resources.NeedsCompletion() && resources.Reusable()) {
