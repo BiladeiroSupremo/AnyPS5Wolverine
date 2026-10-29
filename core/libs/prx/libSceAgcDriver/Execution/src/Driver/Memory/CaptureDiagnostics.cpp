@@ -1,5 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include <algorithm>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -10,7 +17,43 @@ bool Driver::traceBudget() {
 
 void Driver::traceCapture(const char* what, std::uint64_t program, std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> regions, double waitedMs) {
     static const double minMs = [] { const char* text = std::getenv("APS5_TRACE_CAPSYNC_MIN_MS"); return text ? std::atof(text) : 0.05; }();
-    if (waitedMs < minMs || !traceBudget()) return;
+    if (waitedMs < minMs) return;
+    // Per program and queue, the captures that waited and the time, on a [capsync-top] line every
+    // 10 s (the line budget below is spent during loading); a program's first wait of 1 ms or more
+    // is described in full once, budget or not (up to 300 programs).
+    bool describe = false;
+    {
+        struct Total {
+            std::uint64_t count = 0;
+            double ms = 0;
+            const char* what = "";
+        };
+        static std::mutex mutex;
+        static std::map<std::pair<std::uint64_t, std::uint32_t>, Total> totals;
+        static std::set<std::uint64_t> described;
+        static auto last = std::chrono::steady_clock::now();
+        std::lock_guard lock(mutex);
+        auto& total = totals[{program, queue}];
+        ++total.count;
+        total.ms += waitedMs;
+        total.what = what;
+        if (waitedMs >= 1.0 && described.size() < 300) describe = described.insert(program).second;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(10)) {
+            last = now;
+            std::vector<std::pair<std::pair<std::uint64_t, std::uint32_t>, Total>> top(totals.begin(), totals.end());
+            std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+            std::string line = "[capsync-top] (10 s) program q count ms:";
+            char item[96];
+            for (std::size_t index = 0; index < top.size() && index < 16u; ++index) {
+                std::snprintf(item, sizeof(item), " %llx q0x%x %s %llu %.0f;", static_cast<unsigned long long>(top[index].first.first), top[index].first.second, top[index].second.what, static_cast<unsigned long long>(top[index].second.count), top[index].second.ms);
+                line += item;
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+            totals.clear();
+        }
+    }
+    if (!describe && !traceBudget()) return;
     std::fprintf(stderr, "[capsync] %s q0x%x program 0x%llx waited %.1f ms over %zu regions\n", what, queue, static_cast<unsigned long long>(program), waitedMs, regions.size());
     static const bool values = std::getenv("APS5_TRACE_CAPSYNC_VALUES") != nullptr;
     for (const auto& region : regions) {
