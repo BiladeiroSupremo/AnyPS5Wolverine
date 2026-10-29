@@ -1005,6 +1005,31 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     return import;
 }
 
+// A draw that fetches no vertex attributes (mesh programs pull their indices themselves) needs no
+// highest index unless a fan's restart table is built from the indices: its index buffer is bound in
+// place without the CPU scan and without waiting for GPU writes into it that are still pending. Those
+// reach the draw on the GPU like any other in-place read: behind the leading barrier of its pass, or a
+// pass break when a draw of the open pass wrote the range (recordDraw adds the in-place reads to the
+// pass's hazard check). [hooksync] 2026-10-29: ~88 waits per 10 s on queue 0 were these, 65 of them
+// over bytes that had not changed (pending-write notes of written V#s spanning ~1.4 GB). Null when the
+// indices are needed on the CPU or no import serves the range; APS5_SCAN_ALL_INDICES=1 scans as before.
+const HostImport* UnscannedIndexBuffer(const Context& context, const State& state, const Pm4::DrawParameters& draw, bool vertexAttributes, std::size_t bytes) {
+    static const bool scanAll = std::getenv("APS5_SCAN_ALL_INDICES") != nullptr;
+    auto* recorder = context.recorder;
+    if (scanAll || recorder == nullptr || draw.indirect || vertexAttributes || bytes == 0) return nullptr;
+    if (state.primitiveRestart && state.stages.mesh && state.stages.mesh->inputPrimitive == 6) return nullptr;
+    const auto address = draw.indexAddress;
+    if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
+    // Results a completion writes back from the CPU land only after their batch: no GPU order for them.
+    const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+    const auto drawWriters = DrawCopiedWriters();
+    if ((context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) || std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || (address - import->base) % draw.indexSize != 0) return nullptr;
+    recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+    return import;
+}
+
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
@@ -1150,7 +1175,16 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
     } splitReportScope{splitVertex};
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
-    if (draw.indexed) {
+    const auto& attributes = shaders.front().program->vertexAttributes;
+    const auto* unscanned = draw.indexed ? UnscannedIndexBuffer(context, state, draw, !attributes.empty(), static_cast<std::size_t>(indexBytes)) : nullptr;
+    if (unscanned != nullptr) {
+        // No vertex fetch reads the highest index (maxIndex stays 0).
+        if (splitVertex) splitIndexed.fetch_add(1, std::memory_order_relaxed);
+        inputs.indexHandle = unscanned->buffer;
+        inputs.indexOffset = draw.indexAddress - unscanned->base;
+        inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
+        splitMark(0);
+    } else if (draw.indexed) {
         if (splitVertex) splitIndexed.fetch_add(1, std::memory_order_relaxed);
         const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
@@ -1214,7 +1248,6 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
-    const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
     else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
@@ -1923,6 +1956,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const VkCommandBuffer prePass = meshIndirect || gpuIndirect ? recorder->PrePassCommands() : VK_NULL_HANDLE;
     const bool addressBased = resources.HoldsLease() || resources.UsesAddressTable();
     auto passReads = addressBased ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{} : resources.DeviceReads();
+    // The in-place index and vertex reads too: an index buffer bound without waiting for pending GPU
+    // writes (UnscannedIndexBuffer) must break the pass when a draw of it wrote the range.
+    passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
     if (gpuIndirect) {
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
