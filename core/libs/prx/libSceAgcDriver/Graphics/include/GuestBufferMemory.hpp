@@ -270,6 +270,15 @@ public:
     // The in-place reads of the address space this holder took (AcquireRegistered alone, no
     // upload), noted once per batch like ShaderResources::MarkGpuWrites notes a build's.
     void NoteSpaceReads(Recorder& recorder) const;
+    // A BDA template use's holder (ShaderResources::PrepareDrawBindings): the one the previous use on
+    // this thread took, while the address space it holds is still the one AcquireRegistered would
+    // take (current, same generation, imports epoch and device, no mirror it would refresh); else a
+    // new holder. Each use keeps a reference until its batch completed, so a shared holder pins the
+    // space as long as one per use did (PPSA03671: ~5 us per use in the copied-range pass alone).
+    // APS5_NO_SHARED_SPACE_HOLDER=1 takes a holder per use as before.
+    static std::shared_ptr<GuestBufferMemory> TemplateUseHolder(const Context& context);
+    // Uses served by an earlier use's holder since the last call (the [bindings] line).
+    static std::uint64_t TakeSharedHolders();
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);

@@ -147,7 +147,14 @@ std::shared_ptr<Buffer> mirrorTable(const Context& context, const GuestMirror& m
 struct FaultPool {
     std::mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
-    std::vector<std::shared_ptr<Buffer>> free;
+    // `clean`: the last use's CheckFault ran to the end, which leaves the header, the written-page
+    // slots it claimed and the count zero, so the next use needs no 16 KiB clear (APS5_PROFILE_DRAW
+    // [bindings] "fault"; APS5_CLEAR_POOLED_FAULTS=1 clears every time as before).
+    struct Entry {
+        std::shared_ptr<Buffer> buffer;
+        bool clean;
+    };
+    std::vector<Entry> free;
 };
 
 FaultPool& Faults() {
@@ -171,13 +178,15 @@ BdaResources::~BdaResources() {
     if (pooled == VK_NULL_HANDLE || fault == nullptr) return;
     auto& pool = Faults();
     std::lock_guard lock(pool.mutex);
-    if (pool.device == pooled && pool.free.size() < FaultPoolCapacity) pool.free.push_back(std::move(fault));
+    if (pool.device == pooled && pool.free.size() < FaultPoolCapacity) pool.free.push_back({std::move(fault), clean});
 }
 
 std::shared_ptr<BdaResources> BdaResources::ForMirrorUse(const Context& context) {
     const auto* mirror = GuestMirror::Instance();
     Require(mirror != nullptr, "a BDA template use needs the guest mirror");
+    static const bool alwaysClear = std::getenv("APS5_CLEAR_POOLED_FAULTS") != nullptr;
     std::shared_ptr<Buffer> buffer;
+    bool clean = false;
     {
         auto& pool = Faults();
         std::lock_guard lock(pool.mutex);
@@ -186,24 +195,25 @@ std::shared_ptr<BdaResources> BdaResources::ForMirrorUse(const Context& context)
             pool.device = context.device;
         }
         if (!pool.free.empty()) {
-            buffer = std::move(pool.free.back());
+            buffer = std::move(pool.free.back().buffer);
+            clean = pool.free.back().clean && !alwaysClear;
             pool.free.pop_back();
         }
     }
     if (buffer == nullptr) buffer = std::make_shared<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    std::shared_ptr<BdaResources> use(new BdaResources(context, std::move(buffer)));
+    std::shared_ptr<BdaResources> use(new BdaResources(context, std::move(buffer), clean));
     use->pooled = context.device;
     use->table = mirrorTable(context, *mirror);
     use->tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + sizeof(ShaderRecompiler::BdaAbi::Range);
     return use;
 }
 
-BdaResources::BdaResources(const Context& context, std::shared_ptr<Buffer> pooledFault) {
+BdaResources::BdaResources(const Context& context, std::shared_ptr<Buffer> pooledFault, bool clean) {
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     fault = std::move(pooledFault);
-    // A pooled buffer's record was cleared by the previous use's CheckFault; cleared again for the
-    // case of a use that never completed (its batch failed).
-    std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
+    // A pooled buffer's record was cleared by the previous use's CheckFault; cleared here only when
+    // that use never got to the end of it (its batch failed, or the check threw).
+    if (!clean) std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
     program = DrawTimingProgram();
 }
 
@@ -332,6 +342,7 @@ void BdaResources::CheckFault() const {
     std::memcpy(&report, fault->Bytes().data(), sizeof(report));
     if (report.state == ShaderRecompiler::BdaAbi::FaultState::Empty) {
         Require(static_cast<std::uint32_t>(report.reason) == 0 && report.address == 0 && report.bytes == 0 && report.stage == 0 && report.instruction == 0 && report.reserved == 0, "BDA fault record has data without publication");
+        clean = true;
         return;
     }
     Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && report.reserved == 0, "incomplete or invalid BDA fault record");
@@ -350,6 +361,7 @@ void BdaResources::CheckFault() const {
         }
         if (first) std::fprintf(stderr, "[mirror] window mismatch: program 0x%llx stage %u guest 0x%llx window 0x%08x pointer 0x%08x (%llu so far)\n", static_cast<unsigned long long>(program), report.stage, static_cast<unsigned long long>(report.address), report.bytes, report.instruction, static_cast<unsigned long long>(total));
         std::memset(fault->Bytes().data(), 0, sizeof(report));
+        clean = true;
         return;
     }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
@@ -357,6 +369,7 @@ void BdaResources::CheckFault() const {
         loopGuardTripped.store(true, std::memory_order_relaxed);
         std::fprintf(stderr, "[gpu] loop guard: the loop exit at pc 0x%x of shader 0x%llx ran past %u evaluations\n", report.instruction, static_cast<unsigned long long>(report.address), report.bytes);
         std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+        clean = true;
         return;
     }
     std::ostringstream message;

@@ -4464,6 +4464,42 @@ void GuestBufferMemory::NoteSpaceReads(Recorder& recorder) const {
     recorder.NotePendingReads(reads, Recorder::ReadKind::AddressBased);
 }
 
+namespace {
+std::atomic<std::uint64_t> sharedHolders{0};
+}
+
+std::shared_ptr<GuestBufferMemory> GuestBufferMemory::TemplateUseHolder(const Context& context) {
+    static const bool perUse = std::getenv("APS5_NO_SHARED_SPACE_HOLDER") != nullptr;
+    // A weak reference: the uses' bindings own the holder, this only finds it again.
+    thread_local std::weak_ptr<GuestBufferMemory> last;
+    if (!perUse && addressSpaceCacheEnabled()) {
+        if (auto held = last.lock(); held != nullptr && held->space != nullptr) {
+            const auto& space = *held->space;
+            // What AcquireRegistered's hit takes besides the space: a sparse mirror refresh, and
+            // with copy refreshes on, writable and heap mirror refreshes; such spaces are not shared.
+            const bool refreshes = !space.sparseMirrors.empty() || (!skipCopyRefresh() && (!space.writableMirrors.empty() || !space.heapRuns.empty()));
+            bool current = !refreshes && space.device == context.device && space.generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && Spaces().current.load() == held->space;
+            if (current) {
+                auto& state = Imports();
+                std::lock_guard lock(state.mutex);
+                current = space.importsEpoch == state.epoch;
+            }
+            if (current) {
+                sharedHolders.fetch_add(1, std::memory_order_relaxed);
+                return held;
+            }
+        }
+    }
+    auto holder = std::make_shared<GuestBufferMemory>(context);
+    holder->AcquireRegistered();
+    last = holder;
+    return holder;
+}
+
+std::uint64_t GuestBufferMemory::TakeSharedHolders() {
+    return sharedHolders.exchange(0, std::memory_order_relaxed);
+}
+
 std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions(bool withSpace) const {
     if (!uploaded || committed) return std::nullopt;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;

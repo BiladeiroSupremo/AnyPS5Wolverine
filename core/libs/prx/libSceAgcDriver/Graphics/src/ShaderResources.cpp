@@ -3928,8 +3928,8 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
 namespace {
 // Profiling (APS5_PROFILE_DRAW): PrepareDrawBindings by section, per call, on the [bindings] line
 // every 10 s, with the snapshots taken, reused and created.
-enum BindingSection : std::size_t { BindingSetup, BindingSelect, BindingCollect, BindingReuse, BindingCreate, BindingAllocate, BindingUpdate, BindingKeep, BindingSectionCount };
-constexpr const char* BindingSectionNames[BindingSectionCount] = {"setup", "select", "collect", "reuse-lookup", "create+copy", "allocate", "update", "keep"};
+enum BindingSection : std::size_t { BindingSetup, BindingFault, BindingHolder, BindingSelect, BindingCollect, BindingReuse, BindingCreate, BindingAllocate, BindingUpdate, BindingKeep, BindingSectionCount };
+constexpr const char* BindingSectionNames[BindingSectionCount] = {"setup", "fault", "holder", "select", "collect", "reuse-lookup", "create+copy", "allocate", "update", "keep"};
 std::atomic<std::uint64_t> bindingSectionNs[BindingSectionCount]{};
 std::atomic<std::uint64_t> bindingCalls{0}, bindingSnapshots{0}, bindingReused{0}, bindingCreated{0}, bindingEmpty{0}, bindingCreatedBytes{0}, bindingCreatedLarge{0}, bindingInPlace{0};
 std::atomic<std::int64_t> bindingReportNs{0};
@@ -3956,10 +3956,10 @@ struct BindingSplit {
             return;
         }
         if (now - previous < 10'000'000'000ll || !bindingReportNs.compare_exchange_strong(previous, now)) return;
-        char line[640];
+        char line[1024];
         const auto created = bindingCreated.exchange(0);
         const auto createdBytes = bindingCreatedBytes.exchange(0);
-        int n = std::snprintf(line, sizeof(line), "[bindings] %llu calls (10 s; %llu without snapshots), snapshots %llu (reused %llu, created %llu: avg %.1f KiB, %llu over 16 KiB; %llu large moved buffers read in place), us per call:", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(bindingEmpty.exchange(0)), static_cast<unsigned long long>(bindingSnapshots.exchange(0)), static_cast<unsigned long long>(bindingReused.exchange(0)), static_cast<unsigned long long>(created), created != 0 ? static_cast<double>(createdBytes) / 1024.0 / static_cast<double>(created) : 0.0, static_cast<unsigned long long>(bindingCreatedLarge.exchange(0)), static_cast<unsigned long long>(bindingInPlace.exchange(0)));
+        int n = std::snprintf(line, sizeof(line), "[bindings] %llu calls (10 s; %llu without snapshots; %llu template uses on a shared space holder), snapshots %llu (reused %llu, created %llu: avg %.1f KiB, %llu over 16 KiB; %llu large moved buffers read in place), us per call:", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(bindingEmpty.exchange(0)), static_cast<unsigned long long>(GuestBufferMemory::TakeSharedHolders()), static_cast<unsigned long long>(bindingSnapshots.exchange(0)), static_cast<unsigned long long>(bindingReused.exchange(0)), static_cast<unsigned long long>(created), created != 0 ? static_cast<double>(createdBytes) / 1024.0 / static_cast<double>(created) : 0.0, static_cast<unsigned long long>(bindingCreatedLarge.exchange(0)), static_cast<unsigned long long>(bindingInPlace.exchange(0)));
         for (std::size_t i = 0; i < BindingSectionCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
             const auto ns = bindingSectionNs[i].exchange(0, std::memory_order_relaxed);
             n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.1f", BindingSectionNames[i], static_cast<double>(ns) / 1000.0 / static_cast<double>(calls));
@@ -4002,6 +4002,40 @@ struct BindingSplit {
 };
 }
 
+namespace {
+// Moved data blocks (user data words, flattened SRT slots: ~2 per BDA template use, 0.2-1.2 KB) go
+// into slices of a data ring instead of a buffer each, whose odd sizes cost an exact VkBuffer per
+// block from the pool. A use's bindings hold the ring until their batch completed; the ring is only
+// appended to, so no recorded work reads a slice written after it. The thread holds a weak
+// reference: a ring nothing holds any more goes back to the pool and the next block starts another.
+// APS5_NO_DATA_RING=1 makes a buffer per block as before.
+struct DataSlice {
+    std::shared_ptr<Buffer> ring;
+    VkDeviceSize offset;
+};
+std::optional<DataSlice> dataRingSlice(const Context& context, std::size_t bytes) {
+    static const bool off = std::getenv("APS5_NO_DATA_RING") != nullptr;
+    constexpr std::size_t RingBytes = std::size_t{1} << 20u;
+    if (off || bytes == 0 || bytes > RingBytes / 4) return std::nullopt;
+    struct Ring {
+        std::weak_ptr<Buffer> buffer;
+        VkDevice device = VK_NULL_HANDLE;
+        std::size_t used = 0;
+    };
+    thread_local Ring ring;
+    const auto alignment = std::max<std::size_t>(static_cast<std::size_t>(context.limits.minStorageBufferOffsetAlignment), 16);
+    auto buffer = ring.device == context.device ? ring.buffer.lock() : nullptr;
+    auto offset = (ring.used + alignment - 1) / alignment * alignment;
+    if (buffer == nullptr || offset + bytes > RingBytes) {
+        buffer = std::make_shared<Buffer>(context, RingBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        ring = {buffer, context.device, 0};
+        offset = 0;
+    }
+    ring.used = offset + bytes;
+    return DataSlice{std::move(buffer), static_cast<VkDeviceSize>(offset)};
+}
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     // A BDA template's use always gets a set of its own (its fault buffer); other address-based
     // builds bind their own set.
@@ -4020,12 +4054,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (!movedOnly) reads = guestMemory.InPlaceReads();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
+    split.mark(BindingSetup);
     if (bdaUse) {
         result->bda = BdaResources::ForMirrorUse(context);
-        result->space = std::make_unique<GuestBufferMemory>(context);
-        result->space->AcquireRegistered();
+        split.mark(BindingFault);
+        result->space = GuestBufferMemory::TemplateUseHolder(context);
+        split.mark(BindingHolder);
     }
-    split.mark(BindingSetup);
     std::vector<std::size_t> selected;
     const auto steps = movedOnly ? moved.size() : allocations.size();
     for (std::size_t step = 0; step < steps; ++step) {
@@ -4033,13 +4068,21 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto index = movedOnly ? override->allocation : step;
         const auto& item = allocations[index];
         if (override != moved.end() && !override->words.empty()) {
-            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+            DrawBindings::Snapshot snapshot{0, nullptr};
+            if (auto slice = dataRingSlice(context, override->size)) {
+                snapshot.buffer = std::move(slice->ring);
+                snapshot.sliceOffset = slice->offset;
+                snapshot.sliceBytes = override->size;
+            } else {
+                snapshot.buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            }
+            const auto bytes = snapshot.Bytes();
+            std::memcpy(bytes.data(), override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            result->snapshots.push_back(std::move(snapshot));
             continue;
         }
         std::uint64_t address = item.address;
@@ -4131,12 +4174,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];
-            buffers[offset + element] = snapshot.buffer != nullptr ? VkDescriptorBufferInfo{snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()} : VkDescriptorBufferInfo{snapshot.inPlace, snapshot.inPlaceOffset, snapshot.inPlaceBytes};
+            buffers[offset + element] = snapshot.buffer != nullptr ? VkDescriptorBufferInfo{snapshot.buffer->Handle(), snapshot.sliceOffset, snapshot.Bytes().size()} : VkDescriptorBufferInfo{snapshot.inPlace, snapshot.inPlaceOffset, snapshot.inPlaceBytes};
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     split.mark(BindingUpdate);
     recorder.Keep(result);
+    // A data ring counts once per batch, whole (KeepBytes counts an owner once).
     for (const auto& snapshot : result->snapshots) {
         if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     }

@@ -42,8 +42,8 @@ public:
     static TableCacheStats TableCacheCounters();
 
 private:
-    // A use's fault buffer from the pool (ForMirrorUse).
-    BdaResources(const Context& context, std::shared_ptr<Buffer> pooledFault);
+    // A use's fault buffer from the pool (ForMirrorUse); `clean`: its record needs no clear.
+    BdaResources(const Context& context, std::shared_ptr<Buffer> pooledFault, bool clean);
     // The page table is read-only to the shader, so consecutive builds mapping the same ranges to the
     // same device addresses share one buffer while one of them is alive (see the table cache in
     // BdaResources.cpp, which refers to it weakly).
@@ -53,6 +53,8 @@ private:
     std::size_t tableBytes = 0;
     // The fault buffer came from the pool and goes back to it (ForMirrorUse).
     VkDevice pooled = VK_NULL_HANDLE;
+    // CheckFault ran to the end: the pooled buffer's record is zero again (see FaultPool).
+    mutable bool clean = false;
     // The code address of the draw's last program when this was made (DrawTimingProgram), for the
     // window-mismatch reports (APS5_MIRROR_WINDOWS_VERIFY).
     std::uint64_t program = 0;

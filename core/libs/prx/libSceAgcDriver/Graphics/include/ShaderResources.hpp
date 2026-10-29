@@ -146,6 +146,11 @@ public:
             VkBuffer inPlace = VK_NULL_HANDLE;
             VkDeviceSize inPlaceOffset = 0;
             VkDeviceSize inPlaceBytes = 0;
+            // A moved data block's slice of a data ring (`buffer` is the ring; 0 bytes = the whole
+            // buffer), see PrepareDrawBindings.
+            VkDeviceSize sliceOffset = 0;
+            VkDeviceSize sliceBytes = 0;
+            std::span<std::byte> Bytes() const { return sliceBytes != 0 ? buffer->Bytes().subspan(static_cast<std::size_t>(sliceOffset), static_cast<std::size_t>(sliceBytes)) : buffer->Bytes(); }
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation fragmentAllocation;
@@ -155,7 +160,7 @@ public:
         // written-page record the completion consumes (CheckFault), and the address space holder
         // that pins the registered ranges until then and notes their in-place reads.
         std::shared_ptr<BdaResources> bda;
-        std::unique_ptr<GuestBufferMemory> space;
+        std::shared_ptr<GuestBufferMemory> space;
         ~DrawBindings();
     };
     // APS5_BDA_TEMPLATES=1 (mirror mode): an address-based build whose stages bind no guest buffer
