@@ -60,6 +60,14 @@ public:
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    // A dispatch's trailing barrier leaves out the host (its destination stage and HOST_READ), and
+    // the batch owes the one host barrier at its end that a render pass already owes (a CPU access
+    // waits for the batch anyway); APS5_DISPATCH_HOST_IN_TRAIL=1 restores the host in every trailing
+    // barrier. The stage and access mask of that trailing barrier, and OweHostRead for the batch's end.
+    static bool DispatchHostAtEnd();
+    static VkPipelineStageFlags DispatchTrailStages();
+    static VkAccessFlags DispatchTrailAccess();
+    void OweHostRead();
     // Dispatch runs (VulkanDevice::recordDispatch, APS5_DISPATCH_RUNS=1): a direct dispatch's trailing
     // barrier (compute writes -> every later stage and the host) is held, `queue` = its guest queue
     // + 1. The next dispatch of that queue in the same run takes it over (TakeDispatchTrail: no

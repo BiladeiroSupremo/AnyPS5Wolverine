@@ -1465,6 +1465,27 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
+bool Recorder::DispatchHostAtEnd() {
+    // Default since 2026-10-29 (PPSA03671 gameplay, last 15 windows: 74.5 presents per 10 s against
+    // 72.0 in the control run beside it and 68.9-70.4 earlier that day; pictures unchanged).
+    // APS5_DISPATCH_HOST_IN_TRAIL=1 puts the host back into every trailing barrier.
+    static const bool atEnd = std::getenv("APS5_DISPATCH_HOST_IN_TRAIL") == nullptr;
+    return atEnd;
+}
+
+VkPipelineStageFlags Recorder::DispatchTrailStages() {
+    return DispatchHostAtEnd() ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+}
+
+VkAccessFlags Recorder::DispatchTrailAccess() {
+    constexpr VkAccessFlags device = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    return DispatchHostAtEnd() ? device : device | VK_ACCESS_HOST_READ_BIT;
+}
+
+void Recorder::OweHostRead() {
+    if (open != nullptr) open->hostReadOwed = true;
+}
+
 void Recorder::DeferDispatchTrail(std::uint32_t queue) {
     ensureOpen();
     open->heldTrailQueue = queue;
@@ -1482,10 +1503,11 @@ void Recorder::flushDispatchTrail() {
     if (open == nullptr || open->heldTrailQueue == 0) return;
     open->heldTrailQueue = 0;
     // VulkanDevice::recordDispatch's trailing barrier, as it records it outside a run.
-    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+    const auto dispatchedAccess = DispatchTrailAccess();
+    recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, DispatchTrailStages(), VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
     CountBarriers(CommandClass::DispatchTrailing);
     open->coveredAccess = dispatchedAccess;
+    if (DispatchHostAtEnd()) open->hostReadOwed = true;
 }
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
