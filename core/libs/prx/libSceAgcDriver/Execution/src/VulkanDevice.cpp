@@ -2964,6 +2964,20 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     APS5_LOG_OUT_DEBUG("Presentation command buffer begin commands=%p image=%p", reinterpret_cast<void*>(commands), reinterpret_cast<void*>(state->images[index]));
     using CommandClass = Graphics::Recorder::CommandClass;
     Graphics::Recorder::CountPresent();
+    // Causal-profile probe (APS5_SLOW_GPU_FILLS=<n>): n fills of a 256 MiB device buffer per present,
+    // GPU work in queue order behind the frame, so a run shows how much the frame rate depends on GPU
+    // time per frame. The buffer is never freed (a probe).
+    static const int slowFills = std::getenv("APS5_SLOW_GPU_FILLS") != nullptr ? std::atoi(std::getenv("APS5_SLOW_GPU_FILLS")) : 0;
+    if (slowFills > 0) {
+        static Graphics::DeviceBuffer* scratch = nullptr;
+        static VkDevice scratchDevice = VK_NULL_HANDLE;
+        if (scratch == nullptr || scratchDevice != state->device) {
+            scratch = new Graphics::DeviceBuffer(state->context, std::size_t{256} << 20u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            scratchDevice = state->device;
+        }
+        const auto fill = state->DeviceFunction<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+        for (int i = 0; i < slowFills; ++i) fill(commands, scratch->Handle(), 0, VK_WHOLE_SIZE, static_cast<std::uint32_t>(i));
+    }
     if (Graphics::Recorder::GpuTimingEnabled()) {
         if (slot.queries == VK_NULL_HANDLE) {
             VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};

@@ -166,6 +166,14 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             PerformanceTimer timing("DrawPipeline.Commit");
+            // Causal-profile probe (APS5_SLOW_COMMIT_US=<us>): every commit spins this long first, so a
+            // run shows how much the frame depends on the committer's per-commit cost.
+            static const auto slowCommit = std::chrono::microseconds(std::getenv("APS5_SLOW_COMMIT_US") != nullptr ? std::strtoll(std::getenv("APS5_SLOW_COMMIT_US"), nullptr, 10) : 0);
+            if (slowCommit.count() > 0) {
+                const auto until = std::chrono::steady_clock::now() + slowCommit;
+                while (std::chrono::steady_clock::now() < until) {
+                }
+            }
             if (commit != nullptr) (*commit)();
         } catch (const std::exception&) {
             failed = true;

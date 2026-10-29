@@ -1643,6 +1643,20 @@ void Recorder::ensureOpen() {
             throw;
         }
         batch->queue = GuestMemory::GpuLockThreadTag();
+        // Causal-profile probe (APS5_SLOW_GPU_BATCH_MIB=<n>): every batch starts with a fill of an
+        // n MiB device buffer, GPU time inside the frame's work (APS5_SLOW_GPU_FILLS adds it after the
+        // frame instead), so a run shows how much the frame rate depends on GPU time between the
+        // frame's CPU waits. The buffer is never freed (a probe).
+        static const std::size_t slowBatchBytes = static_cast<std::size_t>(std::getenv("APS5_SLOW_GPU_BATCH_MIB") != nullptr ? std::strtoull(std::getenv("APS5_SLOW_GPU_BATCH_MIB"), nullptr, 10) : 0) << 20u;
+        if (slowBatchBytes != 0) {
+            static DeviceBuffer* scratch = nullptr;
+            static VkDevice scratchDevice = VK_NULL_HANDLE;
+            if (scratch == nullptr || scratchDevice != context.device) {
+                scratch = new DeviceBuffer(context, slowBatchBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                scratchDevice = context.device;
+            }
+            context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(batch->commands, scratch->Handle(), 0, VK_WHOLE_SIZE, 0u);
+        }
         if (countingSamples && !segmentMode()) beginSamples(*batch);
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());

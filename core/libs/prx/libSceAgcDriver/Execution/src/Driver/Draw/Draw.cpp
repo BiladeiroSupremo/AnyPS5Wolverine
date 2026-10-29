@@ -217,6 +217,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             ThrownDrawPhases() = timing.phaseMs;
         }
     } thrownPhases{phaseTiming};
+    // Causal-profile probe (APS5_SLOW_DRAW_PACKET_US=<us>): every draw packet spins this long on the
+    // packet worker first, so a run shows how much the frame depends on this thread's per-draw cost.
+    static const auto slowPacket = std::chrono::microseconds(std::getenv("APS5_SLOW_DRAW_PACKET_US") != nullptr ? std::strtoll(std::getenv("APS5_SLOW_DRAW_PACKET_US"), nullptr, 10) : 0);
+    if (slowPacket.count() > 0) {
+        const auto until = std::chrono::steady_clock::now() + slowPacket;
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
 
     const auto drawn = [&] {
         phaseTiming.Phase(DrawRowVectors);

@@ -41,6 +41,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     if (SkipListed(snapshot)) return;
+    // Causal-profile probe (APS5_SLOW_COMPUTE_DISPATCH_US=<us>): every dispatch on a queue other than
+    // queue 0 (async compute) spins this long first, so a run shows how much the frame depends on
+    // that worker's per-dispatch cost.
+    static const auto slowCompute = std::chrono::microseconds(std::getenv("APS5_SLOW_COMPUTE_DISPATCH_US") != nullptr ? std::strtoll(std::getenv("APS5_SLOW_COMPUTE_DISPATCH_US"), nullptr, 10) : 0);
+    if (slowCompute.count() > 0 && submission.queue != 0) {
+        const auto until = std::chrono::steady_clock::now() + slowCompute;
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
     std::vector<std::uint32_t> userData;
     for (std::uint32_t i = 0; i < userCount; ++i) {
