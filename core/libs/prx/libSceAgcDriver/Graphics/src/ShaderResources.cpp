@@ -2621,6 +2621,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
+    // APS5_PROFILE_DRAW: a successful proof's time split into the pending CPU-write checks above, the
+    // texture and storage proof, the imported-region part and the staging / depth-copy tail, with
+    // the element counts ([revalidate-split] every 10 s).
+    const auto pendingDone = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::chrono::steady_clock::time_point proofDone, importsDone;
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
@@ -2740,6 +2745,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    if (profile) proofDone = std::chrono::steady_clock::now();
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
     // to guest memory first (as an upload does), then each import must still be the one the set was
     // written against. This comes last because the lookups and flushes above can reconcile imports
@@ -2780,6 +2786,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
+    if (profile) importsDone = std::chrono::steady_clock::now();
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
@@ -2794,6 +2801,28 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+    }
+    if (profile) {
+        static std::atomic<std::uint64_t> proofs{0}, partNs[4]{}, elements[3]{};
+        static std::atomic<std::int64_t> reported{0};
+        const auto end = std::chrono::steady_clock::now();
+        const auto ns = [](std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count()); };
+        const auto count = proofs.fetch_add(1, std::memory_order_relaxed) + 1;
+        partNs[0].fetch_add(ns(start, pendingDone), std::memory_order_relaxed);
+        partNs[1].fetch_add(ns(pendingDone, proofDone), std::memory_order_relaxed);
+        partNs[2].fetch_add(ns(proofDone, importsDone), std::memory_order_relaxed);
+        partNs[3].fetch_add(ns(importsDone, end), std::memory_order_relaxed);
+        elements[0].fetch_add(directRegions.size() + describedRanges.size(), std::memory_order_relaxed);
+        elements[1].fetch_add(textures.size(), std::memory_order_relaxed);
+        elements[2].fetch_add(storageTextures.size(), std::memory_order_relaxed);
+        const auto now = end.time_since_epoch().count();
+        auto last = reported.load(std::memory_order_relaxed);
+        if (last == 0) reported.compare_exchange_strong(last, now);
+        else if (now - last >= 10'000'000'000ll && reported.compare_exchange_strong(last, now)) {
+            const auto per = [&](std::atomic<std::uint64_t>& total, double scale) { return static_cast<double>(total.exchange(0)) / scale / static_cast<double>(count); };
+            std::fprintf(stderr, "[revalidate-split] %llu successful proofs (10 s), us per proof: pending CPU writes %.2f, texture/storage proof %.2f, imported regions %.2f, staging/depth tail %.2f; per proof: regions+ranges %.1f, textures %.1f, storage images %.1f\n", static_cast<unsigned long long>(count), per(partNs[0], 1000.0), per(partNs[1], 1000.0), per(partNs[2], 1000.0), per(partNs[3], 1000.0), per(elements[0], 1.0), per(elements[1], 1.0), per(elements[2], 1.0));
+            proofs.store(0, std::memory_order_relaxed);
+        }
     }
     return finish(fast, true);
 }
@@ -4212,36 +4241,57 @@ void ShaderResources::WriteBack() {
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+    // (Noting and stamping a recorded draw's later uses of one object once per batch gained nothing,
+    // trbm1 2026-10-30: draws' marks cost ~0.2-0.3 us; the expensive marks are dispatches'.)
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     const bool profiled = BuildProfiled();
-    const auto markStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto now = [&] { return profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
+    const auto markStart = now();
     // The cached address space's ~1200 regions are the same for every build holding it: noted once
     // per batch (its reads list already holds them for the later uses).
     const auto spaceSerial = guestMemory.SpaceSerial();
     const bool withSpace = spaceSerial == 0 || recorder.NoteReadSetOnce(spaceSerial);
     recorder.NotePendingReads(guestMemory.InPlaceReads(withSpace), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
-    const auto readsEnd = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    // APS5_PROFILE_DRAW: the read notes and the whole mark, address-based uses apart ([mark] line).
+    const auto readsEnd = now();
+    std::chrono::steady_clock::time_point storageEnd, copyEnd, notesEnd;
+    // APS5_PROFILE_DRAW: per use, address-based and other apart, the read notes, storage images,
+    // copy-backs, write notes, direct-write stamps and the whole mark ([mark] line).
     const auto countMark = [&] {
         if (!profiled) return;
         static std::mutex mutex;
-        static std::uint64_t uses[2]{}, readsUs[2]{}, totalUs[2]{};
+        static std::uint64_t uses[2]{}, partNs[2][6]{};
         static auto last = std::chrono::steady_clock::now();
-        const auto now = std::chrono::steady_clock::now();
-        const auto kind = guestMemory.HoldsLease() ? 1 : 0;
+        const auto end = std::chrono::steady_clock::now();
+        const auto kind = guestMemory.HoldsLease() ? 0 : 1;
+        const auto ns = [](std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) { return to < from ? 0ull : static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count()); };
         std::lock_guard lock(mutex);
         ++uses[kind];
-        readsUs[kind] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(readsEnd - markStart).count());
-        totalUs[kind] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - markStart).count());
-        if (now - last < std::chrono::seconds(10)) return;
-        last = now;
-        const auto per = [](std::uint64_t us, std::uint64_t count) { return count == 0 ? 0.0 : static_cast<double>(us) / static_cast<double>(count); };
-        AgcDriver::ProfilePrint_nid_no_patch("[mark] GPU-write marks (10 s): address-based %llu, us per use: read notes %.1f, total %.1f; others %llu, read notes %.1f, total %.1f\n", static_cast<unsigned long long>(uses[1]), per(readsUs[1], uses[1]), per(totalUs[1], uses[1]), static_cast<unsigned long long>(uses[0]), per(readsUs[0], uses[0]), per(totalUs[0], uses[0]));
-        uses[0] = uses[1] = readsUs[0] = readsUs[1] = totalUs[0] = totalUs[1] = 0;
+        partNs[kind][0] += ns(markStart, readsEnd);
+        partNs[kind][1] += ns(readsEnd, storageEnd);
+        partNs[kind][2] += ns(storageEnd, copyEnd);
+        partNs[kind][3] += ns(copyEnd, notesEnd);
+        partNs[kind][4] += ns(notesEnd, end);
+        partNs[kind][5] += ns(markStart, end);
+        if (end - last < std::chrono::seconds(10)) return;
+        last = end;
+        const auto per = [&](std::size_t k, std::size_t part) { return uses[k] == 0 ? 0.0 : static_cast<double>(partNs[k][part]) / 1000.0 / static_cast<double>(uses[k]); };
+        constexpr const char* kinds[2] = {"address-based", "other"};
+        std::string text;
+        for (std::size_t k = 0; k < 2; ++k) {
+            char item[192];
+            std::snprintf(item, sizeof(item), " %s %llu (read notes %.2f storage %.2f copy-backs %.2f write notes %.2f stamps %.2f total %.2f);", kinds[k], static_cast<unsigned long long>(uses[k]), per(k, 0), per(k, 1), per(k, 2), per(k, 3), per(k, 4), per(k, 5));
+            text += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[mark] GPU-write marks (10 s), us per use:%s\n", text.c_str());
+        for (std::size_t k = 0; k < 2; ++k) {
+            uses[k] = 0;
+            for (auto& part : partNs[k]) part = 0;
+        }
     };
     if (SkipWriteBack()) {
+        storageEnd = copyEnd = notesEnd = now();
         countMark();
         return;
     }
@@ -4250,13 +4300,16 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         storageTextures[index]->MarkDirty();
         static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
     }
+    storageEnd = now();
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
     guestMemory.RecordCopyBacks(recorder);
+    copyEnd = now();
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
+    notesEnd = now();
     guestMemory.MarkDirectWrites();
     countMark();
     if (!BuildProfiled()) return;

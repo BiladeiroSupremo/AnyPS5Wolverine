@@ -2476,6 +2476,16 @@ LastAcquire& ThreadLastAcquire() {
     return last;
 }
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SpacePath::Count)> spacePathCount{}, spacePathNs{}, spacePathMaxNs{};
+// Rebuilds (any caller): leased ranges, imports made and their creation time (us), and the time in
+// lease / import refresh / per-range pass / rest (ns).
+struct SpaceRebuildStats {
+    std::atomic<std::uint64_t> count{0}, ranges{0}, imports{0}, importUs{0};
+    std::array<std::atomic<std::uint64_t>, 4> partNs{};
+};
+SpaceRebuildStats& SpaceRebuilds() {
+    static SpaceRebuildStats stats;
+    return stats;
+}
 }
 
 void GuestBufferMemory::AcquireRegistered() {
@@ -2556,10 +2566,21 @@ void GuestBufferMemory::AcquireRegistered() {
             lap(timing.mirrorsUs, at);
         }
     }
+    // APS5_PROFILE_DRAW: a rebuild's leased ranges, the imports it made and their time, and its time
+    // split into lease, import refresh, the per-range pass and the rest ([holder-space] line).
+    std::size_t rebuildRanges = 0;
+    std::uint64_t createdBefore = 0, createUsBefore = 0;
+    std::chrono::steady_clock::time_point leaseDone, refreshDone, passDone;
     if (space == nullptr) {
         // Pending GPU results in these ranges are stored when Upload prepares each region.
         lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         lap(timing.leaseUs, at);
+        if (profile) {
+            rebuildRanges = lease.size();
+            createdBefore = ImportCounts().created.load(std::memory_order_relaxed);
+            createUsBefore = ImportCounts().createUs.load(std::memory_order_relaxed);
+            leaseDone = std::chrono::steady_clock::now();
+        }
         {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
@@ -2571,23 +2592,59 @@ void GuestBufferMemory::AcquireRegistered() {
             importsEpoch = state.epoch;
         }
         lap(timing.importsUs, at);
+        if (profile) refreshDone = std::chrono::steady_clock::now();
+        // The imports first, under one hold of the import lock, walking the import map alongside the
+        // registry's (ascending) ranges: an existing import is found by the walk instead of a map
+        // search per range (a rebuild's per-range pass took ~10 ms over ~17.7k leased ranges,
+        // trpf1 2026-10-30); a range without one takes importAllocation as before (which may make or
+        // retire imports, so the walk re-seeks after it). APS5_NO_IMPORT_WALK=1 looks each range up
+        // under its own hold as before.
+        static const bool importWalk = std::getenv("APS5_NO_IMPORT_WALK") == nullptr;
+        std::vector<const HostImport*> entries(lease.size(), nullptr);
+        if (importable && importWalk) {
+            auto& state = Imports();
+            std::lock_guard lock(state.mutex);
+            auto next = state.imports.begin();
+            for (std::size_t index = 0; index < lease.size(); ++index) {
+                const auto& range = lease[index];
+                if (!range->readable || !range->gpu) continue;
+                const auto address = range->address;
+                // The import containing `address`, as findImport finds it: the last one beginning at
+                // or before it.
+                while (next != state.imports.end() && next->first <= address) ++next;
+                const HostImport* current = nullptr;
+                if (next != state.imports.begin()) {
+                    const auto& entry = std::prev(next)->second;
+                    if (address >= entry.base && address + 1 <= entry.base + entry.bytes) current = &entry;
+                }
+                // importAllocation's hit rule.
+                if (current != nullptr && (!importsStale(context, state) || (current->joined && sameRange(*current, lease)))) {
+                    entries[index] = current;
+                    continue;
+                }
+                entries[index] = importAllocation(context, state, address, lease);
+                next = state.imports.upper_bound(address);
+            }
+        }
+        lap(timing.importsUs, at);
         // One pass in the registry's (ascending) order, so the regions come out sorted for AddSnapshot.
-        // The import lock is taken per range: a mirror's preparation may wait for recorded work, which
-        // must not happen under it.
+        // Without the walk the import lock is taken per range: a mirror's preparation may wait for
+        // recorded work, which must not happen under it.
         regions.reserve(lease.size());
         std::vector<AddressCopy> copies;
         std::vector<std::uint64_t> imported;
-        for (const auto& range : lease) {
+        for (std::size_t index = 0; index < lease.size(); ++index) {
+            const auto& range = lease[index];
             if (!range->readable || !range->gpu) continue;
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
-            const HostImport* entry = nullptr;
-            if (importable) {
+            const HostImport* entry = entries[index];
+            if (importable && !importWalk) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
                 entry = importAllocation(context, state, range->address, lease);
+                lap(timing.importsUs, at);
             }
-            lap(timing.importsUs, at);
             if (entry != nullptr) {
                 region.hostBacked = true;
                 // Reused by Upload while no import was dropped since (see importsEpoch).
@@ -2622,6 +2679,7 @@ void GuestBufferMemory::AcquireRegistered() {
             copies.push_back({copied.begin, copied.end, committed, reason});
         }
         releaseImportedMirrors(context, imported);
+        if (profile) passDone = std::chrono::steady_clock::now();
         regionsSorted = sortedLookup;
         static const std::uint64_t copyLimit = [] {
             const char* value = std::getenv("APS5_ADDRESS_COPY_MAX_MIB");
@@ -2720,6 +2778,19 @@ void GuestBufferMemory::AcquireRegistered() {
         spacePathNs[index].fetch_add(ns, std::memory_order_relaxed);
         auto max = spacePathMaxNs[index].load(std::memory_order_relaxed);
         while (ns > max && !spacePathMaxNs[index].compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
+        }
+        if (rebuildRanges != 0) {
+            const auto end = std::chrono::steady_clock::now();
+            const auto span = [](std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) { return to < from ? 0ull : static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count()); };
+            auto& rebuild = SpaceRebuilds();
+            rebuild.count.fetch_add(1, std::memory_order_relaxed);
+            rebuild.ranges.fetch_add(rebuildRanges, std::memory_order_relaxed);
+            rebuild.imports.fetch_add(ImportCounts().created.load(std::memory_order_relaxed) - createdBefore, std::memory_order_relaxed);
+            rebuild.importUs.fetch_add(ImportCounts().createUs.load(std::memory_order_relaxed) - createUsBefore, std::memory_order_relaxed);
+            rebuild.partNs[0].fetch_add(span(acquireStart, leaseDone), std::memory_order_relaxed);
+            rebuild.partNs[1].fetch_add(span(leaseDone, refreshDone), std::memory_order_relaxed);
+            rebuild.partNs[2].fetch_add(span(refreshDone, passDone), std::memory_order_relaxed);
+            rebuild.partNs[3].fetch_add(span(passDone, end), std::memory_order_relaxed);
         }
     }
 }
@@ -4609,7 +4680,10 @@ std::shared_ptr<GuestBufferMemory> GuestBufferMemory::TemplateUseHolder(const Co
                 std::snprintf(item, sizeof(item), " %s %llu/%.0f us (all builds %llu, %.1f ms, max %.2f ms);", SpacePathNames[i], static_cast<unsigned long long>(count), count == 0 ? 0.0 : static_cast<double>(pathNs) / 1e3 / static_cast<double>(count), static_cast<unsigned long long>(all), static_cast<double>(allNs) / 1e6, static_cast<double>(allMax) / 1e6);
                 paths += item;
             }
-            std::fprintf(stderr, "[holder-space] (10 s) new holders by space path:%s\n", paths.c_str());
+            auto& rebuild = SpaceRebuilds();
+            const auto rebuilds = rebuild.count.exchange(0);
+            const auto perRebuild = [&](std::uint64_t total, double scale) { return rebuilds == 0 ? 0.0 : static_cast<double>(total) / scale / static_cast<double>(rebuilds); };
+            std::fprintf(stderr, "[holder-space] (10 s) new holders by space path:%s rebuilds %llu: per rebuild %.0f leased ranges, %.1f imports made (%.2f ms), ms in lease %.2f / import refresh %.2f / per-range pass %.2f / rest %.2f\n", paths.c_str(), static_cast<unsigned long long>(rebuilds), perRebuild(rebuild.ranges.exchange(0), 1.0), perRebuild(rebuild.imports.exchange(0), 1.0), perRebuild(rebuild.importUs.exchange(0), 1000.0), perRebuild(rebuild.partNs[0].exchange(0), 1e6), perRebuild(rebuild.partNs[1].exchange(0), 1e6), perRebuild(rebuild.partNs[2].exchange(0), 1e6), perRebuild(rebuild.partNs[3].exchange(0), 1e6));
             std::fprintf(stderr, "[holder] (10 s) %llu new space holders, %.1f us each (%.0f ms; object %.1f lease %.1f imports %.1f mirrors %.1f compare %.1f rest %.1f); not shared because: none held %llu, refreshing mirrors %llu, device %llu, allocation generation %llu, current space %llu, imports epoch %llu\n", static_cast<unsigned long long>(builds), eachUs, static_cast<double>(ns) / 1e6, lapUs[0], lapUs[1], lapUs[2], lapUs[3], lapUs[4], eachUs - lapUs[0] - lapUs[1] - lapUs[2] - lapUs[3] - lapUs[4], static_cast<unsigned long long>(holderMisses[0].exchange(0)), static_cast<unsigned long long>(holderMisses[1].exchange(0)), static_cast<unsigned long long>(holderMisses[2].exchange(0)), static_cast<unsigned long long>(holderMisses[3].exchange(0)), static_cast<unsigned long long>(holderMisses[4].exchange(0)), static_cast<unsigned long long>(holderMisses[5].exchange(0)));
         }
     }

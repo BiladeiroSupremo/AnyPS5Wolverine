@@ -69,6 +69,53 @@ std::atomic<void (*)(const Mapped&, std::uint64_t)> gpuMapObserver{nullptr};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> unmapObserver{nullptr};
 std::atomic<std::uint32_t> gpuMapObserverCalls{0};
 
+// APS5_PROFILE_DRAW: the guest mutations that need their ranges unpinned, by kind (protect, unmap,
+// remove, image unregister): calls, bytes, calls that found a range pinned (then waited for the
+// driver's pin waiter) and the time they waited, and protects that change no flag of any range they
+// cover; a [guest-alloc] line every 10 s.
+enum class MutationKind : std::size_t { Protect, Unmap, Remove, Unregister, Count };
+constexpr const char* MutationKindNames[static_cast<std::size_t>(MutationKind::Count)] = {"protect", "unmap", "remove", "unregister"};
+thread_local MutationKind currentMutation = MutationKind::Count;
+struct MutationCounters {
+    std::atomic<std::uint64_t> calls{0}, bytes{0}, pinned{0}, waitNs{0}, sameFlags{0};
+};
+MutationCounters mutationCounters[static_cast<std::size_t>(MutationKind::Count)];
+std::atomic<std::int64_t> mutationsReported{0};
+// Protects that change flags, by change: readable on/off, writable on/off, gpu on/off, uncovered start.
+std::atomic<std::uint64_t> protectChanges[7]{};
+
+struct MutationScope {
+    MutationKind previous;
+    explicit MutationScope(MutationKind kind) : previous(currentMutation) { currentMutation = kind; }
+    ~MutationScope() { currentMutation = previous; }
+    MutationScope(const MutationScope&) = delete;
+    MutationScope& operator=(const MutationScope&) = delete;
+};
+
+bool mutationProfile() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+void reportMutations() {
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = mutationsReported.load(std::memory_order_relaxed);
+    if (last == 0) {
+        mutationsReported.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10 || !mutationsReported.compare_exchange_strong(last, now)) return;
+    std::string text;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(MutationKind::Count); ++i) {
+        auto& counters = mutationCounters[i];
+        char item[200];
+        std::snprintf(item, sizeof(item), " %s %llu (%.1f MiB, %llu pinned waiting %.1f ms, %llu same flags);", MutationKindNames[i], static_cast<unsigned long long>(counters.calls.exchange(0)), static_cast<double>(counters.bytes.exchange(0)) / 1048576.0, static_cast<unsigned long long>(counters.pinned.exchange(0)), static_cast<double>(counters.waitNs.exchange(0)) / 1e6, static_cast<unsigned long long>(counters.sameFlags.exchange(0)));
+        text += item;
+    }
+    const auto change = [](std::size_t index) { return static_cast<unsigned long long>(protectChanges[index].exchange(0)); };
+    std::fprintf(stderr, "[guest-alloc] (10 s) mutations needing unpinned ranges:%s flag-changing protects: readable on %llu off %llu, writable on %llu off %llu, gpu on %llu off %llu, uncovered %llu\n", text.c_str(), change(0), change(1), change(2), change(3), change(4), change(5), change(6));
+}
+
 std::chrono::milliseconds pinWait() {
     static const std::chrono::milliseconds value{[] {
         const char* text = std::getenv("APS5_PIN_WAIT_MS");
@@ -346,6 +393,7 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     const auto found = state.registeredImages.find(reinterpret_cast<std::uintptr_t>(image));
     if (found == state.registeredImages.end()) return;
     const auto [begin, end] = *found;
+    const MutationScope scope(MutationKind::Unregister);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, image, end - begin);
     recordChange(mutation, image, end - begin);
     std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
@@ -387,6 +435,18 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     auto* state = static_cast<MutationState*>(mutation);
     const auto deadline = std::chrono::steady_clock::now() + pinWait();
     int syncedRounds = 0;
+    // [guest-alloc]: the kind the caller set (MutationScope), the first pinned scan's time.
+    const auto kind = mutationProfile() ? currentMutation : MutationKind::Count;
+    std::chrono::steady_clock::time_point pinnedAt{};
+    if (kind != MutationKind::Count) {
+        mutationCounters[static_cast<std::size_t>(kind)].calls.fetch_add(1, std::memory_order_relaxed);
+        mutationCounters[static_cast<std::size_t>(kind)].bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    const auto counted = [&] {
+        if (kind == MutationKind::Count) return;
+        if (pinnedAt != std::chrono::steady_clock::time_point{}) mutationCounters[static_cast<std::size_t>(kind)].waitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pinnedAt).count()), std::memory_order_relaxed);
+        reportMutations();
+    };
     for (;;) {
         registry().readableLease.reset();
         registry().allLease.reset();
@@ -403,7 +463,12 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         }
         if (!pinned) {
             if (state != nullptr && bytes != 0) state->unpinned.emplace_back(address, bytes);
+            counted();
             return;
+        }
+        if (kind != MutationKind::Count && pinnedAt == std::chrono::steady_clock::time_point{}) {
+            pinnedAt = std::chrono::steady_clock::now();
+            mutationCounters[static_cast<std::size_t>(kind)].pinned.fetch_add(1, std::memory_order_relaxed);
         }
         if (std::chrono::steady_clock::now() >= deadline) PinnedFailure(address, bytes, ("waited " + std::to_string(pinWait().count()) + " ms for the lease (APS5_PIN_WAIT_MS)").c_str());
         const auto waiter = pinWaiter.load(std::memory_order_acquire);
@@ -519,6 +584,7 @@ Range GuestAllocationsFind_nid_postfix(void*, const void* pointer) {
 
 void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto range = GuestAllocationsFind_nid_postfix(mutation, pointer);
+    const MutationScope scope(MutationKind::Remove);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);
     recordChange(mutation, pointer, range.bytes);
     auto& ranges = registry().ranges;
@@ -590,6 +656,52 @@ bool allocationRemains(const Range& range, const RangePatch& patch) {
 }
 
 void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply) {
+    // A protect whose every covered range already has these flags changes nothing the registry
+    // describes (GPU visibility, access, backing): only the OS protection is applied. Unpinning,
+    // the change record (a new registry generation, which makes the driver rebuild its address
+    // space: 11-27 ms each, up to 252 ms, trbm1 2026-10-30) and the backing renewal are skipped.
+    // About a third of the title's protects in gameplay. APS5_NO_SAME_FLAG_PROTECT_SKIP=1 = old.
+    static const bool skipSame = std::getenv("APS5_NO_SAME_FLAG_PROTECT_SKIP") == nullptr;
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    bool same = bytes != 0;
+    {
+        const auto& ranges = registry().ranges;
+        auto it = ranges.upper_bound(address);
+        if (it != ranges.begin()) --it;
+        auto cursor = address;
+        for (; same && it != ranges.end() && it->first < address + bytes; ++it) {
+            const auto& range = *it->second;
+            if (it->first + range.bytes <= address) continue;
+            same = it->first <= cursor && range.readable == readable && range.writable == writable && range.gpu == gpu;
+            cursor = it->first + range.bytes;
+        }
+        same = same && cursor >= address + bytes;
+    }
+    if (same && mutationProfile()) {
+        mutationCounters[static_cast<std::size_t>(MutationKind::Protect)].sameFlags.fetch_add(1, std::memory_order_relaxed);
+        reportMutations();
+    }
+    if (same && skipSame) {
+        apply();
+        return;
+    }
+    if (!same && mutationProfile()) {
+        // [guest-alloc]: what the protect changes, against the first range it covers.
+        const auto& ranges = registry().ranges;
+        auto it = ranges.upper_bound(address);
+        if (it != ranges.begin()) --it;
+        while (it != ranges.end() && it->first + it->second->bytes <= address) ++it;
+        if (it != ranges.end() && it->first < address + bytes) {
+            const auto& range = *it->second;
+            const auto note = [](std::size_t index) { protectChanges[index].fetch_add(1, std::memory_order_relaxed); };
+            if (range.readable != readable) note(readable ? 0 : 1);
+            if (range.writable != writable) note(writable ? 2 : 3);
+            if (range.gpu != gpu) note(gpu ? 4 : 5);
+        } else {
+            protectChanges[6].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    const MutationScope scope(MutationKind::Protect);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
     recordChange(mutation, pointer, bytes);
     const auto patch = replaceRange(pointer, bytes, false, readable, writable, gpu);
@@ -598,6 +710,7 @@ void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, st
 }
 
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) {
+    const MutationScope scope(MutationKind::Unmap);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
     recordChange(mutation, pointer, bytes);
     const auto end = reinterpret_cast<std::uintptr_t>(pointer) + bytes;
