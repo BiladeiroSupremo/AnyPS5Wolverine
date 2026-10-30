@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -115,6 +116,13 @@ struct StageCapture {
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
 
+// Copies of a native stage's result that hits patch in place: one nothing else holds any more is
+// reused, so a hit allocates nothing (a copy per hit cost ~12 us per draw, trno1 2026-10-30).
+struct NativeResultPool {
+    std::mutex mutex;
+    std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> results;
+};
+
 // APS5_NATIVE_DRAWS (native path, Draw.cpp and Dispatch.cpp): a stage as materialized, the patches
 // that carry a later draw's user words into it, its program and vertex stage info (a hit needs the
 // same), the user words its capture used as values and as base pointers, the capturing draw's user
@@ -144,6 +152,7 @@ struct NativeDrawStage {
     std::uint64_t patchableValues = 0;
     std::shared_ptr<std::atomic<std::uint64_t>> confirmed = std::make_shared<std::atomic<std::uint64_t>>(0);
     std::shared_ptr<std::atomic<bool>> refused = std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<NativeResultPool> pool = std::make_shared<NativeResultPool>();
 };
 
 // The value-used user words that differ from the stage's (bit per word below 64), or ~0 when the
@@ -166,11 +175,6 @@ void NativeAddDataPositions(DispatchVariant& runs, std::span<const std::uint32_t
 // changed and patches in (NativeWithData). Sets runs.flatBinding, dataPositions and dataSlots.
 void NativeDataWords(DispatchVariant& runs, const ShaderRecompiler::RecompileResult& result, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
 
-// `result` with the words a hit found (`live`: the stage's runs->words with the changed ones): data
-// words in its flattened SRT and chain pointers where they appear (chainPatches); a copy unless
-// there is nothing to write.
-std::shared_ptr<const ShaderRecompiler::RecompileResult> NativeWithData(std::shared_ptr<const ShaderRecompiler::RecompileResult> result, const NativeDrawStage& stage, std::span<const std::uint32_t> live);
-
 // APS5_NATIVE_DRAWS=1: every 64th reuse (NativeSampled) is also built as before, rendered from that
 // and compared; a mismatch turns native reuse off for the rest of the run (TripNative, logged), so a
 // state the verify runs did not meet costs a few wrong draws at most. NativeTripped: turned off.
@@ -182,9 +186,12 @@ void TripNative(const char* what, std::uint64_t program);
 // null where they were null (a walk through a null pointer records no read).
 bool NativeSameValues(const NativeDrawStage& stage, std::span<const std::uint32_t> userData);
 
-// The stage with this draw's user words patched in and its vertex attributes' V#s from `vertex`;
-// the stage itself when there is nothing to change, null when a patch lies outside it.
-std::shared_ptr<const ShaderRecompiler::RecompileResult> NativePatchedResult(const NativeDrawStage& stage, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex);
+// The stage with this draw's values: its user words patched in, its vertex attributes' V#s from
+// `vertex`, and the words the gather found (`live`: the stage's runs->words with the changed ones;
+// empty: as stored) at its data slots and chain pointers' places. A pooled copy (NativeResultPool)
+// with every such place rewritten; the stage itself when nothing varies; null when a patch lies
+// outside it.
+std::shared_ptr<const ShaderRecompiler::RecompileResult> NativePatchedResult(const NativeDrawStage& stage, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, std::span<const std::uint32_t> live = {});
 
 // The shader register a draw program's user word comes from, or 0 for a merged stage's driver
 // words (DrawRelocation.cpp).

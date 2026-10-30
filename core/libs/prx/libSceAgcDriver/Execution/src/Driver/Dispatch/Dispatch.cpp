@@ -430,10 +430,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     // A hit built as before and compared (=verify: every hit; =1: a sample, which trips the switch).
     const bool nativeReused = nativeHit != nullptr && !nativeVerify && !NativeSampled();
     if (nativeReused) {
-        compiledResult = NativePatchedResult(*nativeHit, userData, std::nullopt);
-        require(compiledResult != nullptr, "native dispatch: a user-word patch lies outside the cached program");
-        if (nativeLive != nullptr) compiledResult = NativeWithData(std::move(compiledResult), *nativeHit, *nativeLive);
-        require(compiledResult != nullptr, "native dispatch: a chain patch lies outside the cached program");
+        compiledResult = NativePatchedResult(*nativeHit, userData, std::nullopt, nativeLive != nullptr ? std::span<const std::uint32_t>(*nativeLive) : std::span<const std::uint32_t>());
+        require(compiledResult != nullptr, "native dispatch: a patch lies outside the cached program");
         // The runs at this dispatch's pointers, into the entry's words (the commit holds the entry).
         captured = std::move(nativeRegions);
         phaseTiming.Phase(PhaseLookup);
@@ -507,14 +505,21 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
         if (nativeEligible && nativeHit != nullptr) {
             // =verify: the reused copy against this capture.
-            auto patched = NativePatchedResult(*nativeHit, userData, std::nullopt);
-            if (nativeLive != nullptr) patched = NativeWithData(std::move(patched), *nativeHit, *nativeLive);
+            const auto patched = NativePatchedResult(*nativeHit, userData, std::nullopt, nativeLive != nullptr ? std::span<const std::uint32_t>(*nativeLive) : std::span<const std::uint32_t>());
             const bool equal = patched != nullptr && sameCompiledResult(*patched, *compiledResult) && patched->poisonedSrtReads == compiledResult->poisonedSrtReads;
-            if (!equal && !nativeVerify) TripNative("a reused dispatch", address);
+            // A difference after the dispatch's words changed since the gather raced the title's
+            // writes: no trip.
+            bool raced = false;
+            if (!equal) {
+                std::vector<ShaderRecompiler::MemoryRegion> again;
+                std::shared_ptr<const std::vector<std::uint32_t>> againLive;
+                raced = !nativeGather(*nativeHit, userData, address, submission.queue, again, againLive) || (againLive != nullptr) != (nativeLive != nullptr) || (againLive != nullptr && *againLive != *nativeLive);
+            }
+            if (!equal && !raced && !nativeVerify) TripNative("a reused dispatch", address);
             auto& cache = nativeDispatchCache();
             std::lock_guard lock(cache.mutex);
-            ++(equal ? cache.verifyEqual : cache.verifyDiffer);
-            if (!equal && cache.verifyReports < 12) {
+            if (!raced) ++(equal ? cache.verifyEqual : cache.verifyDiffer);
+            if (!equal && !raced && cache.verifyReports < 12) {
                 ++cache.verifyReports;
                 std::uint64_t changed = 0;
                 for (std::size_t word = 0; word < 64 && word < userData.size() && word < nativeHit->userData.size(); ++word) {
@@ -556,8 +561,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 std::vector<ShaderRecompiler::MemoryRegion> learnRegions;
                 std::shared_ptr<const std::vector<std::uint32_t>> learnLive;
                 if (nativeGather(*nativeLearn, userData, address, submission.queue, learnRegions, learnLive)) {
-                    auto patched = NativePatchedResult(*nativeLearn, userData, std::nullopt);
-                    if (learnLive != nullptr) patched = NativeWithData(std::move(patched), *nativeLearn, *learnLive);
+                    const auto patched = NativePatchedResult(*nativeLearn, userData, std::nullopt, learnLive != nullptr ? std::span<const std::uint32_t>(*learnLive) : std::span<const std::uint32_t>());
                     const bool equal = patched != nullptr && sameCompiledResult(*patched, *compiledResult) && patched->poisonedSrtReads == compiledResult->poisonedSrtReads;
                     if (equal) nativeLearn->confirmed->fetch_or(nativeLearnChanges, std::memory_order_relaxed);
                     else nativeLearn->refused->store(true, std::memory_order_relaxed);
