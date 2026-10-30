@@ -372,34 +372,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 break;
             }
             const auto started = std::chrono::steady_clock::now();
-            std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
-            nativeRegions.clear();
-            bool equal = relocatedRuns(*entry->runs, userData, runs);
-            if (equal) {
-                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
-                std::optional<SampledReadScope> sampling;
-                std::uint64_t imagesFlushed = 0, runsSynced = 0;
-                appendEntryRegionsAt(*entry->runs, runs, nativeRegions);
-                // Data words (NativeDataWords) may differ: their values come back in `live`, and
-                // the regions then point at this dispatch's own words.
-                std::vector<std::pair<std::uint32_t, std::uint32_t>> live;
-                const auto outcome = validateVariant(address, submission.queue, *entry->runs, nativeRegions, imagesFlushed, runsSynced, sampling, entry->runs->dataPositions.empty() ? nullptr : &live, &runs);
-                equal = outcome == EntryOutcome::Equal || outcome == EntryOutcome::EqualData;
-                if (outcome == EntryOutcome::EqualData) {
-                    auto words = std::make_shared<std::vector<std::uint32_t>>(entry->runs->words);
-                    for (const auto& [position, value] : live) (*words)[position] = value;
-                    nativeRegions.clear();
-                    std::size_t offset = 0;
-                    for (const auto& [begin, end] : runs) {
-                        const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
-                        nativeRegions.push_back({begin, std::as_bytes(std::span<const std::uint32_t>(*words).subspan(offset, count))});
-                        offset += count;
-                    }
-                    nativeLive = std::move(words);
-                } else {
-                    nativeLive = nullptr;
-                }
-            }
+            const bool equal = nativeGather(*entry, userData, address, submission.queue, nativeRegions, nativeLive);
             {
                 std::lock_guard lock(cache.mutex);
                 cache.gatherNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
@@ -429,7 +402,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (nativeReused) {
         compiledResult = NativePatchedResult(*nativeHit, userData, std::nullopt);
         require(compiledResult != nullptr, "native dispatch: a user-word patch lies outside the cached program");
-        if (nativeLive != nullptr) compiledResult = NativeWithData(std::move(compiledResult), *nativeHit->runs, *nativeLive);
+        if (nativeLive != nullptr) compiledResult = NativeWithData(std::move(compiledResult), *nativeHit, *nativeLive);
+        require(compiledResult != nullptr, "native dispatch: a chain patch lies outside the cached program");
         // The runs at this dispatch's pointers, into the entry's words (the commit holds the entry).
         captured = std::move(nativeRegions);
         phaseTiming.Phase(PhaseLookup);
@@ -504,7 +478,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (nativeEligible && nativeHit != nullptr) {
             // =verify: the reused copy against this capture.
             auto patched = NativePatchedResult(*nativeHit, userData, std::nullopt);
-            if (nativeLive != nullptr) patched = NativeWithData(std::move(patched), *nativeHit->runs, *nativeLive);
+            if (nativeLive != nullptr) patched = NativeWithData(std::move(patched), *nativeHit, *nativeLive);
             const bool equal = patched != nullptr && sameCompiledResult(*patched, *compiledResult) && patched->poisonedSrtReads == compiledResult->poisonedSrtReads;
             if (!equal && !nativeVerify) TripNative("a reused dispatch", address);
             auto& cache = nativeDispatchCache();
@@ -530,8 +504,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 // The words the walk read from pages (not the code and header it was given).
                 const auto regions = shaderMemory->TakeRecentRegions();
                 if (!regions.empty()) {
-                    if (capture->userDataUse.asValue != ~std::uint64_t{0}) stage->runs = NativeRunsFor(regions, capture->userDataUse.reads, userData, compiledResult);
+                    std::vector<std::uint32_t> parents;
+                    if (capture->userDataUse.asValue != ~std::uint64_t{0}) stage->runs = NativeRunsFor(regions, capture->userDataUse.reads, userData, compiledResult, stage.get(), &parents);
                     if (stage->runs != nullptr && dataHits()) NativeDataWords(*stage->runs, *compiledResult, capture->readTrace.leaves, capture->readTrace.otherReads);
+                    if (stage->runs != nullptr) NativeAddDataPositions(*stage->runs, parents);
                     if (stage->runs == nullptr) stage = nullptr;
                 }
             }

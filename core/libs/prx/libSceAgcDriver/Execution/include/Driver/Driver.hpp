@@ -138,6 +138,10 @@ private:
     // APS5_RELOCATED_DRAW_KEYS (DrawRelocation.cpp).
     static bool relocatedDrawKeys();
     static bool relocatedRuns(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
+    // APS5_NATIVE_DRAWS (Draw.cpp): whether a stored native stage's captured words hold at this
+    // draw's pointers (and, for chained runs, at the pointers its first runs hold now); `regions`
+    // gets the runs as found, `live` the stage's first-run words when data words changed.
+    bool nativeGather(const NativeDrawStage& stage, std::span<const std::uint32_t> userData, std::uint64_t program, std::uint32_t queue, std::vector<ShaderRecompiler::MemoryRegion>& regions, std::shared_ptr<const std::vector<std::uint32_t>>& live);
     static void appendEntryRegionsAt(const DispatchVariant& variant, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::vector<ShaderRecompiler::MemoryRegion>& regions);
     static void refreshRelocatedUserWords(const QueueState& queue, const std::vector<std::uint32_t>& relocated, std::vector<DrawProgram>& programs);
     struct DrawRelocationPlan {

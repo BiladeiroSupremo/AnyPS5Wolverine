@@ -322,6 +322,12 @@ struct SrtTape::Frame {
     std::uint64_t* values;
     std::uint8_t* states;
     bool nullRoot = false;
+    // With user-data use tracked: per node, the index in userDataUse->reads of the read that produced
+    // its value (-1 when it is not a read), so a read through a loaded pointer names its parent; and
+    // the node whose read was recorded last.
+    std::int32_t* readOf = nullptr;
+    const Node* lastReadNode = nullptr;
+    std::int32_t lastRead = -1;
 };
 
 bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const {
@@ -338,6 +344,7 @@ bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result)
     }
     frame.states[index] = 1;
     frame.values[index] = value;
+    if (frame.readOf != nullptr) frame.readOf[index] = frame.lastReadNode == &nodes[index] ? frame.lastRead : -1;
     result = value;
     return true;
 }
@@ -353,6 +360,8 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
             continue;
         }
         if (!evaluate(frame, node.arguments[index], operand[index])) return false;
+        // A base low word loaded by a read: the read through it names that read (-2 - its index).
+        if (index == 0 && frame.readOf != nullptr && frame.readOf[node.arguments[0]] >= 0) origin = -2 - frame.readOf[node.arguments[0]];
     }
     const auto a = operand[0];
     const auto b = operand[1];
@@ -391,7 +400,11 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 frame.nullRoot = true;
                 return false;
             }
-            if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
+            if (frame.runtime.userDataUse != nullptr) {
+                frame.runtime.userDataUse->reads.emplace_back(address, origin);
+                frame.lastReadNode = &node;
+                frame.lastRead = static_cast<std::int32_t>(frame.runtime.userDataUse->reads.size() - 1);
+            }
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
                 if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
@@ -532,6 +545,12 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         std::fill_n(states, nodes.size(), std::uint8_t {0});
     }
     Frame frame {runtime, values, states};
+    std::array<std::int32_t, InlineNodes> inlineReadOf;
+    std::vector<std::int32_t> heapReadOf;
+    if (use != nullptr) {
+        if (nodes.size() > InlineNodes) heapReadOf.resize(nodes.size());
+        frame.readOf = nodes.size() > InlineNodes ? heapReadOf.data() : inlineReadOf.data();
+    }
 
     struct Scratch {
         std::vector<std::uint8_t> active;

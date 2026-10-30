@@ -128,22 +128,36 @@ struct NativeDrawStage {
     std::vector<std::uint32_t> userData;
     std::uint64_t asBase = 0;
     std::shared_ptr<DispatchVariant> runs;
+    // Runs read through a pointer the walk loaded from `runs` (absolute as captured): per run, the
+    // position of that pointer's low word in runs->words (chainParents) and its value then
+    // (chained->runPointerValues); a hit moves each run by the pointer's change (Driver::nativeGather).
+    std::shared_ptr<DispatchVariant> chained;
+    std::vector<std::uint32_t> chainParents;
+    // Where those pointers' low words appear in the result (binding or NoBinding for push data, word,
+    // and in `userWord` the pointer's position in runs->words): a hit writes their values now there.
+    std::vector<DispatchVariant::UserWordPatch> chainPatches;
 };
 
 // A stage's captured words (`regions`, the words its walk read from pages) as runs, each relocated
-// at the user word its walk read it through (`walkReads`: address and that word, -1 for a pointer
-// read from memory); words the walk did not read itself stay absolute. Null when a word was read
-// through two bases or a base is not a non-null pointer pair.
-std::shared_ptr<DispatchVariant> NativeRunsFor(std::span<const ShaderRecompiler::MemoryRegion> regions, std::span<const std::pair<std::uint64_t, std::int32_t>> walkReads, const std::vector<std::uint32_t>& userData, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result);
+// at the user word its walk read it through (`walkReads`: address and origin, SrtUserDataUse::reads);
+// words the walk did not read itself stay absolute. Null when a word was read through two bases or
+// a base is not a non-null pointer pair. With `stage`, words read through a pointer loaded from
+// those runs go to stage->chained (one level; the pointer must not appear in the result) and the
+// pointers' positions to `parents` (to join the runs' data positions, NativeAddDataPositions).
+std::shared_ptr<DispatchVariant> NativeRunsFor(std::span<const ShaderRecompiler::MemoryRegion> regions, std::span<const std::pair<std::uint64_t, std::int32_t>> walkReads, const std::vector<std::uint32_t>& userData, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, NativeDrawStage* stage = nullptr, std::vector<std::uint32_t>* parents = nullptr);
+
+// Positions of runs.words a hit may find changed with nothing to patch (chain pointers).
+void NativeAddDataPositions(DispatchVariant& runs, std::span<const std::uint32_t> positions);
 
 // The data words of a stage's runs (as the dispatch cache's data hits): captured words its walk read
 // only to copy them into the flattened SRT (`leaves`, not among `otherReads`), which a hit may find
 // changed and patches in (NativeWithData). Sets runs.flatBinding, dataPositions and dataSlots.
 void NativeDataWords(DispatchVariant& runs, const ShaderRecompiler::RecompileResult& result, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
 
-// `result` with the data words a hit found (`live`: runs.words with the changed ones) in its
-// flattened SRT; a copy unless no data word is set.
-std::shared_ptr<const ShaderRecompiler::RecompileResult> NativeWithData(std::shared_ptr<const ShaderRecompiler::RecompileResult> result, const DispatchVariant& runs, std::span<const std::uint32_t> live);
+// `result` with the words a hit found (`live`: the stage's runs->words with the changed ones): data
+// words in its flattened SRT and chain pointers where they appear (chainPatches); a copy unless
+// there is nothing to write.
+std::shared_ptr<const ShaderRecompiler::RecompileResult> NativeWithData(std::shared_ptr<const ShaderRecompiler::RecompileResult> result, const NativeDrawStage& stage, std::span<const std::uint32_t> live);
 
 // APS5_NATIVE_DRAWS=1: every 64th reuse (NativeSampled) is also built as before, rendered from that
 // and compared; a mismatch turns native reuse off for the rest of the run (TripNative, logged), so a
