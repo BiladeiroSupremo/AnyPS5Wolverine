@@ -139,6 +139,14 @@ struct SpirvEmitterState {
     std::uint32_t mirrorBegin = 0;
     std::uint32_t mirrorFinish = 0;
     std::uint32_t mirrorBase = 0;
+    // Mirror scalar-buffer reads: each V# decoded once where its handle is defined
+    // (HoistScalarBufferDescriptor), by (handle, emitting context); cleared with the mirror words.
+    struct HoistedScalarBuffer {
+        std::uint32_t physical = 0;  // u64: the V# base's mirror address
+        std::uint32_t limit = 0;     // u32: a read's 4-aligned offset is in bounds when below it
+        std::uint32_t spare = 0;     // u64: what an out-of-bounds read loads (the unbound last page)
+    };
+    std::map<std::pair<const void*, const void*>, HoistedScalarBuffer> hoistedScalarBuffers;
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaWriteProbeFunction = 0;
     std::uint32_t bdaAtomicPointerFunction = 0;

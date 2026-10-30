@@ -1428,8 +1428,9 @@ void EmitGetSrtResource(SpirvValueEmitContext& context) {
     EmitVoid(context);
 }
 
-void EmitGetBufferResource(SpirvValueEmitContext& context) {
+void EmitGetBufferResource(SpirvValueEmitContext& context, const IrValue& inst) {
     EmitVoid(context);
+    HoistScalarBufferDescriptor(context, inst);
 }
 
 void EmitGetAddressResource(SpirvValueEmitContext& context) {

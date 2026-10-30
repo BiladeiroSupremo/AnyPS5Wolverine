@@ -891,6 +891,7 @@ MirrorWords LoadMirrorWords(SpirvEmitterState& state) {
 
 void HoistMirrorWords(SpirvEmitterState& state) {
     state.mirrorBegin = state.mirrorFinish = state.mirrorBase = 0u;
+    state.hoistedScalarBuffers.clear();
     if (!BdaMirrorMode() || state.bdaPagetableVariable == 0u) return;
     const auto words = LoadMirrorWords(state);
     state.mirrorBegin = words.begin;
@@ -920,8 +921,13 @@ void DefineMirrorWordFunction(SpirvEmitterState& state) {
     state.mirrorWordFunction = function;
 }
 
-std::uint32_t EmitMirrorWordCall(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid) {
+std::uint32_t EmitMirrorWordCall(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, bool uniform) {
     const auto words = LoadMirrorWords(state);
+    // A wave-uniform read is made here: the helper's window read is per lane (a NonUniform window
+    // index, a waterfall loop around every read) and windows then cost +8 ms GPU per frame
+    // (trnw1, 2026-10-29). APS5_MIRROR_WINDOWS_LANE_CALLS=1 sends every read through the helper.
+    static const bool laneCalls = std::getenv("APS5_MIRROR_WINDOWS_LANE_CALLS") != nullptr;
+    if (uniform && !laneCalls) return EmitMirrorWordRead(state, guest, valid, 0u, words, true);
     if (state.mirrorWordFunction == 0u) return EmitMirrorWordRead(state, guest, valid, 0u, words);
     const auto value = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionCall, TypeU32(state), value, state.mirrorWordFunction, guest, valid, words.begin, words.finish, words.base);

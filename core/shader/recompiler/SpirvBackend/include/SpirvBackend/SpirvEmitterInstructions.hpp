@@ -230,7 +230,7 @@ std::uint32_t EmitUndefU16(SpirvEmitterState& state, const IrValue& inst);
 std::uint32_t EmitUndefU32(SpirvEmitterState& state, const IrValue& inst);
 std::uint32_t EmitUndefU64(SpirvEmitterState& state, const IrValue& inst);
 void EmitGetSrtResource(SpirvValueEmitContext& context);
-void EmitGetBufferResource(SpirvValueEmitContext& context);
+void EmitGetBufferResource(SpirvValueEmitContext& context, const IrValue& inst);
 void EmitGetAddressResource(SpirvValueEmitContext& context);
 void EmitGetScratchResource(SpirvValueEmitContext& context);
 void EmitGetImageResource(SpirvValueEmitContext& context);

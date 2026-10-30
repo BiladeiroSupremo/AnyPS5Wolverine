@@ -1115,6 +1115,7 @@ void EmitProgram(SpirvEmitterState& state) {
     // The body's hoisted mirror words (HoistMirrorWords) are its own: nothing emitted after it
     // may use them.
     state.mirrorBegin = state.mirrorFinish = state.mirrorBase = 0u;
+    state.hoistedScalarBuffers.clear();
     if (state.program.Resources().stage == IrShaderStage::Mesh) {
         EmitMeshEntryPoint(state);
     }

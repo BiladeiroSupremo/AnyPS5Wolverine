@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <set>
 #include <span>
 #include <string>
@@ -821,18 +822,91 @@ void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instr
     });
 }
 
+namespace {
+
+// A scalar buffer's size in bytes (stride * records, or records without a stride).
+std::uint32_t scalarBufferSize(SpirvEmitterState& state, const RuntimeDescriptor& resource) {
+    const auto u64 = TypeScalarU64(state);
+    return Select(state, u64, equal(state, resource.stride, ConstantU32(state, 0u)), Unary(state, spv::OpUConvert, u64, resource.records), Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, resource.stride), Unary(state, spv::OpUConvert, u64, resource.records)));
+}
+
+}
+
+// The V# of mirror scalar reads, decoded once where its handle is defined (which dominates every
+// read of it): the mirror address of its base, and a 32-bit limit below which a read's 4-aligned
+// offset lies in both the V#'s size and the mirror (0 for an invalid V# or a base outside the
+// mirror). Each read then takes one 32-bit compare and a pointer add, all scalar. Decoded at every
+// read, the V#'s 64-bit bounds and the mirror range checks (64-bit compares run on the vector unit:
+// the scalar unit has none) cost ~30 instructions and long-lived 64-bit values (SGPR spills) per
+// read: 0x11d14cab00 88k instructions vs 64.6k on the bound path, and the address path's pixel
+// shaders took ~6 ms of GPU time per frame more than the bound path (trnp1/trgt2, 2026-10-29).
+// A read whose V# starts below the mirror reads zero. APS5_NO_HOISTED_VSHARPS=1 decodes per read.
+void HoistScalarBufferDescriptor(SpirvValueEmitContext& context, const IrValue& handle) {
+    auto& state = context.state;
+    static const bool hoist = std::getenv("APS5_NO_HOISTED_VSHARPS") == nullptr;
+    if (!hoist || state.mirrorBegin == 0u || state.module.InHelperFunction() || BdaMirrorWindows() || !BdaUniformReads() || handle.ArgumentCount() != 4u) return;
+    if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) return;
+    const IrValue* read = nullptr;
+    for (const IrValue* user : handle.Uses()) {
+        if (user->Opcode() != IrOpcode::ReadConstBuffer || user->ArgumentCount() == 0u || user->Argument(0)->Resolve() != &handle) continue;
+        const auto& memory = context.Memory(*user);
+        if (memory.planningOnly || memory.kind != ResourceKind::ScalarBuffer || !memory.gpuDescriptor || memory.coherent) continue;
+        read = user;
+        break;
+    }
+    if (read == nullptr) return;
+    state.module.EmitCapability(spv::CapabilityInt64);
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto resource = descriptor(context, *read, false);
+    const auto size = scalarBufferSize(state, resource);
+    const auto words = LoadMirrorWords(state);
+    const auto inMirror = both(state, resource.valid, both(state, Binary(state, spv::OpUGreaterThanEqual, boolean, resource.base, words.begin), Binary(state, spv::OpULessThan, boolean, resource.base, words.finish)));
+    const auto room = Binary(state, spv::OpISub, u64, words.finish, resource.base);
+    const auto bytes = Select(state, u64, Binary(state, spv::OpULessThan, boolean, size, room), size, room);
+    const auto bytes32 = Select(state, u32, Binary(state, spv::OpUGreaterThan, boolean, bytes, BdaConstant(state, 0xffffffffu)), ConstantU32(state, 0xffffffffu), Unary(state, spv::OpUConvert, u32, bytes));
+    // byte + 4 <= bytes  <=>  byte < bytes - 3 (no offset fits in fewer than four bytes).
+    const auto fits = both(state, inMirror, Binary(state, spv::OpUGreaterThanEqual, boolean, bytes32, ConstantU32(state, 4u)));
+    const auto limit = Select(state, u32, fits, Binary(state, spv::OpISub, u32, bytes32, ConstantU32(state, 3u)), ConstantU32(state, 0u));
+    const auto physical = Binary(state, spv::OpIAdd, u64, words.base, Binary(state, spv::OpISub, u64, resource.base, words.begin));
+    const auto spare = Binary(state, spv::OpISub, u64, Binary(state, spv::OpIAdd, u64, words.base, Binary(state, spv::OpISub, u64, words.finish, words.begin)), BdaConstant(state, 0x10000u));
+    state.hoistedScalarBuffers[{&handle, &context}] = {physical, limit, spare};
+}
+
 std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const IrValue& instruction) {
     auto& state = context.state;
     if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) context.Fail(instruction, "scalar buffer bounds require shaderInt64");
     state.module.EmitCapability(spv::CapabilityInt64);
     const bool mirrorRead = context.Memory(instruction).gpuDescriptor && BdaMirrorMode() && !context.Memory(instruction).coherent;
-    const auto resource = descriptor(context, instruction, !mirrorRead);
     const auto u64 = TypeScalarU64(state);
-    const auto size = Select(state, u64, equal(state, resource.stride, ConstantU32(state, 0u)), Unary(state, spv::OpUConvert, u64, resource.records), Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, resource.stride), Unary(state, spv::OpUConvert, u64, resource.records)));
-    const auto address = EmitAddU32(state, context.Arg(instruction, 1u), ConstantU32(state, context.Memory(instruction).offset));
-    const auto noCarry = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address, context.Arg(instruction, 1u));
+    // A mirror read's offset is a guest SGPR (or an immediate): wave-uniform like the V# words
+    // descriptor() broadcasts. Seen per lane, it made the bounds, then the mirror pointer they select,
+    // per lane: a vector load where the guest made a scalar one, ~10% more VGPRs (RGA, 2026-10-29).
+    // APS5_UNIFORM_BOUNDS=bool broadcasts the bounds flag instead; APS5_NO_UNIFORM_BOUNDS=1 neither.
+    static const int uniformBounds = std::getenv("APS5_NO_UNIFORM_BOUNDS") != nullptr ? 0 : std::getenv("APS5_UNIFORM_BOUNDS") != nullptr && std::strcmp(std::getenv("APS5_UNIFORM_BOUNDS"), "bool") == 0 ? 2 : 1;
+    const bool uniformOffset = mirrorRead && BdaUniformReads() && uniformBounds == 1 && !instruction.Argument(1)->Resolve()->HasImmediate();
+    const auto guestOffset = uniformOffset ? BroadcastFirstU32(state, context.Arg(instruction, 1u)) : context.Arg(instruction, 1u);
+    const auto address = EmitAddU32(state, guestOffset, ConstantU32(state, context.Memory(instruction).offset));
+    const auto noCarry = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address, guestOffset);
     const auto byte = EmitAndConstant(state, address, ~3u);
     const auto offset = Unary(state, spv::OpUConvert, u64, byte);
+    // Its V# decoded at the handle (HoistScalarBufferDescriptor): one compare and a pointer add.
+    if (mirrorRead) {
+        if (const auto found = state.hoistedScalarBuffers.find({instruction.Argument(0)->Resolve(), &context}); found != state.hoistedScalarBuffers.end()) {
+            const auto& hoisted = found->second;
+            const auto inside = both(state, noCarry, Binary(state, spv::OpULessThan, TypeBool(state), byte, hoisted.limit));
+            // The mirror's base and begin are page-aligned: the scalar unit's dropped low two bits.
+            const auto at = Binary(state, spv::OpBitwiseAnd, u64, Binary(state, spv::OpIAdd, u64, hoisted.physical, offset), BdaConstant(state, ~std::uint64_t{3u}));
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, Select(state, u64, inside, at, hoisted.spare));
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, spv::MemoryAccessAlignedMask, 4u);
+            return Select(state, TypeU32(state), inside, value, ConstantU32(state, 0u));
+        }
+    }
+    const auto resource = descriptor(context, instruction, !mirrorRead);
+    const auto size = scalarBufferSize(state, resource);
     const auto inBounds = both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThanEqual, TypeBool(state), Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size)));
     // Under robustBufferAccess2 the word is read whatever the V#'s bounds and a select keeps or
     // drops it (readOrZero): a branch around every constant load split the shader's scalar loads
@@ -844,8 +918,12 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     if (mirrorRead) {
         // A guest scalar load (s_buffer_load): its address is wave-uniform (BdaUniformReads).
         auto guest = Binary(state, spv::OpBitwiseAnd, u64, Binary(state, spv::OpIAdd, u64, resource.base, offset), BdaConstant(state, ~std::uint64_t{3u}));
-        if (BdaUniformReads()) guest = BroadcastFirstU64(state, guest);
-        return EmitMirrorWordCall(state, guest, inBounds);
+        auto valid = inBounds;
+        if (BdaUniformReads()) {
+            if (!uniformOffset) guest = BroadcastFirstU64(state, guest);
+            if (uniformBounds == 2) valid = Binary(state, spv::OpINotEqual, TypeBool(state), BroadcastFirstU32(state, Select(state, TypeU32(state), inBounds, ConstantU32(state, 1u), ConstantU32(state, 0u))), ConstantU32(state, 0u));
+        }
+        return EmitMirrorWordCall(state, guest, valid, BdaUniformReads());
     }
     return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
 }

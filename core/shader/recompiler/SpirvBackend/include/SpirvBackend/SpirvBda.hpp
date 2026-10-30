@@ -77,7 +77,9 @@ std::array<std::uint32_t, 5> EmitMirrorWordsRead(SpirvEmitterState& state, std::
 // The same read as one helper function (read_mirror_word) the reads call: defined with the other
 // BDA functions in mirror mode; EmitMirrorWordCall falls back to the inline read without it.
 void DefineMirrorWordFunction(SpirvEmitterState& state);
-std::uint32_t EmitMirrorWordCall(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid);
+// `uniform`: the caller made `guest` wave-uniform (a guest scalar load); the read is then inline,
+// with the window picked from the first lane.
+std::uint32_t EmitMirrorWordCall(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t valid, bool uniform = false);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
 
 }
