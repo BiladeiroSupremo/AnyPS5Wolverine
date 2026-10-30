@@ -53,7 +53,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         stageCapture.userWordsAsBase = capture->userDataUse.asBase;
         stageCapture.userWordsAsValue = capture->userDataUse.asValue;
         static const bool nativeDraws = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
-        if (nativeDraws) stageCapture.walkReads = capture->userDataUse.reads;
+        if (nativeDraws) {
+            stageCapture.walkReads = capture->userDataUse.reads;
+            stageCapture.dataLeaves = capture->readTrace.leaves;
+            stageCapture.otherReads = capture->readTrace.otherReads;
+        }
         stageCapture.captured = true;
         // APS5_PROFILE_DRAW: native coverage, the stages whose resources need no CPU read of guest
         // memory (user data alone; everything else resolved on the GPU), on a [walk-free] line.

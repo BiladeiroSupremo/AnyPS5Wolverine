@@ -105,6 +105,10 @@ struct StageCapture {
     // APS5_NATIVE_DRAWS: the walk's reads, each with the user word its base pointer came from (-1:
     // a pointer read from memory), to relocate the captured runs exactly.
     std::vector<std::pair<std::uint64_t, std::int32_t>> walkReads;
+    // ... and the capture's read trace: flattened-SRT slots read verbatim from one address (leaves)
+    // and the addresses read for anything else (ResourceCapture::readTrace), for its data words.
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> dataLeaves;
+    std::vector<std::uint64_t> otherReads;
     bool captured = false;
 };
 
@@ -131,6 +135,15 @@ struct NativeDrawStage {
 // read from memory); words the walk did not read itself stay absolute. Null when a word was read
 // through two bases or a base is not a non-null pointer pair.
 std::shared_ptr<DispatchVariant> NativeRunsFor(std::span<const ShaderRecompiler::MemoryRegion> regions, std::span<const std::pair<std::uint64_t, std::int32_t>> walkReads, const std::vector<std::uint32_t>& userData, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result);
+
+// The data words of a stage's runs (as the dispatch cache's data hits): captured words its walk read
+// only to copy them into the flattened SRT (`leaves`, not among `otherReads`), which a hit may find
+// changed and patches in (NativeWithData). Sets runs.flatBinding, dataPositions and dataSlots.
+void NativeDataWords(DispatchVariant& runs, const ShaderRecompiler::RecompileResult& result, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
+
+// `result` with the data words a hit found (`live`: runs.words with the changed ones) in its
+// flattened SRT; a copy unless no data word is set.
+std::shared_ptr<const ShaderRecompiler::RecompileResult> NativeWithData(std::shared_ptr<const ShaderRecompiler::RecompileResult> result, const DispatchVariant& runs, std::span<const std::uint32_t> live);
 
 // Whether a stage's stored user words admit these: the value-used words equal, the base pointers
 // null where they were null (a walk through a null pointer records no read).

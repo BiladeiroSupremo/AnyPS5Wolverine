@@ -13,11 +13,45 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include "Optimization/ResourceMaterializer.hpp"
+#include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// APS5_NATIVE_DRAWS (native path for direct dispatches, see Driver::dispatch): per shape (the
+// dispatch key without user words) its most recent stages first, and 10 s counters.
+struct NativeDispatchCache {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::vector<std::shared_ptr<const NativeDrawStage>>> shapes;
+    // Per shape: stores and hits. Most dispatch shapes change their value-used user words every time
+    // (trn5v, 2026-10-30: ~4k stores and ~170 hits per 10 s), so a shape stored 8 times with fewer
+    // hits than a quarter of its stores is left to the dispatch cache and capture (`unstable`).
+    std::unordered_map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>> churn;
+    std::uint64_t hits = 0, walkingHits = 0, stored = 0, walkingStored = 0, refused = 0, missedValues = 0, missedRuns = 0, gathers = 0, gatherNs = 0, unstable = 0;
+    std::uint64_t verifyEqual = 0, verifyDiffer = 0, verifyReports = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+NativeDispatchCache& nativeDispatchCache() {
+    static auto* cache = new NativeDispatchCache();
+    return *cache;
+}
+
+void reportNativeDispatches(NativeDispatchCache& cache) {
+    const auto clock = std::chrono::steady_clock::now();
+    if (clock - cache.reported < std::chrono::seconds(10)) return;
+    cache.reported = clock;
+    std::fprintf(stderr, "[native-dispatches] (10 s) reuse: %llu hits (%llu walking), %llu stored (%llu walking), %llu refused, %llu of unstable shapes; known shapes missed on value words %llu, on captured words %llu; gathers %llu, %.1f us each; %zu shapes kept; verify: %llu equal, %llu differ\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.walkingHits), static_cast<unsigned long long>(cache.stored), static_cast<unsigned long long>(cache.walkingStored), static_cast<unsigned long long>(cache.refused), static_cast<unsigned long long>(cache.unstable), static_cast<unsigned long long>(cache.missedValues), static_cast<unsigned long long>(cache.missedRuns), static_cast<unsigned long long>(cache.gathers), cache.gathers == 0 ? 0.0 : static_cast<double>(cache.gatherNs) / 1e3 / static_cast<double>(cache.gathers), cache.shapes.size(), static_cast<unsigned long long>(cache.verifyEqual), static_cast<unsigned long long>(cache.verifyDiffer));
+    cache.hits = cache.walkingHits = cache.stored = cache.walkingStored = cache.refused = cache.unstable = cache.missedValues = cache.missedRuns = cache.gathers = cache.gatherNs = cache.verifyEqual = cache.verifyDiffer = 0;
+}
+
+}
 
 // Queue 0's direct dispatches join the draw pipeline (APS5_PIPELINED_DRAWS) unless
 // APS5_NO_PIPELINED_DISPATCHES=1 keeps them inline (draining the queued draws at each one).
@@ -288,10 +322,121 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
+    // APS5_NATIVE_DRAWS (native path for direct dispatches, as Driver::draw's N2/N3): a dispatch the
+    // dispatch cache missed whose shape (its key without user words) was dispatched before, with the
+    // user words that dispatch's capture used as values equal and its captured words equal at this
+    // dispatch's pointers (validateVariant), reuses that dispatch's compiled program with its user
+    // words patched in, skipping capture and materialize. =verify captures as before and compares
+    // ([native-dispatches] line).
+    static const bool nativeDispatches = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
+    static const bool nativeVerify = nativeDispatches && std::string_view(std::getenv("APS5_NATIVE_DRAWS")) == "verify";
+    bool nativeEligible = nativeDispatches && keyHygiene && !cached && !fromAhead && !resolving && !probeThis && indirectArguments == 0;
+    std::uint64_t nativeShape = 0;
+    std::shared_ptr<const NativeDrawStage> nativeHit;
+    std::vector<ShaderRecompiler::MemoryRegion> nativeRegions;
+    std::shared_ptr<const std::vector<std::uint32_t>> nativeLive;
+    if (nativeEligible) {
+        nativeShape = 0xcbf29ce484222325ull;
+        const auto mixShape = [&](std::uint64_t value) {
+            nativeShape ^= value;
+            nativeShape *= 0x100000001b3ull;
+        };
+        mixShape(address);
+        mixShape(packet[4] & 0x8000u);
+        mixShape(reinterpret_cast<std::uintptr_t>(expanded.get()));
+        for (const auto threads : compute.partialThreads) mixShape(threads);
+        mixShape(userData.size());
+        for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+            const auto found = queue.shader.find(offset);
+            mixShape(found == queue.shader.end() ? (1ull << 32u) : found->second);
+        }
+        mixShape(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+        auto& cache = nativeDispatchCache();
+        std::vector<std::shared_ptr<const NativeDrawStage>> entries;
+        {
+            std::lock_guard lock(cache.mutex);
+            const auto churned = cache.churn.find(nativeShape);
+            if (churned != cache.churn.end() && churned->second.first >= 8 && churned->second.second * 4 < churned->second.first) {
+                ++cache.unstable;
+                nativeEligible = false;
+            } else if (const auto found = cache.shapes.find(nativeShape); found != cache.shapes.end()) {
+                entries = found->second;
+            }
+        }
+        bool valuesMatched = false;
+        for (const auto& entry : entries) {
+            if (!NativeSameValues(*entry, userData)) continue;
+            valuesMatched = true;
+            if (entry->runs == nullptr) {
+                nativeHit = entry;
+                break;
+            }
+            const auto started = std::chrono::steady_clock::now();
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+            nativeRegions.clear();
+            bool equal = relocatedRuns(*entry->runs, userData, runs);
+            if (equal) {
+                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
+                std::optional<SampledReadScope> sampling;
+                std::uint64_t imagesFlushed = 0, runsSynced = 0;
+                appendEntryRegionsAt(*entry->runs, runs, nativeRegions);
+                // Data words (NativeDataWords) may differ: their values come back in `live`, and
+                // the regions then point at this dispatch's own words.
+                std::vector<std::pair<std::uint32_t, std::uint32_t>> live;
+                const auto outcome = validateVariant(address, submission.queue, *entry->runs, nativeRegions, imagesFlushed, runsSynced, sampling, entry->runs->dataPositions.empty() ? nullptr : &live, &runs);
+                equal = outcome == EntryOutcome::Equal || outcome == EntryOutcome::EqualData;
+                if (outcome == EntryOutcome::EqualData) {
+                    auto words = std::make_shared<std::vector<std::uint32_t>>(entry->runs->words);
+                    for (const auto& [position, value] : live) (*words)[position] = value;
+                    nativeRegions.clear();
+                    std::size_t offset = 0;
+                    for (const auto& [begin, end] : runs) {
+                        const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+                        nativeRegions.push_back({begin, std::as_bytes(std::span<const std::uint32_t>(*words).subspan(offset, count))});
+                        offset += count;
+                    }
+                    nativeLive = std::move(words);
+                } else {
+                    nativeLive = nullptr;
+                }
+            }
+            {
+                std::lock_guard lock(cache.mutex);
+                cache.gatherNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+                ++cache.gathers;
+            }
+            if (equal) {
+                nativeHit = entry;
+                break;
+            }
+        }
+        if (nativeHit == nullptr) {
+            nativeRegions.clear();
+            nativeLive = nullptr;
+        }
+        std::lock_guard lock(cache.mutex);
+        if (nativeHit != nullptr) {
+            ++cache.hits;
+            ++cache.churn[nativeShape].second;
+            if (nativeHit->runs != nullptr) ++cache.walkingHits;
+        } else if (!entries.empty()) {
+            ++(valuesMatched ? cache.missedRuns : cache.missedValues);
+        }
+        reportNativeDispatches(cache);
+    }
+    const bool nativeReused = nativeHit != nullptr && !nativeVerify;
+    if (nativeReused) {
+        compiledResult = NativePatchedResult(*nativeHit, userData, std::nullopt);
+        require(compiledResult != nullptr, "native dispatch: a user-word patch lies outside the cached program");
+        if (nativeLive != nullptr) compiledResult = NativeWithData(std::move(compiledResult), *nativeHit->runs, *nativeLive);
+        // The runs at this dispatch's pointers, into the entry's words (the commit holds the entry).
+        captured = std::move(nativeRegions);
+        phaseTiming.Phase(PhaseLookup);
+    }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         captureMs += phaseTiming.Elapsed();
-    } else if (!fromAhead) {
+    } else if (!fromAhead && !nativeReused) {
         shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
         std::uint64_t forgetAtCapture = 0;
 
@@ -355,6 +500,56 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
         insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        if (nativeEligible && nativeHit != nullptr) {
+            // =verify: the reused copy against this capture.
+            auto patched = NativePatchedResult(*nativeHit, userData, std::nullopt);
+            if (nativeLive != nullptr) patched = NativeWithData(std::move(patched), *nativeHit->runs, *nativeLive);
+            const bool equal = patched != nullptr && sameCompiledResult(*patched, *compiledResult) && patched->poisonedSrtReads == compiledResult->poisonedSrtReads;
+            auto& cache = nativeDispatchCache();
+            std::lock_guard lock(cache.mutex);
+            ++(equal ? cache.verifyEqual : cache.verifyDiffer);
+            if (!equal && cache.verifyReports < 12) {
+                ++cache.verifyReports;
+                std::uint64_t changed = 0;
+                for (std::size_t word = 0; word < 64 && word < userData.size() && word < nativeHit->userData.size(); ++word) {
+                    if (userData[word] != nativeHit->userData[word]) changed |= std::uint64_t{1} << word;
+                }
+                std::fprintf(stderr, "[native-dispatches] verify: program 0x%llx differs from its reused copy (user words changed 0x%llx, value-used 0x%llx%s)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(changed), static_cast<unsigned long long>(nativeHit->asValue), nativeHit->runs != nullptr ? ", walking" : "");
+            }
+        } else if (nativeEligible) {
+            // A miss keeps this dispatch for its shape, before the shape's older entries (a program
+            // that read inaccessible memory is not kept, as the dispatch cache keeps none).
+            std::shared_ptr<NativeDrawStage> stage;
+            if (capture != nullptr && CacheableResult(*compiledResult)) {
+                auto patches = userWordPatchesFor(*compiledResult, userData);
+                const auto data = shaderDataPatchesFor(*compiledResult);
+                patches.insert(patches.end(), data.begin(), data.end());
+                stage = std::make_shared<NativeDrawStage>(NativeDrawStage{compiledResult, std::move(patches), address, std::nullopt, capture->userDataUse.asValue, userData, capture->userDataUse.asBase, nullptr});
+                // The words the walk read from pages (not the code and header it was given).
+                const auto regions = shaderMemory->TakeRecentRegions();
+                if (!regions.empty()) {
+                    if (capture->userDataUse.asValue != ~std::uint64_t{0}) stage->runs = NativeRunsFor(regions, capture->userDataUse.reads, userData, compiledResult);
+                    if (stage->runs != nullptr && dataHits()) NativeDataWords(*stage->runs, *compiledResult, capture->readTrace.leaves, capture->readTrace.otherReads);
+                    if (stage->runs == nullptr) stage = nullptr;
+                }
+            }
+            auto& cache = nativeDispatchCache();
+            std::lock_guard lock(cache.mutex);
+            if (stage != nullptr) {
+                if (cache.shapes.size() > (1u << 14)) cache.shapes.clear();
+                if (cache.churn.size() > (1u << 16)) cache.churn.clear();
+                ++cache.churn[nativeShape].first;
+                auto& entries = cache.shapes[nativeShape];
+                const bool walking = stage->runs != nullptr;
+                entries.insert(entries.begin(), std::move(stage));
+                if (entries.size() > 4) entries.pop_back();
+                ++cache.stored;
+                if (walking) ++cache.walkingStored;
+            } else {
+                ++cache.refused;
+            }
+            reportNativeDispatches(cache);
+        }
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
@@ -501,7 +696,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         commit.runQueue = VulkanDevice::CurrentDispatchRun().queue;
         commit.inRun = VulkanDevice::CurrentDispatchRun().inRun;
         commit.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        commit.owners = {registeredShader, expanded, shaderMemory, capture};
+        commit.owners = {registeredShader, expanded, shaderMemory, capture, nativeHit, nativeLive};
         commit.liveWords = std::move(liveWords);
         commit.captured = std::move(captured);
         auto writes = dispatchWriteRanges(*compiledResult);
