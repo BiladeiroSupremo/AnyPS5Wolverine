@@ -180,7 +180,10 @@ void NativeDataWords(DispatchVariant& runs, const ShaderRecompiler::RecompileRes
 // state the verify runs did not meet costs a few wrong draws at most. NativeTripped: turned off.
 bool NativeSampled();
 bool NativeTripped();
+// A mismatch blocks the program it was found in (NativeProgramBlocked); past 16 programs it turns
+// the native path off (NativeTripped).
 void TripNative(const char* what, std::uint64_t program);
+bool NativeProgramBlocked(std::uint64_t program);
 
 // Whether a stage's stored user words admit these: the value-used words equal, the base pointers
 // null where they were null (a walk through a null pointer records no read).

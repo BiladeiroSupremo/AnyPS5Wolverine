@@ -144,8 +144,46 @@ bool NativeTripped() {
     return nativeTripped.load(std::memory_order_relaxed);
 }
 
+namespace {
+
+// Programs a sampled check found unlike a fresh build: not reused any more. Beyond MaxBlocked of
+// them the native path turns off whole (a cause wider than a program family).
+struct NativeBlockedPrograms {
+    std::mutex mutex;
+    std::unordered_set<std::uint64_t> programs;
+    std::atomic<std::size_t> count{0};
+};
+
+NativeBlockedPrograms& nativeBlocked() {
+    static NativeBlockedPrograms blocked;
+    return blocked;
+}
+
+constexpr std::size_t MaxBlocked = 16;
+
+}
+
+bool NativeProgramBlocked(std::uint64_t program) {
+    auto& blocked = nativeBlocked();
+    if (blocked.count.load(std::memory_order_relaxed) == 0) return false;
+    std::lock_guard lock(blocked.mutex);
+    return blocked.programs.contains(program);
+}
+
 void TripNative(const char* what, std::uint64_t program) {
-    if (!nativeTripped.exchange(true)) std::fprintf(stderr, "[native] a sampled check found %s of program 0x%llx unlike a fresh build: native reuse is off for the rest of the run\n", what, static_cast<unsigned long long>(program));
+    auto& blocked = nativeBlocked();
+    std::size_t count = 0;
+    {
+        std::lock_guard lock(blocked.mutex);
+        if (!blocked.programs.insert(program).second) return;
+        count = blocked.programs.size();
+        blocked.count.store(count, std::memory_order_relaxed);
+    }
+    if (count <= MaxBlocked) {
+        std::fprintf(stderr, "[native] a sampled check found %s of program 0x%llx unlike a fresh build: that program is no longer reused (%zu blocked)\n", what, static_cast<unsigned long long>(program), count);
+        return;
+    }
+    if (!nativeTripped.exchange(true)) std::fprintf(stderr, "[native] a sampled check found %s of program 0x%llx unlike a fresh build, %zu programs blocked: native reuse is off for the rest of the run\n", what, static_cast<unsigned long long>(program), count);
 }
 
 std::uint64_t NativeValueChanges(const NativeDrawStage& stage, std::span<const std::uint32_t> userData) {
@@ -1278,7 +1316,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<std::shared_ptr<const std::vector<std::uint32_t>>> nativeLive;
     // =verify: the first entry whose value words matched (the miss diagnostic below).
     NativeDrawEntry nativeMissed;
-    if (nativeDraws && !drawHit) {
+    // A draw with a program a sampled check blocked is built as before and not kept.
+    const bool nativeBlockedDraw = nativeDraws && std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return NativeProgramBlocked(program.binary.codeAddress); });
+    if (nativeDraws && !drawHit && !nativeBlockedDraw) {
         auto& cache = nativeDrawCache();
         std::vector<NativeDrawEntry> entries;
         {
@@ -1474,7 +1514,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<std::vector<NativeDrawStage>> store;
         bool walking = false;
         if (nativeHit == nullptr && nativeVerify && nativeMissed != nullptr) noteNativeMiss(*nativeMissed, stageCaptures, programs, decodeReads);
-        if (nativeHit == nullptr) {
+        if (nativeHit == nullptr && !nativeBlockedDraw) {
             store = std::make_shared<std::vector<NativeDrawStage>>(programs.size());
             for (std::size_t i = 0; store != nullptr && i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack) continue;
@@ -1942,6 +1982,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 // skipped as an inline one is (PacketExecution); APS5_STRICT_DRAWS=1 makes it fatal, which stops
 // the pipeline.
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, std::uint32_t packetOpcode, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::DrawResourceProbe probe) {
+    // Causal-profile probe (APS5_SLOW_COMMIT_US=<us>): every committed draw spins this long first,
+    // outside the GPU lock, so a run shows how much the frame depends on the committer's time per
+    // draw (as APS5_SLOW_DRAW_PACKET_US does for queue 0).
+    static const auto slowCommit = std::chrono::microseconds(std::getenv("APS5_SLOW_COMMIT_US") != nullptr ? std::strtoll(std::getenv("APS5_SLOW_COMMIT_US"), nullptr, 10) : 0);
+    if (slowCommit.count() > 0) {
+        const auto until = std::chrono::steady_clock::now() + slowCommit;
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
     GuestMemory::SetCurrentPacket(packetOpcode, queue);
     try {
         // The resource-cache probe before the lock, of the key the worker made when it queued the

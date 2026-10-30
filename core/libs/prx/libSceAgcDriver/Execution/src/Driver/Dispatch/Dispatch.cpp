@@ -333,7 +333,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     // ([native-dispatches] line).
     static const bool nativeDispatches = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
     static const bool nativeVerify = nativeDispatches && std::string_view(std::getenv("APS5_NATIVE_DRAWS")) == "verify";
-    bool nativeEligible = nativeDispatches && !NativeTripped() && keyHygiene && !cached && !fromAhead && !resolving && !probeThis && indirectArguments == 0;
+    bool nativeEligible = nativeDispatches && !NativeTripped() && !NativeProgramBlocked(address) && keyHygiene && !cached && !fromAhead && !resolving && !probeThis && indirectArguments == 0;
     std::uint64_t nativeShape = 0;
     std::shared_ptr<const NativeDrawStage> nativeHit;
     std::vector<ShaderRecompiler::MemoryRegion> nativeRegions;
