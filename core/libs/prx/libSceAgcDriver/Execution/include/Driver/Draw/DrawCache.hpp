@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -99,10 +102,43 @@ struct StageCapture {
     // APS5_RELOCATED_DRAW_KEYS; captured is set when this draw ran the walk.
     std::uint64_t userWordsAsBase = 0;
     std::uint64_t userWordsAsValue = 0;
+    // APS5_NATIVE_DRAWS: the walk's reads, each with the user word its base pointer came from (-1:
+    // a pointer read from memory), to relocate the captured runs exactly.
+    std::vector<std::pair<std::uint64_t, std::int32_t>> walkReads;
     bool captured = false;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
+
+// APS5_NATIVE_DRAWS (native path, Draw.cpp and Dispatch.cpp): a stage as materialized, the patches
+// that carry a later draw's user words into it, its program and vertex stage info (a hit needs the
+// same), the user words its capture used as values and as base pointers, the capturing draw's user
+// words, and for a stage that read guest memory its captured words as runs relocated at their
+// pointers (NativeRunsFor), which a hit compares at its own pointers.
+struct NativeDrawStage {
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::vector<DispatchVariant::UserWordPatch> patches;
+    std::uint64_t program = 0;
+    std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+    std::uint64_t asValue = 0;
+    std::vector<std::uint32_t> userData;
+    std::uint64_t asBase = 0;
+    std::shared_ptr<DispatchVariant> runs;
+};
+
+// A stage's captured words (`regions`, the words its walk read from pages) as runs, each relocated
+// at the user word its walk read it through (`walkReads`: address and that word, -1 for a pointer
+// read from memory); words the walk did not read itself stay absolute. Null when a word was read
+// through two bases or a base is not a non-null pointer pair.
+std::shared_ptr<DispatchVariant> NativeRunsFor(std::span<const ShaderRecompiler::MemoryRegion> regions, std::span<const std::pair<std::uint64_t, std::int32_t>> walkReads, const std::vector<std::uint32_t>& userData, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result);
+
+// Whether a stage's stored user words admit these: the value-used words equal, the base pointers
+// null where they were null (a walk through a null pointer records no read).
+bool NativeSameValues(const NativeDrawStage& stage, std::span<const std::uint32_t> userData);
+
+// The stage with this draw's user words patched in and its vertex attributes' V#s from `vertex`;
+// the stage itself when there is nothing to change, null when a patch lies outside it.
+std::shared_ptr<const ShaderRecompiler::RecompileResult> NativePatchedResult(const NativeDrawStage& stage, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex);
 
 // The shader register a draw program's user word comes from, or 0 for a merged stage's driver
 // words (DrawRelocation.cpp).

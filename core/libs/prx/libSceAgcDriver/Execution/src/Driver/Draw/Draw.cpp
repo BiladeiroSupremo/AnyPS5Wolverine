@@ -26,20 +26,22 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-// APS5_NATIVE_DRAWS (native path N2, see Driver::draw): a walk-free shape's stages as first
-// materialized, the patches that carry a draw's user words into them, the program and the vertex
-// stage info they were built for (a hit needs the same; empty for a GeometryBack role).
-struct NativeDrawStage {
-    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
-    std::vector<DispatchVariant::UserWordPatch> patches;
-    std::uint64_t program = 0;
-    std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
-};
+// APS5_NATIVE_DRAWS (native path N1-N3, see Driver::draw): a shape's stages (NativeDrawStage, empty
+// for a GeometryBack role).
+using NativeDrawEntry = std::shared_ptr<const std::vector<NativeDrawStage>>;
+
+// A shape keeps its most recent entries first (walking shapes vary by their value words).
+constexpr std::size_t NativeEntriesPerShape = 4;
 
 struct NativeDrawCache {
     std::mutex mutex;
-    std::unordered_map<std::uint64_t, std::shared_ptr<const std::vector<NativeDrawStage>>> shapes;
-    std::uint64_t hits = 0, stored = 0, refused = 0, walking = 0;
+    std::unordered_map<std::uint64_t, std::vector<NativeDrawEntry>> shapes;
+    // N1: a shape's decode (its user words are re-read per draw).
+    std::unordered_map<std::uint64_t, std::shared_ptr<const DrawDecode>> decodes;
+    std::uint64_t decodeHits = 0, decodeEqual = 0, decodeDiffer = 0;
+    std::uint64_t hits = 0, walkingHits = 0, stored = 0, walkingStored = 0, refused = 0;
+    // Known shapes no entry matched: value words / vertex shape / program, or captured words.
+    std::uint64_t missedValues = 0, missedRuns = 0, gatherNs = 0, gathers = 0;
     // APS5_NATIVE_DRAWS=verify: stages whose reused copy equals / differs from the fresh one.
     std::uint64_t verifyEqual = 0, verifyDiffer = 0, verifyReports = 0;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
@@ -65,11 +67,12 @@ bool sameVertexShape(const ShaderRecompiler::ShaderVertexStageInfo& a, const Sha
     return true;
 }
 
+}
+
 // The cached stage with this draw's per-draw values: its user words patched in, and its vertex
 // attributes' V#s (the compiled result keeps each attribute's whole V#, base address included:
-// Recompiler.cpp materializeResult) taken from this draw's vertex stage info. The stage itself when
-// there is nothing to change; null when a patch or an attribute lies outside it.
-std::shared_ptr<const ShaderRecompiler::RecompileResult> nativePatchedResult(const NativeDrawStage& stage, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex) {
+// Recompiler.cpp materializeResult) taken from this draw's vertex stage info.
+std::shared_ptr<const ShaderRecompiler::RecompileResult> NativePatchedResult(const NativeDrawStage& stage, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex) {
     if (stage.patches.empty() && stage.result->vertexAttributes.empty()) return stage.result;
     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*stage.result);
     for (auto& attribute : patched->vertexAttributes) {
@@ -89,6 +92,19 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> nativePatchedResult(con
     }
     return patched;
 }
+
+bool NativeSameValues(const NativeDrawStage& stage, std::span<const std::uint32_t> userData) {
+    if (userData.size() != stage.userData.size()) return false;
+    for (std::size_t word = 0; word < userData.size(); ++word) {
+        const bool value = word < 64 ? ((stage.asValue >> word) & 1u) != 0 : stage.asValue == ~std::uint64_t{0};
+        if (value && userData[word] != stage.userData[word]) return false;
+        // A base pointer (the pair at this word) null in one and not the other.
+        if (word < 64 && ((stage.asBase >> word) & 1u) != 0 && word + 1 < userData.size() && ((userData[word] | userData[word + 1]) == 0) != ((stage.userData[word] | stage.userData[word + 1]) == 0)) return false;
+    }
+    return true;
+}
+
+namespace {
 
 // APS5_NATIVE_CENSUS (see Driver::draw): shapes seen (capped, then forgotten) and 10 s counters.
 void noteNativeCensus(std::uint64_t shapeKey, bool drawHit, const std::vector<StageCapture>& captures, const std::vector<ShaderRecompiler::ProgramRole>& roles) {
@@ -141,6 +157,8 @@ struct NativePatchStage {
     std::vector<std::uint32_t> userData;
     std::uint64_t program = 0;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> regions;
+    // The user words the capture used as values (ResourceCapture::userDataUse.asValue).
+    std::uint64_t asValue = 0;
 };
 
 // The user-data pointer (even word and the next, 48 bits) an address lies within 4 KiB after, or -1
@@ -161,8 +179,51 @@ std::uint64_t NativePointerAt(const std::vector<std::uint32_t>& userData, int wo
     return static_cast<std::uint64_t>(userData[static_cast<std::size_t>(word)]) | (static_cast<std::uint64_t>(userData[static_cast<std::size_t>(word) + 1] & 0xffffu) << 32u);
 }
 
+}
+
+// N3: words the walk did not read itself (bindless table entries and material records, reached
+// through descriptors) stay absolute; the pointer of word w is the pair at w (48 bits).
+std::shared_ptr<DispatchVariant> NativeRunsFor(std::span<const ShaderRecompiler::MemoryRegion> captured, std::span<const std::pair<std::uint64_t, std::int32_t>> walkReads, const std::vector<std::uint32_t>& userData, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result) {
+    std::unordered_map<std::uint64_t, std::int32_t> origins;
+    origins.reserve(walkReads.size());
+    for (const auto& [address, origin] : walkReads) {
+        const auto [found, inserted] = origins.emplace(address, origin);
+        if (!inserted && found->second != origin) return nullptr;
+    }
+    std::vector<ShaderRecompiler::MemoryRegion> regions(captured.begin(), captured.end());
+    std::sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
+    auto variant = std::make_shared<DispatchVariant>();
+    variant->compiled = result;
+    for (const auto& region : regions) {
+        for (std::size_t word = 0; word < region.bytes.size() / sizeof(std::uint32_t); ++word) {
+            const auto address = region.guestAddress + word * sizeof(std::uint32_t);
+            const auto found = origins.find(address);
+            const std::int32_t origin = found == origins.end() ? -1 : found->second;
+            if (variant->runs.empty() || variant->runs.back().second != address || variant->runPointerWords.back() != origin) {
+                std::uint64_t pointer = 0;
+                if (origin >= 0) {
+                    if (static_cast<std::size_t>(origin) + 1 >= userData.size() || origin > 0x7fff) return nullptr;
+                    pointer = NativePointerAt(userData, origin);
+                    if (pointer < 0x10000) return nullptr;
+                }
+                variant->runs.emplace_back(address, address);
+                variant->runPointerWords.push_back(static_cast<std::int16_t>(origin));
+                variant->runPointerValues.push_back(pointer);
+            }
+            std::uint32_t value = 0;
+            std::memcpy(&value, region.bytes.data() + word * sizeof(std::uint32_t), sizeof(value));
+            variant->words.push_back(value);
+            variant->runs.back().second = address + sizeof(std::uint32_t);
+        }
+    }
+    return variant;
+}
+
+namespace {
+
 void noteNativePatchVerify(std::uint64_t shapeKey, std::vector<NativePatchStage> now) {
-    // Per kind (0 walk-free stages, 1 walking stages).
+    // Per kind: 0 walk-free stages; walking stages whose regions match, by the value-used user words
+    // (asValue) that changed since the earlier draw: 1 none, 2 only words a patch carries, 3 others.
     struct Counters {
         std::uint64_t stages = 0, equal = 0, program = 0, layout = 0, push = 0, unpatchable = 0;
         std::array<std::uint64_t, 8> descriptor{};
@@ -171,11 +232,11 @@ void noteNativePatchVerify(std::uint64_t shapeKey, std::vector<NativePatchStage>
         std::mutex mutex;
         std::unordered_map<std::uint64_t, std::vector<NativePatchStage>> shapes;
         std::uint64_t draws = 0;
-        std::array<Counters, 2> kinds{};
+        std::array<Counters, 4> kinds{};
         // A walking stage the relocated compare would miss: region count, a region at another
         // place than its pointer + offset (or a static one that moved), bytes differ.
         std::uint64_t missCount = 0, missMoved = 0, missBytes = 0;
-        int examples = 0;
+        std::array<int, 4> examples{};
         std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
     };
     static auto* verify = new Verify();
@@ -189,7 +250,8 @@ void noteNativePatchVerify(std::uint64_t shapeKey, std::vector<NativePatchStage>
             const auto& earlier = before[i];
             const auto& current = now[i];
             const bool walking = !earlier.regions.empty() || !current.regions.empty();
-            auto& counters = verify->kinds[walking ? 1 : 0];
+            std::size_t kind = 0;
+            std::uint64_t patchedWords = 0, changed = 0;
             if (walking) {
                 // What the relocated hit would compare: each earlier region at this draw's pointer
                 // plus the same offset (or the same address when no pointer covers it), same bytes.
@@ -213,7 +275,17 @@ void noteNativePatchVerify(std::uint64_t shapeKey, std::vector<NativePatchStage>
                     ++verify->missBytes;
                     continue;
                 }
+                for (const auto& patch : earlier.patches) {
+                    if (patch.userWord < 64) patchedWords |= std::uint64_t{1} << patch.userWord;
+                }
+                for (std::size_t word = 0; word < 64 && word < earlier.userData.size() && word < current.userData.size(); ++word) {
+                    if (earlier.userData[word] != current.userData[word]) changed |= std::uint64_t{1} << word;
+                }
+                const auto changedValues = changed & (earlier.asValue | current.asValue);
+                kind = changedValues == 0 ? 1 : (changedValues & ~patchedWords) == 0 ? 2 : 3;
             }
+            auto& counters = verify->kinds[kind];
+            static constexpr std::array<const char*, 4> KindNames{"walk-free", "walking k1", "walking k2", "walking k3"};
             const auto& old = *earlier.result;
             const auto& fresh = *current.result;
             const auto& userData = current.userData;
@@ -260,8 +332,8 @@ void noteNativePatchVerify(std::uint64_t shapeKey, std::vector<NativePatchStage>
             if (pushes != fresh.pushConstants) {
                 ++counters.push;
                 same = false;
-                if (verify->examples < 12) {
-                    ++verify->examples;
+                if (verify->examples[kind] < 6) {
+                    ++verify->examples[kind];
                     std::size_t word = 0;
                     while ((word + 1) * 4 <= pushes.size() && std::memcmp(pushes.data() + word * 4, fresh.pushConstants.data() + word * 4, 4) == 0) ++word;
                     std::uint32_t patched = 0, wanted = 0;
@@ -269,7 +341,7 @@ void noteNativePatchVerify(std::uint64_t shapeKey, std::vector<NativePatchStage>
                         std::memcpy(&patched, pushes.data() + word * 4, 4);
                         std::memcpy(&wanted, fresh.pushConstants.data() + word * 4, 4);
                     }
-                    std::fprintf(stderr, "[native-patch] %s program 0x%llx: push word %zu patched 0x%08x, fresh 0x%08x\n", walking ? "walking" : "walk-free", static_cast<unsigned long long>(current.program), word, patched, wanted);
+                    std::fprintf(stderr, "[native-patch] %s program 0x%llx: push word %zu patched 0x%08x, fresh 0x%08x (user words changed 0x%llx, value-used 0x%llx, patched 0x%llx)\n", KindNames[kind], static_cast<unsigned long long>(current.program), word, patched, wanted, static_cast<unsigned long long>(changed), static_cast<unsigned long long>(earlier.asValue | current.asValue), static_cast<unsigned long long>(patchedWords));
                 }
             }
             for (std::size_t b = 0; b < descriptors.size(); ++b) {
@@ -277,11 +349,11 @@ void noteNativePatchVerify(std::uint64_t shapeKey, std::vector<NativePatchStage>
                 const auto role = std::min<std::size_t>(static_cast<std::size_t>(fresh.bindings[b].role), 7);
                 ++counters.descriptor[role];
                 same = false;
-                if (verify->examples < 12) {
-                    ++verify->examples;
+                if (verify->examples[kind] < 6) {
+                    ++verify->examples[kind];
                     std::size_t word = 0;
                     while (word < descriptors[b].size() && descriptors[b][word] == fresh.bindings[b].guestDescriptor[word]) ++word;
-                    std::fprintf(stderr, "[native-patch] %s program 0x%llx: %s binding %zu word %zu patched 0x%08x, fresh 0x%08x\n", walking ? "walking" : "walk-free", static_cast<unsigned long long>(current.program), RoleNames[role], b, word, word < descriptors[b].size() ? descriptors[b][word] : 0u, word < descriptors[b].size() ? fresh.bindings[b].guestDescriptor[word] : 0u);
+                    std::fprintf(stderr, "[native-patch] %s program 0x%llx: %s binding %zu word %zu patched 0x%08x, fresh 0x%08x (user words changed 0x%llx, value-used 0x%llx, patched 0x%llx)\n", KindNames[kind], static_cast<unsigned long long>(current.program), RoleNames[role], b, word, word < descriptors[b].size() ? descriptors[b][word] : 0u, word < descriptors[b].size() ? fresh.bindings[b].guestDescriptor[word] : 0u, static_cast<unsigned long long>(changed), static_cast<unsigned long long>(earlier.asValue | current.asValue), static_cast<unsigned long long>(patchedWords));
                 }
             }
             if (same) ++counters.equal;
@@ -292,20 +364,21 @@ void noteNativePatchVerify(std::uint64_t shapeKey, std::vector<NativePatchStage>
     if (clock - verify->reported < std::chrono::seconds(10)) return;
     verify->reported = clock;
     std::string line;
-    for (std::size_t kind = 0; kind < 2; ++kind) {
+    static constexpr std::array<const char*, 4> KindLabels{"walk-free", "walking k1 (value words equal)", "walking k2 (only patched value words changed)", "walking k3 (unpatched value words changed)"};
+    for (std::size_t kind = 0; kind < verify->kinds.size(); ++kind) {
         const auto& counters = verify->kinds[kind];
         std::string roles;
         for (std::size_t r = 0; r < counters.descriptor.size(); ++r) {
             if (counters.descriptor[r] != 0) roles += " " + std::string(RoleNames[r]) + " " + std::to_string(counters.descriptor[r]);
         }
         char text[320];
-        std::snprintf(text, sizeof(text), "; %s stages compared %llu: patched equals fresh %llu, differs: program %llu, layout %llu, push %llu, unpatchable %llu, descriptors by role:%s", kind == 0 ? "walk-free" : "walking (relocated runs equal)", static_cast<unsigned long long>(counters.stages), static_cast<unsigned long long>(counters.equal), static_cast<unsigned long long>(counters.program), static_cast<unsigned long long>(counters.layout), static_cast<unsigned long long>(counters.push), static_cast<unsigned long long>(counters.unpatchable), roles.empty() ? " none" : roles.c_str());
+        std::snprintf(text, sizeof(text), "; %s stages compared %llu: patched equals fresh %llu, differs: program %llu, layout %llu, push %llu, unpatchable %llu, descriptors by role:%s", KindLabels[kind], static_cast<unsigned long long>(counters.stages), static_cast<unsigned long long>(counters.equal), static_cast<unsigned long long>(counters.program), static_cast<unsigned long long>(counters.layout), static_cast<unsigned long long>(counters.push), static_cast<unsigned long long>(counters.unpatchable), roles.empty() ? " none" : roles.c_str());
         line += text;
     }
     std::fprintf(stderr, "[native-patch] (10 s) %llu repeated draws; walking stages the relocated compare would miss: region count %llu, moved %llu, bytes differ %llu%s\n", static_cast<unsigned long long>(verify->draws), static_cast<unsigned long long>(verify->missCount), static_cast<unsigned long long>(verify->missMoved), static_cast<unsigned long long>(verify->missBytes), line.c_str());
     verify->draws = verify->missCount = verify->missMoved = verify->missBytes = 0;
     verify->kinds = {};
-    verify->examples = 0;
+    verify->examples = {};
 }
 
 // Which user-data words vary from draw to draw, per program (APS5_PROFILE_USER_WORDS): every 10 s,
@@ -573,7 +646,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    // APS5_NATIVE_DRAWS (native path, see the N2/N3 hit below): the draw cache (keyed by every user
+    // word, ~1% hits) is not used; the shape key finds the decode (N1) and the compiled stages.
+    // APS5_NATIVE_DRAWS=verify renders with fresh decodes and stages and compares the reused ones.
+    static const bool nativeDraws = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
+    static const bool nativeVerify = nativeDraws && std::string_view(std::getenv("APS5_NATIVE_DRAWS")) == "verify";
+    const bool useDrawEntries = !nativeDraws && drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
@@ -608,12 +686,53 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         entry = nullptr;
         decode = nullptr;
     }
+    // N1: the shape key (the register key without user words: programs and render state, every
+    // register the decoders read; APS5_VERIFY_DRAW_RECIPE checks that) finds the shape's decode,
+    // whose user words are then read from this draw's registers.
+    const auto nativeKey = nativeDraws ? drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, true) : 0;
+    bool nativeDecoded = false;
+    if (nativeDraws) {
+        auto& cache = nativeDrawCache();
+        {
+            std::lock_guard lock(cache.mutex);
+            if (const auto found = cache.decodes.find(nativeKey); found != cache.decodes.end()) decode = found->second;
+        }
+        nativeDecoded = decode != nullptr && DecodeProgramsCurrent(*decode, *submission.shaders);
+        if (!nativeDecoded) decode = nullptr;
+    }
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
+    std::vector<DrawProgram> programs = decode->programs;
+    if (nativeDecoded) {
+        for (auto& program : programs) {
+            for (std::uint32_t word = 0; word < program.userData.size(); ++word) {
+                if (const auto offset = DrawUserWordRegister(program, word); offset != 0) program.userData[word] = readUserData(queue.shader, offset);
+            }
+        }
+        if (nativeVerify) {
+            auto fresh = decodeDraw(queue, submission);
+            auto refreshed = *decode;
+            refreshed.programs = programs;
+            const bool same = sameDecode(refreshed, *fresh);
+            auto& cache = nativeDrawCache();
+            std::lock_guard lock(cache.mutex);
+            ++(same ? cache.decodeEqual : cache.decodeDiffer);
+            if (!same && cache.verifyReports < 12) {
+                ++cache.verifyReports;
+                std::fprintf(stderr, "[native-draws] verify: the shape's decode with this draw's user words differs from a fresh decode (program 0x%llx)\n", static_cast<unsigned long long>(programs.empty() ? 0 : programs.front().binary.codeAddress));
+            }
+            decode = std::move(fresh);
+            programs = decode->programs;
+        }
+    } else if (nativeDraws) {
+        auto& cache = nativeDrawCache();
+        std::lock_guard lock(cache.mutex);
+        if (cache.decodes.size() > (1u << 14)) cache.decodes.clear();
+        cache.decodes[nativeKey] = decode;
+    }
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
-    std::vector<DrawProgram> programs = decode->programs;
     // A cached decode holds the user words of the draw that made it; the key left these out.
     if (relocation != nullptr) refreshRelocatedUserWords(queue, *relocation, programs);
     // APS5_NATIVE_SHADOW: the title's own view of this draw's shaders against the decoded programs.
@@ -773,33 +892,75 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
     std::vector<std::size_t> resultIndex(programs.size(), 0);
-    // APS5_NATIVE_DRAWS=1 (native path N2; part of the native switch the user wants built whole and
-    // turned on at once): a walk-free draw (no stage reads guest memory for its resources) whose
-    // shape (the register key without user words: programs and render state) was drawn before reuses
-    // that draw's compiled stages with this draw's user words patched in, skipping capture and
-    // materialize. APS5_NATIVE_VERIFY_PATCH found that exact on every walk-free stage compared
-    // (trnv1, 2026-10-30: ~27k, 0 mismatches). Walking shapes (85% of draws) still capture: their
-    // flattened SRTs carry bindless-table state a patch cannot rebuild (N3, not built). The vertex
-    // stage info (memory-derived) must also match the cached stage's.
+    // APS5_NATIVE_DRAWS=1 (native path N2/N3; part of the native switch the user wants built whole
+    // and turned on at once): a draw whose shape (the register key without user words: programs and
+    // render state) was drawn before reuses that draw's compiled stages with this draw's user words
+    // patched in and its vertex V#s, skipping capture and materialize. Every stage needs the same
+    // program and vertex shape and the user words its capture used as values equal: a changed value
+    // word, even one a patch carries, can change a bindless table's heap header, key mapping and
+    // slots (flattened SRT; trnv2, 2026-10-30) or move a T# held in user SGPRs to another image mode
+    // binding (trn1v). A walking stage (N3) also needs its captured words equal at this draw's
+    // pointers (validateVariant, as a draw-cache hit checks them): reused == fresh on every such
+    // stage compared (trnv2, ~25k per 10 s).
     // APS5_NATIVE_DRAWS=verify: every hit also materializes the stages as before, renders with those
     // and compares them with the reused ones (rendering unchanged).
-    static const bool nativeDraws = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
-    static const bool nativeVerify = nativeDraws && std::string_view(std::getenv("APS5_NATIVE_DRAWS")) == "verify";
-    const auto nativeKey = nativeDraws && !drawHit ? drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, true) : 0;
-    std::shared_ptr<const std::vector<NativeDrawStage>> nativeHit;
+    NativeDrawEntry nativeHit;
+    // A hit's walking stages' runs at this draw's pointers (into the entry's words, as matchedRegions).
+    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> nativeRegions;
     if (nativeDraws && !drawHit) {
         auto& cache = nativeDrawCache();
+        std::vector<NativeDrawEntry> entries;
         {
             std::lock_guard lock(cache.mutex);
-            if (const auto found = cache.shapes.find(nativeKey); found != cache.shapes.end()) nativeHit = found->second;
+            if (const auto found = cache.shapes.find(nativeKey); found != cache.shapes.end()) entries = found->second;
         }
-        bool same = nativeHit != nullptr && nativeHit->size() == programs.size();
-        for (std::size_t i = 0; same && i < programs.size(); ++i) {
-            if (roles[i] == Role::GeometryBack) continue;
-            const auto& stage = (*nativeHit)[i];
-            same = stage.result != nullptr && stage.program == programs[i].binary.codeAddress && stage.vertexInfo.has_value() == vertexInfos[i].has_value() && (!vertexInfos[i] || sameVertexShape(*vertexInfos[i], *stage.vertexInfo));
+        const auto sameValues = [&](const std::vector<NativeDrawStage>& entry) {
+            if (entry.size() != programs.size()) return false;
+            for (std::size_t i = 0; i < programs.size(); ++i) {
+                if (roles[i] == Role::GeometryBack) continue;
+                const auto& stage = entry[i];
+                if (stage.result == nullptr || stage.program != programs[i].binary.codeAddress || stage.vertexInfo.has_value() != vertexInfos[i].has_value() || (vertexInfos[i] && !sameVertexShape(*vertexInfos[i], *stage.vertexInfo))) return false;
+                // Walk-free stages too: a T# in user SGPRs whose type changed moves to another image
+                // mode binding (trn1v 2026-10-30, pixel program 0x11d090d900).
+                if (!NativeSameValues(stage, programs[i].userData)) return false;
+            }
+            return true;
+        };
+        bool valuesMatched = false;
+        for (const auto& entry : entries) {
+            if (!sameValues(*entry)) continue;
+            valuesMatched = true;
+            const bool walking = std::any_of(entry->begin(), entry->end(), [](const NativeDrawStage& stage) { return stage.runs != nullptr; });
+            const auto started = std::chrono::steady_clock::now();
+            nativeRegions.assign(programs.size(), {});
+            bool equal = true;
+            if (walking) {
+                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
+                std::optional<SampledReadScope> sampling;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+                std::uint64_t imagesFlushed = 0, runsSynced = 0;
+                for (std::size_t i = 0; equal && i < programs.size(); ++i) {
+                    const auto& stage = (*entry)[i];
+                    if (roles[i] == Role::GeometryBack || stage.runs == nullptr) continue;
+                    equal = relocatedRuns(*stage.runs, programs[i].userData, runs);
+                    if (!equal) break;
+                    appendEntryRegionsAt(*stage.runs, runs, nativeRegions[i]);
+                    equal = validateVariant(programs[i].binary.codeAddress, submission.queue, *stage.runs, nativeRegions[i], imagesFlushed, runsSynced, sampling, nullptr, &runs) == EntryOutcome::Equal;
+                }
+                std::lock_guard lock(cache.mutex);
+                cache.gatherNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+                ++cache.gathers;
+            }
+            if (equal) {
+                nativeHit = entry;
+                break;
+            }
         }
-        if (!same) nativeHit = nullptr;
+        if (nativeHit == nullptr) nativeRegions.clear();
+        if (!entries.empty() && nativeHit == nullptr) {
+            std::lock_guard lock(cache.mutex);
+            ++(valuesMatched ? cache.missedRuns : cache.missedValues);
+        }
     }
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
@@ -827,16 +988,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
             if (nativeHit != nullptr && !nativeVerify) {
-                auto patched = nativePatchedResult((*nativeHit)[i], programs[i].userData, vertexInfos[i]);
+                auto patched = NativePatchedResult((*nativeHit)[i], programs[i].userData, vertexInfos[i]);
                 require(patched != nullptr, "native draw: a user-word patch lies outside the cached stage result");
                 heldResults.push_back(std::move(patched));
                 programResults[i] = heldResults.back().get();
+                if (i < nativeRegions.size()) memory.insert(memory.end(), nativeRegions[i].begin(), nativeRegions[i].end());
             } else {
                 heldResults.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = heldResults.back().get();
                 if (nativeHit != nullptr) {
-                    const auto patched = nativePatchedResult((*nativeHit)[i], programs[i].userData, vertexInfos[i]);
+                    const auto patched = NativePatchedResult((*nativeHit)[i], programs[i].userData, vertexInfos[i]);
                     // sameCompiledResult leaves out the vertex attributes and poisoned SRT reads,
                     // which are per draw too.
                     const auto& fresh = *heldResults.back();
@@ -853,9 +1015,44 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     auto& cache = nativeDrawCache();
                     std::lock_guard lock(cache.mutex);
                     ++(equal ? cache.verifyEqual : cache.verifyDiffer);
-                    if (!equal && cache.verifyReports < 12) {
+                    if (!equal && cache.verifyReports < 24) {
                         ++cache.verifyReports;
-                        std::fprintf(stderr, "[native-draws] verify: stage %zu of program 0x%llx differs from its reused copy%s\n", i, static_cast<unsigned long long>(program.binary.codeAddress), patched == nullptr ? " (patch outside the result)" : "");
+                        // What differs (the first binding word, else the part), and which user words
+                        // of every stage changed since the reused entry's draw (bit per word).
+                        std::string what = patched == nullptr ? "patch outside the result" : "program, layout, attributes or poison";
+                        if (patched != nullptr && patched->pushConstants != fresh.pushConstants) what = "push constants";
+                        for (std::size_t b = 0; patched != nullptr && b < patched->bindings.size() && b < fresh.bindings.size(); ++b) {
+                            const auto& x = patched->bindings[b].guestDescriptor;
+                            const auto& y = fresh.bindings[b].guestDescriptor;
+                            if (x == y) continue;
+                            std::size_t word = 0;
+                            while (word < x.size() && word < y.size() && x[word] == y[word]) ++word;
+                            char text[160];
+                            std::snprintf(text, sizeof(text), "binding %zu (role %u) word %zu: reused 0x%08x, fresh 0x%08x", b, static_cast<unsigned>(fresh.bindings[b].role), word, word < x.size() ? x[word] : 0u, word < y.size() ? y[word] : 0u);
+                            what = text;
+                            break;
+                        }
+                        std::string changed;
+                        for (std::size_t s = 0; s < programs.size(); ++s) {
+                            const auto& stored = (*nativeHit)[s].userData;
+                            std::uint64_t mask = 0;
+                            for (std::size_t word = 0; word < 64 && word < programs[s].userData.size() && word < stored.size(); ++word) {
+                                if (programs[s].userData[word] != stored[word]) mask |= std::uint64_t{1} << word;
+                            }
+                            char text[96];
+                            std::snprintf(text, sizeof(text), " stage %zu 0x%llx (value-used 0x%llx%s)", s, static_cast<unsigned long long>(mask), static_cast<unsigned long long>((*nativeHit)[s].asValue), (*nativeHit)[s].runs != nullptr ? ", walking" : "");
+                            changed += text;
+                        }
+                        // The fresh capture's walk reads, its regions, and the reads inside the
+                        // programs' code/header snapshots (ShaderMemory serves those without a region).
+                        std::size_t inSnapshots = 0;
+                        for (const auto& [address, origin] : stageCaptures[i].walkReads) {
+                            const bool inside = std::any_of(programs.begin(), programs.end(), [&](const DrawProgram& other) {
+                                return std::any_of(other.memory.begin(), other.memory.end(), [&](const ShaderRecompiler::MemoryRegion& region) { return address >= region.guestAddress && address - region.guestAddress < region.bytes.size(); });
+                            });
+                            if (inside) ++inSnapshots;
+                        }
+                        std::fprintf(stderr, "[native-draws] verify: stage %zu of program 0x%llx differs from its reused copy: %s; user words changed:%s; fresh capture: %zu walk reads (%zu in program snapshots), %zu regions\n", i, static_cast<unsigned long long>(program.binary.codeAddress), what.c_str(), changed.c_str(), stageCaptures[i].walkReads.size(), inSnapshots, stageCaptures[i].regions.size());
                     }
                 }
             }
@@ -872,7 +1069,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
-    // APS5_NATIVE_DRAWS: a walk-free miss keeps its stages for its shape ([native-draws] line).
+    // APS5_NATIVE_DRAWS: a miss keeps its stages for its shape, before the shape's older entries
+    // ([native-draws] line).
     if (nativeDraws && !drawHit) {
         auto& cache = nativeDrawCache();
         std::shared_ptr<std::vector<NativeDrawStage>> store;
@@ -883,31 +1081,46 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (roles[i] == Role::GeometryBack) continue;
                 const auto held = std::find_if(heldResults.begin(), heldResults.end(), [&](const auto& result) { return result.get() == programResults[i]; });
                 // Vertex stage info read from memory is fine: every draw decodes its own and a hit
-                // requires it equal to the stored one (requiring none cut hits from ~14k to ~600
-                // per 10 s, trn2v).
-                if (held == heldResults.end() || !stageCaptures[i].captured || !stageCaptures[i].regions.empty()) {
-                    walking = true;
+                // requires it the same shape as the stored one (requiring none cut hits from ~14k to
+                // ~600 per 10 s, trn2v).
+                // A stage that read inaccessible memory (poisoned SRT reads) is not kept, as the draw
+                // cache keeps none (CacheableResult): the walk may go elsewhere once it is readable.
+                if (held == heldResults.end() || !stageCaptures[i].captured || !CacheableResult(**held)) {
                     store = nullptr;
                     break;
                 }
                 auto patches = userWordPatchesFor(**held, programs[i].userData);
                 const auto data = shaderDataPatchesFor(**held);
                 patches.insert(patches.end(), data.begin(), data.end());
-                (*store)[i] = {*held, std::move(patches), programs[i].binary.codeAddress, vertexInfos[i]};
+                auto& stage = (*store)[i];
+                stage = {*held, std::move(patches), programs[i].binary.codeAddress, vertexInfos[i], stageCaptures[i].userWordsAsValue, programs[i].userData, stageCaptures[i].userWordsAsBase};
+                if (stageCaptures[i].regions.empty()) continue;
+                walking = true;
+                // Untracked user words (more than SrtUserDataUse::TrackedWords) are not kept.
+                if (stageCaptures[i].userWordsAsValue != ~std::uint64_t{0}) stage.runs = NativeRunsFor(stageCaptures[i].regions, stageCaptures[i].walkReads, programs[i].userData, *held);
+                if (stage.runs == nullptr) {
+                    store = nullptr;
+                    break;
+                }
             }
         }
         std::lock_guard lock(cache.mutex);
-        if (nativeHit != nullptr) ++cache.hits;
-        else if (store != nullptr) {
+        if (nativeDecoded) ++cache.decodeHits;
+        if (nativeHit != nullptr) {
+            ++cache.hits;
+            if (std::any_of(nativeHit->begin(), nativeHit->end(), [](const NativeDrawStage& stage) { return stage.runs != nullptr; })) ++cache.walkingHits;
+        } else if (store != nullptr) {
             if (cache.shapes.size() > (1u << 14)) cache.shapes.clear();
-            cache.shapes[nativeKey] = std::move(store);
+            auto& entries = cache.shapes[nativeKey];
+            entries.insert(entries.begin(), std::move(store));
+            if (entries.size() > NativeEntriesPerShape) entries.pop_back();
             ++cache.stored;
-        } else if (walking) ++cache.walking;
-        else ++cache.refused;
+            if (walking) ++cache.walkingStored;
+        } else ++cache.refused;
         if (const auto clock = std::chrono::steady_clock::now(); clock - cache.reported >= std::chrono::seconds(10)) {
             cache.reported = clock;
-            std::fprintf(stderr, "[native-draws] (10 s) walk-free reuse: %llu hits, %llu stored, %llu walking draws (capture as before), %llu refused; %zu shapes kept; verify: %llu stages equal, %llu differ\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.stored), static_cast<unsigned long long>(cache.walking), static_cast<unsigned long long>(cache.refused), cache.shapes.size(), static_cast<unsigned long long>(cache.verifyEqual), static_cast<unsigned long long>(cache.verifyDiffer));
-            cache.hits = cache.stored = cache.walking = cache.refused = cache.verifyEqual = cache.verifyDiffer = 0;
+            std::fprintf(stderr, "[native-draws] (10 s) decodes reused %llu (%zu kept; verify %llu equal, %llu differ); reuse: %llu hits (%llu walking), %llu stored (%llu walking), %llu refused; known shapes missed on value words/programs/vertex shape %llu, on captured words %llu; gathers %llu, %.1f us each; %zu shapes kept; verify: %llu stages equal, %llu differ\n", static_cast<unsigned long long>(cache.decodeHits), cache.decodes.size(), static_cast<unsigned long long>(cache.decodeEqual), static_cast<unsigned long long>(cache.decodeDiffer), static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.walkingHits), static_cast<unsigned long long>(cache.stored), static_cast<unsigned long long>(cache.walkingStored), static_cast<unsigned long long>(cache.refused), static_cast<unsigned long long>(cache.missedValues), static_cast<unsigned long long>(cache.missedRuns), static_cast<unsigned long long>(cache.gathers), cache.gathers == 0 ? 0.0 : static_cast<double>(cache.gatherNs) / 1e3 / static_cast<double>(cache.gathers), cache.shapes.size(), static_cast<unsigned long long>(cache.verifyEqual), static_cast<unsigned long long>(cache.verifyDiffer));
+            cache.decodeHits = cache.decodeEqual = cache.decodeDiffer = cache.hits = cache.walkingHits = cache.stored = cache.walkingStored = cache.refused = cache.missedValues = cache.missedRuns = cache.gathers = cache.gatherNs = cache.verifyEqual = cache.verifyDiffer = 0;
         }
     }
     // APS5_NATIVE_CENSUS=1 (native path groundwork, count only): whether the draw's shape (the
@@ -938,7 +1151,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             patches.insert(patches.end(), data.begin(), data.end());
             std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> regions;
             for (const auto& region : stageCaptures[i].regions) regions.emplace_back(region.guestAddress, std::vector<std::byte>(region.bytes.begin(), region.bytes.end()));
-            patchStages.push_back({*held, std::move(patches), programs[i].userData, programs[i].binary.codeAddress, std::move(regions)});
+            patchStages.push_back({*held, std::move(patches), programs[i].userData, programs[i].binary.codeAddress, std::move(regions), stageCaptures[i].userWordsAsValue});
         }
         if (eligible && !patchStages.empty()) noteNativePatchVerify(nativeShape, std::move(patchStages));
     }
@@ -1247,7 +1460,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         // The draw's resource-cache key, made here beside the committer's work (see commitDraw).
         auto probe = recipe == nullptr ? localDevice->ProbeDraw(graphics, drawParameters, stages, false) : Graphics::DrawResourceProbe{};
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), probe = std::move(probe), entry = std::move(entry), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory)]() mutable {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), probe = std::move(probe), entry = std::move(entry), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), nativeHit = std::move(nativeHit)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
             // The committer records the draw: APS5_GPU_TIME_DRAW_PROGRAMS names its pass by this program.
             Graphics::SetDrawTimingProgram(programs.empty() ? 0 : programs.back().binary.codeAddress);

@@ -56,9 +56,11 @@ std::uint32_t RegisterOf(const DrawProgram& program, std::uint32_t word) {
 }
 
 // A merged stage's prefix (DecodeGraphicsPrograms): words 0-1 are the merged user-data pointer at
-// base - 0x0a (0x82 or 0x102), words 2-7 the driver's, words 8.. base + (word - 8).
+// base - 0x0a (0x82 or 0x102), words 2-7 the driver's, words 8.. base + (word - 8). A pixel program
+// also starts at SGPR 0 but has no prefix: word w is base + w (it was mapped as merged before
+// 2026-10-30, so relocated keys refreshed and masked the wrong registers for it).
 std::uint32_t DrawUserWordRegister(const DrawProgram& program, std::uint32_t word) {
-    if (program.firstUserSgpr == 8) return program.userDataBase + word;
+    if (program.firstUserSgpr == 8 || program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) return program.userDataBase + word;
     if (program.firstUserSgpr != 0) return 0;
     if (word >= 8) return program.userDataBase + (word - 8);
     if (word < 2) return program.userDataBase - 0x0a + word;
