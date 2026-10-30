@@ -18,11 +18,230 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+// APS5_NATIVE_CENSUS (see Driver::draw): shapes seen (capped, then forgotten) and 10 s counters.
+void noteNativeCensus(std::uint64_t shapeKey, bool drawHit, const std::vector<StageCapture>& captures, const std::vector<ShaderRecompiler::ProgramRole>& roles) {
+    struct Census {
+        std::mutex mutex;
+        std::unordered_set<std::uint64_t> seen;
+        std::uint64_t draws = 0, cacheHits = 0, repeats = 0, walkFree = 0, walkFreeRepeats = 0, walkingRepeats = 0, repeatWords = 0, uncaptured = 0;
+        std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+    };
+    static auto* census = new Census();
+    bool walkFree = true;
+    bool allCaptured = true;
+    std::uint64_t words = 0;
+    for (std::size_t i = 0; i < captures.size(); ++i) {
+        if (i < roles.size() && roles[i] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
+        if (!captures[i].captured) {
+            allCaptured = false;
+            continue;
+        }
+        for (const auto& region : captures[i].regions) words += region.bytes.size() / sizeof(std::uint32_t);
+        if (!captures[i].regions.empty()) walkFree = false;
+    }
+    std::lock_guard lock(census->mutex);
+    ++census->draws;
+    if (census->seen.size() > (1u << 20)) census->seen.clear();
+    const bool repeat = !census->seen.insert(shapeKey).second;
+    if (drawHit) ++census->cacheHits;
+    else if (!allCaptured) ++census->uncaptured;
+    else {
+        if (repeat) ++census->repeats;
+        if (walkFree) ++census->walkFree;
+        if (repeat && walkFree) ++census->walkFreeRepeats;
+        if (repeat && !walkFree) {
+            ++census->walkingRepeats;
+            census->repeatWords += words;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - census->reported < std::chrono::seconds(10)) return;
+    census->reported = now;
+    std::fprintf(stderr, "[native-census] (10 s) %llu draws: %llu draw-cache hits, %llu not all captured; of the captured: shape seen before %llu, walk-free %llu, both %llu (reuse with values rebuilt), walking repeats %llu (%.1f words to gather each); %zu shapes known\n", static_cast<unsigned long long>(census->draws), static_cast<unsigned long long>(census->cacheHits), static_cast<unsigned long long>(census->uncaptured), static_cast<unsigned long long>(census->repeats), static_cast<unsigned long long>(census->walkFree), static_cast<unsigned long long>(census->walkFreeRepeats), static_cast<unsigned long long>(census->walkingRepeats), census->walkingRepeats == 0 ? 0.0 : static_cast<double>(census->repeatWords) / static_cast<double>(census->walkingRepeats), census->seen.size());
+    census->draws = census->cacheHits = census->repeats = census->walkFree = census->walkFreeRepeats = census->walkingRepeats = census->repeatWords = census->uncaptured = 0;
+}
+
+// APS5_NATIVE_VERIFY_PATCH (see Driver::draw): a stage as materialized, the patches that carry its
+// user words into it, the user words and the guest regions (address, bytes) it was captured with.
+struct NativePatchStage {
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::vector<DispatchVariant::UserWordPatch> patches;
+    std::vector<std::uint32_t> userData;
+    std::uint64_t program = 0;
+    std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> regions;
+};
+
+// The user-data pointer (even word and the next, 48 bits) an address lies within 4 KiB after, or -1
+// (the relocated-key rule, DrawRelocation.cpp).
+int NativePointerFor(const std::vector<std::uint32_t>& userData, std::uint64_t address) {
+    int found = -1;
+    std::uint64_t best = 0x1000;
+    for (std::size_t word = 0; word + 1 < userData.size(); word += 2) {
+        const auto pointer = static_cast<std::uint64_t>(userData[word]) | (static_cast<std::uint64_t>(userData[word + 1] & 0xffffu) << 32u);
+        if (pointer == 0 || address < pointer || address - pointer >= best) continue;
+        best = address - pointer;
+        found = static_cast<int>(word);
+    }
+    return found;
+}
+
+std::uint64_t NativePointerAt(const std::vector<std::uint32_t>& userData, int word) {
+    return static_cast<std::uint64_t>(userData[static_cast<std::size_t>(word)]) | (static_cast<std::uint64_t>(userData[static_cast<std::size_t>(word) + 1] & 0xffffu) << 32u);
+}
+
+void noteNativePatchVerify(std::uint64_t shapeKey, std::vector<NativePatchStage> now) {
+    // Per kind (0 walk-free stages, 1 walking stages).
+    struct Counters {
+        std::uint64_t stages = 0, equal = 0, program = 0, layout = 0, push = 0, unpatchable = 0;
+        std::array<std::uint64_t, 8> descriptor{};
+    };
+    struct Verify {
+        std::mutex mutex;
+        std::unordered_map<std::uint64_t, std::vector<NativePatchStage>> shapes;
+        std::uint64_t draws = 0;
+        std::array<Counters, 2> kinds{};
+        // A walking stage the relocated compare would miss: region count, a region at another
+        // place than its pointer + offset (or a static one that moved), bytes differ.
+        std::uint64_t missCount = 0, missMoved = 0, missBytes = 0;
+        int examples = 0;
+        std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+    };
+    static auto* verify = new Verify();
+    static constexpr std::array<const char*, 8> RoleNames{"buffers", "images", "samplers", "gds", "pagetable", "fault", "flattened-srt", "shader-data"};
+    std::lock_guard lock(verify->mutex);
+    if (verify->shapes.size() > 8192) verify->shapes.clear();
+    auto& before = verify->shapes[shapeKey];
+    if (before.size() == now.size()) {
+        ++verify->draws;
+        for (std::size_t i = 0; i < now.size(); ++i) {
+            const auto& earlier = before[i];
+            const auto& current = now[i];
+            const bool walking = !earlier.regions.empty() || !current.regions.empty();
+            auto& counters = verify->kinds[walking ? 1 : 0];
+            if (walking) {
+                // What the relocated hit would compare: each earlier region at this draw's pointer
+                // plus the same offset (or the same address when no pointer covers it), same bytes.
+                if (earlier.regions.size() != current.regions.size()) {
+                    ++verify->missCount;
+                    continue;
+                }
+                bool moved = false, differ = false;
+                for (std::size_t r = 0; r < earlier.regions.size() && !moved; ++r) {
+                    const auto& [address, bytes] = earlier.regions[r];
+                    const auto word = NativePointerFor(earlier.userData, address);
+                    const auto expected = word < 0 ? address : (static_cast<std::size_t>(word) + 1 < current.userData.size() ? NativePointerAt(current.userData, word) + (address - NativePointerAt(earlier.userData, word)) : ~std::uint64_t{0});
+                    if (current.regions[r].first != expected) moved = true;
+                    else if (current.regions[r].second != bytes) differ = true;
+                }
+                if (moved) {
+                    ++verify->missMoved;
+                    continue;
+                }
+                if (differ) {
+                    ++verify->missBytes;
+                    continue;
+                }
+            }
+            const auto& old = *earlier.result;
+            const auto& fresh = *current.result;
+            const auto& userData = current.userData;
+            ++counters.stages;
+            if (earlier.program != current.program || old.spirv.KeyHashes() != fresh.spirv.KeyHashes() || old.specializationId != fresh.specializationId || old.variantId != fresh.variantId) {
+                ++counters.program;
+                continue;
+            }
+            bool sameLayout = old.shaderDataUserWords == fresh.shaderDataUserWords && old.bindings.size() == fresh.bindings.size() && old.pushConstants.size() == fresh.pushConstants.size();
+            for (std::size_t b = 0; sameLayout && b < old.bindings.size(); ++b) {
+                const auto& x = old.bindings[b];
+                const auto& y = fresh.bindings[b];
+                sameLayout = x.kind == y.kind && x.role == y.role && x.descriptorSet == y.descriptorSet && x.binding == y.binding && x.count == y.count && x.readOnly == y.readOnly && x.imageShape == y.imageShape && x.guestDescriptor.size() == y.guestDescriptor.size();
+            }
+            if (!sameLayout) {
+                ++counters.layout;
+                continue;
+            }
+            // The earlier stage's per-draw values with this draw's user words patched in.
+            auto pushes = old.pushConstants;
+            std::vector<std::vector<std::uint32_t>> descriptors;
+            for (const auto& binding : old.bindings) descriptors.push_back(binding.guestDescriptor);
+            bool patchable = true;
+            for (const auto& patch : earlier.patches) {
+                if (patch.userWord >= userData.size()) {
+                    patchable = false;
+                    break;
+                }
+                const auto value = userData[patch.userWord];
+                if (patch.binding == DispatchVariant::UserWordPatch::NoBinding) {
+                    if ((patch.word + 1) * sizeof(std::uint32_t) > pushes.size()) patchable = false;
+                    else std::memcpy(pushes.data() + patch.word * sizeof(std::uint32_t), &value, sizeof(value));
+                } else if (patch.binding >= descriptors.size() || patch.word >= descriptors[patch.binding].size()) {
+                    patchable = false;
+                } else {
+                    descriptors[patch.binding][patch.word] = value;
+                }
+            }
+            if (!patchable) {
+                ++counters.unpatchable;
+                continue;
+            }
+            bool same = true;
+            if (pushes != fresh.pushConstants) {
+                ++counters.push;
+                same = false;
+                if (verify->examples < 12) {
+                    ++verify->examples;
+                    std::size_t word = 0;
+                    while ((word + 1) * 4 <= pushes.size() && std::memcmp(pushes.data() + word * 4, fresh.pushConstants.data() + word * 4, 4) == 0) ++word;
+                    std::uint32_t patched = 0, wanted = 0;
+                    if ((word + 1) * 4 <= pushes.size()) {
+                        std::memcpy(&patched, pushes.data() + word * 4, 4);
+                        std::memcpy(&wanted, fresh.pushConstants.data() + word * 4, 4);
+                    }
+                    std::fprintf(stderr, "[native-patch] %s program 0x%llx: push word %zu patched 0x%08x, fresh 0x%08x\n", walking ? "walking" : "walk-free", static_cast<unsigned long long>(current.program), word, patched, wanted);
+                }
+            }
+            for (std::size_t b = 0; b < descriptors.size(); ++b) {
+                if (descriptors[b] == fresh.bindings[b].guestDescriptor) continue;
+                const auto role = std::min<std::size_t>(static_cast<std::size_t>(fresh.bindings[b].role), 7);
+                ++counters.descriptor[role];
+                same = false;
+                if (verify->examples < 12) {
+                    ++verify->examples;
+                    std::size_t word = 0;
+                    while (word < descriptors[b].size() && descriptors[b][word] == fresh.bindings[b].guestDescriptor[word]) ++word;
+                    std::fprintf(stderr, "[native-patch] %s program 0x%llx: %s binding %zu word %zu patched 0x%08x, fresh 0x%08x\n", walking ? "walking" : "walk-free", static_cast<unsigned long long>(current.program), RoleNames[role], b, word, word < descriptors[b].size() ? descriptors[b][word] : 0u, word < descriptors[b].size() ? fresh.bindings[b].guestDescriptor[word] : 0u);
+                }
+            }
+            if (same) ++counters.equal;
+        }
+    }
+    before = std::move(now);
+    const auto clock = std::chrono::steady_clock::now();
+    if (clock - verify->reported < std::chrono::seconds(10)) return;
+    verify->reported = clock;
+    std::string line;
+    for (std::size_t kind = 0; kind < 2; ++kind) {
+        const auto& counters = verify->kinds[kind];
+        std::string roles;
+        for (std::size_t r = 0; r < counters.descriptor.size(); ++r) {
+            if (counters.descriptor[r] != 0) roles += " " + std::string(RoleNames[r]) + " " + std::to_string(counters.descriptor[r]);
+        }
+        char text[320];
+        std::snprintf(text, sizeof(text), "; %s stages compared %llu: patched equals fresh %llu, differs: program %llu, layout %llu, push %llu, unpatchable %llu, descriptors by role:%s", kind == 0 ? "walk-free" : "walking (relocated runs equal)", static_cast<unsigned long long>(counters.stages), static_cast<unsigned long long>(counters.equal), static_cast<unsigned long long>(counters.program), static_cast<unsigned long long>(counters.layout), static_cast<unsigned long long>(counters.push), static_cast<unsigned long long>(counters.unpatchable), roles.empty() ? " none" : roles.c_str());
+        line += text;
+    }
+    std::fprintf(stderr, "[native-patch] (10 s) %llu repeated draws; walking stages the relocated compare would miss: region count %llu, moved %llu, bytes differ %llu%s\n", static_cast<unsigned long long>(verify->draws), static_cast<unsigned long long>(verify->missCount), static_cast<unsigned long long>(verify->missMoved), static_cast<unsigned long long>(verify->missBytes), line.c_str());
+    verify->draws = verify->missCount = verify->missMoved = verify->missBytes = 0;
+    verify->kinds = {};
+    verify->examples = 0;
+}
 
 // Which user-data words vary from draw to draw, per program (APS5_PROFILE_USER_WORDS): every 10 s,
 // for the programs drawn most, the distinct values each word took (capped at 64). The draw keys
@@ -530,6 +749,38 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
+    // APS5_NATIVE_CENSUS=1 (native path groundwork, count only): whether the draw's shape (the
+    // register key without user words: programs and render state) was seen before, and whether its
+    // stages captured nothing (walk-free); a [native-census] line every 10 s. A repeated walk-free
+    // shape can reuse its compiled stages with only the per-draw values rebuilt; a repeated walking
+    // shape would gather its runs at the draw's own pointers.
+    static const bool nativeCensus = std::getenv("APS5_NATIVE_CENSUS") != nullptr;
+    // APS5_NATIVE_VERIFY_PATCH=1 (native path groundwork, compare only, rendering unchanged): for a
+    // draw whose shape was drawn before, the earlier draw's compiled stages with this draw's user
+    // words patched in (the pointer pairs they hold verbatim and the shader-data words, as
+    // relocated keys patch them) against this draw's freshly materialized stages: whether patching
+    // rebuilds every per-draw value, or which part it misses ([native-patch] line). Walking stages
+    // are compared when their regions match at this draw's pointers (what a relocated hit checks).
+    static const bool verifyPatch = std::getenv("APS5_NATIVE_VERIFY_PATCH") != nullptr;
+    const auto nativeShape = nativeCensus || verifyPatch ? drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, true) : 0;
+    if (nativeCensus) noteNativeCensus(nativeShape, drawHit, stageCaptures, roles);
+    if (verifyPatch && !drawHit) {
+        std::vector<NativePatchStage> patchStages;
+        bool eligible = true;
+        for (std::size_t i = 0; eligible && i < programs.size(); ++i) {
+            if (roles[i] == Role::GeometryBack) continue;
+            const auto held = std::find_if(heldResults.begin(), heldResults.end(), [&](const auto& result) { return result.get() == programResults[i]; });
+            eligible = held != heldResults.end() && stageCaptures[i].captured;
+            if (!eligible) break;
+            auto patches = userWordPatchesFor(**held, programs[i].userData);
+            const auto data = shaderDataPatchesFor(**held);
+            patches.insert(patches.end(), data.begin(), data.end());
+            std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> regions;
+            for (const auto& region : stageCaptures[i].regions) regions.emplace_back(region.guestAddress, std::vector<std::byte>(region.bytes.begin(), region.bytes.end()));
+            patchStages.push_back({*held, std::move(patches), programs[i].userData, programs[i].binary.codeAddress, std::move(regions)});
+        }
+        if (eligible && !patchStages.empty()) noteNativePatchVerify(nativeShape, std::move(patchStages));
+    }
     ProfileCaptureDiff(programs, stageCaptures);
     std::optional<DrawRelocationPlan> relocationPlan;
     if (useDrawEntries && relocatedDrawKeys() && !drawHit) {
