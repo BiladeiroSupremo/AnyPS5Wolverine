@@ -2461,10 +2461,29 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     totals.snapshotsUs = 0;
 }
 
+namespace {
+// APS5_PROFILE_DRAW: how the calling thread's last AcquireRegistered got its regions (the cached
+// space, or a rebuild and why) and how long it took, for the [holder] line; and every rebuild's time
+// by reason, any caller.
+enum class SpacePath : std::size_t { Served, WaiterDrop, First, Device, Generation, Epoch, SparseRefresh, Uncached, Count };
+constexpr const char* SpacePathNames[static_cast<std::size_t>(SpacePath::Count)] = {"served", "waiter drop", "first", "device", "generation", "epoch", "sparse refresh", "uncached"};
+struct LastAcquire {
+    SpacePath path = SpacePath::Served;
+    double us = 0;
+};
+LastAcquire& ThreadLastAcquire() {
+    thread_local LastAcquire last;
+    return last;
+}
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SpacePath::Count)> spacePathCount{}, spacePathNs{}, spacePathMaxNs{};
+}
+
 void GuestBufferMemory::AcquireRegistered() {
     Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
     ensurePinWaiter();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto acquireStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto path = addressSpaceCacheEnabled() ? SpacePath::Served : SpacePath::Uncached;
     auto& timing = ThreadAddressTiming();
     const auto lap = [&](double& into, std::chrono::steady_clock::time_point& from) {
         if (!profile) return;
@@ -2490,16 +2509,28 @@ void GuestBufferMemory::AcquireRegistered() {
         {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
-            if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
-            else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
-            else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
-            else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
-            else hit = true;
+            if (current == nullptr) {
+                const bool dropped = spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed);
+                (dropped ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
+                path = dropped ? SpacePath::WaiterDrop : SpacePath::First;
+            } else if (current->device != context.device) {
+                spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
+                path = SpacePath::Device;
+            } else if (current->generation != generation) {
+                spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
+                path = SpacePath::Generation;
+            } else if (current->importsEpoch != state.epoch) {
+                spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
+                path = SpacePath::Epoch;
+            } else {
+                hit = true;
+            }
         }
         if (hit) {
             for (auto* mirror : current->sparseMirrors) {
                 if (refreshSparseMirror(*mirror, blocks)) continue;
                 hit = false;
+                path = SpacePath::SparseRefresh;
                 blocks.clear();
                 spaces.current.compare_exchange_strong(current, std::shared_ptr<const AddressSpace>{});
                 break;
@@ -2680,6 +2711,16 @@ void GuestBufferMemory::AcquireRegistered() {
         if (mirrored) ++Mirrors().builds;
         sweepMirrors();
         reportMirrors();
+    }
+    if (profile) {
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - acquireStart).count());
+        const auto index = static_cast<std::size_t>(served ? SpacePath::Served : path == SpacePath::Served ? SpacePath::Uncached : path);
+        ThreadLastAcquire() = {static_cast<SpacePath>(index), static_cast<double>(ns) / 1e3};
+        spacePathCount[index].fetch_add(1, std::memory_order_relaxed);
+        spacePathNs[index].fetch_add(ns, std::memory_order_relaxed);
+        auto max = spacePathMaxNs[index].load(std::memory_order_relaxed);
+        while (ns > max && !spacePathMaxNs[index].compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
+        }
     }
 }
 
@@ -4491,6 +4532,11 @@ std::atomic<std::uint64_t> sharedHolders{0};
 std::array<std::atomic<std::uint64_t>, 6> holderMisses{};
 std::atomic<std::uint64_t> holderBuildNs{0}, holderBuilds{0};
 std::atomic<std::int64_t> holderReported{0};
+// ... and where a new holder's time went: the object, AcquireRegistered's lease, imports, mirror
+// and compare laps (ThreadAddressTiming deltas), in nanoseconds.
+std::array<std::atomic<std::uint64_t>, 5> holderLapNs{};
+// ... and by how AcquireRegistered got the new holder's space (ThreadLastAcquire).
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SpacePath::Count)> holderPathCount{}, holderPathNs{};
 }
 
 std::shared_ptr<GuestBufferMemory> GuestBufferMemory::TemplateUseHolder(const Context& context) {
@@ -4522,9 +4568,21 @@ std::shared_ptr<GuestBufferMemory> GuestBufferMemory::TemplateUseHolder(const Co
     }
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto holder = std::make_shared<GuestBufferMemory>(context);
+    const auto made = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto laps = ThreadAddressTiming();
     holder->AcquireRegistered();
     last = holder;
     if (profile) {
+        const auto& after = ThreadAddressTiming();
+        const auto lapNs = [](double us) { return static_cast<std::uint64_t>(std::max(us, 0.0) * 1000.0); };
+        holderLapNs[0].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(made - started).count()), std::memory_order_relaxed);
+        holderLapNs[1].fetch_add(lapNs(after.leaseUs - laps.leaseUs), std::memory_order_relaxed);
+        holderLapNs[2].fetch_add(lapNs(after.importsUs - laps.importsUs), std::memory_order_relaxed);
+        holderLapNs[3].fetch_add(lapNs(after.mirrorsUs - laps.mirrorsUs), std::memory_order_relaxed);
+        holderLapNs[4].fetch_add(lapNs(after.compareUs - laps.compareUs), std::memory_order_relaxed);
+        const auto& acquired = ThreadLastAcquire();
+        holderPathCount[static_cast<std::size_t>(acquired.path)].fetch_add(1, std::memory_order_relaxed);
+        holderPathNs[static_cast<std::size_t>(acquired.path)].fetch_add(lapNs(acquired.us), std::memory_order_relaxed);
         holderMisses[miss].fetch_add(1, std::memory_order_relaxed);
         holderBuildNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         holderBuilds.fetch_add(1, std::memory_order_relaxed);
@@ -4534,7 +4592,25 @@ std::shared_ptr<GuestBufferMemory> GuestBufferMemory::TemplateUseHolder(const Co
         else if (now - reported >= 10 && holderReported.compare_exchange_strong(reported, now)) {
             const auto builds = holderBuilds.exchange(0);
             const auto ns = holderBuildNs.exchange(0);
-            std::fprintf(stderr, "[holder] (10 s) %llu new space holders, %.1f us each (%.0f ms); not shared because: none held %llu, refreshing mirrors %llu, device %llu, allocation generation %llu, current space %llu, imports epoch %llu\n", static_cast<unsigned long long>(builds), builds == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(builds), static_cast<double>(ns) / 1e6, static_cast<unsigned long long>(holderMisses[0].exchange(0)), static_cast<unsigned long long>(holderMisses[1].exchange(0)), static_cast<unsigned long long>(holderMisses[2].exchange(0)), static_cast<unsigned long long>(holderMisses[3].exchange(0)), static_cast<unsigned long long>(holderMisses[4].exchange(0)), static_cast<unsigned long long>(holderMisses[5].exchange(0)));
+            std::array<double, 5> lapUs{};
+            for (std::size_t i = 0; i < lapUs.size(); ++i) lapUs[i] = builds == 0 ? 0.0 : static_cast<double>(holderLapNs[i].exchange(0)) / 1e3 / static_cast<double>(builds);
+            const double eachUs = builds == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(builds);
+            // Holders by space path (count / avg us), then every AcquireRegistered by path (count /
+            // total ms / max ms).
+            std::string paths;
+            for (std::size_t i = 0; i < static_cast<std::size_t>(SpacePath::Count); ++i) {
+                const auto count = holderPathCount[i].exchange(0);
+                const auto pathNs = holderPathNs[i].exchange(0);
+                const auto all = spacePathCount[i].exchange(0);
+                const auto allNs = spacePathNs[i].exchange(0);
+                const auto allMax = spacePathMaxNs[i].exchange(0);
+                if (count == 0 && all == 0) continue;
+                char item[160];
+                std::snprintf(item, sizeof(item), " %s %llu/%.0f us (all builds %llu, %.1f ms, max %.2f ms);", SpacePathNames[i], static_cast<unsigned long long>(count), count == 0 ? 0.0 : static_cast<double>(pathNs) / 1e3 / static_cast<double>(count), static_cast<unsigned long long>(all), static_cast<double>(allNs) / 1e6, static_cast<double>(allMax) / 1e6);
+                paths += item;
+            }
+            std::fprintf(stderr, "[holder-space] (10 s) new holders by space path:%s\n", paths.c_str());
+            std::fprintf(stderr, "[holder] (10 s) %llu new space holders, %.1f us each (%.0f ms; object %.1f lease %.1f imports %.1f mirrors %.1f compare %.1f rest %.1f); not shared because: none held %llu, refreshing mirrors %llu, device %llu, allocation generation %llu, current space %llu, imports epoch %llu\n", static_cast<unsigned long long>(builds), eachUs, static_cast<double>(ns) / 1e6, lapUs[0], lapUs[1], lapUs[2], lapUs[3], lapUs[4], eachUs - lapUs[0] - lapUs[1] - lapUs[2] - lapUs[3] - lapUs[4], static_cast<unsigned long long>(holderMisses[0].exchange(0)), static_cast<unsigned long long>(holderMisses[1].exchange(0)), static_cast<unsigned long long>(holderMisses[2].exchange(0)), static_cast<unsigned long long>(holderMisses[3].exchange(0)), static_cast<unsigned long long>(holderMisses[4].exchange(0)), static_cast<unsigned long long>(holderMisses[5].exchange(0)));
         }
     }
     return holder;

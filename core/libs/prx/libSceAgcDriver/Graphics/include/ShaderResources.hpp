@@ -252,6 +252,9 @@ public:
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults() const;
+    // APS5_PROFILE_DRAW: the recorder batch a template hit last used this object in (Draw.cpp's
+    // [batch-reuse] line: how often a batch repeats a template).
+    std::uint64_t profileUseBatch = 0;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken

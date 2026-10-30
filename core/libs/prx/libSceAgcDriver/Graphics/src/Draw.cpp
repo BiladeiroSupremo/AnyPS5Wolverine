@@ -1451,6 +1451,29 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             splitAdd(3, at);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                // APS5_PROFILE_DRAW: template hits whose template the open batch already used (and
+                // of them those without moved buffers, which could share that use's bindings), and
+                // repeats of the previous hit's template, on a [batch-reuse] line every 10 s.
+                if (timer.profile && recorder != nullptr) {
+                    static std::atomic<std::uint64_t> reuse[4]{};
+                    static std::atomic<std::int64_t> reuseReported{0};
+                    static const ShaderResources* previous = nullptr;
+                    const auto batch = recorder->Submissions() + 1;
+                    reuse[0].fetch_add(1, std::memory_order_relaxed);
+                    if (cached->profileUseBatch == batch) {
+                        reuse[1].fetch_add(1, std::memory_order_relaxed);
+                        if (moved->empty()) reuse[2].fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (previous == cached.get()) reuse[3].fetch_add(1, std::memory_order_relaxed);
+                    previous = cached.get();
+                    cached->profileUseBatch = batch;
+                    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+                    auto last = reuseReported.load(std::memory_order_relaxed);
+                    if (last == 0) reuseReported.compare_exchange_strong(last, now);
+                    else if (now - last >= 10'000'000'000ll && reuseReported.compare_exchange_strong(last, now)) {
+                        std::fprintf(stderr, "[batch-reuse] template hits (10 s): %llu, template already used in the open batch %llu (%llu without moved buffers), same template as the previous hit %llu\n", static_cast<unsigned long long>(reuse[0].exchange(0)), static_cast<unsigned long long>(reuse[1].exchange(0)), static_cast<unsigned long long>(reuse[2].exchange(0)), static_cast<unsigned long long>(reuse[3].exchange(0)));
+                    }
+                }
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
