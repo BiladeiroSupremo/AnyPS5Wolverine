@@ -17,6 +17,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -27,7 +28,7 @@ namespace {
 
 // APS5_NATIVE_DRAWS (native path N2, see Driver::draw): a walk-free shape's stages as first
 // materialized, the patches that carry a draw's user words into them, the program and the vertex
-// stage info they were built for (empty for a GeometryBack role).
+// stage info they were built for (a hit needs the same; empty for a GeometryBack role).
 struct NativeDrawStage {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::vector<DispatchVariant::UserWordPatch> patches;
@@ -39,6 +40,8 @@ struct NativeDrawCache {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, std::shared_ptr<const std::vector<NativeDrawStage>>> shapes;
     std::uint64_t hits = 0, stored = 0, refused = 0, walking = 0;
+    // APS5_NATIVE_DRAWS=verify: stages whose reused copy equals / differs from the fresh one.
+    std::uint64_t verifyEqual = 0, verifyDiffer = 0, verifyReports = 0;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
@@ -47,11 +50,32 @@ NativeDrawCache& nativeDrawCache() {
     return *cache;
 }
 
-// The cached stage with this draw's user words patched in (the stage itself when nothing is
-// patched), or null when a patch lies outside it.
-std::shared_ptr<const ShaderRecompiler::RecompileResult> nativePatchedResult(const NativeDrawStage& stage, std::span<const std::uint32_t> userData) {
-    if (stage.patches.empty()) return stage.result;
+// Whether two vertex stage infos have the same shape: everything but each V#'s base address and
+// record count (word 0, word 1 bits 0-15, word 2), which the reused stage takes from this draw
+// (nativePatchedResult). The compiled stage depends on the rest (formats and selectors in word 3,
+// stride and swizzle in word 1, the fetch layout).
+bool sameVertexShape(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b) {
+    if (a.resourcesNum != b.resourcesNum || a.fetchAttribReg != b.fetchAttribReg || a.fetchBufferReg != b.fetchBufferReg || a.fetchEmbedded != b.fetchEmbedded || a.paClVsOutCntl != b.paClVsOutCntl) return false;
+    for (std::uint32_t i = 0; i < a.resourcesNum && i < a.resources.size(); ++i) {
+        if (a.resources[i].fields[3] != b.resources[i].fields[3] || (a.resources[i].fields[1] >> 16u) != (b.resources[i].fields[1] >> 16u)) return false;
+        const auto& x = a.resourcesDst[i];
+        const auto& y = b.resourcesDst[i];
+        if (x.registerStart != y.registerStart || x.registersNum != y.registersNum || x.attrId != y.attrId || x.fetchIndex != y.fetchIndex) return false;
+    }
+    return true;
+}
+
+// The cached stage with this draw's per-draw values: its user words patched in, and its vertex
+// attributes' V#s (the compiled result keeps each attribute's whole V#, base address included:
+// Recompiler.cpp materializeResult) taken from this draw's vertex stage info. The stage itself when
+// there is nothing to change; null when a patch or an attribute lies outside it.
+std::shared_ptr<const ShaderRecompiler::RecompileResult> nativePatchedResult(const NativeDrawStage& stage, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex) {
+    if (stage.patches.empty() && stage.result->vertexAttributes.empty()) return stage.result;
     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*stage.result);
+    for (auto& attribute : patched->vertexAttributes) {
+        if (!vertex || attribute.location >= vertex->resourcesNum || attribute.location >= vertex->resources.size()) return nullptr;
+        attribute.resource = vertex->resources[attribute.location];
+    }
     for (const auto& patch : stage.patches) {
         if (patch.userWord >= userData.size()) return nullptr;
         const auto value = userData[patch.userWord];
@@ -757,7 +781,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // (trnv1, 2026-10-30: ~27k, 0 mismatches). Walking shapes (85% of draws) still capture: their
     // flattened SRTs carry bindless-table state a patch cannot rebuild (N3, not built). The vertex
     // stage info (memory-derived) must also match the cached stage's.
+    // APS5_NATIVE_DRAWS=verify: every hit also materializes the stages as before, renders with those
+    // and compares them with the reused ones (rendering unchanged).
     static const bool nativeDraws = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
+    static const bool nativeVerify = nativeDraws && std::string_view(std::getenv("APS5_NATIVE_DRAWS")) == "verify";
     const auto nativeKey = nativeDraws && !drawHit ? drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, true) : 0;
     std::shared_ptr<const std::vector<NativeDrawStage>> nativeHit;
     if (nativeDraws && !drawHit) {
@@ -770,7 +797,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; same && i < programs.size(); ++i) {
             if (roles[i] == Role::GeometryBack) continue;
             const auto& stage = (*nativeHit)[i];
-            same = stage.result != nullptr && stage.program == programs[i].binary.codeAddress && stage.vertexInfo.has_value() == vertexInfos[i].has_value() && (!vertexInfos[i] || sameVertexInfo(*vertexInfos[i], *stage.vertexInfo));
+            same = stage.result != nullptr && stage.program == programs[i].binary.codeAddress && stage.vertexInfo.has_value() == vertexInfos[i].has_value() && (!vertexInfos[i] || sameVertexShape(*vertexInfos[i], *stage.vertexInfo));
         }
         if (!same) nativeHit = nullptr;
     }
@@ -799,8 +826,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     break;
                 }
             }
-            if (nativeHit != nullptr) {
-                auto patched = nativePatchedResult((*nativeHit)[i], programs[i].userData);
+            if (nativeHit != nullptr && !nativeVerify) {
+                auto patched = nativePatchedResult((*nativeHit)[i], programs[i].userData, vertexInfos[i]);
                 require(patched != nullptr, "native draw: a user-word patch lies outside the cached stage result");
                 heldResults.push_back(std::move(patched));
                 programResults[i] = heldResults.back().get();
@@ -808,6 +835,29 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 heldResults.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = heldResults.back().get();
+                if (nativeHit != nullptr) {
+                    const auto patched = nativePatchedResult((*nativeHit)[i], programs[i].userData, vertexInfos[i]);
+                    // sameCompiledResult leaves out the vertex attributes and poisoned SRT reads,
+                    // which are per draw too.
+                    const auto& fresh = *heldResults.back();
+                    const auto sameAttributes = [&] {
+                        if (patched->vertexAttributes.size() != fresh.vertexAttributes.size()) return false;
+                        for (std::size_t a = 0; a < fresh.vertexAttributes.size(); ++a) {
+                            const auto& x = patched->vertexAttributes[a];
+                            const auto& y = fresh.vertexAttributes[a];
+                            if (x.location != y.location || x.components != y.components || x.fetchIndex != y.fetchIndex || x.formatComponents != y.formatComponents || x.resource.fields != y.resource.fields) return false;
+                        }
+                        return true;
+                    };
+                    const bool equal = patched != nullptr && sameCompiledResult(*patched, fresh) && patched->poisonedSrtReads == fresh.poisonedSrtReads && sameAttributes();
+                    auto& cache = nativeDrawCache();
+                    std::lock_guard lock(cache.mutex);
+                    ++(equal ? cache.verifyEqual : cache.verifyDiffer);
+                    if (!equal && cache.verifyReports < 12) {
+                        ++cache.verifyReports;
+                        std::fprintf(stderr, "[native-draws] verify: stage %zu of program 0x%llx differs from its reused copy%s\n", i, static_cast<unsigned long long>(program.binary.codeAddress), patched == nullptr ? " (patch outside the result)" : "");
+                    }
+                }
             }
         }
         const auto& result = *programResults[i];
@@ -832,7 +882,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             for (std::size_t i = 0; store != nullptr && i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack) continue;
                 const auto held = std::find_if(heldResults.begin(), heldResults.end(), [&](const auto& result) { return result.get() == programResults[i]; });
-                if (held == heldResults.end() || !stageCaptures[i].captured || !stageCaptures[i].regions.empty() || !decodeReads[i].empty()) {
+                // Vertex stage info read from memory is fine: every draw decodes its own and a hit
+                // requires it equal to the stored one (requiring none cut hits from ~14k to ~600
+                // per 10 s, trn2v).
+                if (held == heldResults.end() || !stageCaptures[i].captured || !stageCaptures[i].regions.empty()) {
                     walking = true;
                     store = nullptr;
                     break;
@@ -853,8 +906,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         else ++cache.refused;
         if (const auto clock = std::chrono::steady_clock::now(); clock - cache.reported >= std::chrono::seconds(10)) {
             cache.reported = clock;
-            std::fprintf(stderr, "[native-draws] (10 s) walk-free reuse: %llu hits, %llu stored, %llu walking draws (capture as before), %llu refused; %zu shapes kept\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.stored), static_cast<unsigned long long>(cache.walking), static_cast<unsigned long long>(cache.refused), cache.shapes.size());
-            cache.hits = cache.stored = cache.walking = cache.refused = 0;
+            std::fprintf(stderr, "[native-draws] (10 s) walk-free reuse: %llu hits, %llu stored, %llu walking draws (capture as before), %llu refused; %zu shapes kept; verify: %llu stages equal, %llu differ\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.stored), static_cast<unsigned long long>(cache.walking), static_cast<unsigned long long>(cache.refused), cache.shapes.size(), static_cast<unsigned long long>(cache.verifyEqual), static_cast<unsigned long long>(cache.verifyDiffer));
+            cache.hits = cache.stored = cache.walking = cache.refused = cache.verifyEqual = cache.verifyDiffer = 0;
         }
     }
     // APS5_NATIVE_CENSUS=1 (native path groundwork, count only): whether the draw's shape (the
