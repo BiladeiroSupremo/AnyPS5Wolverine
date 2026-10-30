@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <array>
 #include <atomic>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -136,7 +137,18 @@ struct NativeDrawStage {
     // Where those pointers' low words appear in the result (binding or NoBinding for push data, word,
     // and in `userWord` the pointer's position in runs->words): a hit writes their values now there.
     std::vector<DispatchVariant::UserWordPatch> chainPatches;
+    // Dispatches: value-used user words not used as a read base whose every use the patches carry
+    // (patchableValues). A dispatch where only such words changed is built once as before and
+    // compared with this stage patched (learning): equal adds them to `confirmed`, unequal sets
+    // `refused`; later dispatches with only confirmed words changed reuse the stage.
+    std::uint64_t patchableValues = 0;
+    std::shared_ptr<std::atomic<std::uint64_t>> confirmed = std::make_shared<std::atomic<std::uint64_t>>(0);
+    std::shared_ptr<std::atomic<bool>> refused = std::make_shared<std::atomic<bool>>(false);
 };
+
+// The value-used user words that differ from the stage's (bit per word below 64), or ~0 when the
+// words cannot be compared that way (sizes, untracked words, base-pointer nullness).
+std::uint64_t NativeValueChanges(const NativeDrawStage& stage, std::span<const std::uint32_t> userData);
 
 // A stage's captured words (`regions`, the words its walk read from pages) as runs, each relocated
 // at the user word its walk read it through (`walkReads`: address and origin, SrtUserDataUse::reads);

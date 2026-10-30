@@ -35,6 +35,8 @@ struct NativeDispatchCache {
     std::unordered_map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>> churn;
     std::uint64_t hits = 0, walkingHits = 0, stored = 0, walkingStored = 0, refused = 0, missedValues = 0, missedRuns = 0, gathers = 0, gatherNs = 0, unstable = 0;
     std::uint64_t verifyEqual = 0, verifyDiffer = 0, verifyReports = 0;
+    // Learning dispatches (changed patchable value words) whose patched entry equalled / differed.
+    std::uint64_t learnedEqual = 0, learnedDiffer = 0;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
@@ -47,7 +49,8 @@ void reportNativeDispatches(NativeDispatchCache& cache) {
     const auto clock = std::chrono::steady_clock::now();
     if (clock - cache.reported < std::chrono::seconds(10)) return;
     cache.reported = clock;
-    std::fprintf(stderr, "[native-dispatches] (10 s) reuse: %llu hits (%llu walking), %llu stored (%llu walking), %llu refused, %llu of unstable shapes; known shapes missed on value words %llu, on captured words %llu; gathers %llu, %.1f us each; %zu shapes kept; verify: %llu equal, %llu differ\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.walkingHits), static_cast<unsigned long long>(cache.stored), static_cast<unsigned long long>(cache.walkingStored), static_cast<unsigned long long>(cache.refused), static_cast<unsigned long long>(cache.unstable), static_cast<unsigned long long>(cache.missedValues), static_cast<unsigned long long>(cache.missedRuns), static_cast<unsigned long long>(cache.gathers), cache.gathers == 0 ? 0.0 : static_cast<double>(cache.gatherNs) / 1e3 / static_cast<double>(cache.gathers), cache.shapes.size(), static_cast<unsigned long long>(cache.verifyEqual), static_cast<unsigned long long>(cache.verifyDiffer));
+    std::fprintf(stderr, "[native-dispatches] (10 s) reuse: %llu hits (%llu walking), %llu stored (%llu walking), %llu refused, %llu of unstable shapes; known shapes missed on value words %llu, on captured words %llu; gathers %llu, %.1f us each; %zu shapes kept; learned value patches %llu equal, %llu differ; verify: %llu equal, %llu differ\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.walkingHits), static_cast<unsigned long long>(cache.stored), static_cast<unsigned long long>(cache.walkingStored), static_cast<unsigned long long>(cache.refused), static_cast<unsigned long long>(cache.unstable), static_cast<unsigned long long>(cache.missedValues), static_cast<unsigned long long>(cache.missedRuns), static_cast<unsigned long long>(cache.gathers), cache.gathers == 0 ? 0.0 : static_cast<double>(cache.gatherNs) / 1e3 / static_cast<double>(cache.gathers), cache.shapes.size(), static_cast<unsigned long long>(cache.learnedEqual), static_cast<unsigned long long>(cache.learnedDiffer), static_cast<unsigned long long>(cache.verifyEqual), static_cast<unsigned long long>(cache.verifyDiffer));
+    cache.learnedEqual = cache.learnedDiffer = 0;
     cache.hits = cache.walkingHits = cache.stored = cache.walkingStored = cache.refused = cache.unstable = cache.missedValues = cache.missedRuns = cache.gathers = cache.gatherNs = cache.verifyEqual = cache.verifyDiffer = 0;
 }
 
@@ -335,6 +338,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::shared_ptr<const NativeDrawStage> nativeHit;
     std::vector<ShaderRecompiler::MemoryRegion> nativeRegions;
     std::shared_ptr<const std::vector<std::uint32_t>> nativeLive;
+    // An entry whose patchable value words changed for the first time (see NativeDrawStage).
+    std::shared_ptr<const NativeDrawStage> nativeLearn;
+    std::uint64_t nativeLearnChanges = 0;
     if (nativeEligible) {
         nativeShape = 0xcbf29ce484222325ull;
         const auto mixShape = [&](std::uint64_t value) {
@@ -356,7 +362,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         {
             std::lock_guard lock(cache.mutex);
             const auto churned = cache.churn.find(nativeShape);
-            if (churned != cache.churn.end() && churned->second.first >= 8 && churned->second.second * 4 < churned->second.first) {
+            if (!nativeVerify && churned != cache.churn.end() && churned->second.first >= 8 && churned->second.second * 4 < churned->second.first) {
                 ++cache.unstable;
                 nativeEligible = false;
             } else if (const auto found = cache.shapes.find(nativeShape); found != cache.shapes.end()) {
@@ -365,7 +371,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         bool valuesMatched = false;
         for (const auto& entry : entries) {
-            if (!NativeSameValues(*entry, userData)) continue;
+            // Value-used words that changed must be confirmed patchable for this entry; a first
+            // change of patchable ones makes this dispatch a learning one (compared after capture).
+            const auto changes = NativeValueChanges(*entry, userData);
+            if (changes == ~std::uint64_t{0} || (changes & ~entry->patchableValues) != 0 || (changes != 0 && entry->refused->load(std::memory_order_relaxed))) continue;
+            if ((changes & ~entry->confirmed->load(std::memory_order_relaxed)) != 0) {
+                if (nativeLearn == nullptr) {
+                    nativeLearn = entry;
+                    nativeLearnChanges = changes;
+                }
+                continue;
+            }
             valuesMatched = true;
             if (entry->runs == nullptr) {
                 nativeHit = entry;
@@ -394,6 +410,20 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (nativeHit->runs != nullptr) ++cache.walkingHits;
         } else if (!entries.empty()) {
             ++(valuesMatched ? cache.missedRuns : cache.missedValues);
+            // =verify: which value-used words changed against the newest entry (16, from gameplay on).
+            static const auto firstDispatch = std::chrono::steady_clock::now();
+            if (nativeVerify && !valuesMatched && cache.verifyReports < 16 && std::chrono::steady_clock::now() - firstDispatch > std::chrono::seconds(240)) {
+                ++cache.verifyReports;
+                const auto& newest = *entries.front();
+                std::uint64_t changed = 0;
+                std::string words;
+                for (std::size_t word = 0; word < 64 && word < userData.size() && word < newest.userData.size(); ++word) {
+                    if (((newest.asValue >> word) & 1u) == 0 || userData[word] == newest.userData[word]) continue;
+                    changed |= std::uint64_t{1} << word;
+                    if (words.size() < 160) words += " w" + std::to_string(word) + " " + std::to_string(newest.userData[word]) + "->" + std::to_string(userData[word]);
+                }
+                std::fprintf(stderr, "[native-dispatches] value miss: program 0x%llx value-used 0x%llx base 0x%llx changed 0x%llx:%s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(newest.asValue), static_cast<unsigned long long>(newest.asBase), static_cast<unsigned long long>(changed), words.c_str());
+            }
         }
         reportNativeDispatches(cache);
     }
@@ -510,9 +540,34 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     if (stage->runs != nullptr) NativeAddDataPositions(*stage->runs, parents);
                     if (stage->runs == nullptr) stage = nullptr;
                 }
+                // Value-used words not used as a read base whose uses the patches carry.
+                if (stage != nullptr) {
+                    std::uint64_t carried = 0;
+                    for (const auto& patch : stage->patches) {
+                        if (patch.userWord < 64) carried |= std::uint64_t{1} << patch.userWord;
+                    }
+                    stage->patchableValues = stage->asValue & ~stage->asBase & carried;
+                }
+            }
+            // Learning: the entry patched with this dispatch's words against this capture, its
+            // captured words found equal at this dispatch's pointers first.
+            int learned = 0;
+            if (nativeLearn != nullptr && capture != nullptr) {
+                std::vector<ShaderRecompiler::MemoryRegion> learnRegions;
+                std::shared_ptr<const std::vector<std::uint32_t>> learnLive;
+                if (nativeGather(*nativeLearn, userData, address, submission.queue, learnRegions, learnLive)) {
+                    auto patched = NativePatchedResult(*nativeLearn, userData, std::nullopt);
+                    if (learnLive != nullptr) patched = NativeWithData(std::move(patched), *nativeLearn, *learnLive);
+                    const bool equal = patched != nullptr && sameCompiledResult(*patched, *compiledResult) && patched->poisonedSrtReads == compiledResult->poisonedSrtReads;
+                    if (equal) nativeLearn->confirmed->fetch_or(nativeLearnChanges, std::memory_order_relaxed);
+                    else nativeLearn->refused->store(true, std::memory_order_relaxed);
+                    learned = equal ? 1 : -1;
+                }
             }
             auto& cache = nativeDispatchCache();
             std::lock_guard lock(cache.mutex);
+            if (learned > 0) ++cache.learnedEqual;
+            if (learned < 0) ++cache.learnedDiffer;
             if (stage != nullptr) {
                 if (cache.shapes.size() > (1u << 14)) cache.shapes.clear();
                 if (cache.churn.size() > (1u << 16)) cache.churn.clear();

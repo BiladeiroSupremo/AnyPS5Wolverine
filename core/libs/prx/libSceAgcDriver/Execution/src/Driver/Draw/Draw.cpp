@@ -148,6 +148,16 @@ void TripNative(const char* what, std::uint64_t program) {
     if (!nativeTripped.exchange(true)) std::fprintf(stderr, "[native] a sampled check found %s of program 0x%llx unlike a fresh build: native reuse is off for the rest of the run\n", what, static_cast<unsigned long long>(program));
 }
 
+std::uint64_t NativeValueChanges(const NativeDrawStage& stage, std::span<const std::uint32_t> userData) {
+    if (userData.size() != stage.userData.size() || userData.size() > 64 || stage.asValue == ~std::uint64_t{0}) return ~std::uint64_t{0};
+    std::uint64_t changed = 0;
+    for (std::size_t word = 0; word < userData.size(); ++word) {
+        if (((stage.asBase >> word) & 1u) != 0 && word + 1 < userData.size() && ((userData[word] | userData[word + 1]) == 0) != ((stage.userData[word] | stage.userData[word + 1]) == 0)) return ~std::uint64_t{0};
+        if (((stage.asValue >> word) & 1u) != 0 && userData[word] != stage.userData[word]) changed |= std::uint64_t{1} << word;
+    }
+    return changed;
+}
+
 bool NativeSameValues(const NativeDrawStage& stage, std::span<const std::uint32_t> userData) {
     if (userData.size() != stage.userData.size()) return false;
     for (std::size_t word = 0; word < userData.size(); ++word) {
