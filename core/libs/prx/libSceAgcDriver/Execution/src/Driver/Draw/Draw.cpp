@@ -25,6 +25,47 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+// APS5_NATIVE_DRAWS (native path N2, see Driver::draw): a walk-free shape's stages as first
+// materialized, the patches that carry a draw's user words into them, the program and the vertex
+// stage info they were built for (empty for a GeometryBack role).
+struct NativeDrawStage {
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::vector<DispatchVariant::UserWordPatch> patches;
+    std::uint64_t program = 0;
+    std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+};
+
+struct NativeDrawCache {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const std::vector<NativeDrawStage>>> shapes;
+    std::uint64_t hits = 0, stored = 0, refused = 0, walking = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+NativeDrawCache& nativeDrawCache() {
+    static auto* cache = new NativeDrawCache();
+    return *cache;
+}
+
+// The cached stage with this draw's user words patched in (the stage itself when nothing is
+// patched), or null when a patch lies outside it.
+std::shared_ptr<const ShaderRecompiler::RecompileResult> nativePatchedResult(const NativeDrawStage& stage, std::span<const std::uint32_t> userData) {
+    if (stage.patches.empty()) return stage.result;
+    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*stage.result);
+    for (const auto& patch : stage.patches) {
+        if (patch.userWord >= userData.size()) return nullptr;
+        const auto value = userData[patch.userWord];
+        if (patch.binding == DispatchVariant::UserWordPatch::NoBinding) {
+            if ((patch.word + 1) * sizeof(std::uint32_t) > patched->pushConstants.size()) return nullptr;
+            std::memcpy(patched->pushConstants.data() + patch.word * sizeof(std::uint32_t), &value, sizeof(value));
+        } else {
+            if (patch.binding >= patched->bindings.size() || patch.word >= patched->bindings[patch.binding].guestDescriptor.size()) return nullptr;
+            patched->bindings[patch.binding].guestDescriptor[patch.word] = value;
+        }
+    }
+    return patched;
+}
+
 // APS5_NATIVE_CENSUS (see Driver::draw): shapes seen (capped, then forgotten) and 10 s counters.
 void noteNativeCensus(std::uint64_t shapeKey, bool drawHit, const std::vector<StageCapture>& captures, const std::vector<ShaderRecompiler::ProgramRole>& roles) {
     struct Census {
@@ -708,6 +749,31 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
     std::vector<std::size_t> resultIndex(programs.size(), 0);
+    // APS5_NATIVE_DRAWS=1 (native path N2; part of the native switch the user wants built whole and
+    // turned on at once): a walk-free draw (no stage reads guest memory for its resources) whose
+    // shape (the register key without user words: programs and render state) was drawn before reuses
+    // that draw's compiled stages with this draw's user words patched in, skipping capture and
+    // materialize. APS5_NATIVE_VERIFY_PATCH found that exact on every walk-free stage compared
+    // (trnv1, 2026-10-30: ~27k, 0 mismatches). Walking shapes (85% of draws) still capture: their
+    // flattened SRTs carry bindless-table state a patch cannot rebuild (N3, not built). The vertex
+    // stage info (memory-derived) must also match the cached stage's.
+    static const bool nativeDraws = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
+    const auto nativeKey = nativeDraws && !drawHit ? drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, true) : 0;
+    std::shared_ptr<const std::vector<NativeDrawStage>> nativeHit;
+    if (nativeDraws && !drawHit) {
+        auto& cache = nativeDrawCache();
+        {
+            std::lock_guard lock(cache.mutex);
+            if (const auto found = cache.shapes.find(nativeKey); found != cache.shapes.end()) nativeHit = found->second;
+        }
+        bool same = nativeHit != nullptr && nativeHit->size() == programs.size();
+        for (std::size_t i = 0; same && i < programs.size(); ++i) {
+            if (roles[i] == Role::GeometryBack) continue;
+            const auto& stage = (*nativeHit)[i];
+            same = stage.result != nullptr && stage.program == programs[i].binary.codeAddress && stage.vertexInfo.has_value() == vertexInfos[i].has_value() && (!vertexInfos[i] || sameVertexInfo(*vertexInfos[i], *stage.vertexInfo));
+        }
+        if (!same) nativeHit = nullptr;
+    }
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -733,9 +799,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     break;
                 }
             }
-            heldResults.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
-            if (!rejected.empty()) return DrawVerdict::Rejected;
-            programResults[i] = heldResults.back().get();
+            if (nativeHit != nullptr) {
+                auto patched = nativePatchedResult((*nativeHit)[i], programs[i].userData);
+                require(patched != nullptr, "native draw: a user-word patch lies outside the cached stage result");
+                heldResults.push_back(std::move(patched));
+                programResults[i] = heldResults.back().get();
+            } else {
+                heldResults.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+                if (!rejected.empty()) return DrawVerdict::Rejected;
+                programResults[i] = heldResults.back().get();
+            }
         }
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
@@ -749,6 +822,41 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
+    // APS5_NATIVE_DRAWS: a walk-free miss keeps its stages for its shape ([native-draws] line).
+    if (nativeDraws && !drawHit) {
+        auto& cache = nativeDrawCache();
+        std::shared_ptr<std::vector<NativeDrawStage>> store;
+        bool walking = false;
+        if (nativeHit == nullptr) {
+            store = std::make_shared<std::vector<NativeDrawStage>>(programs.size());
+            for (std::size_t i = 0; store != nullptr && i < programs.size(); ++i) {
+                if (roles[i] == Role::GeometryBack) continue;
+                const auto held = std::find_if(heldResults.begin(), heldResults.end(), [&](const auto& result) { return result.get() == programResults[i]; });
+                if (held == heldResults.end() || !stageCaptures[i].captured || !stageCaptures[i].regions.empty() || !decodeReads[i].empty()) {
+                    walking = true;
+                    store = nullptr;
+                    break;
+                }
+                auto patches = userWordPatchesFor(**held, programs[i].userData);
+                const auto data = shaderDataPatchesFor(**held);
+                patches.insert(patches.end(), data.begin(), data.end());
+                (*store)[i] = {*held, std::move(patches), programs[i].binary.codeAddress, vertexInfos[i]};
+            }
+        }
+        std::lock_guard lock(cache.mutex);
+        if (nativeHit != nullptr) ++cache.hits;
+        else if (store != nullptr) {
+            if (cache.shapes.size() > (1u << 14)) cache.shapes.clear();
+            cache.shapes[nativeKey] = std::move(store);
+            ++cache.stored;
+        } else if (walking) ++cache.walking;
+        else ++cache.refused;
+        if (const auto clock = std::chrono::steady_clock::now(); clock - cache.reported >= std::chrono::seconds(10)) {
+            cache.reported = clock;
+            std::fprintf(stderr, "[native-draws] (10 s) walk-free reuse: %llu hits, %llu stored, %llu walking draws (capture as before), %llu refused; %zu shapes kept\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.stored), static_cast<unsigned long long>(cache.walking), static_cast<unsigned long long>(cache.refused), cache.shapes.size());
+            cache.hits = cache.stored = cache.walking = cache.refused = 0;
+        }
+    }
     // APS5_NATIVE_CENSUS=1 (native path groundwork, count only): whether the draw's shape (the
     // register key without user words: programs and render state) was seen before, and whether its
     // stages captured nothing (walk-free); a [native-census] line every 10 s. A repeated walk-free
@@ -800,7 +908,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     }
     const bool relocatedDraw = relocation != nullptr || (relocationPlan && std::any_of(relocationPlan->stages.begin(), relocationPlan->stages.end(), [](bool stage) { return stage; }));
-    cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, relocationPlan ? relocationPlan->insertKey : drawKey, registerKey, decode, phaseTiming, relocationPlan ? &*relocationPlan : nullptr);
+    // A native hit captured nothing: the draw cache gets no entry from it.
+    cacheDrawStages(useDrawEntries && nativeHit == nullptr, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, relocationPlan ? relocationPlan->insertKey : drawKey, registerKey, decode, phaseTiming, relocationPlan ? &*relocationPlan : nullptr);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
