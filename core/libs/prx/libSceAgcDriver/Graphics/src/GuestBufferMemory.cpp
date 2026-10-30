@@ -4485,33 +4485,58 @@ void GuestBufferMemory::NoteSpaceReads(Recorder& recorder) const {
 
 namespace {
 std::atomic<std::uint64_t> sharedHolders{0};
+// APS5_PROFILE_DRAW: why a template use could not take the shared holder (none held, refreshing
+// mirrors, another device, allocation generation, another current space, imports epoch) and the
+// time the new holders took, on a [holder] line every 10 s.
+std::array<std::atomic<std::uint64_t>, 6> holderMisses{};
+std::atomic<std::uint64_t> holderBuildNs{0}, holderBuilds{0};
+std::atomic<std::int64_t> holderReported{0};
 }
 
 std::shared_ptr<GuestBufferMemory> GuestBufferMemory::TemplateUseHolder(const Context& context) {
     static const bool perUse = std::getenv("APS5_NO_SHARED_SPACE_HOLDER") != nullptr;
-    // A weak reference: the uses' bindings own the holder, this only finds it again.
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // A weak reference: the uses' bindings own the holder, this only finds it again. It dies whenever
+    // no recorded draw uses it and the next use builds a new one (0.5-4.7 ms each, ~400 per 10 s in
+    // PPSA03671 gameplay, trnh1 2026-10-30), but holding it strongly stalled the run (trnh2: ~2 ms
+    // per commit): something waits for the holder to be released.
     thread_local std::weak_ptr<GuestBufferMemory> last;
+    std::size_t miss = 0;
     if (!perUse && addressSpaceCacheEnabled()) {
         if (auto held = last.lock(); held != nullptr && held->space != nullptr) {
             const auto& space = *held->space;
             // What AcquireRegistered's hit takes besides the space: a sparse mirror refresh, and
             // with copy refreshes on, writable and heap mirror refreshes; such spaces are not shared.
             const bool refreshes = !space.sparseMirrors.empty() || (!skipCopyRefresh() && (!space.writableMirrors.empty() || !space.heapRuns.empty()));
-            bool current = !refreshes && space.device == context.device && space.generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && Spaces().current.load() == held->space;
-            if (current) {
+            miss = refreshes ? 1 : space.device != context.device ? 2 : space.generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix() ? 3 : Spaces().current.load() != held->space ? 4 : 0;
+            if (miss == 0) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
-                current = space.importsEpoch == state.epoch;
+                if (space.importsEpoch != state.epoch) miss = 5;
             }
-            if (current) {
+            if (miss == 0) {
                 sharedHolders.fetch_add(1, std::memory_order_relaxed);
                 return held;
             }
         }
     }
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto holder = std::make_shared<GuestBufferMemory>(context);
     holder->AcquireRegistered();
     last = holder;
+    if (profile) {
+        holderMisses[miss].fetch_add(1, std::memory_order_relaxed);
+        holderBuildNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+        holderBuilds.fetch_add(1, std::memory_order_relaxed);
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto reported = holderReported.load(std::memory_order_relaxed);
+        if (reported == 0) holderReported.compare_exchange_strong(reported, now);
+        else if (now - reported >= 10 && holderReported.compare_exchange_strong(reported, now)) {
+            const auto builds = holderBuilds.exchange(0);
+            const auto ns = holderBuildNs.exchange(0);
+            std::fprintf(stderr, "[holder] (10 s) %llu new space holders, %.1f us each (%.0f ms); not shared because: none held %llu, refreshing mirrors %llu, device %llu, allocation generation %llu, current space %llu, imports epoch %llu\n", static_cast<unsigned long long>(builds), builds == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(builds), static_cast<double>(ns) / 1e6, static_cast<unsigned long long>(holderMisses[0].exchange(0)), static_cast<unsigned long long>(holderMisses[1].exchange(0)), static_cast<unsigned long long>(holderMisses[2].exchange(0)), static_cast<unsigned long long>(holderMisses[3].exchange(0)), static_cast<unsigned long long>(holderMisses[4].exchange(0)), static_cast<unsigned long long>(holderMisses[5].exchange(0)));
+        }
+    }
     return holder;
 }
 
