@@ -126,6 +126,75 @@ bool NativeSameValues(const NativeDrawStage& stage, std::span<const std::uint32_
 
 namespace {
 
+std::uint64_t NativePointerAt(const std::vector<std::uint32_t>& userData, int word);
+
+// APS5_NATIVE_DRAWS=verify: why a known shape's entry whose value words matched missed on its
+// captured words: its words at this draw's runs against what this draw's capture read, by run kind
+// (relocated at a user pointer, or absolute), and the words read on one side only ([native-miss]).
+void noteNativeMiss(const std::vector<NativeDrawStage>& entry, const std::vector<StageCapture>& captures, const std::vector<DrawProgram>& programs) {
+    struct Counters {
+        std::mutex mutex;
+        std::uint64_t misses = 0, relativeDiffer = 0, absoluteDiffer = 0, notRead = 0, newReads = 0;
+        int examples = 0;
+        std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+    };
+    static auto* counters = new Counters();
+    std::uint64_t relativeDiffer = 0, absoluteDiffer = 0, notRead = 0, newReads = 0;
+    char example[224] = "";
+    for (std::size_t i = 0; i < entry.size() && i < captures.size() && i < programs.size(); ++i) {
+        const auto& stage = entry[i];
+        if (stage.runs == nullptr || !captures[i].captured) continue;
+        std::unordered_map<std::uint64_t, std::uint32_t> now;
+        for (const auto& region : captures[i].regions) {
+            for (std::size_t k = 0; k < region.bytes.size() / sizeof(std::uint32_t); ++k) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, region.bytes.data() + k * sizeof(value), sizeof(value));
+                now.emplace(region.guestAddress + k * sizeof(value), value);
+            }
+        }
+        std::unordered_set<std::uint64_t> covered;
+        const auto& runs = *stage.runs;
+        std::size_t offset = 0;
+        for (std::size_t r = 0; r < runs.runs.size(); ++r) {
+            const auto count = static_cast<std::size_t>((runs.runs[r].second - runs.runs[r].first) / sizeof(std::uint32_t));
+            const int word = runs.runPointerWords[r];
+            const bool relative = word >= 0 && static_cast<std::size_t>(word) + 1 < programs[i].userData.size();
+            const auto begin = relative ? NativePointerAt(programs[i].userData, word) + (runs.runs[r].first - runs.runPointerValues[r]) : runs.runs[r].first;
+            for (std::size_t k = 0; k < count; ++k) {
+                const auto address = begin + k * sizeof(std::uint32_t);
+                covered.insert(address);
+                const auto found = now.find(address);
+                const auto stored = runs.words[offset + k];
+                if (found == now.end()) {
+                    ++notRead;
+                } else if (found->second != stored) {
+                    ++(relative ? relativeDiffer : absoluteDiffer);
+                    if (example[0] == '\0') std::snprintf(example, sizeof(example), "program 0x%llx stage %zu run %zu of %zu (%s %d) word %zu: stored 0x%08x, now 0x%08x", static_cast<unsigned long long>(stage.program), i, r, runs.runs.size(), relative ? "user pointer" : "absolute", word, k, stored, found->second);
+                }
+            }
+            offset += count;
+        }
+        for (const auto& [address, value] : now) {
+            if (!covered.contains(address)) ++newReads;
+        }
+    }
+    std::lock_guard lock(counters->mutex);
+    ++counters->misses;
+    counters->relativeDiffer += relativeDiffer;
+    counters->absoluteDiffer += absoluteDiffer;
+    counters->notRead += notRead;
+    counters->newReads += newReads;
+    if (example[0] != '\0' && counters->examples < 16) {
+        ++counters->examples;
+        std::fprintf(stderr, "[native-miss] %s (this miss: %llu/%llu words differ pointer/absolute, %llu not read now, %llu new)\n", example, static_cast<unsigned long long>(relativeDiffer), static_cast<unsigned long long>(absoluteDiffer), static_cast<unsigned long long>(notRead), static_cast<unsigned long long>(newReads));
+    }
+    const auto clock = std::chrono::steady_clock::now();
+    if (clock - counters->reported < std::chrono::seconds(10)) return;
+    counters->reported = clock;
+    std::fprintf(stderr, "[native-miss] (10 s) %llu misses on captured words: words differ at user-pointer runs %llu, at absolute runs %llu; stored words not read now %llu; words read now only %llu\n", static_cast<unsigned long long>(counters->misses), static_cast<unsigned long long>(counters->relativeDiffer), static_cast<unsigned long long>(counters->absoluteDiffer), static_cast<unsigned long long>(counters->notRead), static_cast<unsigned long long>(counters->newReads));
+    counters->misses = counters->relativeDiffer = counters->absoluteDiffer = counters->notRead = counters->newReads = 0;
+}
+
 // APS5_NATIVE_CENSUS (see Driver::draw): shapes seen (capped, then forgotten) and 10 s counters.
 void noteNativeCensus(std::uint64_t shapeKey, bool drawHit, const std::vector<StageCapture>& captures, const std::vector<ShaderRecompiler::ProgramRole>& roles) {
     struct Census {
@@ -929,6 +998,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // or into nativeLive: the draw's own words where data words changed).
     std::vector<std::vector<ShaderRecompiler::MemoryRegion>> nativeRegions;
     std::vector<std::shared_ptr<const std::vector<std::uint32_t>>> nativeLive;
+    // =verify: the first entry whose value words matched (the miss diagnostic below).
+    NativeDrawEntry nativeMissed;
     if (nativeDraws && !drawHit) {
         auto& cache = nativeDrawCache();
         std::vector<NativeDrawEntry> entries;
@@ -952,6 +1023,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& entry : entries) {
             if (!sameValues(*entry)) continue;
             valuesMatched = true;
+            if (nativeMissed == nullptr) nativeMissed = entry;
             const bool walking = std::any_of(entry->begin(), entry->end(), [](const NativeDrawStage& stage) { return stage.runs != nullptr; });
             const auto started = std::chrono::steady_clock::now();
             nativeRegions.assign(programs.size(), {});
@@ -1118,6 +1190,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto& cache = nativeDrawCache();
         std::shared_ptr<std::vector<NativeDrawStage>> store;
         bool walking = false;
+        if (nativeHit == nullptr && nativeVerify && nativeMissed != nullptr) noteNativeMiss(*nativeMissed, stageCaptures, programs);
         if (nativeHit == nullptr) {
             store = std::make_shared<std::vector<NativeDrawStage>>(programs.size());
             for (std::size_t i = 0; store != nullptr && i < programs.size(); ++i) {
