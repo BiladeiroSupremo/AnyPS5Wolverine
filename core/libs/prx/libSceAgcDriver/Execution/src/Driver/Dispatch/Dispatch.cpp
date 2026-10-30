@@ -13,6 +13,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
@@ -78,6 +79,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     if (SkipListed(snapshot)) return;
+    // APS5_ADDRESS_SRT_LIST_ALL=1 (with APS5_ADDRESS_SRT_LEARN=1): the code hash of every program
+    // dispatched on an async queue (not queue 0) once, on the [address-srt-learn] line (whether or
+    // not its capture waited), to build an APS5_ADDRESS_SRT list of the whole async queue; a program
+    // not translated yet is reported at a later dispatch.
+    static const bool listAll = std::getenv("APS5_ADDRESS_SRT_LIST_ALL") != nullptr;
+    if (listAll && submission.queue != 0) {
+        static thread_local std::uint64_t lastListed = 0;
+        if (address != lastListed) {
+            lastListed = address;
+            ShaderRecompiler::Detail::ReportCaptureWait(address);
+        }
+    }
     // Causal-profile probe (APS5_SLOW_COMPUTE_DISPATCH_US=<us>): every dispatch on a queue other than
     // queue 0 (async compute) spins this long first, so a run shows how much the frame depends on
     // that worker's per-dispatch cost.

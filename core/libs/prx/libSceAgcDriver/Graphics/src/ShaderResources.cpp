@@ -3226,7 +3226,13 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
         allocations.push_back({0, EmptyBufferBytes, false, nullptr, ShaderRecompiler::DescriptorRole::GuestBuffers, false});
         return allocations.size() - 1;
     }
-    Require(byteSize <= context.limits.maxStorageBufferRange, "shader buffer exceeds descriptor range limit");
+    if (byteSize > context.limits.maxStorageBufferRange) {
+        // The V# itself: a garbage size usually came from GPU-written words read before (or
+        // without) their writer (the async-compute chain on the address path, trasrt2 2026-10-30).
+        char text[192];
+        std::snprintf(text, sizeof(text), "shader buffer exceeds descriptor range limit (V# %08x %08x %08x %08x: base 0x%llx, %llu bytes)", words[0], words[1], words[2], words[3], static_cast<unsigned long long>(address), static_cast<unsigned long long>(byteSize));
+        throw std::runtime_error(text);
+    }
     Require(byteSize <= std::numeric_limits<std::size_t>::max(), "shader buffer size exceeds host address space");
     auto size = static_cast<std::size_t>(byteSize);
     if (const std::uint64_t stride = descriptor.Stride(); stride != 0) {
