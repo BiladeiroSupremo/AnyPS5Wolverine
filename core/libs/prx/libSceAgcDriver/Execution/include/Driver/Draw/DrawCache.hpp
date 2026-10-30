@@ -145,6 +145,13 @@ void NativeDataWords(DispatchVariant& runs, const ShaderRecompiler::RecompileRes
 // flattened SRT; a copy unless no data word is set.
 std::shared_ptr<const ShaderRecompiler::RecompileResult> NativeWithData(std::shared_ptr<const ShaderRecompiler::RecompileResult> result, const DispatchVariant& runs, std::span<const std::uint32_t> live);
 
+// APS5_NATIVE_DRAWS=1: every 64th reuse (NativeSampled) is also built as before, rendered from that
+// and compared; a mismatch turns native reuse off for the rest of the run (TripNative, logged), so a
+// state the verify runs did not meet costs a few wrong draws at most. NativeTripped: turned off.
+bool NativeSampled();
+bool NativeTripped();
+void TripNative(const char* what, std::uint64_t program);
+
 // Whether a stage's stored user words admit these: the value-used words equal, the base pointers
 // null where they were null (a walk through a null pointer records no read).
 bool NativeSameValues(const NativeDrawStage& stage, std::span<const std::uint32_t> userData);

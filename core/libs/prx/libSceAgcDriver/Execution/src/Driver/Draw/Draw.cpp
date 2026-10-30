@@ -113,6 +113,25 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> NativeWithData(std::sha
     return patched;
 }
 
+namespace {
+
+std::atomic<bool> nativeTripped{false};
+std::atomic<std::uint64_t> nativeSamples{0};
+
+}
+
+bool NativeSampled() {
+    return nativeSamples.fetch_add(1, std::memory_order_relaxed) % 64u == 63u;
+}
+
+bool NativeTripped() {
+    return nativeTripped.load(std::memory_order_relaxed);
+}
+
+void TripNative(const char* what, std::uint64_t program) {
+    if (!nativeTripped.exchange(true)) std::fprintf(stderr, "[native] a sampled check found %s of program 0x%llx unlike a fresh build: native reuse is off for the rest of the run\n", what, static_cast<unsigned long long>(program));
+}
+
 bool NativeSameValues(const NativeDrawStage& stage, std::span<const std::uint32_t> userData) {
     if (userData.size() != stage.userData.size()) return false;
     for (std::size_t word = 0; word < userData.size(); ++word) {
@@ -131,19 +150,28 @@ std::uint64_t NativePointerAt(const std::vector<std::uint32_t>& userData, int wo
 // APS5_NATIVE_DRAWS=verify: why a known shape's entry whose value words matched missed on its
 // captured words: its words at this draw's runs against what this draw's capture read, by run kind
 // (relocated at a user pointer, or absolute), and the words read on one side only ([native-miss]).
-void noteNativeMiss(const std::vector<NativeDrawStage>& entry, const std::vector<StageCapture>& captures, const std::vector<DrawProgram>& programs) {
+void noteNativeMiss(const std::vector<NativeDrawStage>& entry, const std::vector<StageCapture>& captures, const std::vector<DrawProgram>& programs, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads) {
     struct Counters {
         std::mutex mutex;
         std::uint64_t misses = 0, relativeDiffer = 0, absoluteDiffer = 0, notRead = 0, newReads = 0;
+        // Misses by kind: reads moved (a chained pointer), only words the vertex decode also read
+        // differ, other words differ.
+        std::uint64_t moved = 0, vertexOnly = 0, other = 0;
         int examples = 0;
         std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
     };
     static auto* counters = new Counters();
-    std::uint64_t relativeDiffer = 0, absoluteDiffer = 0, notRead = 0, newReads = 0;
+    std::uint64_t relativeDiffer = 0, absoluteDiffer = 0, notRead = 0, newReads = 0, nonVertex = 0;
     char example[224] = "";
     for (std::size_t i = 0; i < entry.size() && i < captures.size() && i < programs.size(); ++i) {
         const auto& stage = entry[i];
         if (stage.runs == nullptr || !captures[i].captured) continue;
+        std::unordered_set<std::uint64_t> decoded;
+        if (i < decodeReads.size()) {
+            for (const auto& read : decodeReads[i]) {
+                for (std::size_t k = 0; k < read.bytes.size() / sizeof(std::uint32_t); ++k) decoded.insert(read.address + k * sizeof(std::uint32_t));
+            }
+        }
         std::unordered_map<std::uint64_t, std::uint32_t> now;
         for (const auto& region : captures[i].regions) {
             for (std::size_t k = 0; k < region.bytes.size() / sizeof(std::uint32_t); ++k) {
@@ -169,6 +197,7 @@ void noteNativeMiss(const std::vector<NativeDrawStage>& entry, const std::vector
                     ++notRead;
                 } else if (found->second != stored) {
                     ++(relative ? relativeDiffer : absoluteDiffer);
+                    if (!decoded.contains(address)) ++nonVertex;
                     if (example[0] == '\0') std::snprintf(example, sizeof(example), "program 0x%llx stage %zu run %zu of %zu (%s %d) word %zu: stored 0x%08x, now 0x%08x", static_cast<unsigned long long>(stage.program), i, r, runs.runs.size(), relative ? "user pointer" : "absolute", word, k, stored, found->second);
                 }
             }
@@ -180,6 +209,7 @@ void noteNativeMiss(const std::vector<NativeDrawStage>& entry, const std::vector
     }
     std::lock_guard lock(counters->mutex);
     ++counters->misses;
+    ++(notRead + newReads != 0 ? counters->moved : nonVertex == 0 ? counters->vertexOnly : counters->other);
     counters->relativeDiffer += relativeDiffer;
     counters->absoluteDiffer += absoluteDiffer;
     counters->notRead += notRead;
@@ -191,8 +221,8 @@ void noteNativeMiss(const std::vector<NativeDrawStage>& entry, const std::vector
     const auto clock = std::chrono::steady_clock::now();
     if (clock - counters->reported < std::chrono::seconds(10)) return;
     counters->reported = clock;
-    std::fprintf(stderr, "[native-miss] (10 s) %llu misses on captured words: words differ at user-pointer runs %llu, at absolute runs %llu; stored words not read now %llu; words read now only %llu\n", static_cast<unsigned long long>(counters->misses), static_cast<unsigned long long>(counters->relativeDiffer), static_cast<unsigned long long>(counters->absoluteDiffer), static_cast<unsigned long long>(counters->notRead), static_cast<unsigned long long>(counters->newReads));
-    counters->misses = counters->relativeDiffer = counters->absoluteDiffer = counters->notRead = counters->newReads = 0;
+    std::fprintf(stderr, "[native-miss] (10 s) %llu misses on captured words (reads moved %llu, only vertex-decoded words differ %llu, other words differ %llu): words differ at user-pointer runs %llu, at absolute runs %llu; stored words not read now %llu; words read now only %llu\n", static_cast<unsigned long long>(counters->misses), static_cast<unsigned long long>(counters->moved), static_cast<unsigned long long>(counters->vertexOnly), static_cast<unsigned long long>(counters->other), static_cast<unsigned long long>(counters->relativeDiffer), static_cast<unsigned long long>(counters->absoluteDiffer), static_cast<unsigned long long>(counters->notRead), static_cast<unsigned long long>(counters->newReads));
+    counters->misses = counters->relativeDiffer = counters->absoluteDiffer = counters->notRead = counters->newReads = counters->moved = counters->vertexOnly = counters->other = 0;
 }
 
 // APS5_NATIVE_CENSUS (see Driver::draw): shapes seen (capped, then forgotten) and 10 s counters.
@@ -737,9 +767,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     // APS5_NATIVE_DRAWS (native path, see the N2/N3 hit below): the draw cache (keyed by every user
     // word, ~1% hits) is not used; the shape key finds the decode (N1) and the compiled stages.
-    // APS5_NATIVE_DRAWS=verify renders with fresh decodes and stages and compares the reused ones.
-    static const bool nativeDraws = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
-    static const bool nativeVerify = nativeDraws && std::string_view(std::getenv("APS5_NATIVE_DRAWS")) == "verify";
+    // APS5_NATIVE_DRAWS=verify renders with fresh decodes and stages and compares the reused ones;
+    // =1 does so for a sample (NativeSampled) and turns the native path off at a mismatch.
+    static const bool nativeSwitch = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
+    static const bool nativeVerify = nativeSwitch && std::string_view(std::getenv("APS5_NATIVE_DRAWS")) == "verify";
+    const bool nativeDraws = nativeSwitch && !NativeTripped();
     const bool useDrawEntries = !nativeDraws && drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
@@ -799,11 +831,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (const auto offset = DrawUserWordRegister(program, word); offset != 0) program.userData[word] = readUserData(queue.shader, offset);
             }
         }
-        if (nativeVerify) {
+        if (nativeVerify || NativeSampled()) {
             auto fresh = decodeDraw(queue, submission);
             auto refreshed = *decode;
             refreshed.programs = programs;
             const bool same = sameDecode(refreshed, *fresh);
+            if (!same && !nativeVerify) TripNative("a decode", programs.empty() ? 0 : programs.front().binary.codeAddress);
             auto& cache = nativeDrawCache();
             std::lock_guard lock(cache.mutex);
             ++(same ? cache.decodeEqual : cache.decodeDiffer);
@@ -1074,7 +1107,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::lock_guard lock(cache.mutex);
             ++(valuesMatched ? cache.missedRuns : cache.missedValues);
         }
+        // The gather's time shows as key/lookup/validate in the [draw] driver phases.
+        phaseTiming.Phase(DrawRowKeyLookupValidate);
     }
+    // A hit built as before and compared (=verify: every hit; =1: a sample, which trips the switch).
+    const bool nativeCheck = nativeHit != nullptr && (nativeVerify || NativeSampled());
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -1100,7 +1137,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     break;
                 }
             }
-            if (nativeHit != nullptr && !nativeVerify) {
+            if (nativeHit != nullptr && !nativeCheck) {
                 auto patched = NativePatchedResult((*nativeHit)[i], programs[i].userData, vertexInfos[i]);
                 if (i < nativeLive.size() && nativeLive[i] != nullptr) patched = NativeWithData(std::move(patched), *(*nativeHit)[i].runs, *nativeLive[i]);
                 require(patched != nullptr, "native draw: a user-word patch lies outside the cached stage result");
@@ -1127,6 +1164,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                         return true;
                     };
                     const bool equal = patched != nullptr && sameCompiledResult(*patched, fresh) && patched->poisonedSrtReads == fresh.poisonedSrtReads && sameAttributes();
+                    if (!equal && !nativeVerify) TripNative("a reused stage", program.binary.codeAddress);
                     auto& cache = nativeDrawCache();
                     std::lock_guard lock(cache.mutex);
                     ++(equal ? cache.verifyEqual : cache.verifyDiffer);
@@ -1190,7 +1228,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto& cache = nativeDrawCache();
         std::shared_ptr<std::vector<NativeDrawStage>> store;
         bool walking = false;
-        if (nativeHit == nullptr && nativeVerify && nativeMissed != nullptr) noteNativeMiss(*nativeMissed, stageCaptures, programs);
+        if (nativeHit == nullptr && nativeVerify && nativeMissed != nullptr) noteNativeMiss(*nativeMissed, stageCaptures, programs, decodeReads);
         if (nativeHit == nullptr) {
             store = std::make_shared<std::vector<NativeDrawStage>>(programs.size());
             for (std::size_t i = 0; store != nullptr && i < programs.size(); ++i) {

@@ -330,7 +330,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     // ([native-dispatches] line).
     static const bool nativeDispatches = std::getenv("APS5_NATIVE_DRAWS") != nullptr;
     static const bool nativeVerify = nativeDispatches && std::string_view(std::getenv("APS5_NATIVE_DRAWS")) == "verify";
-    bool nativeEligible = nativeDispatches && keyHygiene && !cached && !fromAhead && !resolving && !probeThis && indirectArguments == 0;
+    bool nativeEligible = nativeDispatches && !NativeTripped() && keyHygiene && !cached && !fromAhead && !resolving && !probeThis && indirectArguments == 0;
     std::uint64_t nativeShape = 0;
     std::shared_ptr<const NativeDrawStage> nativeHit;
     std::vector<ShaderRecompiler::MemoryRegion> nativeRegions;
@@ -424,7 +424,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         reportNativeDispatches(cache);
     }
-    const bool nativeReused = nativeHit != nullptr && !nativeVerify;
+    // A hit built as before and compared (=verify: every hit; =1: a sample, which trips the switch).
+    const bool nativeReused = nativeHit != nullptr && !nativeVerify && !NativeSampled();
     if (nativeReused) {
         compiledResult = NativePatchedResult(*nativeHit, userData, std::nullopt);
         require(compiledResult != nullptr, "native dispatch: a user-word patch lies outside the cached program");
@@ -505,6 +506,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             auto patched = NativePatchedResult(*nativeHit, userData, std::nullopt);
             if (nativeLive != nullptr) patched = NativeWithData(std::move(patched), *nativeHit->runs, *nativeLive);
             const bool equal = patched != nullptr && sameCompiledResult(*patched, *compiledResult) && patched->poisonedSrtReads == compiledResult->poisonedSrtReads;
+            if (!equal && !nativeVerify) TripNative("a reused dispatch", address);
             auto& cache = nativeDispatchCache();
             std::lock_guard lock(cache.mutex);
             ++(equal ? cache.verifyEqual : cache.verifyDiffer);
