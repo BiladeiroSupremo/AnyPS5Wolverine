@@ -346,8 +346,10 @@ std::array<std::atomic<std::uint64_t>, 5>& NativeChainCounts() {
 // The native hit path's time after the gather, by part (ns totals over hits, [native-hit] line):
 // patched results, the store block, the queued-label check, the snapshots, the rest up to the commit.
 struct NativeHitTiming {
-    std::array<std::atomic<std::uint64_t>, 6> ns{};
-    std::atomic<std::uint64_t> hits{0};
+    // ... and [6]/[7]: the "vectors" draw phase before the gather / after it up to the commit;
+    // [8]: the store block of draws that missed (over `misses`).
+    std::array<std::atomic<std::uint64_t>, 9> ns{};
+    std::atomic<std::uint64_t> hits{0}, misses{0};
 };
 
 NativeHitTiming& nativeHitTiming() {
@@ -518,11 +520,17 @@ bool Driver::nativeGather(const NativeDrawStage& stage, std::span<const std::uin
     // Words with a GPU write still pending: a capture takes the value that write will store (a
     // known value) where the comparison below sees memory as it is, so the stage is built as before
     // (trno1/trno2: 1-in-64 checks found 0x11d43831xx/0x11d43837xx flattened-SRT word 7 stale).
+    // Writes still queued in the draw pipeline count too: a capture drains them first and then takes
+    // the value they will store (queryPendingWrite), the comparison would drain and compare memory
+    // (trno5: 0x11d4383500 word 7 stored 0x348 vs 0xa8 fresh, with only the recorder ranges checked).
     PendingView pending;
     pending.Load();
+    auto& pipeline = DrawPipeline::Queue0();
+    const bool queued = DrawPipeline::Active() && pipeline.Busy();
     const auto overPending = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& list) {
         for (const auto& [begin, end] : list) {
-            if (pending.Overlaps(begin, static_cast<std::size_t>(end - begin))) return true;
+            const auto bytes = static_cast<std::size_t>(end - begin);
+            if (pending.Overlaps(begin, bytes) || (queued && pipeline.Overlaps(begin, bytes))) return true;
         }
         return false;
     };
@@ -1262,6 +1270,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // APS5_NATIVE_DRAWS=verify: every hit also materializes the stages as before, renders with those
     // and compares them with the reused ones (rendering unchanged).
     NativeDrawEntry nativeHit;
+    // [native-hit]: the "vectors" draw phase a hit had accumulated by its gather (ms).
+    double nativeVectorsBefore = 0.0;
     // A hit's walking stages' runs at this draw's pointers (into the entry's words, as matchedRegions,
     // or into nativeLive: the draw's own words where data words changed).
     std::vector<std::vector<ShaderRecompiler::MemoryRegion>> nativeRegions;
@@ -1321,6 +1331,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         // The gather's time shows as key/lookup/validate in the [draw] driver phases.
         phaseTiming.Phase(DrawRowKeyLookupValidate);
+        if (nativeHit != nullptr) nativeVectorsBefore = phaseMs[DrawRowVectors];
     }
     // A hit built as before and compared (=verify: every hit; =1: a sample, which trips the switch).
     const bool nativeCheck = nativeHit != nullptr && (nativeVerify || NativeSampled());
@@ -1387,6 +1398,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                         const auto& before = i < nativeLive.size() ? nativeLive[i] : nullptr;
                         raced = !nativeGather((*nativeHit)[i], programs[i].userData, program.binary.codeAddress, submission.queue, again, againLive) || (againLive != nullptr) != (before != nullptr) || (againLive != nullptr && *againLive != *before);
                     }
+                    // What this capture read that the entry's runs do not cover ([native-miss] line).
+                    if (!equal && !raced) noteNativeMiss(*nativeHit, stageCaptures, programs, decodeReads);
                     if (!equal && !raced && !nativeVerify) TripNative("a reused stage", program.binary.codeAddress);
                     auto& cache = nativeDrawCache();
                     std::lock_guard lock(cache.mutex);
@@ -1452,7 +1465,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // check, snapshots, commit.
     const bool timedHit = nativeHit != nullptr && !nativeCheck;
     std::array<std::uint64_t, 4> hitMarks{};
-    if (timedHit) hitMarks[0] = nativeNowNs();
+    const auto storeStarted = nativeDraws && !drawHit ? nativeNowNs() : 0;
+    if (timedHit) hitMarks[0] = storeStarted;
     // APS5_NATIVE_DRAWS: a miss keeps its stages for its shape, before the shape's older entries
     // ([native-draws] line).
     if (nativeDraws && !drawHit) {
@@ -1515,12 +1529,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             cache.decodeHits = cache.decodeEqual = cache.decodeDiffer = cache.hits = cache.walkingHits = cache.dataWordHits = cache.stored = cache.walkingStored = cache.chainedStored = cache.refused = cache.missedValues = cache.missedRuns = cache.gathers = cache.gatherNs = cache.verifyEqual = cache.verifyDiffer = cache.verifyRaced = 0;
             auto& hitTiming = nativeHitTiming();
             const auto timedHits = static_cast<double>(std::max<std::uint64_t>(hitTiming.hits.exchange(0), 1));
-            std::array<double, 6> us{};
+            std::array<double, 8> us{};
             for (std::size_t part = 0; part < us.size(); ++part) us[part] = static_cast<double>(hitTiming.ns[part].exchange(0)) / 1e3 / timedHits;
-            std::fprintf(stderr, "[native-hit] (10 s) us per reused draw after its gather: patched results %.1f, indirect classify %.1f, store block %.1f, up to the label check %.1f, snapshots %.1f, rest to the commit %.1f\n", us[0], us[5], us[1], us[2], us[3], us[4]);
+            const auto misses = hitTiming.misses.exchange(0);
+            const auto storeUs = static_cast<double>(hitTiming.ns[8].exchange(0)) / 1e3;
+            std::fprintf(stderr, "[native-hit] (10 s) us per reused draw after its gather: patched results %.1f, indirect classify %.1f, store block %.1f, up to the label check %.1f, snapshots %.1f, rest to the commit %.1f; \"vectors\" phase before the gather %.1f, after it %.1f; misses %llu, store block %.1f us each (%.0f ms)\n", us[0], us[5], us[1], us[2], us[3], us[4], us[6], us[7], static_cast<unsigned long long>(misses), misses == 0 ? 0.0 : storeUs / static_cast<double>(misses), storeUs / 1e3);
         }
     }
     if (timedHit) hitMarks[1] = nativeNowNs();
+    if (nativeDraws && !drawHit && nativeHit == nullptr) {
+        nativeHitTiming().ns[8].fetch_add(nativeNowNs() - storeStarted, std::memory_order_relaxed);
+        nativeHitTiming().misses.fetch_add(1, std::memory_order_relaxed);
+    }
     // APS5_NATIVE_CENSUS=1 (native path groundwork, count only): whether the draw's shape (the
     // register key without user words: programs and render state) was seen before, and whether its
     // stages captured nothing (walk-free); a [native-census] line every 10 s. A repeated walk-free
@@ -1862,6 +1882,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             hitTiming.hits.fetch_add(1, std::memory_order_relaxed);
         }
         phaseTiming.Phase(DrawRowVectors);
+        if (timedHit) {
+            auto& hitTiming = nativeHitTiming();
+            hitTiming.ns[6].fetch_add(static_cast<std::uint64_t>(nativeVectorsBefore * 1e6), std::memory_order_relaxed);
+            hitTiming.ns[7].fetch_add(static_cast<std::uint64_t>((phaseMs[DrawRowVectors] - nativeVectorsBefore) * 1e6), std::memory_order_relaxed);
+        }
         auto writes = drawWriteRanges(graphics, stages);
         // The guest memory this draw's preparation read (its captures, the decode's reads).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
